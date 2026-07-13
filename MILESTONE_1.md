@@ -259,13 +259,20 @@ Only the **planning** and **breakdown** phases exist in Half 1:
 
 ## 5. Phase 2 — Interactive planning  *(the spike lives here)*
 
-- [ ] **T-200 — [SPIKE] agent-harness interactive multi-turn PoC.** *deps: T-001*
+- [x] **T-200 — [SPIKE] agent-harness interactive multi-turn PoC.** *deps: T-001*
   Standalone example driving Claude Code via `agent-harness` across **≥2 turns**,
   streaming normalized `RunEvent`s. Document: native session-resume vs.
   transcript-replay fallback; how tool-calls surface mid-conversation; crate
   maturity/license. **AC:** a working multi-turn transcript is produced and the
   findings are written up. **GATE:** if interactive support is inadequate, stop
   and revisit the architecture before building T-201+.
+  **Done:** verdict PROCEED-WITH-CAVEATS — see [`docs/spikes/T-200-agent-harness.md`](./docs/spikes/T-200-agent-harness.md).
+  Crate is `agent-harness = "=0.3.5"` (imported as `harness`, MIT/Apache-2.0).
+  Native resume works (`session_id` from `RunEvent::Session`); keep the durable
+  `transcript_message` store as source of truth with a replay fallback. MCP is
+  wired via `RunTuning.extra_args` (`--mcp-config` + `--allowedTools` +
+  `--permission-mode bypassPermissions`); read-only is enforced by tool-scoping +
+  a read-only checkout, **not** `RunMode::Ask`. Enums are `#[non_exhaustive]`.
 
 - [ ] **T-201 — Transcript store & planning-session lifecycle.** *deps: T-003, T-200*
   Create a planning session bound to a (new) `Planning`-status epic; persist every

@@ -1,0 +1,28 @@
+# T-200 spike: standalone PoC crate for the agent-harness interactive multi-turn evaluation.
+#
+# This is intentionally its OWN workspace (empty `[workspace]` table below) so it
+# is detached from the root Deerborn workspace and cannot disturb the
+# `deerborn-server` build. Build/run it from inside this directory:
+#     cargo run --bin multi_turn         # native session-resume PoC
+#     cargo run --bin mcp_config_demo    # prints the --mcp-config wiring (no run)
+[package]
+name = "t200-agent-harness"
+version = "0.1.0"
+edition = "2021"
+publish = false
+
+# Detach from the parent workspace — keeps `deerborn-server` untouched/buildable.
+[workspace]
+
+[dependencies]
+# Ground truth: latest published is 0.3.5 (task brief said "~v0.4"; it is not on
+# crates.io as of 2026-07-13). Imported in Rust as `harness`.
+agent-harness = "0.3.5"
+
+[[bin]]
+name = "multi_turn"
+path = "src/multi_turn.rs"
+
+[[bin]]
+name = "mcp_config_demo"
+path = "src/mcp_config_demo.rs"
