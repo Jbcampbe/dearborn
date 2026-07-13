@@ -46,11 +46,23 @@ curl http://127.0.0.1:8787/health
 # → {"status":"ok"}
 ```
 
-The bind address defaults to `127.0.0.1:8787`. Override it with the `DEERBORN_BIND`
-env var (full config handling arrives in T-002):
+The server reads its configuration from the environment (see the
+[Configuration](#configuration) table below). `DEERBORN_TOKEN` and
+`DEERBORN_MASTER_KEY` are **required** — the server refuses to start without
+them:
 
 ```bash
-DEERBORN_BIND=127.0.0.1:9000 cargo run -p deerborn-server
+DEERBORN_TOKEN=my-secret-token DEERBORN_MASTER_KEY=... cargo run -p deerborn-server
+# → deerborn-server listening on http://127.0.0.1:8787
+```
+
+Every route except `GET /health` requires an `Authorization: Bearer <token>`
+header matching `DEERBORN_TOKEN`; requests without it get `401`:
+
+```bash
+curl http://127.0.0.1:8787/health                                   # → 200 (public)
+curl -H "Authorization: Bearer my-secret-token" \
+     http://127.0.0.1:8787/whoami                                   # → 200 {"status":"authenticated"}
 ```
 
 ### Everything (server + Vite dev server)
@@ -74,8 +86,20 @@ just test      # == cargo test  (the whole-repo gate)
 just build     # cargo build --release  +  vite production build (client/dist)
 ```
 
-## Environment variables
+## Configuration
 
-| Variable        | Default            | Purpose                                  |
-| --------------- | ------------------ | ---------------------------------------- |
-| `DEERBORN_BIND` | `127.0.0.1:8787`   | Server bind address. Full config: T-002. |
+Config is read from the process environment. As an **optional** fallback, point
+`DEERBORN_CONFIG` at a `KEY=VALUE` file (`#` comments and blank lines ignored);
+environment variables always take precedence over the file.
+
+| Variable              | Required | Default          | Purpose                                                                 |
+| --------------------- | :------: | ---------------- | ----------------------------------------------------------------------- |
+| `DEERBORN_TOKEN`      |   yes    | —                | Single-user bearer token; every route except `GET /health` requires it. |
+| `DEERBORN_MASTER_KEY` |   yes    | —                | AES-256-GCM key material for encrypting PATs at rest (consumed in T-102).|
+| `DEERBORN_BIND`       |    no    | `127.0.0.1:8787` | Server bind address.                                                     |
+| `DEERBORN_DB`         |    no    | `./deerborn.db`  | Path to the local libSQL database file (T-003).                         |
+| `DEERBORN_CLONE_ROOT` |    no    | `./clones`       | Root directory under which per-project clones live (T-103).             |
+| `DEERBORN_CONFIG`     |    no    | —                | Optional path to a `KEY=VALUE` config file used as a fallback source.    |
+
+The server **fails fast at boot** with a clear error (non-zero exit) if
+`DEERBORN_TOKEN` or `DEERBORN_MASTER_KEY` is missing or empty.
