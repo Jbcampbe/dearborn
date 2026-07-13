@@ -47,6 +47,14 @@ pub enum AppError {
     Db(#[from] DbError),
 }
 
+/// Let handlers `?`-propagate raw `libsql` query errors (from `query`/`execute`/
+/// `Row::get`) straight into the generic-500 `Db` path, same as a [`DbError`].
+impl From<libsql::Error> for AppError {
+    fn from(err: libsql::Error) -> Self {
+        AppError::Db(DbError::Libsql(err))
+    }
+}
+
 impl AppError {
     /// The HTTP status and stable machine-readable error code for this error.
     fn status_and_code(&self) -> (StatusCode, &'static str) {

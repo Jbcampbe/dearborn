@@ -9,6 +9,7 @@ pub mod config;
 pub mod db;
 pub mod error;
 pub mod hub;
+pub mod projects;
 pub mod ws;
 
 use std::sync::Arc;
@@ -68,6 +69,16 @@ pub fn app(state: AppState) -> Router {
 
     let protected = Router::new()
         .route("/whoami", get(whoami))
+        .route(
+            "/projects",
+            get(projects::list_projects).post(projects::create_project),
+        )
+        .route(
+            "/projects/:id",
+            get(projects::get_project)
+                .patch(projects::update_project)
+                .delete(projects::delete_project),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_bearer,
