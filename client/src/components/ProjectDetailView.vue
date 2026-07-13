@@ -1,22 +1,27 @@
 <script setup lang="ts">
 import { onMounted, ref } from "vue";
-import { RouterLink } from "vue-router";
+import { RouterLink, useRouter } from "vue-router";
 import { useAuthStore } from "../stores/auth";
 import { ApiError } from "../api/client";
 import { getProject, refreshProject, type Project } from "../api/projects";
+import { createEpic, listEpics, type Epic } from "../api/epics";
 import CloneStatusBadge from "./CloneStatusBadge.vue";
 
-// Project detail shell (T-104). Shows the project's identity + clone lifecycle
-// and a placeholder where the kanban board lands in T-401. A "Re-clone" action
-// triggers a background `git fetch`; because the clone settles asynchronously,
-// the user reloads (or re-clones again) to watch pending → ready/error.
+// Project detail shell (T-104). Shows the project's identity + clone lifecycle,
+// the project's epics, and a "Start planning" entry point (T-204) that creates
+// an epic and drops the user into the planning chat. The kanban board lands in
+// T-401. A "Re-clone" action triggers a background `git fetch`; because the
+// clone settles asynchronously, the user reloads to watch pending → ready/error.
 const props = defineProps<{ id: string }>();
 
 const auth = useAuthStore();
+const router = useRouter();
 const project = ref<Project | null>(null);
+const epics = ref<Epic[]>([]);
 const loading = ref(true);
 const error = ref<string | null>(null);
 const refreshing = ref(false);
+const planning = ref(false);
 
 async function load() {
   const token = auth.token;
@@ -26,7 +31,12 @@ async function load() {
   loading.value = true;
   error.value = null;
   try {
-    project.value = await getProject(token, props.id);
+    const [proj, epicList] = await Promise.all([
+      getProject(token, props.id),
+      listEpics(token, props.id),
+    ]);
+    project.value = proj;
+    epics.value = epicList;
   } catch (err) {
     if (err instanceof ApiError && err.isAuth) {
       auth.logout(`Token rejected (401): ${err.message}. Please re-enter it.`);
@@ -35,6 +45,32 @@ async function load() {
     error.value = err instanceof Error ? err.message : "failed to load project";
   } finally {
     loading.value = false;
+  }
+}
+
+// Create a fresh epic (lands in the Planning lane) and open the planning chat.
+async function startPlanning() {
+  const token = auth.token;
+  if (token === null || planning.value) {
+    return;
+  }
+  const title = window.prompt("What do you want to build? (epic title)")?.trim();
+  if (!title) {
+    return;
+  }
+  planning.value = true;
+  error.value = null;
+  try {
+    const epic = await createEpic(token, props.id, title);
+    await router.push({ name: "epic-planning", params: { id: epic.id } });
+  } catch (err) {
+    if (err instanceof ApiError && err.isAuth) {
+      auth.logout(`Token rejected (401): ${err.message}. Please re-enter it.`);
+      return;
+    }
+    error.value = err instanceof Error ? err.message : "failed to start planning";
+  } finally {
+    planning.value = false;
   }
 }
 
@@ -114,6 +150,30 @@ onMounted(load);
             {{ refreshing ? "Re-cloning…" : "Re-clone" }}
           </button>
         </div>
+      </section>
+
+      <section class="epics">
+        <div class="epics-head">
+          <h2>Epics ({{ epics.length }})</h2>
+          <button class="primary" :disabled="planning" @click="startPlanning">
+            {{ planning ? "Starting…" : "Start planning" }}
+          </button>
+        </div>
+
+        <p v-if="epics.length === 0" class="empty">
+          No epics yet. Start planning to create the first one.
+        </p>
+        <ul v-else class="epic-list">
+          <li v-for="epic in epics" :key="epic.id">
+            <RouterLink
+              class="epic-link"
+              :to="{ name: 'epic-planning', params: { id: epic.id } }"
+            >
+              <span class="epic-title">{{ epic.title }}</span>
+              <span class="epic-status">{{ epic.status }}</span>
+            </RouterLink>
+          </li>
+        </ul>
       </section>
 
       <section class="board">
@@ -203,6 +263,62 @@ dd {
 .actions button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
+}
+.epics {
+  margin-top: 2rem;
+}
+.epics-head {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+}
+.primary {
+  font: inherit;
+  padding: 0.4rem 0.9rem;
+  border: 1px solid #2563eb;
+  border-radius: 6px;
+  background: #2563eb;
+  color: #fff;
+  cursor: pointer;
+}
+.primary:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.empty {
+  color: #6b7280;
+}
+.epic-list {
+  list-style: none;
+  padding: 0;
+  margin: 0.5rem 0 0;
+}
+.epic-list li {
+  border-bottom: 1px solid #eee;
+}
+.epic-link {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+  padding: 0.7rem 0.4rem;
+  text-decoration: none;
+  color: inherit;
+  border-radius: 6px;
+}
+.epic-link:hover {
+  background: #f3f4f6;
+}
+.epic-title {
+  font-weight: 600;
+}
+.epic-status {
+  margin-left: auto;
+  font-size: 0.8rem;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  background: #eef2ff;
+  color: #3730a3;
 }
 .board {
   margin-top: 2rem;

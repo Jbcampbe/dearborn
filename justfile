@@ -15,9 +15,10 @@ dev:
     trap 'kill "$server_pid" 2>/dev/null || true' EXIT INT TERM
     (cd client && npm run dev)
 
-# Whole-repo test gate. Becomes Deerborn's own test_cmd later.
+# Whole-repo test gate (Rust + client). Becomes Deerborn's own test_cmd later.
 test:
     cargo test
+    cd client && npm test
 
 # Build the release binary and the Vite production assets.
 build:

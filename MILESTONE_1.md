@@ -352,7 +352,7 @@ Only the **planning** and **breakdown** phases exist in Half 1:
   the live end-to-end smoke test is `tests/mcp_live.rs` (`#[ignore]`d). See
   `CONVENTIONS.md` §"Local MCP server".
 
-- [ ] **T-204 — Planning chat UI + Epic record view.** *deps: T-104, T-202, T-203*
+- [x] **T-204 — Planning chat UI + Epic record view.** *deps: T-104, T-202, T-203*
   A chat panel (streaming) beside a live-updating Epic record; a "start planning"
   flow that lands a new Epic in the **Planning** lane. **AC:** a user plans an epic
   entirely in the browser and sees the Epic record fill in as they talk.
