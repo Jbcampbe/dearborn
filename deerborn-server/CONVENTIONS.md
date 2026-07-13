@@ -150,6 +150,37 @@ malformed frames get an `error` frame back (the connection stays open).
 | `error`        | Protocol error; `payload.message` explains it. `topic` is `""`. |
 | *(any other)*  | A published event, delivered only to connections subscribed to its `topic`. |
 
+### Planning `RunEvent` stream (T-202)
+
+A user message on an epic (`POST /epics/:id/messages`) triggers a planning agent
+run whose normalized `RunEvent`s are relayed live to the epic's topic,
+`epic:<id>`. Each event is published as one frame: the `type` is the mapping
+below and the `payload` is the **serialized `RunEvent` verbatim** (camelCase,
+`kind`-tagged — e.g. `runId`, `sessionId`, `toolCallId`, `delta`).
+
+| `RunEvent` | frame `type` | notes |
+| ---------- | ------------ | ----- |
+| `Started`        | `started`         | run began |
+| `Session`        | `session`         | carries `sessionId` (captured for native resume) |
+| `Text`           | `text`            | assistant reply chunk (`delta`); concatenated into the stored `agent` message |
+| `Thinking`       | `thinking`        | reasoning chunk (`delta`) |
+| `ToolStart`      | `tool_start`      | T-203+ (`input` is always absent for Claude) |
+| `ToolEnd`        | `tool_end`        | T-203+ |
+| `SuggestedEdits` | `suggested_edits` | |
+| `Activity`       | `activity`        | |
+| `Usage`          | `usage`           | token accounting |
+| `AskQuestion`    | `ask_question`    | |
+| `Error`          | `error`           | terminal, followed by `exited` |
+| `Exited`         | `exited`          | sent exactly once at run end |
+
+`RunEvent` is `#[non_exhaustive]`; any future kind relays under the generic type
+`event` rather than being dropped. The events stream over WS only — the HTTP
+`POST` returns the stored **user** message immediately (`201`). The assembled
+`agent` reply (and any `tool` events) are written to `transcript_message` when
+the run completes; the durable transcript is the source of truth. At most one run
+is in flight per epic; a trigger arriving during a run is **ignored** (its user
+message is still stored, but no overlapping run starts).
+
 ### Publishing from server code
 
 The `Hub` on `AppState` is the API future tasks (T-202, T-401) call:

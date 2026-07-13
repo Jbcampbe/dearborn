@@ -300,11 +300,27 @@ Only the **planning** and **breakdown** phases exist in Half 1:
   libSQL's single writer). `append_message` / `load_transcript` / `set_harness_session_id`
   are the shared store helpers T-202 reuses.
 
-- [ ] **T-202 — Planning agent run + WS streaming.** *deps: T-201, T-005*
+- [x] **T-202 — Planning agent run + WS streaming.** *deps: T-201, T-005*
   A user message triggers an agent run via the harness; `RunEvent`s (text,
   reasoning, tool calls, lifecycle) stream over WS to subscribers on `epic:<id>`;
   the transcript updates live. **AC:** a browser sends a message and watches the
   agent's response stream token-by-token; the exchange is durably stored.
+  **Done:** `src/planning.rs`. The harness sits behind a `PlanningAgent` trait
+  (real `ClaudePlanningAgent` wraps `harness::Claude`; a scripted fake makes
+  `cargo test` hermetic) injected into `AppState` (`with_planner`). `POST
+  /epics/:id/messages` persists the user message then spawns a background run:
+  it drains the harness's **blocking** `mpsc::Receiver<RunEvent>` on
+  `spawn_blocking`, relays every event live to `epic:<id>` (mapping in
+  CONVENTIONS §WebSocket), accumulates `Text` deltas + captures `session_id`,
+  and on completion persists the assembled `agent` reply (+ any `tool` events)
+  via `append_message` and stores the resume id via `set_harness_session_id`.
+  Native `resume` uses the stored `harness_session_id`. A per-epic in-flight set
+  on `AppState` (`try_acquire_run` → RAII `InflightGuard`) prevents overlapping
+  runs: a concurrent trigger is **ignored** (its user message is still stored, no
+  second run starts) so `seq`/resume never interleave. Added
+  `agent-harness = "=0.3.5"`. A live-`claude` smoke test is `#[ignore]`d.
+  Product-planning prompt lives in `PlanningConfig` (`PRODUCT_PLANNING`), shaped
+  so T-205 adds a `technical` config against the same engine.
 
 - [ ] **T-203 — Local MCP server: `update_epic` + `read_codebase_context`.** *deps: T-202, T-103*
   Expose Deerborn's local MCP server to the shelled-out agent, scoped to the

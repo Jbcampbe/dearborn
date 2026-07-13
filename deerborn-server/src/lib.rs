@@ -12,10 +12,12 @@ pub mod epics;
 pub mod error;
 pub mod git;
 pub mod hub;
+pub mod planning;
 pub mod projects;
 pub mod ws;
 
-use std::sync::Arc;
+use std::collections::HashSet;
+use std::sync::{Arc, Mutex};
 
 use std::path::Path;
 
@@ -31,6 +33,7 @@ pub use crypto::MasterKey;
 pub use db::{Db, DbError};
 pub use error::{AppError, AppResult};
 pub use hub::Hub;
+pub use planning::PlanningAgent;
 
 /// Initialise the global `tracing` subscriber. Idempotent; safe to skip in tests.
 /// Honours `RUST_LOG`, defaulting to `info`.
@@ -55,15 +58,29 @@ pub struct AppState {
     /// AES-256 key (derived from `DEERBORN_MASTER_KEY`) used to encrypt/decrypt
     /// per-project PATs. Never serialised or logged.
     pub crypto: Arc<MasterKey>,
+    /// The planning agent that drives interactive epic-planning runs (T-202).
+    /// Production is [`planning::ClaudePlanningAgent`]; tests inject a fake.
+    pub planner: Arc<dyn PlanningAgent>,
+    /// Epics with a planning run currently in flight. A second trigger for an
+    /// epic already in this set is ignored (its user message is still stored),
+    /// so runs never interleave on `seq`/resume. See [`AppState::try_acquire_run`].
+    pub inflight: Arc<Mutex<HashSet<String>>>,
 }
 
 impl AppState {
-    /// Construct shared state from a resolved [`Config`] and open [`Db`].
+    /// Construct shared state from a resolved [`Config`] and open [`Db`], using
+    /// the production planning agent ([`planning::ClaudePlanningAgent`]).
     ///
     /// The master key is derived here; `config.master_key` is guaranteed
     /// non-empty by config loading, so derivation cannot fail. Boot code should
     /// nevertheless call [`MasterKey::derive`] first to fail fast (see `main`).
     pub fn new(config: Config, db: Db) -> AppState {
+        AppState::with_planner(config, db, Arc::new(planning::ClaudePlanningAgent::new()))
+    }
+
+    /// Like [`AppState::new`] but with an injected [`PlanningAgent`] — the seam
+    /// that lets tests drive planning runs hermetically with a scripted fake.
+    pub fn with_planner(config: Config, db: Db, planner: Arc<dyn PlanningAgent>) -> AppState {
         let crypto = MasterKey::derive(&config.master_key)
             .expect("master key material validated non-empty at config load");
         AppState {
@@ -71,6 +88,41 @@ impl AppState {
             db,
             hub: Arc::new(Hub::new()),
             crypto: Arc::new(crypto),
+            planner,
+            inflight: Arc::new(Mutex::new(HashSet::new())),
+        }
+    }
+
+    /// Claim the in-flight slot for `epic_id` for a planning run.
+    ///
+    /// Returns `Some(guard)` if no run was already active for the epic — the
+    /// caller spawns the run and holds the guard for its lifetime; dropping it
+    /// frees the slot. Returns `None` if a run is already in flight (the caller
+    /// then ignores the trigger).
+    pub fn try_acquire_run(&self, epic_id: &str) -> Option<InflightGuard> {
+        let mut set = self.inflight.lock().expect("inflight mutex poisoned");
+        if set.contains(epic_id) {
+            return None;
+        }
+        set.insert(epic_id.to_string());
+        Some(InflightGuard {
+            set: self.inflight.clone(),
+            epic_id: epic_id.to_string(),
+        })
+    }
+}
+
+/// RAII claim on an epic's planning in-flight slot. Frees the slot on drop, so
+/// the slot is released however the run ends (completion, error, or panic).
+pub struct InflightGuard {
+    set: Arc<Mutex<HashSet<String>>>,
+    epic_id: String,
+}
+
+impl Drop for InflightGuard {
+    fn drop(&mut self) {
+        if let Ok(mut set) = self.set.lock() {
+            set.remove(&self.epic_id);
         }
     }
 }

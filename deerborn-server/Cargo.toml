@@ -20,6 +20,7 @@ serde_json = { workspace = true }
 thiserror = { workspace = true }
 libsql = { workspace = true }
 ulid = { workspace = true }
+agent-harness = { workspace = true }
 tower = { workspace = true }
 tower-http = { workspace = true }
 tracing = { workspace = true }

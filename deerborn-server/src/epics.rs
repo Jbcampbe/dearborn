@@ -35,6 +35,7 @@ use libsql::{params, Connection, Row};
 use serde::{Deserialize, Serialize};
 use serde_json::json;
 
+use crate::planning::config_for_phase;
 use crate::{AppError, AppResult, AppState};
 
 /// Columns projected into an [`Epic`] DTO. The Half-2 lease columns
@@ -197,6 +198,18 @@ pub async fn post_message(
     }
 
     let message = append_message(conn, &id, &phase, "user", &content).await?;
+
+    // Trigger a planning agent run for this turn (T-202). The reply streams over
+    // WS on `epic:<id>` and is persisted on completion — not returned inline. A
+    // second trigger while a run is in flight for this epic is ignored: the user
+    // message above is still stored, but no overlapping run starts (so `seq` and
+    // native resume never interleave).
+    if config_for_phase(&phase).is_some() {
+        if let Some(guard) = state.try_acquire_run(&id) {
+            crate::planning::spawn_run(state.clone(), id, phase, guard, content);
+        }
+    }
+
     Ok((StatusCode::CREATED, Json(message)))
 }
 
@@ -296,6 +309,29 @@ pub async fn set_harness_session_id(
         )));
     }
     Ok(())
+}
+
+/// Read the stored native harness `session_id` for an epic's planning phase, if
+/// one has been captured yet (T-202 passes it back as `RunRequest.resume`).
+///
+/// `Ok(None)` when the session exists but has no id yet, or when no session row
+/// exists for `(epic_id, phase)` — callers treat "no resume id" uniformly.
+pub async fn get_harness_session_id(
+    conn: &Connection,
+    epic_id: &str,
+    phase: &str,
+) -> AppResult<Option<String>> {
+    let mut rows = conn
+        .query(
+            "SELECT harness_session_id FROM planning_session \
+             WHERE epic_id = ?1 AND phase = ?2",
+            params![epic_id, phase],
+        )
+        .await?;
+    match rows.next().await? {
+        Some(row) => Ok(row.get::<Option<String>>(0)?),
+        None => Ok(None),
+    }
 }
 
 // ---- row / value plumbing ----------------------------------------------
@@ -416,7 +452,14 @@ mod tests {
     async fn test_app() -> axum::Router {
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
-        app(AppState::new(Config::for_test(TOKEN), db))
+        // These tests exercise the pure transcript store, so inject the silent
+        // planner: message triggers still fire a run, but it streams and persists
+        // nothing (T-202's run behaviour is tested in `crate::planning`).
+        app(AppState::with_planner(
+            Config::for_test(TOKEN),
+            db,
+            std::sync::Arc::new(crate::planning::testing::SilentPlanningAgent),
+        ))
     }
 
     fn req(method: &str, uri: &str, body: Option<Json>) -> Request<Body> {
