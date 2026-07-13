@@ -43,7 +43,9 @@ The contract every handler (T-101+) must follow. Established in T-004.
   ```
 - **No content** (e.g. delete) → `204` with an empty body.
 - **Secrets are never returned.** `pat_encrypted` and any decrypted PAT never
-  appear in a response or a log line.
+  appear in a response or a log line. A per-project PAT may be **supplied** on
+  `POST`/`PATCH /projects` as a `pat` field, but is only ever stored encrypted
+  (see [PAT encryption](#pat-encryption-at-rest)) and never read back.
 
 ## Error responses
 
@@ -139,6 +141,22 @@ state.hub.publish("epic:123", "message", json!({ "text": "hello" }));
 serialises the envelope once and fans it out to every current subscriber of the
 topic. It never blocks and never fails; a slow client that overflows its buffer
 drops the **oldest** frames (bounded per-connection queue).
+
+## PAT encryption at rest
+
+Per-project GitHub PATs (T-102) are encrypted with **AES-256-GCM** before insert
+into `project.pat_encrypted` and never leave the server in plaintext:
+
+- **Key:** `SHA-256(DEERBORN_MASTER_KEY)` gives the 256-bit AES key. Any
+  non-empty master-key material is accepted; derivation is validated at boot
+  (empty material fails fast).
+- **Nonce/layout:** a fresh random 96-bit nonce per encryption; the stored BLOB
+  is `nonce || ciphertext` (nonce prepended; ciphertext carries its GCM tag).
+- **Set/clear:** `POST` accepts an optional `pat`; `PATCH` uses the double-option
+  shape (`null`/empty clears to `NULL`, a value re-encrypts). An empty/whitespace
+  `pat` is treated as "no PAT".
+- **Decrypt:** a crate-internal path only (used by cloning, T-103); there is no
+  route that returns a PAT.
 
 ## Logging
 

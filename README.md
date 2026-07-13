@@ -98,7 +98,7 @@ environment variables always take precedence over the file.
 | Variable              | Required | Default          | Purpose                                                                 |
 | --------------------- | :------: | ---------------- | ----------------------------------------------------------------------- |
 | `DEERBORN_TOKEN`      |   yes    | —                | Single-user bearer token; every route except `GET /health` requires it. |
-| `DEERBORN_MASTER_KEY` |   yes    | —                | AES-256-GCM key material for encrypting PATs at rest (consumed in T-102).|
+| `DEERBORN_MASTER_KEY` |   yes    | —                | Secret material for encrypting PATs at rest (see [Secret handling](#secret-handling)).|
 | `DEERBORN_BIND`       |    no    | `127.0.0.1:8787` | Server bind address.                                                     |
 | `DEERBORN_DB`         |    no    | `./deerborn.db`  | Path to the local libSQL database file (T-003).                         |
 | `DEERBORN_CLONE_ROOT` |    no    | `./clones`       | Root directory under which per-project clones live (T-103).             |
@@ -106,3 +106,24 @@ environment variables always take precedence over the file.
 
 The server **fails fast at boot** with a clear error (non-zero exit) if
 `DEERBORN_TOKEN` or `DEERBORN_MASTER_KEY` is missing or empty.
+
+## Secret handling
+
+Per-project GitHub PATs are **encrypted at rest** with **AES-256-GCM** (T-102):
+
+- **Key derivation.** The 256-bit AES key is `SHA-256(DEERBORN_MASTER_KEY)` — the
+  master-key material may be any non-empty string (any length/format); SHA-256
+  deterministically maps it to the 32 bytes AES-256 needs. Derivation is
+  validated at boot, so a key that cannot form a valid 256-bit key (i.e. empty
+  material) fails fast with a non-zero exit.
+- **Nonce & storage layout.** A fresh random **96-bit nonce** is generated per
+  encryption; the value stored in the `project.pat_encrypted` BLOB is
+  `nonce || ciphertext` (the 12-byte nonce prepended to the AES-GCM ciphertext,
+  which already carries its 128-bit auth tag).
+- **Rotation.** Changing `DEERBORN_MASTER_KEY` changes the derived key, so PATs
+  encrypted under the old value stop decrypting (a wrong/rotated key yields a
+  GCM authentication error, never plaintext) and must be re-entered.
+- **Never returned, never logged.** A PAT is accepted only on `POST`/`PATCH
+  /projects`; it is never included in any API response and never written to a
+  log line (the request field is a redacted-`Debug` `Secret`). The decrypt path
+  is crate-internal, used only by cloning (T-103).

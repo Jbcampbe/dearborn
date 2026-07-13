@@ -6,6 +6,7 @@
 
 pub mod auth;
 pub mod config;
+pub mod crypto;
 pub mod db;
 pub mod error;
 pub mod hub;
@@ -19,6 +20,7 @@ use serde_json::{json, Value};
 use tower_http::trace::TraceLayer;
 
 pub use config::{Config, ConfigError};
+pub use crypto::MasterKey;
 pub use db::{Db, DbError};
 pub use error::{AppError, AppResult};
 pub use hub::Hub;
@@ -43,15 +45,25 @@ pub struct AppState {
     /// Topic pub/sub broadcaster for live WebSocket subscriptions. Server-side
     /// code publishes events via `state.hub.publish(topic, type, payload)`.
     pub hub: Arc<Hub>,
+    /// AES-256 key (derived from `DEERBORN_MASTER_KEY`) used to encrypt/decrypt
+    /// per-project PATs. Never serialised or logged.
+    pub crypto: Arc<MasterKey>,
 }
 
 impl AppState {
     /// Construct shared state from a resolved [`Config`] and open [`Db`].
+    ///
+    /// The master key is derived here; `config.master_key` is guaranteed
+    /// non-empty by config loading, so derivation cannot fail. Boot code should
+    /// nevertheless call [`MasterKey::derive`] first to fail fast (see `main`).
     pub fn new(config: Config, db: Db) -> AppState {
+        let crypto = MasterKey::derive(&config.master_key)
+            .expect("master key material validated non-empty at config load");
         AppState {
             config: Arc::new(config),
             db,
             hub: Arc::new(Hub::new()),
+            crypto: Arc::new(crypto),
         }
     }
 }

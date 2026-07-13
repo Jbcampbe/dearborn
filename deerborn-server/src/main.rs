@@ -1,6 +1,6 @@
 //! Deerborn server binary entrypoint.
 
-use deerborn_server::{app, init_tracing, AppState, Config, Db};
+use deerborn_server::{app, init_tracing, AppState, Config, Db, MasterKey};
 
 #[tokio::main]
 async fn main() {
@@ -15,6 +15,13 @@ async fn main() {
             std::process::exit(1);
         }
     };
+
+    // Fail fast if DEERBORN_MASTER_KEY can't form a valid 256-bit key (see
+    // `crypto::MasterKey::derive`) — before binding a socket or touching the db.
+    if let Err(err) = MasterKey::derive(&config.master_key) {
+        eprintln!("deerborn-server: master key error: {err}");
+        std::process::exit(1);
+    }
 
     // Open the database and apply migrations at boot (idempotent).
     let db = match Db::connect(&config.db_path).await {

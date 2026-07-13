@@ -6,18 +6,25 @@
 //! collections wrap an `items` array, IDs are server-generated ULIDs, and all
 //! `*_at` timestamps are unix milliseconds.
 //!
-//! ## What this task deliberately does NOT do
+//! ## PAT handling (T-102)
 //!
-//! * **PAT handling is T-102.** No `pat` is accepted, stored, or returned here;
-//!   `pat_encrypted` is left `NULL` on insert. The request DTOs mark the exact
-//!   seam where T-102 slots the field in (search for `T-102`).
-//! * **Cloning is T-103.** `clone_status` starts at its schema default
-//!   `'pending'`; `clone_path`/`clone_error` stay `NULL`. No git runs here.
+//! `POST`/`PATCH` accept an optional `pat`, encrypted with AES-256-GCM (see
+//! [`crate::crypto`]) before it is written to the `pat_encrypted` BLOB. The
+//! plaintext PAT lives only inside the request handler's stack frame; the
+//! internal decrypt path is [`load_decrypted_pat`] (used by T-103's cloning —
+//! never exposed via a route).
+//!
+//! ## Cloning (T-103)
+//!
+//! `clone_status` starts at its schema default `'pending'`; `clone_path`/
+//! `clone_error` stay `NULL` in this file. No git runs here.
 //!
 //! ## Secrets
 //!
 //! The serialized [`Project`] response omits `pat_encrypted` entirely — the
 //! column is never selected into the DTO, so it can never leak through the API.
+//! The incoming `pat` is wrapped in [`Secret`], whose `Debug` is redacted, so it
+//! cannot leak through a log line either.
 
 use axum::{
     extract::{Path, State},
@@ -28,6 +35,7 @@ use libsql::{params, params_from_iter, Connection, Row, Value};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
 
+use crate::crypto::Secret;
 use crate::{AppError, AppResult, AppState};
 
 /// The columns projected into a [`Project`] DTO. Note the conspicuous absence of
@@ -67,8 +75,12 @@ pub struct CreateProject {
     test_cmd: Option<String>,
     #[serde(default)]
     run_cmd: Option<String>,
-    // T-102 seam: add `pat: Option<String>` here; encrypt it and bind the
-    // ciphertext into the `pat_encrypted` column in `create_project` below.
+    /// Optional GitHub PAT. Encrypted (AES-256-GCM) before insert into
+    /// `pat_encrypted`; never echoed back. Wrapped in [`Secret`] so it can never
+    /// leak through a `Debug` log line. An empty/whitespace value is treated as
+    /// "no PAT" (column left `NULL`).
+    #[serde(default)]
+    pat: Option<Secret>,
 }
 
 /// `PATCH /projects/{id}` body — partial update. Every field is optional:
@@ -89,8 +101,10 @@ pub struct UpdateProject {
     test_cmd: Option<Option<String>>,
     #[serde(default, deserialize_with = "double_option")]
     run_cmd: Option<Option<String>>,
-    // T-102 seam: add `pat: Option<Option<String>>` here (same double-option
-    // shape) to allow setting / clearing the stored PAT on update.
+    /// Set / clear the stored PAT (double-option): absent → untouched, `null` (or
+    /// an empty string) → clear to `NULL`, value → re-encrypt and replace.
+    #[serde(default, deserialize_with = "double_option")]
+    pat: Option<Option<Secret>>,
 }
 
 /// Deserialize a present-but-maybe-null field into `Some(_)`, leaving an absent
@@ -116,13 +130,16 @@ pub async fn create_project(
     let now = now_ms();
     let conn = state.db.conn();
 
-    // `pat_encrypted`, `clone_path`, `clone_error` are left NULL; `clone_status`
-    // takes its schema default of 'pending' by omission. T-102 adds the PAT bind
-    // to this INSERT; T-103 populates the clone_* columns out of band.
+    // Encrypt the PAT (if any) before it touches the row. The plaintext lives only
+    // in this stack frame; only ciphertext is persisted.
+    let pat_encrypted = encrypt_pat(&state, req.pat.as_ref())?;
+
+    // `clone_path`, `clone_error` are left NULL; `clone_status` takes its schema
+    // default of 'pending' by omission. T-103 populates the clone_* columns.
     conn.execute(
         "INSERT INTO project \
-             (id, name, repo_url, setup_cmd, test_cmd, run_cmd, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)",
+             (id, name, repo_url, setup_cmd, test_cmd, run_cmd, pat_encrypted, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
         params![
             id.clone(),
             name,
@@ -130,6 +147,7 @@ pub async fn create_project(
             req.setup_cmd,
             req.test_cmd,
             req.run_cmd,
+            blob_or_null(pat_encrypted),
             now,
             now,
         ],
@@ -199,6 +217,13 @@ pub async fn update_project(
         }
     }
 
+    // PAT gets the same double-option treatment, but the value is encrypted (or
+    // cleared to NULL on an explicit null / empty string) rather than stored raw.
+    if let Some(pat) = req.pat {
+        assignments.push("pat_encrypted = ?");
+        values.push(blob_or_null(encrypt_pat(&state, pat.as_ref())?));
+    }
+
     // Always bump updated_at, even for an otherwise-empty patch.
     assignments.push("updated_at = ?");
     values.push(Value::Integer(now_ms()));
@@ -261,6 +286,59 @@ fn row_to_project(row: &Row) -> Result<Project, libsql::Error> {
     })
 }
 
+/// Encrypt an optional PAT for storage. An absent or empty/whitespace-only PAT
+/// yields `None` (column set to `NULL`); otherwise the trimmed token is encrypted
+/// with the master key. Encryption failure surfaces as a generic `500` (the PAT
+/// is never included in the error).
+fn encrypt_pat(state: &AppState, pat: Option<&Secret>) -> AppResult<Option<Vec<u8>>> {
+    let Some(pat) = pat else { return Ok(None) };
+    let trimmed = pat.expose().trim();
+    if trimmed.is_empty() {
+        return Ok(None);
+    }
+    let blob = state
+        .crypto
+        .encrypt_pat(trimmed)
+        .map_err(|_| AppError::Internal("failed to encrypt PAT".to_string()))?;
+    Ok(Some(blob))
+}
+
+/// Map optional ciphertext into a bindable `Value` (`Blob` or `Null`).
+fn blob_or_null(blob: Option<Vec<u8>>) -> Value {
+    match blob {
+        Some(bytes) => Value::Blob(bytes),
+        None => Value::Null,
+    }
+}
+
+/// **Internal decrypt path** (T-103 calls this to get the plaintext PAT for
+/// `git clone`/`git fetch`). Deliberately NOT exposed via any route and never
+/// serialised: it reads the `pat_encrypted` BLOB for `id` and decrypts it.
+///
+/// Returns `Ok(None)` when the project exists but has no stored PAT, and a
+/// `NotFound` error when the project id is unknown.
+// Consumed by T-103's clone/refresh; kept crate-internal by design.
+#[allow(dead_code)]
+pub(crate) async fn load_decrypted_pat(state: &AppState, id: &str) -> AppResult<Option<String>> {
+    let mut rows = state
+        .db
+        .conn()
+        .query("SELECT pat_encrypted FROM project WHERE id = ?1", params![id])
+        .await?;
+    let row = rows.next().await?.ok_or_else(|| not_found(id))?;
+    let blob: Option<Vec<u8>> = row.get(0)?;
+    match blob {
+        Some(bytes) => {
+            let pat = state
+                .crypto
+                .decrypt_pat(&bytes)
+                .map_err(|_| AppError::Internal("failed to decrypt PAT".to_string()))?;
+            Ok(Some(pat))
+        }
+        None => Ok(None),
+    }
+}
+
 /// Require a present, non-empty (after trim) string field, or `400 bad_request`.
 fn require_field(value: Option<String>, field: &str) -> AppResult<String> {
     match value {
@@ -307,9 +385,17 @@ mod tests {
     const TOKEN: &str = "s3cret-token";
 
     async fn test_app() -> axum::Router {
+        let (app, _state) = test_app_with_state().await;
+        app
+    }
+
+    /// Like [`test_app`] but also hands back the [`AppState`] so a test can reach
+    /// the raw db (to inspect `pat_encrypted`) and the internal decrypt path.
+    async fn test_app_with_state() -> (axum::Router, AppState) {
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
-        app(AppState::new(Config::for_test(TOKEN), db))
+        let state = AppState::new(Config::for_test(TOKEN), db);
+        (app(state.clone()), state)
     }
 
     /// Build an authenticated request; `body` sets `Content-Type: application/json`.
@@ -545,6 +631,161 @@ mod tests {
         let untouched = body_json(untouched).await;
         assert_eq!(untouched["name"], "P2");
         assert_eq!(untouched["test_cmd"], Json::Null);
+    }
+
+    // ---- T-102: PAT encryption at rest ----------------------------------
+
+    const PAT: &str = "ghp_exampleSecretToken_ABC123";
+
+    /// (a) A `pat` supplied on create is accepted but never echoed back — no
+    /// `pat` or `pat_encrypted` field appears in any response.
+    #[tokio::test]
+    async fn create_with_pat_never_returns_it() {
+        let app = test_app().await;
+        let created = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/projects",
+                Some(json!({
+                    "name": "Secret",
+                    "repo_url": "https://example.com/s.git",
+                    "pat": PAT
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let created = body_json(created).await;
+        let id = created["id"].as_str().unwrap().to_string();
+
+        // Neither the plaintext PAT nor a pat/pat_encrypted field is present, and
+        // the serialized body contains the token nowhere.
+        assert!(created.get("pat").is_none());
+        assert!(created.get("pat_encrypted").is_none());
+        assert!(!created.to_string().contains("ghp_"));
+
+        // ...nor on GET, nor in the list.
+        let got = app
+            .clone()
+            .oneshot(req("GET", &format!("/projects/{id}"), None))
+            .await
+            .unwrap();
+        let got = body_json(got).await;
+        assert!(got.get("pat_encrypted").is_none());
+        assert!(!got.to_string().contains("ghp_"));
+
+        let listed = app
+            .clone()
+            .oneshot(req("GET", "/projects", None))
+            .await
+            .unwrap();
+        assert!(!body_json(listed).await.to_string().contains("ghp_"));
+    }
+
+    /// (b) The bytes actually stored in `pat_encrypted` are ciphertext: non-empty
+    /// and never containing the plaintext token. (c) The internal decrypt path
+    /// round-trips them back to the original PAT.
+    #[tokio::test]
+    async fn stored_pat_is_ciphertext_and_decrypts_via_internal_path() {
+        let (app, state) = test_app_with_state().await;
+        let created = app
+            .oneshot(req(
+                "POST",
+                "/projects",
+                Some(json!({
+                    "name": "Secret",
+                    "repo_url": "https://example.com/s.git",
+                    "pat": PAT
+                })),
+            ))
+            .await
+            .unwrap();
+        let id = body_json(created).await["id"].as_str().unwrap().to_string();
+
+        // Read the raw stored bytes straight from the db.
+        let mut rows = state
+            .db
+            .conn()
+            .query("SELECT pat_encrypted FROM project WHERE id = ?1", params![id.clone()])
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let stored: Vec<u8> = row.get(0).unwrap();
+
+        // Ciphertext: non-empty, and the plaintext never appears in it.
+        assert!(!stored.is_empty());
+        assert_ne!(stored, PAT.as_bytes());
+        assert!(
+            !stored.windows(PAT.len()).any(|w| w == PAT.as_bytes()),
+            "plaintext PAT must not appear in stored bytes"
+        );
+
+        // Internal decrypt path recovers the original PAT.
+        let decrypted = load_decrypted_pat(&state, &id).await.unwrap();
+        assert_eq!(decrypted.as_deref(), Some(PAT));
+    }
+
+    /// A project created without a PAT stores `NULL` and decrypts to `None`.
+    #[tokio::test]
+    async fn no_pat_stores_null_and_decrypts_none() {
+        let (app, state) = test_app_with_state().await;
+        let created = app
+            .oneshot(req(
+                "POST",
+                "/projects",
+                Some(json!({ "name": "NoPat", "repo_url": "https://example.com/n.git" })),
+            ))
+            .await
+            .unwrap();
+        let id = body_json(created).await["id"].as_str().unwrap().to_string();
+        assert_eq!(load_decrypted_pat(&state, &id).await.unwrap(), None);
+    }
+
+    /// PATCH can set a PAT, then clear it back to `NULL` with an explicit null.
+    #[tokio::test]
+    async fn patch_can_set_and_clear_pat() {
+        let (app, state) = test_app_with_state().await;
+        let created = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/projects",
+                Some(json!({ "name": "P", "repo_url": "https://example.com/p.git" })),
+            ))
+            .await
+            .unwrap();
+        let id = body_json(created).await["id"].as_str().unwrap().to_string();
+
+        // Set a PAT via PATCH...
+        let set = app
+            .clone()
+            .oneshot(req(
+                "PATCH",
+                &format!("/projects/{id}"),
+                Some(json!({ "pat": PAT })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(set.status(), StatusCode::OK);
+        assert!(!body_json(set).await.to_string().contains("ghp_"));
+        assert_eq!(
+            load_decrypted_pat(&state, &id).await.unwrap().as_deref(),
+            Some(PAT)
+        );
+
+        // ...then clear it with an explicit null (double-option semantics).
+        let cleared = app
+            .clone()
+            .oneshot(req(
+                "PATCH",
+                &format!("/projects/{id}"),
+                Some(json!({ "pat": null })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cleared.status(), StatusCode::OK);
+        assert_eq!(load_decrypted_pat(&state, &id).await.unwrap(), None);
     }
 
     #[tokio::test]
