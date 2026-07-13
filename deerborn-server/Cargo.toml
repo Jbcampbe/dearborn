@@ -1,0 +1,22 @@
+[package]
+name = "deerborn-server"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+
+[[bin]]
+name = "deerborn-server"
+path = "src/main.rs"
+
+[lib]
+name = "deerborn_server"
+path = "src/lib.rs"
+
+[dependencies]
+tokio = { workspace = true }
+axum = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+
+[dev-dependencies]
+tower = { version = "0.5", features = ["util"] }
