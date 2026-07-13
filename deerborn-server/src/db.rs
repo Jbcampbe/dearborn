@@ -22,11 +22,18 @@ struct Migration {
 }
 
 /// All migrations, in application order. Append new ones; never edit applied SQL.
-const MIGRATIONS: &[Migration] = &[Migration {
-    id: 1,
-    name: "0001_baseline",
-    sql: include_str!("../migrations/0001_baseline.sql"),
-}];
+const MIGRATIONS: &[Migration] = &[
+    Migration {
+        id: 1,
+        name: "0001_baseline",
+        sql: include_str!("../migrations/0001_baseline.sql"),
+    },
+    Migration {
+        id: 2,
+        name: "0002_planning_session",
+        sql: include_str!("../migrations/0002_planning_session.sql"),
+    },
+];
 
 /// Errors surfaced while opening the database or running migrations.
 #[derive(Debug, Error)]
@@ -119,8 +126,8 @@ mod tests {
     async fn migrations_create_schema_and_roundtrip_a_project() {
         let db = Db::connect(":memory:").await.unwrap();
 
-        // Fresh boot applies the single baseline migration.
-        assert_eq!(db.run_migrations().await.unwrap(), 1);
+        // Fresh boot applies every ordered migration.
+        assert_eq!(db.run_migrations().await.unwrap(), MIGRATIONS.len() as u32);
         // Re-running is a no-op.
         assert_eq!(db.run_migrations().await.unwrap(), 0);
 
@@ -133,6 +140,7 @@ mod tests {
             "transcript_message",
             "agent_run",
             "comment",
+            "planning_session",
         ] {
             let mut rows = db
                 .conn()
@@ -193,7 +201,11 @@ mod tests {
 
         {
             let db = Db::connect(path).await.unwrap();
-            assert_eq!(db.run_migrations().await.unwrap(), 1, "first boot applies");
+            assert_eq!(
+                db.run_migrations().await.unwrap(),
+                MIGRATIONS.len() as u32,
+                "first boot applies"
+            );
         }
         {
             // A fresh connection to the same file sees the applied migration.

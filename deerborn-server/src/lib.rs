@@ -8,6 +8,7 @@ pub mod auth;
 pub mod config;
 pub mod crypto;
 pub mod db;
+pub mod epics;
 pub mod error;
 pub mod git;
 pub mod hub;
@@ -105,6 +106,16 @@ pub fn app(state: AppState) -> Router {
             "/projects/:id/refresh",
             axum::routing::post(projects::refresh_project),
         )
+        .route(
+            "/projects/:id/epics",
+            get(epics::list_epics).post(epics::create_epic),
+        )
+        .route("/epics/:id", get(epics::get_epic))
+        .route(
+            "/epics/:id/messages",
+            axum::routing::post(epics::post_message),
+        )
+        .route("/epics/:id/transcript", get(epics::get_transcript))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_bearer,

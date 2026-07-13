@@ -26,6 +26,24 @@ The contract every handler (T-101+) must follow. Established in T-004.
 - **Actions** on a resource are a sub-path verb-noun: `POST /projects/{id}/refresh`
   re-syncs the canonical clone (returns the `200` project, now `clone_status='pending'`).
 
+### Epics & planning transcript (T-201)
+
+Epics are nested under their project; the durable planning transcript is nested
+under its epic:
+
+| Action                              | Method + path                     | Success status |
+| ----------------------------------- | --------------------------------- | -------------- |
+| create an epic (starts planning)    | `POST /projects/{id}/epics`       | `201` (epic, `status='Planning'`) |
+| list a project's epics              | `GET /projects/{id}/epics`        | `200` (`items`) |
+| get one epic                        | `GET /epics/{id}`                 | `200`          |
+| append a `user` transcript message  | `POST /epics/{id}/messages`       | `201` (the stored message, with its assigned `seq`) |
+| load the transcript in `seq` order  | `GET /epics/{id}/transcript`      | `200` (`items`) |
+
+`POST /epics/{id}/messages` takes `{ phase, content }` where `phase ∈
+product|technical`; it stores one `role='user'` message. Transcript messages
+carry a **monotonic `seq` per epic** (1, 2, 3, …); agent/tool messages are
+appended by the same store path in T-202.
+
 ## Identifiers & timestamps
 
 - **IDs** are opaque strings (ULID/UUID) generated server-side.

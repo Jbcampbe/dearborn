@@ -152,6 +152,19 @@ CREATE TABLE transcript_message (
   created_at INTEGER NOT NULL
 );
 
+-- Planning-session lifecycle (T-201; migration 0002). One row per (epic, phase);
+-- holds the durable harness resume id so a planning chat survives a restart.
+-- The `product` row is created with the epic; `technical` is added in T-205.
+CREATE TABLE planning_session (
+  epic_id            TEXT NOT NULL REFERENCES epic(id),
+  phase              TEXT NOT NULL,                    -- product|technical
+  harness_session_id TEXT,                             -- harness resume id; NULL until T-202's first run
+  status             TEXT NOT NULL DEFAULT 'active',   -- active|complete
+  created_at         INTEGER NOT NULL,
+  updated_at         INTEGER NOT NULL,
+  PRIMARY KEY (epic_id, phase)
+);
+
 -- Per-run/per-stage evidence (mostly written by Half 2; table exists now).
 CREATE TABLE agent_run (
   id         TEXT PRIMARY KEY,
@@ -274,11 +287,18 @@ Only the **planning** and **breakdown** phases exist in Half 1:
   `--permission-mode bypassPermissions`); read-only is enforced by tool-scoping +
   a read-only checkout, **not** `RunMode::Ask`. Enums are `#[non_exhaustive]`.
 
-- [ ] **T-201 — Transcript store & planning-session lifecycle.** *deps: T-003, T-200*
+- [x] **T-201 — Transcript store & planning-session lifecycle.** *deps: T-003, T-200*
   Create a planning session bound to a (new) `Planning`-status epic; persist every
   user + agent + tool message to `transcript_message` with monotonic `seq`;
   resumable after a server restart. **AC:** messages persist and reload in order;
   a restarted server can resume an in-flight session.
+  **Done:** `src/epics.rs`. Routes: `POST/GET /projects/:id/epics`, `GET /epics/:id`,
+  `POST /epics/:id/messages`, `GET /epics/:id/transcript`. Added the
+  `planning_session` table (§2.2) via migration `0002_planning_session.sql` to hold
+  the durable harness resume `session_id` per `(epic_id, phase)` (T-202 populates it).
+  Monotonic `seq` is assigned as `MAX(seq)+1` inside the single `INSERT` (atomic under
+  libSQL's single writer). `append_message` / `load_transcript` / `set_harness_session_id`
+  are the shared store helpers T-202 reuses.
 
 - [ ] **T-202 — Planning agent run + WS streaming.** *deps: T-201, T-005*
   A user message triggers an agent run via the harness; `RunEvent`s (text,
