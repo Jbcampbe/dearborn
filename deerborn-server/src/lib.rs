@@ -8,6 +8,8 @@ pub mod auth;
 pub mod config;
 pub mod db;
 pub mod error;
+pub mod hub;
+pub mod ws;
 
 use std::sync::Arc;
 
@@ -18,6 +20,7 @@ use tower_http::trace::TraceLayer;
 pub use config::{Config, ConfigError};
 pub use db::{Db, DbError};
 pub use error::{AppError, AppResult};
+pub use hub::Hub;
 
 /// Initialise the global `tracing` subscriber. Idempotent; safe to skip in tests.
 /// Honours `RUST_LOG`, defaulting to `info`.
@@ -36,6 +39,9 @@ pub fn init_tracing() {
 pub struct AppState {
     pub config: Arc<Config>,
     pub db: Db,
+    /// Topic pub/sub broadcaster for live WebSocket subscriptions. Server-side
+    /// code publishes events via `state.hub.publish(topic, type, payload)`.
+    pub hub: Arc<Hub>,
 }
 
 impl AppState {
@@ -44,6 +50,7 @@ impl AppState {
         AppState {
             config: Arc::new(config),
             db,
+            hub: Arc::new(Hub::new()),
         }
     }
 }
@@ -52,7 +59,12 @@ impl AppState {
 ///
 /// `/health` is public; every other route sits behind the bearer-token layer.
 pub fn app(state: AppState) -> Router {
-    let public = Router::new().route("/health", get(health));
+    // `/health` is public; `/ws` authenticates the handshake in-handler (the
+    // header-only bearer middleware would reject browser WS handshakes, which
+    // carry the token in the query string instead).
+    let public = Router::new()
+        .route("/health", get(health))
+        .route("/ws", get(ws::ws_handler));
 
     let protected = Router::new()
         .route("/whoami", get(whoami))

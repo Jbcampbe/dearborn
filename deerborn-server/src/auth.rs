@@ -37,7 +37,10 @@ pub async fn require_bearer(
 
 /// Extract the token from an `Authorization` header value, if it is a Bearer
 /// credential. The scheme is matched case-insensitively per RFC 7235.
-fn bearer_token(header: &str) -> Option<&str> {
+///
+/// Shared with the WebSocket handshake (`ws.rs`), which also accepts a bearer
+/// token from the `Authorization` header.
+pub(crate) fn bearer_token(header: &str) -> Option<&str> {
     let (scheme, token) = header.split_once(' ')?;
     if scheme.eq_ignore_ascii_case("bearer") {
         let token = token.trim();

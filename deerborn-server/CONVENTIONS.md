@@ -73,6 +73,73 @@ Handlers return `AppResult<T>` (`Result<T, AppError>`) and `?`-propagate;
 `AppError` implements `IntoResponse`, so returning `Err(...)` produces the
 envelope automatically.
 
+## WebSocket & live subscriptions (`GET /ws`)
+
+REST carries commands/queries; the WebSocket carries **live subscriptions**
+(planning `RunEvent` streaming, kanban/status updates). Established in T-005.
+Server-side code publishes through the shared `Hub` on `AppState`.
+
+### Handshake auth
+
+A browser cannot set an `Authorization` header on a WebSocket handshake, so `/ws`
+accepts the bearer token from **either**:
+
+- the query string — `GET /ws?token=<DEERBORN_TOKEN>` (browsers), **or**
+- an `Authorization: Bearer <DEERBORN_TOKEN>` header (native clients / tests).
+
+The token is validated **before** the upgrade. An absent/invalid token is
+rejected with a `401` and the standard error envelope — the socket is never
+opened. Because of the query-param path, `/ws` is registered **outside** the
+header-only bearer middleware (which would reject every browser handshake);
+it does its own token check in the handler.
+
+### Message envelope
+
+Every frame — both directions — is a JSON object:
+
+```json
+{ "topic": "<string>", "type": "<string>", "payload": { } }
+```
+
+`topic` is an **opaque string**. Conventions (string-matched; not validated for
+existence at the transport layer):
+
+- `epic:<id>` — planning-chat stream + epic-scoped updates (T-202).
+- `project:<id>` — project kanban / board updates (T-401).
+
+### Client → server (control frames)
+
+| Frame | Effect |
+| ----- | ------ |
+| `{ "type": "subscribe",   "topic": "epic:<id>" }`   | Start receiving events for the topic. Idempotent. |
+| `{ "type": "unsubscribe", "topic": "epic:<id>" }`   | Stop receiving events for the topic. |
+
+`payload` may be present on control frames but is ignored. Unknown types and
+malformed frames get an `error` frame back (the connection stays open).
+
+### Server → client frames
+
+| `type` | Meaning |
+| ------ | ------- |
+| `subscribed`   | Ack of a `subscribe`. Sent **after** the subscription is live, so a client may wait for it before triggering a publish (avoids a subscribe/publish race). |
+| `unsubscribed` | Ack of an `unsubscribe`. |
+| `error`        | Protocol error; `payload.message` explains it. `topic` is `""`. |
+| *(any other)*  | A published event, delivered only to connections subscribed to its `topic`. |
+
+### Publishing from server code
+
+The `Hub` on `AppState` is the API future tasks (T-202, T-401) call:
+
+```rust
+// -> number of connections it was delivered to (0 = no subscribers, a no-op)
+state.hub.publish("epic:123", "message", json!({ "text": "hello" }));
+```
+
+`publish(topic: &str, event_type: &str, payload: serde_json::Value) -> usize`
+serialises the envelope once and fans it out to every current subscriber of the
+topic. It never blocks and never fails; a slow client that overflows its buffer
+drops the **oldest** frames (bounded per-connection queue).
+
 ## Logging
 
 Every request is traced via `tower_http::trace::TraceLayer` on top of the

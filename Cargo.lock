@@ -220,11 +220,13 @@ name = "deerborn-server"
 version = "0.1.0"
 dependencies = [
  "axum",
+ "futures-util",
  "libsql",
  "serde",
  "serde_json",
  "thiserror 2.0.18",
  "tokio",
+ "tokio-tungstenite",
  "tower",
  "tower-http",
  "tracing",
