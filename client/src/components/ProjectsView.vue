@@ -1,20 +1,16 @@
 <script setup lang="ts">
 import { onMounted, ref } from "vue";
+import { RouterLink } from "vue-router";
 import { useAuthStore } from "../stores/auth";
-import { apiFetch, ApiError, type Collection } from "../api/client";
+import { ApiError } from "../api/client";
+import { listProjects, type Project } from "../api/projects";
+import CreateProjectForm from "./CreateProjectForm.vue";
+import CloneStatusBadge from "./CloneStatusBadge.vue";
 
-// The authenticated view. Proves the round trip by fetching `GET /projects`
-// with the stored bearer token and rendering the result. A `401` (wrong token)
-// logs the user out with an auth-error message, bouncing them back to the token
-// screen — never a silent failure.
-
-interface Project {
-  id: string;
-  name: string;
-  repo_url: string;
-  clone_status: string;
-}
-
+// The projects home: a create form beside the live list. Fetches `GET /projects`
+// with the stored bearer token; a `401` bounces back to the token screen with a
+// message (never a silent failure). A newly created project is prepended to the
+// list without a round trip.
 const auth = useAuthStore();
 const projects = ref<Project[]>([]);
 const loading = ref(true);
@@ -28,11 +24,9 @@ async function load() {
   loading.value = true;
   error.value = null;
   try {
-    const data = await apiFetch<Collection<Project>>("/projects", token);
-    projects.value = data.items;
+    projects.value = await listProjects(token);
   } catch (err) {
     if (err instanceof ApiError && err.isAuth) {
-      // Wrong/expired token: surface the auth error on the token screen.
       auth.logout(`Token rejected (401): ${err.message}. Please re-enter it.`);
       return;
     }
@@ -40,6 +34,10 @@ async function load() {
   } finally {
     loading.value = false;
   }
+}
+
+function onCreated(project: Project) {
+  projects.value = [project, ...projects.value];
 }
 
 onMounted(load);
@@ -52,31 +50,43 @@ onMounted(load);
       <button class="logout" @click="auth.logout()">Log out</button>
     </header>
 
-    <section>
-      <div class="row">
-        <h2>Projects ({{ projects.length }})</h2>
-        <button class="refresh" :disabled="loading" @click="load">Refresh</button>
-      </div>
+    <div class="layout">
+      <CreateProjectForm @created="onCreated" />
 
-      <p v-if="loading">Loading…</p>
-      <p v-else-if="error" class="error" role="alert">{{ error }}</p>
-      <p v-else-if="projects.length === 0" class="empty">
-        No projects yet. (The authenticated round trip succeeded.)
-      </p>
-      <ul v-else class="projects">
-        <li v-for="project in projects" :key="project.id">
-          <span class="name">{{ project.name }}</span>
-          <span class="repo">{{ project.repo_url }}</span>
-          <span class="status" :data-status="project.clone_status">{{ project.clone_status }}</span>
-        </li>
-      </ul>
-    </section>
+      <section class="list-panel">
+        <div class="row">
+          <h2>Projects ({{ projects.length }})</h2>
+          <button class="refresh" :disabled="loading" @click="load">Reload</button>
+        </div>
+
+        <p v-if="loading">Loading…</p>
+        <p v-else-if="error" class="error" role="alert">{{ error }}</p>
+        <p v-else-if="projects.length === 0" class="empty">
+          No projects yet. Create one to get started.
+        </p>
+        <ul v-else class="projects">
+          <li v-for="project in projects" :key="project.id">
+            <RouterLink
+              class="project-link"
+              :to="{ name: 'project-detail', params: { id: project.id } }"
+            >
+              <span class="name">{{ project.name }}</span>
+              <span class="repo">{{ project.repo_url }}</span>
+              <CloneStatusBadge :status="project.clone_status" />
+            </RouterLink>
+            <p v-if="project.clone_status === 'error' && project.clone_error" class="clone-error">
+              {{ project.clone_error }}
+            </p>
+          </li>
+        </ul>
+      </section>
+    </div>
   </main>
 </template>
 
 <style scoped>
 main {
-  max-width: 48rem;
+  max-width: 60rem;
   margin: 3rem auto;
   padding: 0 1rem;
 }
@@ -85,12 +95,7 @@ header {
   align-items: baseline;
   justify-content: space-between;
 }
-.row {
-  display: flex;
-  align-items: center;
-  gap: 1rem;
-}
-button {
+.logout {
   font: inherit;
   padding: 0.3rem 0.7rem;
   border: 1px solid #ccc;
@@ -98,7 +103,31 @@ button {
   background: #f3f4f6;
   cursor: pointer;
 }
-button:disabled {
+.layout {
+  display: grid;
+  grid-template-columns: 22rem 1fr;
+  gap: 2rem;
+  align-items: start;
+}
+@media (max-width: 46rem) {
+  .layout {
+    grid-template-columns: 1fr;
+  }
+}
+.row {
+  display: flex;
+  align-items: center;
+  gap: 1rem;
+}
+.refresh {
+  font: inherit;
+  padding: 0.3rem 0.7rem;
+  border: 1px solid #ccc;
+  border-radius: 6px;
+  background: #f3f4f6;
+  cursor: pointer;
+}
+.refresh:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }
@@ -115,13 +144,22 @@ button:disabled {
 .projects {
   list-style: none;
   padding: 0;
+  margin: 0;
 }
 .projects li {
+  border-bottom: 1px solid #eee;
+}
+.project-link {
   display: flex;
   gap: 1rem;
   align-items: center;
-  padding: 0.6rem 0;
-  border-bottom: 1px solid #eee;
+  padding: 0.7rem 0.4rem;
+  text-decoration: none;
+  color: inherit;
+  border-radius: 6px;
+}
+.project-link:hover {
+  background: #f3f4f6;
 }
 .name {
   font-weight: 600;
@@ -129,10 +167,16 @@ button:disabled {
 .repo {
   color: #555;
   font-size: 0.9rem;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.status {
+.project-link :deep(.badge) {
   margin-left: auto;
+}
+.clone-error {
+  margin: 0 0.4rem 0.5rem;
   font-size: 0.8rem;
-  color: #444;
+  color: #991b1b;
 }
 </style>
