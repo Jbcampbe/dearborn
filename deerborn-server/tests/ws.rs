@@ -28,6 +28,7 @@ async fn serve() -> (SocketAddr, Arc<Hub>) {
         master_key: "test-master-key".to_string(),
         db_path: ":memory:".to_string(),
         clone_root: "./clones".to_string(),
+        auto_clone: false,
     };
     let state = AppState::new(config, db);
     let hub = state.hub.clone();

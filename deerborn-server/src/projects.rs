@@ -16,8 +16,10 @@
 //!
 //! ## Cloning (T-103)
 //!
-//! `clone_status` starts at its schema default `'pending'`; `clone_path`/
-//! `clone_error` stay `NULL` in this file. No git runs here.
+//! On create (when `config.auto_clone`), `clone_path` is recorded and a
+//! background task shells out to `git clone` (see [`crate::git`]), flipping
+//! `clone_status` from `'pending'` to `'ready'`/`'error'` and publishing a
+//! `project:<id>` WS event. `POST /projects/{id}/refresh` re-syncs the checkout.
 //!
 //! ## Secrets
 //!
@@ -35,7 +37,10 @@ use libsql::{params, params_from_iter, Connection, Row, Value};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
 
+use std::path::{Path as FsPath, PathBuf};
+
 use crate::crypto::Secret;
+use crate::git::{self, GitError};
 use crate::{AppError, AppResult, AppState};
 
 /// The columns projected into a [`Project`] DTO. Note the conspicuous absence of
@@ -143,7 +148,7 @@ pub async fn create_project(
         params![
             id.clone(),
             name,
-            repo_url,
+            repo_url.clone(),
             req.setup_cmd,
             req.test_cmd,
             req.run_cmd,
@@ -153,6 +158,20 @@ pub async fn create_project(
         ],
     )
     .await?;
+
+    // T-103: kick off the canonical read-only clone in the background. Record the
+    // intended `clone_path` up front; the row stays `clone_status='pending'` until
+    // the spawned task flips it to `ready`/`error`.
+    if state.config.auto_clone {
+        let dest = clone_dest(&state.config.clone_root, &id);
+        conn.execute(
+            "UPDATE project SET clone_path = ?1 WHERE id = ?2",
+            params![dest.to_string_lossy().to_string(), id.clone()],
+        )
+        .await?;
+        let pat_plain = plaintext_pat(req.pat.as_ref());
+        spawn_clone(state.clone(), id.clone(), repo_url, pat_plain, dest);
+    }
 
     let project = fetch_project(conn, &id)
         .await?
@@ -258,6 +277,113 @@ pub async fn delete_project(
     Ok(StatusCode::NO_CONTENT)
 }
 
+/// `POST /projects/{id}/refresh` — re-sync the canonical read-only checkout.
+///
+/// Sets `clone_status='pending'` and (in production) spawns a background
+/// `git fetch` + hard-reset to origin's default branch, updating the row to
+/// `ready`/`error` on completion. Returns the (now-`pending`) project. `404` if
+/// the project does not exist.
+pub async fn refresh_project(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> AppResult<Json<Project>> {
+    let project = fetch_project(state.db.conn(), &id)
+        .await?
+        .ok_or_else(|| not_found(&id))?;
+
+    // Decrypt the stored PAT (crate-internal path) for the git operation.
+    let pat = load_decrypted_pat(&state, &id).await?;
+    let dest = project
+        .clone_path
+        .clone()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| clone_dest(&state.config.clone_root, &id));
+
+    state
+        .db
+        .conn()
+        .execute(
+            "UPDATE project SET clone_status = 'pending', clone_error = NULL, \
+                 clone_path = ?1, updated_at = ?2 WHERE id = ?3",
+            params![dest.to_string_lossy().to_string(), now_ms(), id.clone()],
+        )
+        .await?;
+
+    if state.config.auto_clone {
+        let state = state.clone();
+        let id = id.clone();
+        let repo_url = project.repo_url.clone();
+        let dest = dest.clone();
+        tokio::spawn(async move {
+            let result = git::refresh_repo(&repo_url, pat.as_deref(), &dest).await;
+            record_clone_outcome(&state, &id, &dest, result).await;
+        });
+    }
+
+    let refreshed = fetch_project(state.db.conn(), &id)
+        .await?
+        .ok_or_else(|| not_found(&id))?;
+    Ok(Json(refreshed))
+}
+
+/// The per-project clone directory: `<clone_root>/<project id>`.
+fn clone_dest(clone_root: &str, id: &str) -> PathBuf {
+    FsPath::new(clone_root).join(id)
+}
+
+/// Extract a trimmed, non-empty plaintext PAT from the request `Secret`.
+fn plaintext_pat(pat: Option<&Secret>) -> Option<String> {
+    pat.map(|s| s.expose().trim().to_string())
+        .filter(|s| !s.is_empty())
+}
+
+/// Spawn the background clone task and record its outcome on completion.
+fn spawn_clone(state: AppState, id: String, repo_url: String, pat: Option<String>, dest: PathBuf) {
+    tokio::spawn(async move {
+        let result = git::clone_repo(&repo_url, pat.as_deref(), &dest).await;
+        record_clone_outcome(&state, &id, &dest, result).await;
+    });
+}
+
+/// Write the terminal clone/refresh state to the row and publish a
+/// `project:<id>` `clone_status` WS event. `GitError` messages are already
+/// redacted of any token, so they are safe to store and log.
+async fn record_clone_outcome(state: &AppState, id: &str, dest: &FsPath, result: Result<(), GitError>) {
+    let (status, clone_error) = match &result {
+        Ok(()) => ("ready", None),
+        Err(err) => ("error", Some(err.message.clone())),
+    };
+
+    let write = state
+        .db
+        .conn()
+        .execute(
+            "UPDATE project SET clone_status = ?1, clone_error = ?2, updated_at = ?3 WHERE id = ?4",
+            params![status, clone_error.clone(), now_ms(), id.to_string()],
+        )
+        .await;
+    if let Err(err) = write {
+        tracing::error!(project = %id, error = %err, "failed to record clone outcome");
+        return;
+    }
+
+    state.hub.publish(
+        &format!("project:{id}"),
+        "clone_status",
+        json!({
+            "id": id,
+            "clone_status": status,
+            "clone_error": clone_error,
+            "clone_path": dest.to_string_lossy(),
+        }),
+    );
+
+    match &result {
+        Ok(()) => tracing::info!(project = %id, path = %dest.display(), "clone ready"),
+        Err(err) => tracing::warn!(project = %id, reason = %err.message, "clone failed"),
+    }
+}
+
 /// Load a single project by id, mapping the row (sans `pat_encrypted`) to the DTO.
 async fn fetch_project(conn: &Connection, id: &str) -> AppResult<Option<Project>> {
     let sql = format!("SELECT {PROJECT_COLUMNS} FROM project WHERE id = ?1");
@@ -316,9 +442,8 @@ fn blob_or_null(blob: Option<Vec<u8>>) -> Value {
 /// serialised: it reads the `pat_encrypted` BLOB for `id` and decrypts it.
 ///
 /// Returns `Ok(None)` when the project exists but has no stored PAT, and a
-/// `NotFound` error when the project id is unknown.
-// Consumed by T-103's clone/refresh; kept crate-internal by design.
-#[allow(dead_code)]
+/// `NotFound` error when the project id is unknown. Consumed by T-103's
+/// clone/refresh; kept crate-internal by design.
 pub(crate) async fn load_decrypted_pat(state: &AppState, id: &str) -> AppResult<Option<String>> {
     let mut rows = state
         .db
@@ -786,6 +911,126 @@ mod tests {
             .unwrap();
         assert_eq!(cleared.status(), StatusCode::OK);
         assert_eq!(load_decrypted_pat(&state, &id).await.unwrap(), None);
+    }
+
+    // ---- T-103: clone lifecycle -----------------------------------------
+
+    /// Build an app whose state has real cloning enabled and a private temp
+    /// clone root, plus the temp dir path (caller cleans it up).
+    async fn clone_test_app() -> (axum::Router, AppState, PathBuf) {
+        let db = Db::connect(":memory:").await.unwrap();
+        db.run_migrations().await.unwrap();
+        let root = std::env::temp_dir().join(format!(
+            "deerborn-clone-test-{}-{}",
+            std::process::id(),
+            now_ms()
+        ));
+        let mut config = Config::for_test(TOKEN);
+        config.auto_clone = true;
+        config.clone_root = root.to_string_lossy().to_string();
+        let state = AppState::new(config, db);
+        (app(state.clone()), state, root)
+    }
+
+    /// Poll `clone_status` until it leaves `pending` (or time out).
+    async fn wait_until_settled(state: &AppState, id: &str) -> (String, Option<String>) {
+        for _ in 0..100 {
+            let mut rows = state
+                .db
+                .conn()
+                .query(
+                    "SELECT clone_status, clone_error FROM project WHERE id = ?1",
+                    params![id.to_string()],
+                )
+                .await
+                .unwrap();
+            let row = rows.next().await.unwrap().unwrap();
+            let status: String = row.get(0).unwrap();
+            if status != "pending" {
+                return (status, row.get(1).unwrap());
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+        }
+        panic!("clone_status stayed 'pending' too long");
+    }
+
+    /// Creating a project against a bad URL drives the background clone to
+    /// `error` with a readable, token-free reason; the response is `pending`.
+    #[tokio::test]
+    async fn create_with_bad_url_settles_to_error() {
+        let (app, state, root) = clone_test_app().await;
+        let created = app
+            .oneshot(req(
+                "POST",
+                "/projects",
+                Some(json!({
+                    "name": "Bad",
+                    "repo_url": "https://deerborn.invalid/nope/nope.git",
+                    "pat": "ghp_secretTokenXYZ"
+                })),
+            ))
+            .await
+            .unwrap();
+        let created = body_json(created).await;
+        let id = created["id"].as_str().unwrap().to_string();
+        // Response is immediate: still pending, clone_path recorded up front.
+        assert_eq!(created["clone_status"], "pending");
+        assert!(created["clone_path"].as_str().unwrap().ends_with(&id));
+
+        let (status, error) = wait_until_settled(&state, &id).await;
+        assert_eq!(status, "error");
+        let error = error.expect("error status must carry a reason");
+        assert!(!error.is_empty());
+        assert!(!error.contains("ghp_"), "token must not leak into clone_error: {error}");
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// The refresh route on a project that never cloned settles to `error` for a
+    /// bad URL (refresh falls back to an initial clone when none exists).
+    #[tokio::test]
+    async fn refresh_bad_url_settles_to_error() {
+        let (app, state, root) = clone_test_app().await;
+
+        let created = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/projects",
+                Some(json!({
+                    "name": "Bad",
+                    "repo_url": "https://deerborn.invalid/nope/nope.git"
+                })),
+            ))
+            .await
+            .unwrap();
+        let id = body_json(created).await["id"].as_str().unwrap().to_string();
+        // Let the create-time clone settle first.
+        wait_until_settled(&state, &id).await;
+
+        let refreshed = app
+            .oneshot(req("POST", &format!("/projects/{id}/refresh"), None))
+            .await
+            .unwrap();
+        assert_eq!(refreshed.status(), StatusCode::OK);
+        assert_eq!(body_json(refreshed).await["clone_status"], "pending");
+
+        let (status, error) = wait_until_settled(&state, &id).await;
+        assert_eq!(status, "error");
+        assert!(!error.unwrap().is_empty());
+
+        let _ = std::fs::remove_dir_all(&root);
+    }
+
+    /// Refresh of an unknown project id is a `404`.
+    #[tokio::test]
+    async fn refresh_missing_project_is_404() {
+        let response = test_app()
+            .await
+            .oneshot(req("POST", "/projects/nope/refresh", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

@@ -107,6 +107,25 @@ environment variables always take precedence over the file.
 The server **fails fast at boot** with a clear error (non-zero exit) if
 `DEERBORN_TOKEN` or `DEERBORN_MASTER_KEY` is missing or empty.
 
+## Canonical read-only clone (T-103)
+
+On project create, Deerborn clones the repo's default branch (git-over-HTTPS,
+using the decrypted PAT when present) into `<DEERBORN_CLONE_ROOT>/<project id>` —
+the canonical **read-only** checkout later planning/execution reads from. The
+clone runs **asynchronously**: `POST /projects` returns immediately with
+`clone_status='pending'`; a background task then sets `clone_status` to `ready`
+or, on failure, `error` (with a readable, token-redacted `clone_error`), and
+publishes a `clone_status` event on the `project:<id>` WebSocket topic.
+
+`POST /projects/{id}/refresh` re-syncs an existing checkout (`git fetch` +
+hard-reset to origin's default branch), moving it back through
+`pending → ready/error`.
+
+The PAT is shelled out to `git` as an argument only and is **never** written to
+a log or persisted in `.git/config` (the remote is reset to the token-free URL
+after clone; fetch re-injects credentials transiently). Git operations that fail
+capture git's stderr with any token redacted.
+
 ## Secret handling
 
 Per-project GitHub PATs are **encrypted at rest** with **AES-256-GCM** (T-102):

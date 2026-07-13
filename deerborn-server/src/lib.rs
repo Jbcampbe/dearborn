@@ -9,6 +9,7 @@ pub mod config;
 pub mod crypto;
 pub mod db;
 pub mod error;
+pub mod git;
 pub mod hub;
 pub mod projects;
 pub mod ws;
@@ -90,6 +91,10 @@ pub fn app(state: AppState) -> Router {
             get(projects::get_project)
                 .patch(projects::update_project)
                 .delete(projects::delete_project),
+        )
+        .route(
+            "/projects/:id/refresh",
+            axum::routing::post(projects::refresh_project),
         )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),

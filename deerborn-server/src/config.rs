@@ -33,6 +33,10 @@ pub struct Config {
     pub db_path: String,
     /// Root directory under which per-project clones live (`DEERBORN_CLONE_ROOT`).
     pub clone_root: String,
+    /// Whether project create/refresh spawns a real `git clone`/`git fetch`
+    /// (T-103). Always `true` in production; tests default it `false` so plain
+    /// CRUD tests never shell out to git. Not env-configurable — an internal seam.
+    pub auto_clone: bool,
 }
 
 /// Errors that prevent the server from booting with a valid configuration.
@@ -77,6 +81,7 @@ impl Config {
             master_key,
             db_path,
             clone_root,
+            auto_clone: true,
         })
     }
 }
@@ -152,6 +157,9 @@ impl Config {
             master_key: "test-master-key".to_string(),
             db_path: ":memory:".to_string(),
             clone_root: DEFAULT_CLONE_ROOT.to_string(),
+            // Plain CRUD tests must not shell out to git; T-103 tests that
+            // exercise cloning flip this on explicitly.
+            auto_clone: false,
         }
     }
 }

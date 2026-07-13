@@ -23,6 +23,8 @@ The contract every handler (T-101+) must follow. Established in T-004.
   | get           | `GET /projects/{id}`         | `200`          |
   | update        | `PATCH /projects/{id}`       | `200`          |
   | delete        | `DELETE /projects/{id}`      | `204` (no body)|
+- **Actions** on a resource are a sub-path verb-noun: `POST /projects/{id}/refresh`
+  re-syncs the canonical clone (returns the `200` project, now `clone_status='pending'`).
 
 ## Identifiers & timestamps
 
@@ -107,7 +109,9 @@ Every frame — both directions — is a JSON object:
 existence at the transport layer):
 
 - `epic:<id>` — planning-chat stream + epic-scoped updates (T-202).
-- `project:<id>` — project kanban / board updates (T-401).
+- `project:<id>` — project kanban / board updates (T-401), and the
+  `clone_status` event (T-103) published when a background clone/refresh reaches
+  `ready`/`error` (`payload`: `{ id, clone_status, clone_error, clone_path }`).
 
 ### Client → server (control frames)
 
