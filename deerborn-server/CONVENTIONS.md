@@ -38,11 +38,33 @@ under its epic:
 | get one epic                        | `GET /epics/{id}`                 | `200`          |
 | append a `user` transcript message  | `POST /epics/{id}/messages`       | `201` (the stored message, with its assigned `seq`) |
 | load the transcript in `seq` order  | `GET /epics/{id}/transcript`      | `200` (`items`) |
+| list the planning sessions          | `GET /epics/{id}/sessions`        | `200` (`items`) |
+| advance product → technical planning | `POST /epics/{id}/advance-phase` | `201` (`items` = the epic's sessions) |
 
 `POST /epics/{id}/messages` takes `{ phase, content }` where `phase ∈
 product|technical`; it stores one `role='user'` message. Transcript messages
 carry a **monotonic `seq` per epic** (1, 2, 3, …); agent/tool messages are
 appended by the same store path in T-202.
+
+#### Two-phase planning lifecycle (T-205)
+
+Planning runs in two phases — **product** then **technical** — on **one
+continuous transcript** (`seq` stays globally monotonic across both; only `phase`
+differs per message). The `product` planning session is created with the epic
+(§2.2). The user advances via `POST /epics/{id}/advance-phase`, which marks the
+`product` session `complete` and creates the `technical` session (`active`); it
+returns the epic's sessions and is `409 conflict` if the epic has already
+advanced. A message is accepted only for a phase whose planning session exists,
+so a `technical` message **before** advancing is rejected `409 conflict`.
+
+`GET /epics/{id}/sessions` returns `{ items: [{ epic_id, phase, status,
+created_at, updated_at }] }` so the client knows the active phase and whether it
+may advance. The `planning_session.harness_session_id` (the internal harness
+resume handle) is **never** exposed by the API. Native resume is keyed per
+`(epic, phase)`: the technical run resumes the technical session, never the
+product one, and the technical planner is seeded with the epic's
+`product_context` (continuity) plus the read-only clone + `read_codebase_context`
+so it has code-inspection context. Its `update_epic` writes `technical_context`.
 
 ## Identifiers & timestamps
 

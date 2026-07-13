@@ -155,6 +155,36 @@ describe("planning stream reducer", () => {
     expect(state.turns[0].id).not.toBe(state.turns[1].id);
   });
 
+  it("stamps hydrated turns with their persisted phase", () => {
+    const messages: TranscriptMessage[] = [
+      { ...msg("m1", "user", "product idea"), phase: "product" },
+      { ...msg("m2", "agent", "the plan"), phase: "technical" },
+    ];
+    const state = initialState();
+    hydrate(state, makeEpic(), messages);
+    expect(state.turns[0].phase).toBe("product");
+    expect(state.turns[1].phase).toBe("technical");
+  });
+
+  it("stamps local turns with the state's current phase", () => {
+    const state = initialState();
+    hydrate(state, makeEpic(), []);
+    // Default phase is product.
+    appendUserTurn(state, "product msg");
+    expect(state.turns[0].phase).toBe("product");
+
+    // After advancing, the view flips the phase; new turns take it.
+    state.phase = "technical";
+    appendUserTurn(state, "technical msg");
+    expect(state.turns[1].phase).toBe("technical");
+
+    // A streamed technical turn finalizes under the current phase too.
+    applyFrame(state, frame("started", { runId: "r1" }));
+    applyFrame(state, frame("text", { runId: "r1", delta: "tech reply" }));
+    applyFrame(state, frame("exited", { runId: "r1", exitCode: 0, cancelled: false }));
+    expect(state.turns[2]).toMatchObject({ role: "agent", text: "tech reply", phase: "technical" });
+  });
+
   it("tolerates a text delta arriving before started", () => {
     const state = initialState();
     applyFrame(state, frame("text", { runId: "r1", delta: "eager" }));

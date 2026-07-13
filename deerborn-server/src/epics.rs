@@ -84,6 +84,24 @@ pub struct TranscriptMessage {
     pub created_at: i64,
 }
 
+/// A planning session as returned by the API (`planning_session`, §2.2), one per
+/// `(epic, phase)`. The durable `harness_session_id` is an internal resume handle
+/// and is deliberately **omitted** from this DTO — the client never sees it.
+#[derive(Debug, Serialize)]
+pub struct PlanningSession {
+    pub epic_id: String,
+    /// `product` | `technical`.
+    pub phase: String,
+    /// `active` | `complete`.
+    pub status: String,
+    pub created_at: i64,
+    pub updated_at: i64,
+}
+
+/// Columns projected into a [`PlanningSession`] DTO. Note the absence of
+/// `harness_session_id`: it is a server-only resume handle.
+const SESSION_COLUMNS: &str = "epic_id, phase, status, created_at, updated_at";
+
 /// `POST /projects/{id}/epics` body. `title` is required (validated in the
 /// handler so a missing/empty field yields the standard `bad_request` envelope).
 #[derive(Debug, Deserialize)]
@@ -193,8 +211,22 @@ pub async fn post_message(
     let content = require_field(req.content, "content")?;
     let conn = state.db.conn();
 
+    // Reject an unknown phase first (400) so it never masquerades as a missing
+    // session (409) below.
+    validate_phase(&phase)?;
+
     if !epic_exists(conn, &id).await? {
         return Err(epic_not_found(&id));
+    }
+
+    // A message may only be posted in a phase whose planning session has been
+    // started. The `product` session is created with the epic; the `technical`
+    // session only exists after the user advances the epic (T-205). Posting a
+    // `technical` message before advancing is a state conflict, not a bad body.
+    if !planning_session_exists(conn, &id, &phase).await? {
+        return Err(AppError::Conflict(format!(
+            "epic {id} has not advanced to `{phase}` planning; no active {phase} session"
+        )));
     }
 
     let message = append_message(conn, &id, &phase, "user", &content).await?;
@@ -225,6 +257,74 @@ pub async fn get_transcript(
     }
     let items = load_transcript(conn, &id).await?;
     Ok(Json(json!({ "items": items })))
+}
+
+/// `GET /epics/{id}/sessions` — the epic's planning sessions (`items`), so the
+/// client knows which phase is active and whether it may advance. `404` if the
+/// epic does not exist. The internal `harness_session_id` is never exposed.
+pub async fn list_sessions(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> AppResult<Json<serde_json::Value>> {
+    let conn = state.db.conn();
+    if !epic_exists(conn, &id).await? {
+        return Err(epic_not_found(&id));
+    }
+    let items = load_sessions(conn, &id).await?;
+    Ok(Json(json!({ "items": items })))
+}
+
+/// `POST /epics/{id}/advance-phase` — advance an epic from product → technical
+/// planning **on the same transcript**.
+///
+/// Validates that the epic and its `product` planning session exist, marks the
+/// product session `complete`, and creates the `technical` session (`active`).
+/// The transcript continues on the same monotonic `seq`; only the `phase` on new
+/// messages differs. Returns the epic's planning sessions (`items`) so the client
+/// can flip to the technical phase. `404` if the epic (or its product session) is
+/// missing; `409` if the epic has already advanced (a technical session exists).
+pub async fn advance_phase(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
+    let conn = state.db.conn();
+
+    if !epic_exists(conn, &id).await? {
+        return Err(epic_not_found(&id));
+    }
+    // The product phase must have been started (it is, at epic creation); guard
+    // anyway so advancing is only ever from a real product session.
+    if !planning_session_exists(conn, &id, "product").await? {
+        return Err(AppError::NotFound(format!(
+            "epic {id} has no product planning session to advance from"
+        )));
+    }
+    // Idempotency guard: advancing twice is a state conflict.
+    if planning_session_exists(conn, &id, "technical").await? {
+        return Err(AppError::Conflict(format!(
+            "epic {id} has already advanced to technical planning"
+        )));
+    }
+
+    let now = now_ms();
+    // Product planning is done; mark its session complete (the transcript stays).
+    conn.execute(
+        "UPDATE planning_session SET status = 'complete', updated_at = ?1 \
+         WHERE epic_id = ?2 AND phase = 'product'",
+        params![now, id.clone()],
+    )
+    .await?;
+    // Open the technical session; the durable harness_session_id stays NULL until
+    // the first technical run captures it (mirrors epic creation for product).
+    conn.execute(
+        "INSERT INTO planning_session (epic_id, phase, status, created_at, updated_at) \
+         VALUES (?1, 'technical', 'active', ?2, ?3)",
+        params![id.clone(), now, now],
+    )
+    .await?;
+
+    let items = load_sessions(conn, &id).await?;
+    Ok((StatusCode::CREATED, Json(json!({ "items": items }))))
 }
 
 // ---- reusable store helpers (T-202 consumes these) ----------------------
@@ -282,6 +382,37 @@ pub async fn load_transcript(
         items.push(row_to_message(&row)?);
     }
     Ok(items)
+}
+
+/// Load an epic's planning sessions, ordered by `created_at` (product before
+/// technical). The internal `harness_session_id` is not projected.
+pub async fn load_sessions(
+    conn: &Connection,
+    epic_id: &str,
+) -> AppResult<Vec<PlanningSession>> {
+    let sql = format!(
+        "SELECT {SESSION_COLUMNS} FROM planning_session WHERE epic_id = ?1 \
+         ORDER BY created_at ASC, phase ASC"
+    );
+    let mut rows = conn.query(&sql, params![epic_id]).await?;
+    let mut items = Vec::new();
+    while let Some(row) = rows.next().await? {
+        items.push(row_to_session(&row)?);
+    }
+    Ok(items)
+}
+
+/// Whether a `planning_session` row exists for `(epic_id, phase)`. Gates message
+/// posting (a `technical` message is rejected until the epic advances) and the
+/// advance flow.
+async fn planning_session_exists(conn: &Connection, epic_id: &str, phase: &str) -> AppResult<bool> {
+    let mut rows = conn
+        .query(
+            "SELECT 1 FROM planning_session WHERE epic_id = ?1 AND phase = ?2",
+            params![epic_id, phase],
+        )
+        .await?;
+    Ok(rows.next().await?.is_some())
 }
 
 /// Persist the native harness `session_id` for an epic's planning phase (T-202).
@@ -420,6 +551,16 @@ fn row_to_epic(row: &Row) -> Result<Epic, libsql::Error> {
         status: row.get(5)?,
         created_at: row.get(6)?,
         updated_at: row.get(7)?,
+    })
+}
+
+fn row_to_session(row: &Row) -> Result<PlanningSession, libsql::Error> {
+    Ok(PlanningSession {
+        epic_id: row.get(0)?,
+        phase: row.get(1)?,
+        status: row.get(2)?,
+        created_at: row.get(3)?,
+        updated_at: row.get(4)?,
     })
 }
 

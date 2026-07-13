@@ -4,7 +4,15 @@ import { RouterLink } from "vue-router";
 
 import { useAuthStore } from "../stores/auth";
 import { ApiError } from "../api/client";
-import { getEpic, getTranscript, postMessage } from "../api/epics";
+import {
+  advancePhase,
+  getEpic,
+  getSessions,
+  getTranscript,
+  postMessage,
+  type PlanningPhase,
+  type PlanningSession,
+} from "../api/epics";
 import {
   appendUserTurn,
   hydrate,
@@ -13,14 +21,15 @@ import {
 } from "../planning/stream";
 import { useEpicStream, type EpicStream, type StreamStatus } from "../planning/useEpicStream";
 
-// Planning chat UI + live Epic record (T-204). Two panes: a streaming chat on
-// the left (transcript history + the in-flight agent reply, token by token, with
-// tool-call chips) and the Epic record on the right, which fills in live as the
-// agent calls `update_epic` (an `epic_updated` WS frame). On mount we hydrate
-// from REST (epic + transcript) then open the WebSocket; the pure reducer folds
-// every frame into `state`.
+// Planning chat UI + live Epic record (T-204/T-205). Two panes: a streaming chat
+// on the left (transcript history + the in-flight agent reply, token by token,
+// with tool-call chips) and the Epic record on the right, which fills in live as
+// the agent calls `update_epic` (an `epic_updated` WS frame). Planning runs in
+// two phases — product then technical — on ONE transcript; the user advances
+// with a control, and messages after that carry `phase: "technical"`. On mount we
+// hydrate from REST (epic + transcript + sessions) then open the WebSocket; the
+// pure reducer folds every frame into `state`.
 const props = defineProps<{ id: string }>();
-const PHASE = "product" as const;
 
 const auth = useAuthStore();
 const state = reactive<PlanningState>(initialState());
@@ -28,16 +37,46 @@ const loading = ref(true);
 const error = ref<string | null>(null);
 const draft = ref("");
 const sending = ref(false);
+const advancing = ref(false);
+const sessions = ref<PlanningSession[]>([]);
 const streamStatus = ref<StreamStatus>("connecting");
 const scroller = ref<HTMLElement | null>(null);
-// The live stream is opened after the async hydrate (below), so cleanup is
-// registered here synchronously and wired to it once it exists.
-let stream: EpicStream | null = null;
-onBeforeUnmount(() => stream?.close());
 
 // A run is in flight while the reducer holds a streaming turn; gate the composer.
 const runInFlight = computed(() => state.streaming !== null);
 const projectId = computed<string | null>(() => state.epic?.project_id ?? null);
+
+// Phase state, derived from the epic's planning sessions. The technical session
+// only exists after advancing; while it doesn't, we're in the product phase.
+const hasTechnical = computed(() => sessions.value.some((s) => s.phase === "technical"));
+const currentPhase = computed<PlanningPhase>(() => (hasTechnical.value ? "technical" : "product"));
+// Keep the reducer's stamp-phase in sync so live-finalized turns land under the
+// active phase (hydrated turns keep their own persisted phase).
+watch(currentPhase, (phase) => (state.phase = phase), { immediate: true });
+
+// Advance is offered only while still in product planning; it's disabled until
+// there's some product progress, and while a run/advance is in flight.
+const canAdvance = computed(() => state.epic !== null && !hasTechnical.value);
+const advanceDisabled = computed(
+  () =>
+    advancing.value ||
+    runInFlight.value ||
+    (!state.epic?.product_context && state.turns.length === 0),
+);
+
+// One continuous transcript, tagged with a divider at the product → technical
+// boundary so the two phases read as distinct sections without splitting the list.
+const transcriptItems = computed(() =>
+  state.turns.map((turn, i) => ({
+    turn,
+    dividerBefore:
+      turn.phase === "technical" && (i === 0 || state.turns[i - 1].phase !== "technical"),
+  })),
+);
+// The live stream is opened after the async hydrate (below), so cleanup is
+// registered here synchronously and wired to it once it exists.
+let stream: EpicStream | null = null;
+onBeforeUnmount(() => stream?.close());
 
 function bounceIfAuth(err: unknown): boolean {
   if (err instanceof ApiError && err.isAuth) {
@@ -55,11 +94,13 @@ async function load() {
   loading.value = true;
   error.value = null;
   try {
-    const [epic, transcript] = await Promise.all([
+    const [epic, transcript, sessionList] = await Promise.all([
       getEpic(token, props.id),
       getTranscript(token, props.id),
+      getSessions(token, props.id),
     ]);
     hydrate(state, epic, transcript);
+    sessions.value = sessionList;
     // Only open the live stream once the history is in place. Pass our own
     // status ref so no extra watcher is needed (we're past an `await`, so the
     // setup effect scope is no longer current).
@@ -86,7 +127,7 @@ async function send() {
   appendUserTurn(state, content);
   draft.value = "";
   try {
-    await postMessage(token, props.id, PHASE, content);
+    await postMessage(token, props.id, currentPhase.value, content);
   } catch (err) {
     if (bounceIfAuth(err)) {
       return;
@@ -94,6 +135,27 @@ async function send() {
     error.value = err instanceof Error ? err.message : "failed to send message";
   } finally {
     sending.value = false;
+  }
+}
+
+// Advance product → technical planning: the transcript continues on the same
+// sequence, and the composer flips to `phase: "technical"` (via `currentPhase`).
+async function advance() {
+  const token = auth.token;
+  if (token === null || hasTechnical.value || advancing.value || runInFlight.value) {
+    return;
+  }
+  advancing.value = true;
+  error.value = null;
+  try {
+    sessions.value = await advancePhase(token, props.id);
+  } catch (err) {
+    if (bounceIfAuth(err)) {
+      return;
+    }
+    error.value = err instanceof Error ? err.message : "failed to advance the phase";
+  } finally {
+    advancing.value = false;
   }
 }
 
@@ -143,11 +205,26 @@ onMounted(load);
           <span class="status" :data-status="state.epic.status">
             {{ state.epic.status }}
           </span>
+          <span class="phase" :data-phase="currentPhase">
+            {{ currentPhase === "technical" ? "Technical planning" : "Product planning" }}
+          </span>
         </div>
         <span class="conn" :data-status="streamStatus">
           {{ streamStatus === "open" ? "live" : streamStatus }}
         </span>
       </header>
+
+      <!-- Advance product → technical planning (T-205). Shown only while still in
+           product planning; disappears once the technical phase is active. -->
+      <div v-if="canAdvance" class="advance-bar">
+        <p>
+          Done defining the product? Advance to <strong>technical planning</strong> — the agent
+          will inspect the codebase and plan the technical approach on this same transcript.
+        </p>
+        <button :disabled="advanceDisabled" @click="advance">
+          {{ advancing ? "Advancing…" : "Advance to technical planning" }}
+        </button>
+      </div>
 
       <div class="panes">
         <!-- Chat panel ------------------------------------------------------ -->
@@ -158,18 +235,23 @@ onMounted(load);
               fill in the epic as you talk.
             </p>
 
-            <div v-for="turn in state.turns" :key="turn.id" class="turn" :data-role="turn.role">
-              <template v-if="turn.role === 'tool'">
-                <span class="tool-chip" :data-status="turn.tool?.status">
-                  <span class="tool-name">{{ turn.tool?.name }}</span>
-                  <span class="tool-state">{{ turn.tool?.status }}</span>
-                </span>
-              </template>
-              <template v-else>
-                <span class="role">{{ turn.role }}</span>
-                <div class="bubble">{{ turn.text }}</div>
-              </template>
-            </div>
+            <template v-for="item in transcriptItems" :key="item.turn.id">
+              <div v-if="item.dividerBefore" class="phase-divider">
+                <span>Technical planning</span>
+              </div>
+              <div class="turn" :data-role="item.turn.role">
+                <template v-if="item.turn.role === 'tool'">
+                  <span class="tool-chip" :data-status="item.turn.tool?.status">
+                    <span class="tool-name">{{ item.turn.tool?.name }}</span>
+                    <span class="tool-state">{{ item.turn.tool?.status }}</span>
+                  </span>
+                </template>
+                <template v-else>
+                  <span class="role">{{ item.turn.role }}</span>
+                  <div class="bubble">{{ item.turn.text }}</div>
+                </template>
+              </div>
+            </template>
 
             <!-- The in-flight agent turn (streams token by token). -->
             <div v-if="state.streaming" class="turn streaming" data-role="agent">
@@ -235,7 +317,13 @@ onMounted(load);
             <div v-if="state.epic.technical_context" class="context-body">
               {{ state.epic.technical_context }}
             </div>
-            <p v-else class="context-empty">Technical planning arrives in T-205.</p>
+            <p v-else class="context-empty">
+              {{
+                currentPhase === "technical"
+                  ? "Fills in as you plan the technical approach…"
+                  : "Advance to technical planning to start."
+              }}
+            </p>
           </section>
         </aside>
       </div>
@@ -275,6 +363,66 @@ header h1 {
   border-radius: 999px;
   background: #eef2ff;
   color: #3730a3;
+}
+.phase {
+  font-size: 0.8rem;
+  margin-left: 0.4rem;
+  padding: 0.1rem 0.5rem;
+  border-radius: 999px;
+  background: #f3f4f6;
+  color: #374151;
+}
+.phase[data-phase="technical"] {
+  background: #ecfdf5;
+  color: #065f46;
+}
+.advance-bar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 1rem;
+  margin-top: 1rem;
+  padding: 0.75rem 1rem;
+  border: 1px solid #ddd6fe;
+  border-radius: 10px;
+  background: #f5f3ff;
+}
+.advance-bar p {
+  margin: 0;
+  font-size: 0.85rem;
+  color: #4c1d95;
+}
+.advance-bar button {
+  flex-shrink: 0;
+  font: inherit;
+  padding: 0.5rem 1.1rem;
+  border: 1px solid #7c3aed;
+  border-radius: 8px;
+  background: #7c3aed;
+  color: #fff;
+  cursor: pointer;
+}
+.advance-bar button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.phase-divider {
+  display: flex;
+  align-items: center;
+  text-align: center;
+  color: #065f46;
+  font-size: 0.72rem;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  gap: 0.6rem;
+  margin: 0.4rem 0;
+}
+.phase-divider::before,
+.phase-divider::after {
+  content: "";
+  flex: 1;
+  height: 1px;
+  background: #a7f3d0;
 }
 .conn {
   font-size: 0.75rem;

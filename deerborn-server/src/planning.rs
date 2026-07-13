@@ -45,8 +45,10 @@ use std::sync::mpsc::Receiver;
 use harness::{Claude, Harness, RunEvent, RunMode, RunRequest, RunTuning};
 use serde_json::Value;
 
+use libsql::Connection;
+
 use crate::epics::{
-    append_message, get_epic_clone_path, get_harness_session_id, set_harness_session_id,
+    append_message, fetch_epic, get_epic_clone_path, get_harness_session_id, set_harness_session_id,
 };
 use crate::{AppState, InflightGuard};
 
@@ -98,14 +100,72 @@ You must NOT modify the codebase, run commands, or change the epic's status, lan
 or anything beyond its product context — those tools are the entire surface you have. \
 Be concise and conversational.";
 
+/// Technical-planning role (T-205). The second half of planning: given a
+/// product definition already agreed in the product phase, this planner works
+/// out *how* to build it. It has the same tool surface as product planning
+/// (`update_epic` + `read_codebase_context`) but maintains the epic's
+/// `technical_context` and is steered to ground every decision in the real code.
+///
+/// The product outcome does not carry over automatically — each phase is its own
+/// harness session — so [`spawn_run`] seeds the prior product context into this
+/// run's continuity preamble (see [`PlanningRunRequest::continuity`]).
+pub const TECHNICAL_PLANNING: PlanningConfig = PlanningConfig {
+    phase: "technical",
+    system_prompt: TECHNICAL_PLANNING_PROMPT,
+    tools_enabled: true,
+};
+
+const TECHNICAL_PLANNING_PROMPT: &str = "\
+You are Deerborn's technical-planning partner. The product-planning phase has \
+already agreed WHAT to build (its outcome is provided to you as the product \
+context). Your job is to work out HOW: the technical approach, architecture, the \
+concrete files and modules to touch, data model / API changes, sequencing, and \
+technical risks.
+
+Ground every decision in the ACTUAL code, not assumptions:
+- `read_codebase_context`: read-only access to the project's canonical clone \
+(list directories, read files). Inspect the real structure, existing patterns, \
+and the specific files your plan would change BEFORE proposing an approach. Quote \
+what you find.
+- `update_epic`: keep the epic's technical context current. Whenever the approach \
+firms up, call it with the FULL up-to-date technical plan (markdown); the value you \
+pass REPLACES the stored technical context. Do this proactively, not only when asked.
+
+Build on the product context — do not re-open settled product decisions. You must \
+NOT modify the codebase, run commands, or change the epic's status, lane, or \
+anything beyond its technical context — those two tools are your entire surface. \
+Be concise and conversational, asking one or two sharp questions at a time.";
+
 /// Resolve the [`PlanningConfig`] for a transcript phase, or `None` if the phase
-/// has no planning role yet. T-205 wires the `technical` arm.
+/// has no planning role.
 pub fn config_for_phase(phase: &str) -> Option<&'static PlanningConfig> {
     match phase {
         "product" => Some(&PRODUCT_PLANNING),
-        // "technical" => Some(&TECHNICAL_PLANNING), // T-205
+        "technical" => Some(&TECHNICAL_PLANNING),
         _ => None,
     }
+}
+
+/// Build the technical phase's continuity preamble from the epic's title and the
+/// `product_context` the product phase produced. Returned as a system-prompt
+/// block so the technical planner builds on the settled product decisions rather
+/// than re-deriving them. Best-effort: on a DB error / missing epic it returns
+/// `None` and the run proceeds without the seed (the tools still work).
+async fn technical_continuity(conn: &Connection, epic_id: &str) -> Option<String> {
+    let epic = fetch_epic(conn, epic_id).await.ok().flatten()?;
+    let product = epic
+        .product_context
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .unwrap_or("(the product phase recorded no product context)");
+    Some(format!(
+        "You are continuing planning for the epic titled \"{title}\".\n\n\
+         The product-planning phase already produced the product context below. \
+         Treat it as settled input and build your technical plan on top of it:\n\n\
+         --- PRODUCT CONTEXT ---\n{product}\n--- END PRODUCT CONTEXT ---",
+        title = epic.title,
+    ))
 }
 
 // ---- the agent seam ------------------------------------------------------
@@ -124,6 +184,12 @@ pub struct PlanningRunRequest {
     pub resume: Option<String>,
     /// System prompt for the phase (stable across turns).
     pub system_prompt: &'static str,
+    /// Cross-phase continuity, appended as a *second* system prompt (T-205).
+    /// Because each phase is its own harness session, a later phase cannot see an
+    /// earlier phase's conversation; [`spawn_run`] seeds the prior phase's outcome
+    /// here (e.g. the technical run receives the epic's `product_context` + title)
+    /// so the run builds on it. `None` for the first phase, which has no prior.
+    pub continuity: Option<String>,
     /// MCP wiring for a tools-enabled phase (T-203). `None` for a plain
     /// conversational run; `Some` adds `--mcp-config`/`--allowedTools`/
     /// `--permission-mode bypassPermissions` so the agent can reach Deerborn's
@@ -173,6 +239,12 @@ impl PlanningAgent for ClaudePlanningAgent {
             "--append-system-prompt".to_string(),
             req.system_prompt.to_string(),
         ];
+        // Cross-phase continuity (T-205): the prior phase's outcome, appended as a
+        // second system prompt so a later phase (e.g. technical) builds on it.
+        if let Some(continuity) = &req.continuity {
+            extra_args.push("--append-system-prompt".to_string());
+            extra_args.push(continuity.clone());
+        }
         // Tools-enabled phase (T-203): wire Deerborn's local MCP server exactly as
         // the T-200 spike proved. Read-only is enforced by the allow-list (only the
         // two planning tools) + the read-only clone as `cwd`, NOT by `RunMode`.
@@ -348,12 +420,24 @@ pub fn spawn_run(
             }
         }
 
+        // Cross-phase continuity (T-205): a later phase is a separate harness
+        // session, so it cannot see the earlier phase's conversation. Seed the
+        // technical phase with the epic's title + product context so it builds on
+        // the product outcome (and, together with the read-only clone + MCP tools
+        // below, "has code-inspection context" per the T-205 AC).
+        let continuity = if config.phase == "technical" {
+            technical_continuity(state.db.conn(), &epic_id).await
+        } else {
+            None
+        };
+
         let req = PlanningRunRequest {
             run_id: ulid::Ulid::new().to_string(),
             prompt: user_content,
             cwd,
             resume,
             system_prompt: config.system_prompt,
+            continuity,
             mcp,
         };
 
@@ -421,6 +505,9 @@ pub(crate) mod testing {
         pub run_id: String,
         pub prompt: String,
         pub resume: Option<String>,
+        /// The cross-phase continuity preamble the engine passed (T-205): `Some`
+        /// for a technical run seeded with product context, `None` otherwise.
+        pub continuity: Option<String>,
     }
 
     /// A one-shot gate: the fake's run thread blocks before its terminal
@@ -484,6 +571,7 @@ pub(crate) mod testing {
                 run_id: req.run_id.clone(),
                 prompt: req.prompt.clone(),
                 resume: req.resume.clone(),
+                continuity: req.continuity.clone(),
             });
 
             let (tx, rx) = std::sync::mpsc::channel();
@@ -628,16 +716,33 @@ mod tests {
     }
 
     async fn post_message(app: &axum::Router, epic_id: &str, content: &str) -> StatusCode {
+        post_message_phase(app, epic_id, "product", content).await
+    }
+
+    async fn post_message_phase(
+        app: &axum::Router,
+        epic_id: &str,
+        phase: &str,
+        content: &str,
+    ) -> StatusCode {
         let posted = app
             .clone()
             .oneshot(req(
                 "POST",
                 &format!("/epics/{epic_id}/messages"),
-                Some(json!({ "phase": "product", "content": content })),
+                Some(json!({ "phase": phase, "content": content })),
             ))
             .await
             .unwrap();
         posted.status()
+    }
+
+    /// Advance an epic product → technical; return the response for assertions.
+    async fn advance_phase(app: &axum::Router, epic_id: &str) -> axum::response::Response {
+        app.clone()
+            .oneshot(req("POST", &format!("/epics/{epic_id}/advance-phase"), None))
+            .await
+            .unwrap()
     }
 
     /// Collect published frames from a hub subscription until an `exited` frame
@@ -837,6 +942,217 @@ mod tests {
         let items = load_transcript(state.db.conn(), &epic_id).await.unwrap();
         assert_eq!(items.len(), 2);
         assert!(items.iter().all(|m| m.role == "user"));
+    }
+
+    // ---- T-205: two-phase planning on one transcript ----
+
+    /// Both phases run against the same epic on ONE continuous transcript: a
+    /// product turn, then advance, then a technical turn — `phase` recorded per
+    /// message, `seq` globally monotonic across both phases. The technical run is
+    /// seeded with the product context (continuity), proving it builds on the
+    /// product outcome.
+    #[tokio::test]
+    async fn advance_then_technical_shares_transcript_with_phase_and_monotonic_seq() {
+        let agent = Arc::new(ScriptedPlanningAgent::new("sess-1", &["reply"]));
+        let recorded = agent.recorded();
+        let (state, app) = app_with(agent).await;
+        let project_id = seed_project(&app).await;
+        let epic_id = create_epic(&app, &project_id).await;
+
+        // Product turn.
+        assert_eq!(post_message(&app, &epic_id, "product idea").await, StatusCode::CREATED);
+        wait_for_transcript(&state, &epic_id, 2).await; // user + agent
+
+        // Record a product context, so the technical continuity has real content.
+        state
+            .db
+            .conn()
+            .execute(
+                "UPDATE epic SET product_context = ?1 WHERE id = ?2",
+                libsql::params!["Users need one-click export.".to_string(), epic_id.clone()],
+            )
+            .await
+            .unwrap();
+
+        // Advance product → technical.
+        let advanced = advance_phase(&app, &epic_id).await;
+        assert_eq!(advanced.status(), StatusCode::CREATED);
+        let sessions = body_json(advanced).await;
+        let items = sessions["items"].as_array().unwrap();
+        let by_phase = |p: &str| items.iter().find(|s| s["phase"] == p).unwrap().clone();
+        assert_eq!(by_phase("product")["status"], "complete");
+        assert_eq!(by_phase("technical")["status"], "active");
+        // The internal resume handle is never exposed.
+        assert!(items.iter().all(|s| s.get("harness_session_id").is_none()));
+
+        // Technical turn on the SAME transcript.
+        assert_eq!(
+            post_message_phase(&app, &epic_id, "technical", "how should we build it?").await,
+            StatusCode::CREATED
+        );
+        let items = wait_for_transcript(&state, &epic_id, 4).await;
+
+        // One continuous transcript: monotonic seq 1..4, phase recorded per msg.
+        assert_eq!(items.len(), 4);
+        let seqs: Vec<i64> = items.iter().map(|m| m["seq"].as_i64().unwrap()).collect();
+        assert_eq!(seqs, vec![1, 2, 3, 4], "seq stays globally monotonic across phases");
+        let phases: Vec<&str> = items.iter().map(|m| m["phase"].as_str().unwrap()).collect();
+        assert_eq!(phases, vec!["product", "product", "technical", "technical"]);
+        let roles: Vec<&str> = items.iter().map(|m| m["role"].as_str().unwrap()).collect();
+        assert_eq!(roles, vec!["user", "agent", "user", "agent"]);
+
+        // The technical run was seeded with the product context (continuity).
+        let runs = recorded.lock().unwrap();
+        assert_eq!(runs.len(), 2, "one product run + one technical run");
+        let tech = &runs[1];
+        let continuity = tech.continuity.as_deref().expect("technical run carries continuity");
+        assert!(
+            continuity.contains("Users need one-click export."),
+            "continuity must seed the product context, got: {continuity}"
+        );
+    }
+
+    /// Per-phase native resume: the technical session resumes ITS OWN
+    /// `harness_session_id`, never the product session's. The first technical run
+    /// opens fresh (resume `None`) even though the product session already has a
+    /// captured id; a second technical turn resumes the technical id.
+    #[tokio::test]
+    async fn technical_run_resumes_the_technical_session_not_the_product_one() {
+        let agent = Arc::new(ScriptedPlanningAgent::new("sess-1", &["ok"]));
+        let recorded = agent.recorded();
+        let (state, app) = app_with(agent).await;
+        let project_id = seed_project(&app).await;
+        let epic_id = create_epic(&app, &project_id).await;
+
+        // Product turn captures the product session's harness id.
+        assert_eq!(post_message(&app, &epic_id, "p").await, StatusCode::CREATED);
+        wait_for_transcript(&state, &epic_id, 2).await;
+
+        assert_eq!(advance_phase(&app, &epic_id).await.status(), StatusCode::CREATED);
+
+        // Technical turn 1, then turn 2.
+        assert_eq!(post_message_phase(&app, &epic_id, "technical", "t1").await, StatusCode::CREATED);
+        wait_for_transcript(&state, &epic_id, 4).await;
+        assert_eq!(post_message_phase(&app, &epic_id, "technical", "t2").await, StatusCode::CREATED);
+        wait_for_transcript(&state, &epic_id, 6).await;
+
+        let resumes: Vec<Option<String>> = {
+            let runs = recorded.lock().unwrap();
+            assert_eq!(runs.len(), 3, "product + two technical runs");
+            runs.iter().map(|r| r.resume.clone()).collect()
+        };
+        assert_eq!(resumes[0], None, "product turn 1 opens fresh");
+        assert_eq!(
+            resumes[1], None,
+            "technical turn 1 must open a FRESH session, not resume the product one"
+        );
+        assert_eq!(
+            resumes[2].as_deref(),
+            Some("sess-1"),
+            "technical turn 2 resumes the technical session id"
+        );
+
+        // Both sessions carry their own (here identical-valued) captured id.
+        let harness_id = |phase: &'static str| {
+            let conn = state.db.conn().clone();
+            let epic_id = epic_id.clone();
+            async move {
+                let mut rows = conn
+                    .query(
+                        "SELECT harness_session_id FROM planning_session \
+                         WHERE epic_id = ?1 AND phase = ?2",
+                        libsql::params![epic_id, phase],
+                    )
+                    .await
+                    .unwrap();
+                rows.next().await.unwrap().unwrap().get::<Option<String>>(0).unwrap()
+            }
+        };
+        assert_eq!(harness_id("product").await.as_deref(), Some("sess-1"));
+        assert_eq!(harness_id("technical").await.as_deref(), Some("sess-1"));
+    }
+
+    /// A `technical`-phase message before advancing is rejected with the standard
+    /// error envelope (409 conflict) and appends nothing to the transcript.
+    #[tokio::test]
+    async fn technical_message_before_advancing_is_rejected() {
+        let agent = Arc::new(ScriptedPlanningAgent::new("sess-1", &["ok"]));
+        let (state, app) = app_with(agent).await;
+        let project_id = seed_project(&app).await;
+        let epic_id = create_epic(&app, &project_id).await;
+
+        let response = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                &format!("/epics/{epic_id}/messages"),
+                Some(json!({ "phase": "technical", "content": "too early" })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(body_json(response).await["error"]["code"], "conflict");
+
+        // Nothing was persisted for the rejected technical message.
+        let items = load_transcript(state.db.conn(), &epic_id).await.unwrap();
+        assert!(items.is_empty(), "rejected message must not persist");
+    }
+
+    /// The technical run's `update_epic` (via the MCP handler) writes
+    /// `technical_context` and publishes `epic_updated` on `epic:<id>` — the epic
+    /// fills in live during the technical phase exactly as it does for product.
+    #[tokio::test]
+    async fn technical_phase_update_epic_writes_technical_context_and_publishes() {
+        let (state, app) = app_with(Arc::new(SilentPlanningAgent)).await;
+        let project_id = seed_project(&app).await;
+        let epic_id = create_epic(&app, &project_id).await;
+        assert_eq!(advance_phase(&app, &epic_id).await.status(), StatusCode::CREATED);
+
+        // A technical-phase run mints a capability scoped to (epic, technical).
+        let guard = state
+            .caps
+            .mint(epic_id.clone(), "technical".into(), std::path::PathBuf::from("/tmp"));
+
+        let mut sub = state.hub.subscribe(&format!("epic:{epic_id}"));
+
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/mcp/{}", guard.token()))
+                    .header(CONTENT_TYPE, "application/json")
+                    .body(Body::from(
+                        json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                               "params":{"name":"update_epic",
+                                         "arguments":{"content":"Add an axum route + libSQL migration."}}})
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // The technical column filled; product stayed NULL.
+        let epic = crate::epics::fetch_epic(state.db.conn(), &epic_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            epic.technical_context.as_deref(),
+            Some("Add an axum route + libSQL migration.")
+        );
+        assert_eq!(epic.product_context, None);
+
+        // Live epic_updated frame carried the technical context.
+        let frame = sub.recv().await.unwrap();
+        let value: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(value["type"], "epic_updated");
+        assert_eq!(
+            value["payload"]["technical_context"],
+            "Add an axum route + libSQL migration."
+        );
     }
 
     /// Ignore-marked live smoke test: drives the REAL `claude` CLI end to end.

@@ -357,11 +357,34 @@ Only the **planning** and **breakdown** phases exist in Half 1:
   flow that lands a new Epic in the **Planning** lane. **AC:** a user plans an epic
   entirely in the browser and sees the Epic record fill in as they talk.
 
-- [ ] **T-205 — Second planning config (technical planning).** *deps: T-204*
+- [x] **T-205 — Second planning config (technical planning).** *deps: T-204*
   Two prompt configs (product + technical) share the one chat/transcript engine;
   the user advances an epic from product → technical planning on the same
   transcript. **AC:** both phases run against the same epic; `phase` is recorded on
   each message; technical planning has code-inspection context.
+  **Done:** `TECHNICAL_PLANNING` config in `src/planning.rs` (`tools_enabled=true`,
+  `config_for_phase` `technical` arm). Each phase is its own harness session, so
+  `spawn_run` seeds the technical run with the epic's title + `product_context` as a
+  second `--append-system-prompt` (continuity) and keeps the read-only clone `cwd` +
+  MCP `read_codebase_context` wired — that is the "code-inspection context" AC.
+  Advance flow: `POST /epics/:id/advance-phase` marks the `product` session
+  `complete` and creates the `technical` session (`active`), returning the sessions
+  (`items`); it 409s if already advanced. `GET /epics/:id/sessions` exposes phase
+  state (`{ phase, status, ... }`) **without** the internal `harness_session_id`. A
+  `technical` message before advancing is rejected `409 conflict` (no active
+  technical session). Per-phase native resume is keyed by `(epic, phase)`, so the
+  technical run resumes the technical id, never product's; its `update_epic` writes
+  `technical_context` (the MCP cap is minted with the run's phase) and publishes
+  `epic_updated`. Client: `PlanningView.vue` gained an advance control, a
+  phase indicator, and a product→technical divider in the one continuous
+  transcript; the reducer (`stream.ts`) now stamps each turn with its `phase`
+  (Vitest extended). Hermetic gate covers the two-phase transcript, per-phase
+  resume, the pre-advance rejection, and the technical `update_epic` path; a live
+  sibling smoke test is `tests/mcp_live.rs::live_technical_planning_reads_clone_and_fills_technical_context`
+  (`#[ignore]`d).
+
+**Phase 2 complete** — T-200 through T-205 all merged; interactive planning
+(product + technical) works end to end.
 
 ---
 

@@ -15,7 +15,7 @@
 // text), so a live-finalized transcript is identical to one re-fetched from
 // `GET /epics/:id/transcript` after a reload.
 
-import type { Epic, TranscriptMessage, TranscriptRole } from "../api/epics";
+import type { Epic, PlanningPhase, TranscriptMessage, TranscriptRole } from "../api/epics";
 
 /** A single tool call the agent made during a run, rendered as a chip. */
 export interface ToolCall {
@@ -35,6 +35,13 @@ export interface Turn {
   text: string;
   /** Present only on `tool` turns. */
   tool: ToolCall | null;
+  /**
+   * The planning phase this turn belongs to (T-205). Hydrated turns take it from
+   * the persisted message; locally-finalized turns take the state's current
+   * phase. Lets the view draw a divider where the transcript crosses product →
+   * technical without splitting the one continuous list.
+   */
+  phase: PlanningPhase;
 }
 
 /** The in-flight agent turn while a run streams. `null` when no run is active. */
@@ -59,6 +66,13 @@ export interface PlanningState {
   error: string | null;
   /** Monotonic counter for stable keys on locally-finalized turns. */
   nextKey: number;
+  /**
+   * The phase new local turns are stamped with (the composer's active phase).
+   * Defaults to `product`; the view flips it to `technical` after advancing so a
+   * streamed technical turn finalizes under the right phase. Hydrated turns keep
+   * their own persisted phase regardless of this value.
+   */
+  phase: PlanningPhase;
 }
 
 // ---- WS frame payload shapes --------------------------------------------
@@ -98,7 +112,7 @@ export interface EpicFrame {
 
 /** A fresh, empty view model. */
 export function initialState(): PlanningState {
-  return { epic: null, turns: [], streaming: null, error: null, nextKey: 0 };
+  return { epic: null, turns: [], streaming: null, error: null, nextKey: 0, phase: "product" };
 }
 
 /**
@@ -114,9 +128,21 @@ export function hydrate(state: PlanningState, epic: Epic, messages: TranscriptMe
 /** Map a persisted transcript message to a display turn. */
 function messageToTurn(message: TranscriptMessage): Turn {
   if (message.role === "tool") {
-    return { id: message.id, role: "tool", text: "", tool: parseToolContent(message.content) };
+    return {
+      id: message.id,
+      role: "tool",
+      text: "",
+      tool: parseToolContent(message.content),
+      phase: message.phase,
+    };
   }
-  return { id: message.id, role: message.role, text: message.content, tool: null };
+  return {
+    id: message.id,
+    role: message.role,
+    text: message.content,
+    tool: null,
+    phase: message.phase,
+  };
 }
 
 /**
@@ -143,7 +169,13 @@ function parseToolContent(content: string): ToolCall {
 
 /** Append an optimistic local `user` turn (the composer echoes it immediately). */
 export function appendUserTurn(state: PlanningState, content: string): void {
-  state.turns.push({ id: nextKey(state, "user"), role: "user", text: content, tool: null });
+  state.turns.push({
+    id: nextKey(state, "user"),
+    role: "user",
+    text: content,
+    tool: null,
+    phase: state.phase,
+  });
 }
 
 /**
@@ -248,10 +280,22 @@ function finalizeStreaming(state: PlanningState): void {
     return;
   }
   for (const call of s.toolCalls) {
-    state.turns.push({ id: nextKey(state, "tool"), role: "tool", text: "", tool: { ...call } });
+    state.turns.push({
+      id: nextKey(state, "tool"),
+      role: "tool",
+      text: "",
+      tool: { ...call },
+      phase: state.phase,
+    });
   }
   if (s.text.length > 0) {
-    state.turns.push({ id: nextKey(state, "agent"), role: "agent", text: s.text, tool: null });
+    state.turns.push({
+      id: nextKey(state, "agent"),
+      role: "agent",
+      text: s.text,
+      tool: null,
+      phase: state.phase,
+    });
   }
   state.streaming = null;
 }

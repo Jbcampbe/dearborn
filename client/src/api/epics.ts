@@ -31,8 +31,23 @@ export interface Epic {
 /** Transcript role (`epics.rs` `TranscriptMessage`). */
 export type TranscriptRole = "user" | "agent" | "tool" | "system";
 
-/** Planning phase. Only `product` is wired up until T-205 adds `technical`. */
+/** Planning phase. `product` runs first; the user advances to `technical`. */
 export type PlanningPhase = "product" | "technical";
+
+/** Planning-session lifecycle status (`planning_session.status`). */
+export type SessionStatus = "active" | "complete";
+
+/**
+ * A planning session (`planning_session`), one per `(epic, phase)`. The internal
+ * `harness_session_id` resume handle is intentionally NOT exposed by the API.
+ */
+export interface PlanningSession {
+  epic_id: string;
+  phase: PlanningPhase;
+  status: SessionStatus;
+  created_at: number;
+  updated_at: number;
+}
 
 /**
  * A durable planning-transcript message (`transcript_message`, ordered by
@@ -95,4 +110,27 @@ export function postMessage(
     method: "POST",
     body: JSON.stringify({ phase, content }),
   });
+}
+
+/** `GET /epics/{id}/sessions` → the epic's planning sessions (product first). */
+export async function getSessions(token: string, id: string): Promise<PlanningSession[]> {
+  const data = await apiFetch<Collection<PlanningSession>>(
+    `/epics/${encodeURIComponent(id)}/sessions`,
+    token,
+  );
+  return data.items;
+}
+
+/**
+ * `POST /epics/{id}/advance-phase` → the epic's sessions after advancing product
+ * → technical (`201`). The transcript continues on the same `seq`; subsequent
+ * messages are sent with `phase: "technical"`.
+ */
+export async function advancePhase(token: string, id: string): Promise<PlanningSession[]> {
+  const data = await apiFetch<Collection<PlanningSession>>(
+    `/epics/${encodeURIComponent(id)}/advance-phase`,
+    token,
+    { method: "POST" },
+  );
+  return data.items;
 }

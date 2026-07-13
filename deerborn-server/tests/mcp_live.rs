@@ -158,3 +158,153 @@ async fn live_planning_agent_reads_clone_and_updates_epic_via_mcp() {
 
     std::fs::remove_dir_all(&clone_dir).ok();
 }
+
+/// LIVE end-to-end for T-205: after product planning, the epic advances to
+/// TECHNICAL planning; the technical run reads the same read-only clone and
+/// fills `technical_context` (a separate column) via `update_epic` — proving the
+/// second phase config shares the one chat/MCP engine and has code-inspection
+/// context.
+///
+/// Run with:
+/// ```sh
+/// cargo test -p deerborn-server --test mcp_live \
+///   live_technical_planning_reads_clone_and_fills_technical_context \
+///   -- --ignored --nocapture
+/// ```
+#[tokio::test]
+#[ignore = "drives the live `claude` CLI; run with --ignored"]
+async fn live_technical_planning_reads_clone_and_fills_technical_context() {
+    use axum::body::Body;
+    use axum::http::{header::AUTHORIZATION, header::CONTENT_TYPE, Request, StatusCode};
+    use tower::ServiceExt;
+
+    let clone_dir = std::env::temp_dir().join(format!("deerborn-t205-live-{}", ulid::Ulid::new()));
+    std::fs::create_dir_all(clone_dir.join("src")).unwrap();
+    std::fs::write(
+        clone_dir.join("src/marker.rs"),
+        format!("// project marker\npub const MARKER: &str = \"{MARKER}\";\n"),
+    )
+    .unwrap();
+
+    let db = Db::connect(":memory:").await.unwrap();
+    db.run_migrations().await.unwrap();
+    let config = Config {
+        bind: "127.0.0.1:0".to_string(),
+        token: TOKEN.to_string(),
+        master_key: "test-master-key".to_string(),
+        db_path: ":memory:".to_string(),
+        clone_root: "./clones".to_string(),
+        static_dir: "./client/dist".to_string(),
+        auto_clone: false,
+    };
+    let state = AppState::new(config, db);
+
+    let now = 1_700_000_000_000i64;
+    let project_id = ulid::Ulid::new().to_string();
+    let epic_id = ulid::Ulid::new().to_string();
+    state
+        .db
+        .conn()
+        .execute(
+            "INSERT INTO project (id, name, repo_url, clone_path, clone_status, created_at, updated_at) \
+             VALUES (?1, 'Live', 'https://example.com/p.git', ?2, 'ready', ?3, ?3)",
+            libsql::params![project_id.clone(), clone_dir.to_string_lossy().to_string(), now],
+        )
+        .await
+        .unwrap();
+    // A Planning epic with an already-agreed product context, plus its product
+    // session (as epic creation would create).
+    state
+        .db
+        .conn()
+        .execute(
+            "INSERT INTO epic (id, project_id, title, product_context, status, created_at, updated_at) \
+             VALUES (?1, ?2, 'Live', 'Users need a documented MARKER constant.', 'Planning', ?3, ?3)",
+            libsql::params![epic_id.clone(), project_id.clone(), now],
+        )
+        .await
+        .unwrap();
+    state
+        .db
+        .conn()
+        .execute(
+            "INSERT INTO planning_session (epic_id, phase, status, created_at, updated_at) \
+             VALUES (?1, 'product', 'active', ?2, ?2)",
+            libsql::params![epic_id.clone(), now],
+        )
+        .await
+        .unwrap();
+
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let addr: SocketAddr = listener.local_addr().unwrap();
+    state.set_advertised_base(format!("http://127.0.0.1:{}", addr.port()));
+    let served = state.clone();
+    tokio::spawn(async move {
+        axum::serve(listener, app(served)).await.unwrap();
+    });
+
+    // Advance to technical planning.
+    let advanced = app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/epics/{epic_id}/advance-phase"))
+                .header(AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .body(Body::empty())
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(advanced.status(), StatusCode::CREATED);
+
+    // A technical-phase message; the technical run reads the clone + writes
+    // technical_context.
+    let prompt = format!(
+        "Use read_codebase_context to read `src/marker.rs`, then call update_epic with the \
+         technical context set to exactly the value of the MARKER constant you find. It looks \
+         like {MARKER}."
+    );
+    let posted = app(state.clone())
+        .oneshot(
+            Request::builder()
+                .method("POST")
+                .uri(format!("/epics/{epic_id}/messages"))
+                .header(AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(
+                    serde_json::json!({ "phase": "technical", "content": prompt }).to_string(),
+                ))
+                .unwrap(),
+        )
+        .await
+        .unwrap();
+    assert_eq!(posted.status(), StatusCode::CREATED);
+
+    let deadline = tokio::time::Instant::now() + Duration::from_secs(180);
+    let mut technical_context: Option<String> = None;
+    while tokio::time::Instant::now() < deadline {
+        let mut rows = state
+            .db
+            .conn()
+            .query(
+                "SELECT technical_context FROM epic WHERE id = ?1",
+                libsql::params![epic_id.clone()],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        if let Some(ctx) = row.get::<Option<String>>(0).unwrap() {
+            technical_context = Some(ctx);
+            break;
+        }
+        tokio::time::sleep(Duration::from_secs(2)).await;
+    }
+
+    let ctx = technical_context.expect("technical run should have populated technical_context");
+    assert!(
+        ctx.contains(MARKER),
+        "technical_context must quote the marker read from the clone; got: {ctx}"
+    );
+
+    std::fs::remove_dir_all(&clone_dir).ok();
+}

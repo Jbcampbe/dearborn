@@ -197,6 +197,11 @@ pub fn app(state: AppState) -> Router {
             axum::routing::post(epics::post_message),
         )
         .route("/epics/:id/transcript", get(epics::get_transcript))
+        .route("/epics/:id/sessions", get(epics::list_sessions))
+        .route(
+            "/epics/:id/advance-phase",
+            axum::routing::post(epics::advance_phase),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_bearer,
