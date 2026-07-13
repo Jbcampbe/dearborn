@@ -195,35 +195,35 @@ Only the **planning** and **breakdown** phases exist in Half 1:
 
 ## 3. Phase 0 — Foundations
 
-- [ ] **T-001 — Workspace scaffolding & run story.** *deps: none*
+- [x] **T-001 — Workspace scaffolding & run story.** *deps: none*
   Cargo workspace (`deerborn-server` + `client/`), `justfile` (`dev`/`test`/`build`),
   README run instructions. **AC:** `cargo run` boots a server answering `200` on
   `GET /health`; `just dev` runs server + Vite together; `just test` is wired
   (may be near-empty). Ratifies §1 stack choices.
 
-- [ ] **T-002 — Config & single-user token auth.** *deps: T-001*
+- [x] **T-002 — Config & single-user token auth.** *deps: T-001*
   Load config from env/file: bind addr, `DEERBORN_TOKEN`, `DEERBORN_MASTER_KEY`,
   db path, clone root. **AC:** a middleware rejects any request lacking
   `Authorization: Bearer <token>` except `/health`; env vars documented in README;
   missing `MASTER_KEY` fails fast at boot.
 
-- [ ] **T-003 — libSQL connection, migrations & baseline schema.** *deps: T-001*
+- [x] **T-003 — libSQL connection, migrations & baseline schema.** *deps: T-001*
   Connection pool + ordered-`.sql` migration runner applied idempotently at boot;
   land the full §2.2 schema as migration `0001`. **AC:** fresh boot creates all
   tables; re-boot is a no-op; a test inserts and reads back a `project` row.
 
-- [ ] **T-004 — REST scaffolding: error model & JSON envelope.** *deps: T-002, T-003*
+- [x] **T-004 — REST scaffolding: error model & JSON envelope.** *deps: T-002, T-003*
   Consistent error type → HTTP status mapping; a JSON response/error envelope;
   request logging. **AC:** a deliberately failing handler returns the structured
   error shape; a documented list of route conventions exists.
 
-- [ ] **T-005 — WebSocket scaffolding & subscription protocol.** *deps: T-004*
+- [x] **T-005 — WebSocket scaffolding & subscription protocol.** *deps: T-004*
   Authenticated WS endpoint; clients subscribe to topics (e.g. `epic:<id>`,
   `project:<id>`); define the message envelope (`{topic, type, payload}`). **AC:**
   a client connects with the token, subscribes, and receives a server-pushed test
   event; unauthenticated connect is rejected.
 
-- [ ] **T-006 — Vue/TS client shell served by the binary.** *deps: T-004*
+- [x] **T-006 — Vue/TS client shell served by the binary.** *deps: T-004*
   Vite SPA; the built assets are served at `/` by the Rust binary (dev proxies to
   Vite). A token entry screen persists the bearer token. **AC:** `cargo run` (prod
   build) serves the SPA; an authenticated call (e.g. `GET /projects`) succeeds and
@@ -233,24 +233,24 @@ Only the **planning** and **breakdown** phases exist in Half 1:
 
 ## 4. Phase 1 — Projects
 
-- [ ] **T-101 — Project CRUD API.** *deps: T-004*
+- [x] **T-101 — Project CRUD API.** *deps: T-004*
   Create/list/get/update/delete projects. `name` + `repo_url` required;
   `setup/test/run_cmd` optional. **AC:** full CRUD round-trips; validation errors
   are structured; `test_cmd` NULL is allowed and preserved.
 
-- [ ] **T-102 — PAT encryption at rest.** *deps: T-101, T-002*
+- [x] **T-102 — PAT encryption at rest.** *deps: T-101, T-002*
   Encrypt the PAT with AES-256-GCM (key from `DEERBORN_MASTER_KEY`) before insert;
   provide an internal decrypt path. **AC:** PAT never appears in any API response
   or log; stored bytes are ciphertext; a round-trip test encrypts→decrypts.
 
-- [ ] **T-103 — Canonical read-only clone lifecycle.** *deps: T-101, T-102*
+- [x] **T-103 — Canonical read-only clone lifecycle.** *deps: T-101, T-102*
   On project create, `git clone` (using the decrypted PAT over HTTPS) into a
   per-project dir under the clone root; record `clone_path`/`clone_status`; expose
   a refresh (`git fetch`) action; clone failure → `clone_status='error'` + message.
   **AC:** creating a project against a real GitHub repo yields a `ready` clone on
   disk; a bad URL/PAT yields `error` with a readable reason; refresh updates it.
 
-- [ ] **T-104 — Projects UI (list, create, detail shell).** *deps: T-006, T-101*
+- [x] **T-104 — Projects UI (list, create, detail shell).** *deps: T-006, T-101*
   Create-project form (name, repo URL, PAT, optional cmds); projects list;
   clicking a project opens an (empty) detail/kanban page. **AC:** a user creates a
   project end-to-end in the browser and sees it listed; detail page loads.
