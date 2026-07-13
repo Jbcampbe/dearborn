@@ -5,6 +5,9 @@ Self-hosted Rust server that turns an approved epic into a PR autonomously. See
 for resolved v1 decisions, and [MILESTONE_1.md](./MILESTONE_1.md) for the current
 task plan.
 
+The HTTP/REST API contract (routes, JSON success/error envelopes, status codes)
+is documented in [`deerborn-server/CONVENTIONS.md`](./deerborn-server/CONVENTIONS.md).
+
 ## Layout
 
 ```

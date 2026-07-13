@@ -1,9 +1,11 @@
 //! Deerborn server binary entrypoint.
 
-use deerborn_server::{app, AppState, Config, Db};
+use deerborn_server::{app, init_tracing, AppState, Config, Db};
 
 #[tokio::main]
 async fn main() {
+    init_tracing();
+
     // Fail fast on bad configuration (e.g. missing DEERBORN_MASTER_KEY / TOKEN)
     // before we bind a socket or touch the database.
     let config = match Config::from_env() {
@@ -23,7 +25,7 @@ async fn main() {
         }
     };
     match db.run_migrations().await {
-        Ok(n) => println!("deerborn-server: migrations up to date ({n} newly applied)"),
+        Ok(n) => tracing::info!(newly_applied = n, "migrations up to date"),
         Err(err) => {
             eprintln!("deerborn-server: migration error: {err}");
             std::process::exit(1);
@@ -37,7 +39,7 @@ async fn main() {
         .await
         .unwrap_or_else(|e| panic!("failed to bind {addr}: {e}"));
 
-    println!("deerborn-server listening on http://{addr}");
+    tracing::info!(%addr, "deerborn-server listening on http://{addr}");
 
     axum::serve(listener, app(state))
         .await

@@ -7,14 +7,27 @@
 pub mod auth;
 pub mod config;
 pub mod db;
+pub mod error;
 
 use std::sync::Arc;
 
 use axum::{middleware, routing::get, Json, Router};
 use serde_json::{json, Value};
+use tower_http::trace::TraceLayer;
 
 pub use config::{Config, ConfigError};
 pub use db::{Db, DbError};
+pub use error::{AppError, AppResult};
+
+/// Initialise the global `tracing` subscriber. Idempotent; safe to skip in tests.
+/// Honours `RUST_LOG`, defaulting to `info`.
+pub fn init_tracing() {
+    use tracing_subscriber::{fmt, EnvFilter};
+    let filter = EnvFilter::try_from_default_env()
+        .unwrap_or_else(|_| EnvFilter::new("info,deerborn_server=debug"));
+    // `try_init` returns Err if a subscriber is already set — ignore it.
+    let _ = fmt().with_env_filter(filter).try_init();
+}
 
 /// Shared application state handed to handlers and middleware.
 ///
@@ -48,7 +61,10 @@ pub fn app(state: AppState) -> Router {
             auth::require_bearer,
         ));
 
-    public.merge(protected).with_state(state)
+    public
+        .merge(protected)
+        .layer(TraceLayer::new_for_http())
+        .with_state(state)
 }
 
 /// Liveness probe. Public — returns `200 OK` with a small JSON body.

@@ -7,19 +7,22 @@
 use axum::{
     body::Body,
     extract::State,
-    http::{header::AUTHORIZATION, Request, StatusCode},
+    http::{header::AUTHORIZATION, Request},
     middleware::Next,
     response::Response,
 };
 
-use crate::AppState;
+use crate::{AppError, AppState};
 
 /// Reject requests lacking a valid `Authorization: Bearer <token>` header.
+///
+/// On failure returns [`AppError::Unauthorized`], which renders the standard
+/// JSON error envelope with a `401` status.
 pub async fn require_bearer(
     State(state): State<AppState>,
     request: Request<Body>,
     next: Next,
-) -> Result<Response, StatusCode> {
+) -> Result<Response, AppError> {
     let presented = request
         .headers()
         .get(AUTHORIZATION)
@@ -28,7 +31,7 @@ pub async fn require_bearer(
 
     match presented {
         Some(token) if token == state.config.token => Ok(next.run(request).await),
-        _ => Err(StatusCode::UNAUTHORIZED),
+        _ => Err(AppError::Unauthorized),
     }
 }
 
