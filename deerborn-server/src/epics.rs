@@ -334,9 +334,65 @@ pub async fn get_harness_session_id(
     }
 }
 
+/// Write an epic's phase context column (`product`→`product_context`,
+/// `technical`→`technical_context`), bump `updated_at`, and return the updated
+/// [`Epic`]. Used by the planning agent's `update_epic` MCP tool (T-203); the
+/// **column is chosen from a fixed match on `phase`**, never interpolated from
+/// caller input, so there is no injection surface. `phase` is validated to the
+/// two planning phases; a missing epic is a `404`.
+pub(crate) async fn update_epic_context(
+    conn: &Connection,
+    epic_id: &str,
+    phase: &str,
+    content: &str,
+) -> AppResult<Epic> {
+    let column = match phase {
+        "product" => "product_context",
+        "technical" => "technical_context",
+        other => {
+            return Err(AppError::BadRequest(format!(
+                "`phase` must be `product` or `technical`, got `{other}`"
+            )))
+        }
+    };
+
+    let sql = format!("UPDATE epic SET {column} = ?1, updated_at = ?2 WHERE id = ?3");
+    let affected = conn
+        .execute(&sql, params![content, now_ms(), epic_id])
+        .await?;
+    if affected == 0 {
+        return Err(epic_not_found(epic_id));
+    }
+
+    fetch_epic(conn, epic_id)
+        .await?
+        .ok_or_else(|| AppError::Internal(format!("epic {epic_id} vanished after update")))
+}
+
+/// The project's canonical clone path for an epic, if the clone is on disk.
+/// Used by T-203 to point a tools-enabled planning run's `cwd` (and the
+/// `read_codebase_context` root) at the read-only checkout. `Ok(None)` when the
+/// epic is unknown or its project has not been cloned yet.
+pub(crate) async fn get_epic_clone_path(
+    conn: &Connection,
+    epic_id: &str,
+) -> AppResult<Option<String>> {
+    let mut rows = conn
+        .query(
+            "SELECT p.clone_path FROM epic e JOIN project p ON p.id = e.project_id \
+             WHERE e.id = ?1",
+            params![epic_id],
+        )
+        .await?;
+    match rows.next().await? {
+        Some(row) => Ok(row.get::<Option<String>>(0)?),
+        None => Ok(None),
+    }
+}
+
 // ---- row / value plumbing ----------------------------------------------
 
-async fn fetch_epic(conn: &Connection, id: &str) -> AppResult<Option<Epic>> {
+pub(crate) async fn fetch_epic(conn: &Connection, id: &str) -> AppResult<Option<Epic>> {
     let sql = format!("SELECT {EPIC_COLUMNS} FROM epic WHERE id = ?1");
     let mut rows = conn.query(&sql, params![id]).await?;
     match rows.next().await? {

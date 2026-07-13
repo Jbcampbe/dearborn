@@ -46,6 +46,13 @@ async fn main() {
         .await
         .unwrap_or_else(|e| panic!("failed to bind {addr}: {e}"));
 
+    // Advertise Deerborn's loopback origin so planning runs can build the MCP
+    // config URL the shelled-out agent connects back to (T-203). Use the bound
+    // port; force the host to loopback (a 0.0.0.0 bind is not a dialable host).
+    if let Ok(local) = listener.local_addr() {
+        state.set_advertised_base(format!("http://127.0.0.1:{}", local.port()));
+    }
+
     tracing::info!(%addr, "deerborn-server listening on http://{addr}");
 
     axum::serve(listener, app(state))

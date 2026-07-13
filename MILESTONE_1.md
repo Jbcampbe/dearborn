@@ -322,13 +322,35 @@ Only the **planning** and **breakdown** phases exist in Half 1:
   Product-planning prompt lives in `PlanningConfig` (`PRODUCT_PLANNING`), shaped
   so T-205 adds a `technical` config against the same engine.
 
-- [ ] **T-203 — Local MCP server: `update_epic` + `read_codebase_context`.** *deps: T-202, T-103*
+- [x] **T-203 — Local MCP server: `update_epic` + `read_codebase_context`.** *deps: T-202, T-103*
   Expose Deerborn's local MCP server to the shelled-out agent, scoped to the
   planning tool surface (§2.4). `update_epic` maintains `epic.product_context` /
   `technical_context`; `read_codebase_context` reads the project's canonical clone
   **read-only**. **AC:** during a chat the agent calls `update_epic` and the Epic
   record changes live on the client; the agent can quote real code from the clone;
   the agent cannot mutate lane/status.
+  **Done:** `src/mcp.rs`. Transport is an **in-process http (streamable-http) MCP
+  endpoint** the Deerborn binary hosts — `POST /mcp/:cap`, minimal hand-rolled
+  JSON-RPC 2.0 (no `rmcp` dep; only two tools). A stdio subprocess was rejected: it
+  couldn't reach the in-memory `Hub` or the shared libSQL writer that `update_epic`
+  needs. The route sits **outside** the browser bearer layer (like `/ws`) and is
+  authed by a **per-run capability token** (`:cap` path segment) minted per planning
+  run and mapped server-side to a fixed scope `{ epic_id, phase, clone_path }`
+  ([`mcp::CapabilityStore`], RAII [`CapabilityGuard`] revokes on run end + a TTL
+  backstop). The agent never supplies the target epic/phase — they come from the
+  token — so it can only write the scoped context column and cannot touch
+  `status`/lane/`branch_name`/another epic. `update_epic` writes the phase column
+  (fixed match, no SQL injection), bumps `updated_at`, and publishes an
+  `epic_updated` event on `epic:<id>`. `read_codebase_context` lists/reads the clone
+  and enforces confinement by canonicalizing every path and rejecting `../`,
+  absolute, and symlink escapes. Wired into the run in `src/planning.rs`:
+  `PlanningConfig.tools_enabled` (true for product planning) makes `spawn_run` mint a
+  capability, write a temp `--mcp-config` JSON, set `cwd` to the read-only clone, and
+  add `--allowedTools mcp__deerborn__update_epic,mcp__deerborn__read_codebase_context`
+  + `--permission-mode bypassPermissions` (per T-200 spike; read-only comes from
+  tool-scoping + the clone, not `RunMode`). Hermetic gate covers all AC (13 tests);
+  the live end-to-end smoke test is `tests/mcp_live.rs` (`#[ignore]`d). See
+  `CONVENTIONS.md` §"Local MCP server".
 
 - [ ] **T-204 — Planning chat UI + Epic record view.** *deps: T-104, T-202, T-203*
   A chat panel (streaming) beside a live-updating Epic record; a "start planning"

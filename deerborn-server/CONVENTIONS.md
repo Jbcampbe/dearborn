@@ -195,6 +195,59 @@ serialises the envelope once and fans it out to every current subscriber of the
 topic. It never blocks and never fails; a slow client that overflows its buffer
 drops the **oldest** frames (bounded per-connection queue).
 
+## Local MCP server (`POST /mcp/:cap`, T-203)
+
+During an interactive planning run the shelled-out Claude Code agent connects
+**back** to Deerborn over MCP to maintain the epic record and read the project's
+code. Deerborn hosts the MCP server **in-process** (a stdio subprocess couldn't
+reach the in-memory `Hub` or the shared libSQL writer), speaking the minimal
+**streamable-http** transport: JSON-RPC 2.0 over HTTP at `POST /mcp/:cap`.
+
+- **Why in-process / hand-rolled:** `update_epic` must mutate the shared DB and
+  publish a WS event on the live `Hub`; only two tools are exposed, so a
+  hand-rolled JSON-RPC endpoint keeps deps lean (no `rmcp`).
+- **Transport contract:** a JSON-RPC **request** (has `id`) gets a single
+  `application/json` JSON-RPC response (the spec permits this instead of an SSE
+  stream); a **notification** (no `id`, e.g. `notifications/initialized`) gets
+  `202 Accepted` with no body. Methods handled: `initialize`, `tools/list`,
+  `tools/call`, `ping`. A `GET` returns `405`.
+
+### Capability-token auth & scoping
+
+`/mcp/:cap` sits **outside** the browser bearer layer (like `/ws`). The `:cap`
+path segment is a **per-run capability token**, minted when a planning run starts
+and mapped server-side to a fixed **scope** `{ epic_id, phase, clone_path }`. The
+run holds an RAII guard that **revokes the token when the run ends** (a TTL is a
+backstop). An unknown/expired token is rejected with `401` before any method runs.
+
+The agent **never supplies the target epic or phase** — they come from the token's
+scope. So a token minted for epic A + `product` can only write A's
+`product_context` and read A's clone; it cannot address another epic or change
+`status`/lane/`branch_name`/leases. The MCP config URL Deerborn generates:
+
+```json
+{ "mcpServers": { "deerborn": {
+  "type": "http",
+  "url": "http://127.0.0.1:<port>/mcp/<cap-token>",
+  "headers": { "Authorization": "Bearer <cap-token>" }
+} } }
+```
+
+### The two phase-scoped tools (§2.4)
+
+| Tool | Effect |
+| ---- | ------ |
+| `update_epic` | Writes the scope's phase context column (`product`→`product_context`, `technical`→`technical_context`) from the agent's `content` arg, bumps `updated_at`, and publishes an `epic_updated` frame on `epic:<id>` (payload = the updated epic). Target epic+phase are the token's, not the args'. |
+| `read_codebase_context` | Read-only listing/reading of the project's canonical clone. A repo-relative `path` (default = repo root); a dir lists, a file reads (capped). **Confinement is enforced in code:** every path is canonicalized and `../`, absolute, and symlink escapes are rejected — this does not rely on `RunMode`. |
+
+Tool-level failures (bad path, missing arg) come back as a JSON-RPC *result* with
+`isError: true` (so the model sees them); an unknown tool name is a JSON-RPC
+`-32601` error. The tools are exposed to the agent via
+`--allowedTools mcp__deerborn__update_epic,mcp__deerborn__read_codebase_context`;
+the run's `cwd` is the read-only clone and `--permission-mode bypassPermissions`
+is set for headless auto-approval (read-only is guaranteed by the tool allow-list
++ the clone, per the T-200 spike, **not** by the run mode).
+
 ## PAT encryption at rest
 
 Per-project GitHub PATs (T-102) are encrypted with **AES-256-GCM** before insert

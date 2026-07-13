@@ -12,6 +12,7 @@ pub mod epics;
 pub mod error;
 pub mod git;
 pub mod hub;
+pub mod mcp;
 pub mod planning;
 pub mod projects;
 pub mod ws;
@@ -33,6 +34,7 @@ pub use crypto::MasterKey;
 pub use db::{Db, DbError};
 pub use error::{AppError, AppResult};
 pub use hub::Hub;
+pub use mcp::CapabilityStore;
 pub use planning::PlanningAgent;
 
 /// Initialise the global `tracing` subscriber. Idempotent; safe to skip in tests.
@@ -65,6 +67,15 @@ pub struct AppState {
     /// epic already in this set is ignored (its user message is still stored),
     /// so runs never interleave on `seq`/resume. See [`AppState::try_acquire_run`].
     pub inflight: Arc<Mutex<HashSet<String>>>,
+    /// Per-run MCP capability tokens (T-203). A planning run mints a token scoped
+    /// to one `(epic, phase, clone_path)`; the shelled-out agent authenticates its
+    /// `POST /mcp/:cap` calls with it. See [`crate::mcp`].
+    pub caps: Arc<CapabilityStore>,
+    /// Deerborn's own loopback origin (e.g. `http://127.0.0.1:8787`), used to
+    /// build the MCP config URL handed to the agent. Set once after the listener
+    /// binds (`main`, or the live test); `None` in unit tests that never spawn a
+    /// real agent, which disables MCP wiring for the run.
+    pub advertised_base: Arc<Mutex<Option<String>>>,
 }
 
 impl AppState {
@@ -90,7 +101,21 @@ impl AppState {
             crypto: Arc::new(crypto),
             planner,
             inflight: Arc::new(Mutex::new(HashSet::new())),
+            caps: Arc::new(CapabilityStore::new()),
+            advertised_base: Arc::new(Mutex::new(None)),
         }
+    }
+
+    /// Record Deerborn's loopback origin (`http://host:port`) once the listener
+    /// is bound, so planning runs can build the agent's MCP config URL. Idempotent
+    /// last-write-wins.
+    pub fn set_advertised_base(&self, base: impl Into<String>) {
+        *self.advertised_base.lock().expect("base mutex poisoned") = Some(base.into());
+    }
+
+    /// The advertised loopback origin, if set (see [`set_advertised_base`](Self::set_advertised_base)).
+    pub fn advertised_base(&self) -> Option<String> {
+        self.advertised_base.lock().expect("base mutex poisoned").clone()
     }
 
     /// Claim the in-flight slot for `epic_id` for a planning run.
@@ -140,7 +165,11 @@ pub fn app(state: AppState) -> Router {
     // carry the token in the query string instead).
     let public = Router::new()
         .route("/health", get(health))
-        .route("/ws", get(ws::ws_handler));
+        .route("/ws", get(ws::ws_handler))
+        // Deerborn's local MCP server for planning runs (T-203). Authed by the
+        // per-run capability token in the `:cap` path segment, NOT the browser
+        // bearer token — so it lives outside the bearer layer, like `/ws`.
+        .route("/mcp/:cap", axum::routing::post(mcp::mcp_endpoint));
 
     let protected = Router::new()
         .route("/whoami", get(whoami))
