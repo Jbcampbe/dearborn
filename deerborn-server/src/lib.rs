@@ -6,6 +6,7 @@
 
 pub mod auth;
 pub mod config;
+pub mod db;
 
 use std::sync::Arc;
 
@@ -13,21 +14,23 @@ use axum::{middleware, routing::get, Json, Router};
 use serde_json::{json, Value};
 
 pub use config::{Config, ConfigError};
+pub use db::{Db, DbError};
 
 /// Shared application state handed to handlers and middleware.
 ///
-/// `Clone` is cheap: everything inside is reference-counted. Later tasks extend
-/// this (e.g. the libSQL handle lands in T-003).
+/// `Clone` is cheap: everything inside is reference-counted.
 #[derive(Clone)]
 pub struct AppState {
     pub config: Arc<Config>,
+    pub db: Db,
 }
 
 impl AppState {
-    /// Construct shared state from a resolved [`Config`].
-    pub fn new(config: Config) -> AppState {
+    /// Construct shared state from a resolved [`Config`] and open [`Db`].
+    pub fn new(config: Config, db: Db) -> AppState {
         AppState {
             config: Arc::new(config),
+            db,
         }
     }
 }
@@ -67,8 +70,10 @@ mod tests {
 
     const TOKEN: &str = "s3cret-token";
 
-    fn test_app() -> Router {
-        app(AppState::new(Config::for_test(TOKEN)))
+    async fn test_app() -> Router {
+        let db = Db::connect(":memory:").await.unwrap();
+        db.run_migrations().await.unwrap();
+        app(AppState::new(Config::for_test(TOKEN), db))
     }
 
     async fn body_json(response: axum::response::Response) -> Value {
@@ -80,7 +85,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_is_public_and_returns_200_ok() {
-        let response = test_app()
+        let response = test_app().await
             .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
             .await
             .unwrap();
@@ -91,7 +96,7 @@ mod tests {
 
     #[tokio::test]
     async fn protected_route_without_token_is_401() {
-        let response = test_app()
+        let response = test_app().await
             .oneshot(Request::builder().uri("/whoami").body(Body::empty()).unwrap())
             .await
             .unwrap();
@@ -101,7 +106,7 @@ mod tests {
 
     #[tokio::test]
     async fn protected_route_with_wrong_token_is_401() {
-        let response = test_app()
+        let response = test_app().await
             .oneshot(
                 Request::builder()
                     .uri("/whoami")
@@ -117,7 +122,7 @@ mod tests {
 
     #[tokio::test]
     async fn protected_route_with_correct_token_is_200() {
-        let response = test_app()
+        let response = test_app().await
             .oneshot(
                 Request::builder()
                     .uri("/whoami")
