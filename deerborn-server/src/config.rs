@@ -18,6 +18,10 @@ pub const DEFAULT_BIND: &str = "127.0.0.1:8787";
 pub const DEFAULT_DB_PATH: &str = "./deerborn.db";
 /// Default per-project clone root when `DEERBORN_CLONE_ROOT` is unset.
 pub const DEFAULT_CLONE_ROOT: &str = "./clones";
+/// Default directory of built SPA assets when `DEERBORN_STATIC_DIR` is unset.
+/// Relative to the process working directory (the workspace root under `cargo
+/// run`). If it does not exist the server serves the API only (see `lib::app`).
+pub const DEFAULT_STATIC_DIR: &str = "./client/dist";
 
 /// Fully-resolved server configuration.
 #[derive(Debug, Clone)]
@@ -33,6 +37,9 @@ pub struct Config {
     pub db_path: String,
     /// Root directory under which per-project clones live (`DEERBORN_CLONE_ROOT`).
     pub clone_root: String,
+    /// Directory of built Vite SPA assets served at `/` (`DEERBORN_STATIC_DIR`).
+    /// When it is absent the server logs a warning and serves the API only.
+    pub static_dir: String,
     /// Whether project create/refresh spawns a real `git clone`/`git fetch`
     /// (T-103). Always `true` in production; tests default it `false` so plain
     /// CRUD tests never shell out to git. Not env-configurable — an internal seam.
@@ -74,6 +81,9 @@ impl Config {
         let clone_root = resolve(&file, "DEERBORN_CLONE_ROOT")
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| DEFAULT_CLONE_ROOT.to_string());
+        let static_dir = resolve(&file, "DEERBORN_STATIC_DIR")
+            .filter(|v| !v.is_empty())
+            .unwrap_or_else(|| DEFAULT_STATIC_DIR.to_string());
 
         Ok(Config {
             bind,
@@ -81,6 +91,7 @@ impl Config {
             master_key,
             db_path,
             clone_root,
+            static_dir,
             auto_clone: true,
         })
     }
@@ -157,6 +168,7 @@ impl Config {
             master_key: "test-master-key".to_string(),
             db_path: ":memory:".to_string(),
             clone_root: DEFAULT_CLONE_ROOT.to_string(),
+            static_dir: DEFAULT_STATIC_DIR.to_string(),
             // Plain CRUD tests must not shell out to git; T-103 tests that
             // exercise cloning flip this on explicitly.
             auto_clone: false,

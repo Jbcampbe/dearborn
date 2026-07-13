@@ -16,9 +16,14 @@ pub mod ws;
 
 use std::sync::Arc;
 
+use std::path::Path;
+
 use axum::{middleware, routing::get, Json, Router};
 use serde_json::{json, Value};
-use tower_http::trace::TraceLayer;
+use tower_http::{
+    services::{ServeDir, ServeFile},
+    trace::TraceLayer,
+};
 
 pub use config::{Config, ConfigError};
 pub use crypto::MasterKey;
@@ -71,7 +76,11 @@ impl AppState {
 
 /// Build the application router.
 ///
-/// `/health` is public; every other route sits behind the bearer-token layer.
+/// `/health` is public; every other API route sits behind the bearer-token
+/// layer. Any request that matches **no** API route falls through to the SPA
+/// static handler (the built Vite assets), so the HTML/JS load without auth and
+/// the user can then enter their token — auth is enforced on the API calls the
+/// SPA makes, not on serving the static shell.
 pub fn app(state: AppState) -> Router {
     // `/health` is public; `/ws` authenticates the handshake in-handler (the
     // header-only bearer middleware would reject browser WS handshakes, which
@@ -101,10 +110,37 @@ pub fn app(state: AppState) -> Router {
             auth::require_bearer,
         ));
 
-    public
-        .merge(protected)
-        .layer(TraceLayer::new_for_http())
-        .with_state(state)
+    let mut router = public.merge(protected);
+
+    // Serve the built SPA (and its client-side-routing fallback) for everything
+    // the API routes above don't claim. Degrade gracefully if it isn't built.
+    if let Some(spa) = spa_service(&state.config.static_dir) {
+        router = router.fallback_service(spa);
+    }
+
+    router.layer(TraceLayer::new_for_http()).with_state(state)
+}
+
+/// Build the static-file service for the built SPA at `dir`, or `None` if `dir`
+/// doesn't exist (dev without a client build). `ServeDir` serves real asset
+/// files; any unknown path (a client-side route like `/projects/123`) falls
+/// back to `index.html` so the Vue router can take over — an SPA fallback.
+///
+/// Returning `None` (rather than crashing) lets `cargo run` still serve the API
+/// when the client hasn't been built; a warning tells the operator how to fix it.
+fn spa_service(static_dir: &str) -> Option<ServeDir<ServeFile>> {
+    let dir = Path::new(static_dir);
+    let index = dir.join("index.html");
+    if !index.is_file() {
+        tracing::warn!(
+            static_dir = %static_dir,
+            "no built SPA found (missing {}); serving API only — run `npm run build` in ./client",
+            index.display()
+        );
+        return None;
+    }
+    tracing::info!(static_dir = %static_dir, "serving built SPA with client-side-routing fallback");
+    Some(ServeDir::new(dir).fallback(ServeFile::new(index)))
 }
 
 /// Liveness probe. Public — returns `200 OK` with a small JSON body.
@@ -130,6 +166,26 @@ mod tests {
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
         app(AppState::new(Config::for_test(TOKEN), db))
+    }
+
+    /// Build an app whose SPA static dir is a freshly-created temp dir holding a
+    /// sentinel `index.html`, so the static/SPA-fallback path is exercised.
+    async fn test_app_with_spa(marker: &str) -> (Router, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!("deerborn-spa-test-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+        std::fs::write(dir.join("index.html"), marker).unwrap();
+        let db = Db::connect(":memory:").await.unwrap();
+        db.run_migrations().await.unwrap();
+        let mut config = Config::for_test(TOKEN);
+        config.static_dir = dir.to_string_lossy().into_owned();
+        (app(AppState::new(config, db)), dir)
+    }
+
+    async fn body_text(response: axum::response::Response) -> String {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        String::from_utf8(bytes.to_vec()).unwrap()
     }
 
     async fn body_json(response: axum::response::Response) -> Value {
@@ -196,5 +252,50 @@ mod tests {
     #[test]
     fn default_bind_is_well_formed() {
         assert!(config::DEFAULT_BIND.parse::<std::net::SocketAddr>().is_ok());
+    }
+
+    #[tokio::test]
+    async fn spa_served_at_root_when_built() {
+        let marker = "<!doctype html><title>deerborn-spa-marker</title>";
+        let (app, dir) = test_app_with_spa(marker).await;
+        let response = app
+            .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_text(response).await, marker);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn unknown_client_route_falls_back_to_index_html() {
+        let marker = "<!doctype html><title>deerborn-spa-marker</title>";
+        let (app, dir) = test_app_with_spa(marker).await;
+        // A client-side-routing path (not an API route, not a real file) must
+        // return index.html so the Vue router can take over.
+        let response = app
+            .oneshot(Request::builder().uri("/foo/bar").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_text(response).await, marker);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[tokio::test]
+    async fn api_routes_win_over_spa_fallback() {
+        let (app, dir) = test_app_with_spa("spa").await;
+        // `/projects` is a real API route: it must still enforce auth (401),
+        // never be shadowed by the static/SPA fallback.
+        let response = app
+            .oneshot(Request::builder().uri("/projects").body(Body::empty()).unwrap())
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(body_json(response).await["error"]["code"], "unauthorized");
+        std::fs::remove_dir_all(dir).ok();
     }
 }

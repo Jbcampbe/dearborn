@@ -75,7 +75,31 @@ just dev
 ```
 
 Runs the Rust server and the Vite dev server together. Vite serves the SPA on
-<http://localhost:5173> and proxies `/health` to the Rust server. Ctrl-C stops both.
+<http://localhost:5173> with hot-reload and proxies the API it calls (`/health`,
+`/whoami`, `/projects`, and the `/ws` WebSocket) to the Rust server on `:8787`.
+Ctrl-C stops both.
+
+## Serving the client (T-006)
+
+In **production** the Rust binary serves the built Vite SPA itself — no separate
+web server. `just build` (or `cd client && npm run build`) emits the assets to
+`client/dist`; the binary serves them at `/` with an **SPA fallback**: any path
+that isn't an API route and isn't a real asset file returns `index.html`, so
+client-side routing works on deep links / refreshes.
+
+- The assets dir is `DEERBORN_STATIC_DIR` (default `./client/dist`, relative to
+  the working directory — the workspace root under `cargo run`).
+- API routes always win: `/health`, `/ws`, `/projects*` etc. are matched before
+  the static fallback, so serving the SPA never shadows or unauth-exposes them.
+  The static/SPA files are served **without** auth (so the shell can load and
+  prompt for a token); auth is enforced on the API calls the SPA then makes.
+- If the assets dir is missing (e.g. you ran `cargo run` without building the
+  client), the server logs a warning and serves the **API only** — it does not
+  crash. Build the client to get the SPA back.
+
+The SPA persists the bearer token in `localStorage`, shows a token-entry screen
+when none is set, attaches `Authorization: Bearer <token>` to API calls, and on
+a `401` clears the token and returns to the entry screen with an auth error.
 
 ## Testing
 
@@ -102,6 +126,7 @@ environment variables always take precedence over the file.
 | `DEERBORN_BIND`       |    no    | `127.0.0.1:8787` | Server bind address.                                                     |
 | `DEERBORN_DB`         |    no    | `./deerborn.db`  | Path to the local libSQL database file (T-003).                         |
 | `DEERBORN_CLONE_ROOT` |    no    | `./clones`       | Root directory under which per-project clones live (T-103).             |
+| `DEERBORN_STATIC_DIR` |    no    | `./client/dist`  | Directory of built Vite SPA assets served at `/` (T-006).               |
 | `DEERBORN_CONFIG`     |    no    | —                | Optional path to a `KEY=VALUE` config file used as a fallback source.    |
 
 The server **fails fast at boot** with a clear error (non-zero exit) if
