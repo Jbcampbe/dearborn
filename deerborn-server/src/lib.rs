@@ -5,6 +5,7 @@
 //! cleanly.
 
 pub mod auth;
+pub mod breakdown;
 pub mod config;
 pub mod crypto;
 pub mod db;
@@ -15,6 +16,7 @@ pub mod hub;
 pub mod mcp;
 pub mod planning;
 pub mod projects;
+pub mod tasks;
 pub mod ws;
 
 use std::collections::HashSet;
@@ -34,6 +36,7 @@ pub use crypto::MasterKey;
 pub use db::{Db, DbError};
 pub use error::{AppError, AppResult};
 pub use hub::Hub;
+pub use breakdown::BreakdownAgent;
 pub use mcp::CapabilityStore;
 pub use planning::PlanningAgent;
 
@@ -63,6 +66,11 @@ pub struct AppState {
     /// The planning agent that drives interactive epic-planning runs (T-202).
     /// Production is [`planning::ClaudePlanningAgent`]; tests inject a fake.
     pub planner: Arc<dyn PlanningAgent>,
+    /// The one-shot breakdown agent that turns an approved epic into a task DAG
+    /// (T-301). Production is [`breakdown::ClaudeBreakdownAgent`]; tests inject
+    /// a fake. Shares the planning in-flight slot so the two never overlap on
+    /// one epic.
+    pub breakdown: Arc<dyn BreakdownAgent>,
     /// Epics with a planning run currently in flight. A second trigger for an
     /// epic already in this set is ignored (its user message is still stored),
     /// so runs never interleave on `seq`/resume. See [`AppState::try_acquire_run`].
@@ -86,12 +94,42 @@ impl AppState {
     /// non-empty by config loading, so derivation cannot fail. Boot code should
     /// nevertheless call [`MasterKey::derive`] first to fail fast (see `main`).
     pub fn new(config: Config, db: Db) -> AppState {
-        AppState::with_planner(config, db, Arc::new(planning::ClaudePlanningAgent::new()))
+        AppState::with_agents(
+            config,
+            db,
+            Arc::new(planning::ClaudePlanningAgent::new()),
+            Arc::new(breakdown::ClaudeBreakdownAgent::new()),
+        )
     }
 
     /// Like [`AppState::new`] but with an injected [`PlanningAgent`] — the seam
     /// that lets tests drive planning runs hermetically with a scripted fake.
-    pub fn with_planner(config: Config, db: Db, planner: Arc<dyn PlanningAgent>) -> AppState {
+    /// The breakdown agent defaults to the production
+    /// [`breakdown::ClaudeBreakdownAgent`] (override it via [`with_agents`]).
+    pub fn with_planner(
+        config: Config,
+        db: Db,
+        planner: Arc<dyn PlanningAgent>,
+    ) -> AppState {
+        AppState::with_agents(
+            config,
+            db,
+            planner,
+            Arc::new(breakdown::ClaudeBreakdownAgent::new()),
+        )
+    }
+
+    /// Like [`with_planner`](Self::with_planner) but also injecting the
+    /// [`BreakdownAgent`] — the seam tests use to drive breakdown runs
+    /// hermetically (T-301). Production wiring ([`AppState::new`] /
+    /// [`with_planner`](Self::with_planner)) defaults the breakdown agent to
+    /// [`breakdown::ClaudeBreakdownAgent`].
+    pub fn with_agents(
+        config: Config,
+        db: Db,
+        planner: Arc<dyn PlanningAgent>,
+        breakdown: Arc<dyn BreakdownAgent>,
+    ) -> AppState {
         let crypto = MasterKey::derive(&config.master_key)
             .expect("master key material validated non-empty at config load");
         AppState {
@@ -100,6 +138,7 @@ impl AppState {
             hub: Arc::new(Hub::new()),
             crypto: Arc::new(crypto),
             planner,
+            breakdown,
             inflight: Arc::new(Mutex::new(HashSet::new())),
             caps: Arc::new(CapabilityStore::new()),
             advertised_base: Arc::new(Mutex::new(None)),
@@ -201,6 +240,10 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/epics/:id/advance-phase",
             axum::routing::post(epics::advance_phase),
+        )
+        .route(
+            "/epics/:id/breakdown",
+            axum::routing::post(breakdown::trigger_breakdown),
         )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),

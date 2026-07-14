@@ -500,6 +500,22 @@ pub(crate) async fn update_epic_context(
         .ok_or_else(|| AppError::Internal(format!("epic {epic_id} vanished after update")))
 }
 
+/// The `project_id` an epic belongs to, or `None` if the epic is unknown. Used
+/// when minting a capability that needs the project (breakdown's `create_task`,
+/// and planning's scope) without projecting a whole [`Epic`].
+pub(crate) async fn get_epic_project_id(
+    conn: &Connection,
+    epic_id: &str,
+) -> AppResult<Option<String>> {
+    let mut rows = conn
+        .query("SELECT project_id FROM epic WHERE id = ?1", params![epic_id])
+        .await?;
+    match rows.next().await? {
+        Some(row) => Ok(Some(row.get::<String>(0)?)),
+        None => Ok(None),
+    }
+}
+
 /// The project's canonical clone path for an epic, if the clone is on disk.
 /// Used by T-203 to point a tools-enabled planning run's `cwd` (and the
 /// `read_codebase_context` root) at the read-only checkout. `Ok(None)` when the

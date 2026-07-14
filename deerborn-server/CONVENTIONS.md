@@ -66,6 +66,20 @@ product one, and the technical planner is seeded with the epic's
 `product_context` (continuity) plus the read-only clone + `read_codebase_context`
 so it has code-inspection context. Its `update_epic` writes `technical_context`.
 
+#### Breakdown (T-301)
+
+`POST /epics/{id}/breakdown` runs a **one-shot, non-interactive** breakdown
+agent on an *approved* epic and moves it **Planning → Ready**. It is `409
+conflict` unless the epic is in `Planning` **and** has advanced to technical
+planning (a `technical` session exists), or if a run is already in flight for
+the epic; `404` if the epic does not exist. The run's normalized `RunEvent`s
+stream live over WS on `epic:<id>` (same mapping as planning); it does **not**
+write to `transcript_message` — its durable output is the `task` rows +
+`task_dependency` edges the agent creates via its MCP tools, plus one
+`agent_run` row (`stage='breakdown'`) and the `epic.status='Ready'` transition
+Deerborn owns. Breakdown shares the planning in-flight slot, so a planning run
+and a breakdown run never overlap on one epic.
+
 ## Identifiers & timestamps
 
 - **IDs** are opaque strings (ULID/UUID) generated server-side.
@@ -152,6 +166,10 @@ existence at the transport layer):
 - `project:<id>` — project kanban / board updates (T-401), and the
   `clone_status` event (T-103) published when a background clone/refresh reaches
   `ready`/`error` (`payload`: `{ id, clone_status, clone_error, clone_path }`).
+- `epic:<id>` also carries `dag_updated` (T-301), published whenever a task or
+  dependency is created/changed under the epic (`payload`: `{ nodes: [Task],
+  edges: [{ blocker_id, blocked_id }] }`), and `epic_updated` (payload = the
+  updated epic) on the `Planning → Ready` breakdown transition.
 
 ### Client → server (control frames)
 
@@ -170,6 +188,8 @@ malformed frames get an `error` frame back (the connection stays open).
 | `subscribed`   | Ack of a `subscribe`. Sent **after** the subscription is live, so a client may wait for it before triggering a publish (avoids a subscribe/publish race). |
 | `unsubscribed` | Ack of an `unsubscribe`. |
 | `error`        | Protocol error; `payload.message` explains it. `topic` is `""`. |
+| `epic_updated` | An epic's record changed (planning `update_epic`, or the breakdown `Planning → Ready` transition). `payload` = the updated epic. |
+| `dag_updated`  | A task or dependency changed under the epic (T-301). `payload` = `{ nodes: [Task], edges: [{ blocker_id, blocked_id }] }`. |
 | *(any other)*  | A published event, delivered only to connections subscribed to its `topic`. |
 
 ### Planning `RunEvent` stream (T-202)
@@ -269,6 +289,26 @@ Tool-level failures (bad path, missing arg) come back as a JSON-RPC *result* wit
 the run's `cwd` is the read-only clone and `--permission-mode bypassPermissions`
 is set for headless auto-approval (read-only is guaranteed by the tool allow-list
 + the clone, per the T-200 spike, **not** by the run mode).
+
+### Breakdown phase tools (T-301, §2.4)
+
+A breakdown run mints a capability scoped to `{ epic_id, project_id, phase:
+"breakdown", clone_path }`. Its `tools/list` returns **only** the two breakdown
+tools (the planning tools are hidden for this scope):
+
+| Tool | Effect |
+| ---- | ------ |
+| `create_task` | Create ONE task under the **scope's** epic + project (`title` required; optional `description`, `acceptance`, and `blocks`: ids of existing tasks this new task blocks). The epic + project come from the token, never the args — the agent cannot target another epic. Returns the new task's id; publishes a `dag_updated` frame on `epic:<id>`. |
+| `link_dependency` | Add a `blocker_id → blocked_id` edge (blocker must finish first). Both endpoints must belong to the scope's epic. A self-edge or cross-epic link is rejected; a cycle is rejected (`isError` with a clear message). Publishes `dag_updated`. |
+
+The tool surface is `--allowedTools
+mcp__deerborn__create_task,mcp__deerborn__link_dependency`; the run's `cwd` is
+the read-only clone (the breakdown agent may inspect the code to ground its
+slices). The agent never changes the epic's status — Deerborn owns the
+`Planning → Ready` transition when the run completes. Cycle rejection uses a
+forward DFS over the existing edges (adding `blocker → blocked` is rejected iff
+`blocked` can already reach `blocker`); T-302 reuses the same guard for the REST
+DAG API.
 
 ## PAT encryption at rest
 

@@ -390,13 +390,37 @@ Only the **planning** and **breakdown** phases exist in Half 1:
 
 ## 6. Phase 3 — Breakdown & the DAG
 
-- [ ] **T-301 — One-shot breakdown agent (`to-tasks`).** *deps: T-205*
+- [x] **T-301 — One-shot breakdown agent (`to-tasks`).** *deps: T-205*
   On request, run the breakdown agent (vertical-slice / tracer-bullet logic from
   `references/prompts/to-tasks.md`) against the approved epic; it creates `task`
   rows + `blocks:` edges via the `create_task` / `link_dependency` MCP tools; the
   epic moves **Planning → Ready**. **AC:** an approved epic yields a persisted task
   DAG with dependencies; tasks carry `title`/`description`/`acceptance`; epic is
   `Ready`.
+  **Done:** `src/tasks.rs` (task store: `create_task`, `link_dependency`,
+  `list_tasks_for_epic`, `list_dependencies_for_epic`, cycle guard
+  `would_create_cycle`, `unlink_dependency`). `src/breakdown.rs` (one-shot
+  `BreakdownAgent` trait + `ClaudeBreakdownAgent` + scripted/silent fakes;
+  `POST /epics/:id/breakdown` → `trigger_breakdown` → `spawn_breakdown`). The
+  breakdown run mints a `breakdown`-phase MCP capability, drains the blocking
+  `RunEvent` receiver on `spawn_blocking` relaying live to `epic:<id>` (reuses
+  `planning::ws_type`), and on completion sets `epic.status='Ready'`, records an
+  `agent_run` row (`stage='breakdown'`), and publishes `dag_updated` +
+  `epic_updated`. It is `202 Accepted`; `409` unless `status='Planning'` **and**
+  a `technical` session exists (the "approved epic" gate), or a run is in flight;
+  `404` if the epic is unknown. Breakdown does **not** write to
+  `transcript_message` (planning-only); its artifact is the task DAG. The MCP
+  server (`src/mcp.rs`) gained `create_task` + `link_dependency` tools gated by
+  `scope.phase=="breakdown"` (`tools/list` branches on phase); `CapabilityScope`
+  gained a required `project_id` (planning mints updated to supply it).
+  `BREAKDOWN_ALLOWED_TOOLS` is the phase allow-list; the read-only clone is `cwd`.
+  `publish_dag(state, epic_id)` builds `{ nodes, edges }` and publishes
+  `dag_updated` (reused by T-302). `AppState` gained a `breakdown:` agent field
+  and a `with_agents(config, db, planner, breakdown)` constructor (`with_planner`
+  defaults the breakdown agent). Hermetic gate covers the store, the MCP tool
+  path (create/link, `blocks`, cycle rejection, cross-epic rejection, hostile
+  args ignored), and the route (202 + Ready transition + `agent_run` row + live
+  frames; 409/404 rejections); a live `claude` smoke test is `#[ignore]`d.
 
 - [ ] **T-302 — DAG validation & readiness API.** *deps: T-301*
   Reject cycles; compute per-task readiness (§2.3); expose the DAG (nodes + edges)

@@ -48,7 +48,8 @@ use serde_json::Value;
 use libsql::Connection;
 
 use crate::epics::{
-    append_message, fetch_epic, get_epic_clone_path, get_harness_session_id, set_harness_session_id,
+    append_message, fetch_epic, get_epic_clone_path, get_epic_project_id, get_harness_session_id,
+    set_harness_session_id,
 };
 use crate::{AppState, InflightGuard};
 
@@ -398,7 +399,20 @@ pub fn spawn_run(
             match (clone_path, state.advertised_base()) {
                 (Some(clone_path), Some(base)) => {
                     let clone_pb = PathBuf::from(&clone_path);
-                    let guard = state.caps.mint(epic_id.clone(), phase.clone(), clone_pb.clone());
+                    // The scope needs the project (unused by planning's tools, but
+                    // part of the shared scope shape); fall back to empty if the
+                    // epic vanished, which only disables tools harmlessly.
+                    let project_id = get_epic_project_id(state.db.conn(), &epic_id)
+                        .await
+                        .ok()
+                        .flatten()
+                        .unwrap_or_default();
+                    let guard = state.caps.mint(
+                        epic_id.clone(),
+                        project_id,
+                        phase.clone(),
+                        clone_pb.clone(),
+                    );
                     match crate::mcp::write_mcp_config(&base, guard.token()) {
                         Ok(path) => {
                             cwd = Some(clone_pb);
@@ -1109,9 +1123,12 @@ mod tests {
         assert_eq!(advance_phase(&app, &epic_id).await.status(), StatusCode::CREATED);
 
         // A technical-phase run mints a capability scoped to (epic, technical).
-        let guard = state
-            .caps
-            .mint(epic_id.clone(), "technical".into(), std::path::PathBuf::from("/tmp"));
+        let guard = state.caps.mint(
+            epic_id.clone(),
+            project_id.clone(),
+            "technical".into(),
+            std::path::PathBuf::from("/tmp"),
+        );
 
         let mut sub = state.hub.subscribe(&format!("epic:{epic_id}"));
 

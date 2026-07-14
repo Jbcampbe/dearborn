@@ -49,6 +49,7 @@ use axum::{
 use serde_json::{json, Value};
 
 use crate::epics::update_epic_context;
+use crate::tasks;
 use crate::{AppError, AppState};
 
 /// The MCP server name the agent addresses tools under (`mcp__deerborn__<tool>`).
@@ -58,6 +59,11 @@ pub const MCP_SERVER_NAME: &str = "deerborn";
 /// (MILESTONE_1 §2.4). These are the *only* tools the agent may call.
 pub const PLANNING_ALLOWED_TOOLS: &str =
     "mcp__deerborn__update_epic,mcp__deerborn__read_codebase_context";
+
+/// The phase-scoped `--allowedTools` allow-list value for a breakdown run
+/// (MILESTONE_1 §2.4). These are the *only* tools the breakdown agent may call.
+pub const BREAKDOWN_ALLOWED_TOOLS: &str =
+    "mcp__deerborn__create_task,mcp__deerborn__link_dependency";
 
 /// Default lifetime of a minted capability token. A planning run is far shorter;
 /// the [`CapabilityGuard`] revokes the token the instant the run ends regardless,
@@ -76,7 +82,12 @@ const MAX_READ_BYTES: usize = 200_000;
 pub struct CapabilityScope {
     /// The one epic this token may act on.
     pub epic_id: String,
-    /// The one phase (`product` | `technical`) whose context column it may write.
+    /// The one project this token acts under (used by breakdown's `create_task`
+    /// to set `task.project_id`; the agent never supplies it).
+    pub project_id: String,
+    /// The phase whose tool surface + scope this token grants:
+    /// `product` | `technical` (planning: `update_epic` + `read_codebase_context`)
+    /// or `breakdown` (`create_task` + `link_dependency`).
     pub phase: String,
     /// The project's canonical read-only clone; the confinement root for reads.
     pub clone_path: PathBuf,
@@ -97,16 +108,18 @@ impl CapabilityStore {
         CapabilityStore::default()
     }
 
-    /// Mint a token scoped to `(epic_id, phase, clone_path)` with the default TTL.
-    /// The returned [`CapabilityGuard`] revokes the token on drop.
+    /// Mint a token scoped to `(epic_id, project_id, phase, clone_path)` with the
+    /// default TTL. The returned [`CapabilityGuard`] revokes the token on drop.
     pub fn mint(
         self: &Arc<Self>,
         epic_id: String,
+        project_id: String,
         phase: String,
         clone_path: PathBuf,
     ) -> CapabilityGuard {
         self.mint_with_expiry(
             epic_id,
+            project_id,
             phase,
             clone_path,
             now_ms() + CAPABILITY_TTL.as_millis() as i64,
@@ -118,6 +131,7 @@ impl CapabilityStore {
     pub(crate) fn mint_with_expiry(
         self: &Arc<Self>,
         epic_id: String,
+        project_id: String,
         phase: String,
         clone_path: PathBuf,
         expires_at: i64,
@@ -125,6 +139,7 @@ impl CapabilityStore {
         let token = ulid::Ulid::new().to_string();
         let scope = CapabilityScope {
             epic_id,
+            project_id,
             phase,
             clone_path,
             expires_at,
@@ -240,7 +255,7 @@ pub async fn mcp_endpoint(
 
     let result = match method {
         "initialize" => Ok(initialize_result(&params)),
-        "tools/list" => Ok(tools_list_result()),
+        "tools/list" => Ok(tools_list_result(&scope.phase)),
         "tools/call" => tools_call(&state, &scope, &params).await,
         "ping" => Ok(json!({})),
         other => Err(JsonRpcError::method_not_found(other)),
@@ -271,8 +286,12 @@ fn initialize_result(params: &Value) -> Value {
     })
 }
 
-/// The `tools/list` result: exactly the two phase-scoped planning tools.
-fn tools_list_result() -> Value {
+/// The `tools/list` result, scoped to `phase`: the two planning tools for
+/// `product`/`technical`, or the two breakdown tools for `breakdown`.
+fn tools_list_result(phase: &str) -> Value {
+    if phase == "breakdown" {
+        return breakdown_tools_list_result();
+    }
     json!({
         "tools": [
             {
@@ -316,6 +335,60 @@ fn tools_list_result() -> Value {
     })
 }
 
+/// The `tools/list` result for a **breakdown** run: exactly the two task-DAG
+/// tools (MILESTONE_1 §2.4). The target epic + project are fixed by the token
+/// scope, never by tool arguments.
+fn breakdown_tools_list_result() -> Value {
+    json!({
+        "tools": [
+            {
+                "name": "create_task",
+                "description": "Create ONE task (a thin, end-to-end vertical slice) under \
+                    THIS epic. Provide a `title`, a `description` of the end-to-end behavior \
+                    (not layer-by-layer), and `acceptance` criteria. Optionally pass `blocks`: \
+                    a list of EXISTING task ids that this new task blocks (i.e. this task must \
+                    complete before them). The epic and project are fixed by the breakdown \
+                    session — you cannot target another epic. Returns the new task's id so you \
+                    can wire dependencies. Create blockers before the tasks they block.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "title": { "type": "string", "description": "Short task title." },
+                        "description": {
+                            "type": "string",
+                            "description": "The end-to-end behavior this slice delivers."
+                        },
+                        "acceptance": {
+                            "type": "string",
+                            "description": "Acceptance criteria: how to verify the slice is done."
+                        },
+                        "blocks": {
+                            "type": "array",
+                            "items": { "type": "string" },
+                            "description": "Ids of existing tasks this new task blocks (optional)."
+                        }
+                    },
+                    "required": ["title"]
+                }
+            },
+            {
+                "name": "link_dependency",
+                "description": "Add a dependency edge: `blocker_id` blocks `blocked_id` (the \
+                    blocker must finish before the blocked task can start). Both must be tasks \
+                    in THIS epic. Rejected if it would create a cycle.",
+                "inputSchema": {
+                    "type": "object",
+                    "properties": {
+                        "blocker_id": { "type": "string", "description": "Task that must finish first." },
+                        "blocked_id": { "type": "string", "description": "Task that waits on the blocker." }
+                    },
+                    "required": ["blocker_id", "blocked_id"]
+                }
+            }
+        ]
+    })
+}
+
 /// Dispatch a `tools/call` to the named tool. Tool-level failures come back as a
 /// successful JSON-RPC response with `isError: true` (so the model sees them),
 /// not as a protocol error; an unknown tool name is a protocol error.
@@ -330,6 +403,8 @@ async fn tools_call(
     let outcome = match name {
         "update_epic" => tool_update_epic(state, scope, &args).await,
         "read_codebase_context" => tool_read_codebase_context(scope, &args).await,
+        "create_task" => tool_create_task(state, scope, &args).await,
+        "link_dependency" => tool_link_dependency(state, scope, &args).await,
         other => {
             return Err(JsonRpcError::method_not_found(&format!(
                 "tools/call {other}"
@@ -387,6 +462,131 @@ fn extract_content(args: &Value) -> Option<String> {
         }
     }
     None
+}
+
+// ---- tool: create_task (breakdown) ---------------------------------------
+
+/// Create one task under the scoped epic/project, optionally wiring it as a
+/// blocker of existing tasks (`blocks`). The epic + project come from `scope`,
+/// never from `args`, so the breakdown agent cannot target another epic. On
+/// success, publishes a `dag_updated` event so the client's DAG updates live.
+async fn tool_create_task(
+    state: &AppState,
+    scope: &CapabilityScope,
+    args: &Value,
+) -> Result<String, String> {
+    let title = args
+        .get("title")
+        .and_then(Value::as_str)
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "create_task requires a non-empty `title` string".to_string())?;
+    let description = args.get("description").and_then(Value::as_str);
+    let acceptance = args.get("acceptance").and_then(Value::as_str);
+
+    let task = tasks::create_task(
+        state.db.conn(),
+        &scope.epic_id,
+        &scope.project_id,
+        title,
+        description,
+        acceptance,
+    )
+    .await
+    .map_err(|e| format!("failed to create task: {e}"))?;
+
+    // Optional `blocks`: existing task ids this new task blocks. Same-epic /
+    // cycle validation happens in `tasks::link_dependency`.
+    let mut linked = 0usize;
+    if let Some(blocks) = args.get("blocks").and_then(Value::as_array) {
+        for entry in blocks {
+            if let Some(blocked_id) = entry.as_str() {
+                tasks::link_dependency(state.db.conn(), &task.id, blocked_id)
+                    .await
+                    .map_err(|e| format!("task created ({}), but linking to {blocked_id} failed: {e}", task.id))?;
+                linked += 1;
+            }
+        }
+    }
+
+    publish_dag(state, &scope.epic_id).await;
+
+    Ok(format!(
+        "Created task {} (\"{}\"){}.",
+        task.id,
+        task.title,
+        if linked > 0 {
+            format!(", blocking {linked} task(s)")
+        } else {
+            String::new()
+        }
+    ))
+}
+
+// ---- tool: link_dependency (breakdown) -----------------------------------
+
+/// Link `blocker_id` → `blocked_id` within the scoped epic. Both tasks must
+/// belong to the scope's epic (rejected otherwise); a cycle is rejected. On
+/// success, publishes a `dag_updated` event.
+async fn tool_link_dependency(
+    state: &AppState,
+    scope: &CapabilityScope,
+    args: &Value,
+) -> Result<String, String> {
+    let blocker_id = args
+        .get("blocker_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "link_dependency requires `blocker_id`".to_string())?;
+    let blocked_id = args
+        .get("blocked_id")
+        .and_then(Value::as_str)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| "link_dependency requires `blocked_id`".to_string())?;
+
+    // Both endpoints must belong to the scoped epic (the agent cannot reach
+    // across epics). `link_dependency` also re-checks same-epic + cycles.
+    let conn = state.db.conn();
+    for id in [blocker_id, blocked_id] {
+        let belongs = tasks::task_belongs_to_epic(conn, id, &scope.epic_id)
+            .await
+            .map_err(|e| format!("failed to validate task {id}: {e}"))?;
+        if !belongs {
+            return Err(format!("task {id} is not part of this epic"));
+        }
+    }
+
+    tasks::link_dependency(conn, blocker_id, blocked_id)
+        .await
+        .map_err(|e| format!("failed to link dependency: {e}"))?;
+
+    publish_dag(state, &scope.epic_id).await;
+    Ok(format!("Linked {blocker_id} → {blocked_id}."))
+}
+
+/// Build the epic's task DAG (`{ nodes, edges }`) and publish it on `epic:<id>`
+/// under the `dag_updated` type, so a subscribed client re-renders the graph.
+/// Best-effort: a read error is logged and the publish is skipped.
+pub async fn publish_dag(state: &AppState, epic_id: &str) {
+    let conn = state.db.conn();
+    let nodes = match tasks::list_tasks_for_epic(conn, epic_id).await {
+        Ok(n) => n,
+        Err(err) => {
+            tracing::warn!(epic = %epic_id, error = %err, "dag publish: failed to load tasks");
+            return;
+        }
+    };
+    let edges = match tasks::list_dependencies_for_epic(conn, epic_id).await {
+        Ok(e) => e,
+        Err(err) => {
+            tracing::warn!(epic = %epic_id, error = %err, "dag publish: failed to load edges");
+            return;
+        }
+    };
+    let payload = json!({ "nodes": nodes, "edges": edges });
+    state
+        .hub
+        .publish(&format!("epic:{epic_id}"), "dag_updated", payload);
 }
 
 // ---- tool: read_codebase_context -----------------------------------------
@@ -622,6 +822,7 @@ mod tests {
         // Expired token → 401 (forge an expiry in the past).
         let guard = state.caps.mint_with_expiry(
             epic_id,
+            "proj".into(),
             "product".into(),
             PathBuf::from("/tmp"),
             now_ms() - 1,
@@ -641,7 +842,7 @@ mod tests {
         let (_p, epic_id) = seed_epic(&state, None).await;
         let guard = state
             .caps
-            .mint(epic_id, "product".into(), PathBuf::from("/tmp"));
+            .mint(epic_id, "proj".into(), "product".into(), PathBuf::from("/tmp"));
 
         // initialize handshake.
         let (status, init) = rpc(
@@ -685,7 +886,7 @@ mod tests {
         let (_p, epic_id) = seed_epic(&state, None).await;
         let guard = state
             .caps
-            .mint(epic_id.clone(), "product".into(), PathBuf::from("/tmp"));
+            .mint(epic_id.clone(), "proj".into(), "product".into(), PathBuf::from("/tmp"));
 
         // Subscribe BEFORE the call so we catch the epic_updated frame.
         let mut sub = state.hub.subscribe(&format!("epic:{epic_id}"));
@@ -726,7 +927,7 @@ mod tests {
         let (_p, epic_id) = seed_epic(&state, None).await;
         let guard = state
             .caps
-            .mint(epic_id.clone(), "technical".into(), PathBuf::from("/tmp"));
+            .mint(epic_id.clone(), "proj".into(), "technical".into(), PathBuf::from("/tmp"));
 
         rpc(
             &app,
@@ -770,7 +971,7 @@ mod tests {
         // ignored.
         let guard = state
             .caps
-            .mint(epic_a.clone(), "product".into(), PathBuf::from("/tmp"));
+            .mint(epic_a.clone(), "proj".into(), "product".into(), PathBuf::from("/tmp"));
         rpc(
             &app,
             guard.token(),
@@ -811,7 +1012,7 @@ mod tests {
         let token = {
             let guard = state
                 .caps
-                .mint(epic_id, "product".into(), PathBuf::from("/tmp"));
+                .mint(epic_id, "proj".into(), "product".into(), PathBuf::from("/tmp"));
             guard.token().to_string()
             // guard dropped here → token revoked
         };
@@ -840,6 +1041,7 @@ mod tests {
         let clone = temp_clone();
         let scope = CapabilityScope {
             epic_id: "e".into(),
+            project_id: "proj".into(),
             phase: "product".into(),
             clone_path: clone.clone(),
             expires_at: now_ms() + 10_000,
@@ -872,6 +1074,7 @@ mod tests {
         std::fs::write(&secret, "TOP SECRET").unwrap();
         let scope = CapabilityScope {
             epic_id: "e".into(),
+            project_id: "proj".into(),
             phase: "product".into(),
             clone_path: clone.clone(),
             expires_at: now_ms() + 10_000,
@@ -892,6 +1095,7 @@ mod tests {
         let clone = temp_clone();
         let scope = CapabilityScope {
             epic_id: "e".into(),
+            project_id: "proj".into(),
             phase: "product".into(),
             clone_path: clone.clone(),
             expires_at: now_ms() + 10_000,
@@ -920,6 +1124,7 @@ mod tests {
 
         let scope = CapabilityScope {
             epic_id: "e".into(),
+            project_id: "proj".into(),
             phase: "product".into(),
             clone_path: clone.clone(),
             expires_at: now_ms() + 10_000,
@@ -945,7 +1150,7 @@ mod tests {
         let (state, app) = boot().await;
         let clone = temp_clone();
         let (_p, epic_id) = seed_epic(&state, Some(&clone.to_string_lossy())).await;
-        let guard = state.caps.mint(epic_id, "product".into(), clone.clone());
+        let guard = state.caps.mint(epic_id, "proj".into(), "product".into(), clone.clone());
 
         let (status, body) = rpc(
             &app,
@@ -968,7 +1173,7 @@ mod tests {
         let (_p, epic_id) = seed_epic(&state, None).await;
         let guard = state
             .caps
-            .mint(epic_id, "product".into(), PathBuf::from("/tmp"));
+            .mint(epic_id, "proj".into(), "product".into(), PathBuf::from("/tmp"));
         let (status, body) = rpc(
             &app,
             guard.token(),
@@ -992,5 +1197,247 @@ mod tests {
             value["mcpServers"]["deerborn"]["headers"]["Authorization"],
             "Bearer TOK123"
         );
+    }
+
+    // ---- breakdown tools (T-301) ----
+
+    /// Mint a breakdown-scope capability for `epic_id` (clone_path unused by the
+    /// breakdown tools, so `/tmp` is fine).
+    fn breakdown_cap(state: &AppState, epic_id: &str, project_id: &str) -> CapabilityGuard {
+        state.caps.mint(
+            epic_id.to_string(),
+            project_id.to_string(),
+            "breakdown".to_string(),
+            PathBuf::from("/tmp"),
+        )
+    }
+
+    #[tokio::test]
+    async fn breakdown_tools_list_returns_create_task_and_link_dependency() {
+        let (state, app) = boot().await;
+        let (project_id, epic_id) = seed_epic(&state, None).await;
+        let guard = breakdown_cap(&state, &epic_id, &project_id);
+
+        let (status, body) = rpc(
+            &app,
+            guard.token(),
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/list"}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        let tools = body["result"]["tools"].as_array().unwrap();
+        let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
+        assert_eq!(names, vec!["create_task", "link_dependency"]);
+    }
+
+    #[tokio::test]
+    async fn create_task_via_endpoint_persists_row_and_publishes_dag_updated() {
+        let (state, app) = boot().await;
+        let (project_id, epic_id) = seed_epic(&state, None).await;
+        let guard = breakdown_cap(&state, &epic_id, &project_id);
+
+        let mut sub = state.hub.subscribe(&format!("epic:{epic_id}"));
+
+        let (status, body) = rpc(
+            &app,
+            guard.token(),
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                   "params":{"name":"create_task","arguments":{
+                       "title":"Slice one",
+                       "description":"end-to-end behavior",
+                       "acceptance":"it works"
+                   }}}),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(body["result"]["isError"], false);
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("Created task"));
+
+        // The task row exists with the scoped epic + project and the spec fields.
+        let tasks = crate::tasks::list_tasks_for_epic(state.db.conn(), &epic_id)
+            .await
+            .unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].title, "Slice one");
+        assert_eq!(tasks[0].description.as_deref(), Some("end-to-end behavior"));
+        assert_eq!(tasks[0].acceptance.as_deref(), Some("it works"));
+        assert_eq!(tasks[0].project_id, project_id);
+        assert_eq!(tasks[0].epic_id.as_deref(), Some(epic_id.as_str()));
+
+        // A dag_updated frame carried the new DAG.
+        let frame = sub.recv().await.unwrap();
+        let value: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(value["type"], "dag_updated");
+        assert_eq!(value["topic"], format!("epic:{epic_id}"));
+        assert_eq!(value["payload"]["nodes"].as_array().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn create_task_ignores_hostile_epic_and_project_args() {
+        let (state, app) = boot().await;
+        let (project_id, epic_id) = seed_epic(&state, None).await;
+        // A second epic the token must NOT be able to target.
+        let (_, other_epic) = seed_epic(&state, None).await;
+        let guard = breakdown_cap(&state, &epic_id, &project_id);
+
+        rpc(
+            &app,
+            guard.token(),
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                   "params":{"name":"create_task","arguments":{
+                       "title":"hostile",
+                       "epic_id": other_epic,
+                       "project_id": "some-other-project"
+                   }}}),
+        )
+        .await;
+
+        // The task landed under the SCOPE's epic, not the argued one.
+        let tasks = crate::tasks::list_tasks_for_epic(state.db.conn(), &epic_id)
+            .await
+            .unwrap();
+        assert_eq!(tasks.len(), 1);
+        assert_eq!(tasks[0].epic_id.as_deref(), Some(epic_id.as_str()));
+        assert_eq!(tasks[0].project_id, project_id);
+        // The other epic got nothing.
+        assert!(crate::tasks::list_tasks_for_epic(state.db.conn(), &other_epic)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn create_task_with_blocks_links_edges() {
+        let (state, app) = boot().await;
+        let (project_id, epic_id) = seed_epic(&state, None).await;
+        let guard = breakdown_cap(&state, &epic_id, &project_id);
+
+        // Create the blocked task first (so its id is known), then a blocker that
+        // blocks it via the `blocks` arg.
+        let blocked = crate::tasks::create_task(
+            state.db.conn(),
+            &epic_id,
+            &project_id,
+            "B",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+
+        let (_status, body) = rpc(
+            &app,
+            guard.token(),
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                   "params":{"name":"create_task","arguments":{
+                       "title":"A",
+                       "blocks": [blocked.id]
+                   }}}),
+        )
+        .await;
+        assert_eq!(body["result"]["isError"], false);
+
+        let edges = crate::tasks::list_dependencies_for_epic(state.db.conn(), &epic_id)
+            .await
+            .unwrap();
+        assert_eq!(edges.len(), 1);
+        // The new task (A) blocks `blocked` (B).
+        assert_eq!(edges[0].blocked_id, blocked.id);
+    }
+
+    #[tokio::test]
+    async fn link_dependency_via_endpoint_links_and_rejects_a_cycle() {
+        let (state, app) = boot().await;
+        let (project_id, epic_id) = seed_epic(&state, None).await;
+        let guard = breakdown_cap(&state, &epic_id, &project_id);
+        let conn = state.db.conn();
+
+        let a = crate::tasks::create_task(conn, &epic_id, &project_id, "A", None, None)
+            .await
+            .unwrap();
+        let b = crate::tasks::create_task(conn, &epic_id, &project_id, "B", None, None)
+            .await
+            .unwrap();
+        let c = crate::tasks::create_task(conn, &epic_id, &project_id, "C", None, None)
+            .await
+            .unwrap();
+        // A -> B -> C is valid.
+        for (blocker, blocked) in [(a.id.clone(), b.id.clone()), (b.id.clone(), c.id.clone())] {
+            let (_status, body) = rpc(
+                &app,
+                guard.token(),
+                json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                       "params":{"name":"link_dependency",
+                                  "arguments":{"blocker_id": blocker, "blocked_id": blocked}}}),
+            )
+            .await;
+            assert_eq!(body["result"]["isError"], false);
+        }
+
+        // C -> A closes the cycle: the tool returns isError with a clear message.
+        let (_status, body) = rpc(
+            &app,
+            guard.token(),
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                   "params":{"name":"link_dependency",
+                              "arguments":{"blocker_id": c.id, "blocked_id": a.id}}}),
+        )
+        .await;
+        assert_eq!(body["result"]["isError"], true);
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("cycle"), "got: {text}");
+
+        // The rejected edge was not persisted.
+        let edges = crate::tasks::list_dependencies_for_epic(conn, &epic_id)
+            .await
+            .unwrap();
+        assert_eq!(edges.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn link_dependency_rejects_tasks_outside_the_scoped_epic() {
+        let (state, app) = boot().await;
+        let (project_id, epic_id) = seed_epic(&state, None).await;
+        let (other_project, other_epic) = seed_epic(&state, None).await;
+        let guard = breakdown_cap(&state, &epic_id, &project_id);
+
+        // A task under THIS epic, and one under a DIFFERENT epic.
+        let a = crate::tasks::create_task(state.db.conn(), &epic_id, &project_id, "A", None, None)
+            .await
+            .unwrap();
+        let x = crate::tasks::create_task(state.db.conn(), &other_epic, &other_project, "X", None, None)
+            .await
+            .unwrap();
+
+        let (_status, body) = rpc(
+            &app,
+            guard.token(),
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                   "params":{"name":"link_dependency",
+                              "arguments":{"blocker_id": a.id, "blocked_id": x.id}}}),
+        )
+        .await;
+        assert_eq!(body["result"]["isError"], true);
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("not part of this epic"), "got: {text}");
+    }
+
+    #[tokio::test]
+    async fn create_task_rejects_missing_title() {
+        let (state, app) = boot().await;
+        let (project_id, epic_id) = seed_epic(&state, None).await;
+        let guard = breakdown_cap(&state, &epic_id, &project_id);
+
+        let (_status, body) = rpc(
+            &app,
+            guard.token(),
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                   "params":{"name":"create_task","arguments":{"title":"   "}}}),
+        )
+        .await;
+        assert_eq!(body["result"]["isError"], true);
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("title"));
     }
 }
