@@ -471,11 +471,31 @@ Only the **planning** and **breakdown** phases exist in Half 1:
 
 ## 7. Phase 4 — Kanban & the enqueue seam
 
-- [ ] **T-401 — Project-detail kanban (epics + parentless tasks).** *deps: T-104, T-005*
+- [x] **T-401 — Project-detail kanban (epics + parentless tasks).** *deps: T-104, T-005*
   Lanes: `Planning | Ready | In Progress | Completed | Cancelled` (+ `Blocked`
   surfaced). Show epics and standalone tasks; update live over WS; allow the
   permitted lane transitions. **AC:** epics appear in the right lanes and move
   between them; two browsers see the same board update in real time.
+  **Done:** `deerborn-server/src/board.rs` (`Board { epics, tasks }`,
+  `load_board`, `publish_board` best-effort on `project:<id>`, `GET
+  /projects/:id/board` handler). `deerborn-server/src/lanes.rs` (`POST
+  /epics/:id/lane` with the permitted-transition table; `409` on disallowed,
+  `400` on unknown lane, `404` on unknown epic; publishes `epic_updated` on
+  `epic:<id>` + `board_updated` on `project:<id>`). `epics.rs` gained
+  `pub(crate) list_epics_by_project` + `pub(crate) project_exists`;
+  `tasks.rs` gained `pub(crate) list_standalone_tasks`. `breakdown.rs` now
+  also publishes `board_updated` on its `Planning → Ready` transition.
+  Routes wired in `lib.rs` `app()`. `client/src/api/board.ts` (`getBoard`,
+  `setEpicLane`, `EpicLane`). `client/src/board/stream.ts` (pure reducer:
+  `initialBoardState`, `hydrateBoard`, `applyBoardFrame`) +
+  `client/src/board/useBoardStream.ts` (WS composable on `project:<id>`).
+  `client/src/components/ProjectKanbanView.vue` (six-lane kanban, epic cards
+  with `<RouterLink>` + lane-move `<select>`, standalone-task cards with
+  task→lane mapping, empty-lane placeholders, WS status line, `ApiError.isAuth`
+  bounce). `ProjectDetailView.vue` placeholder replaced with `<ProjectKanbanView>`.
+  `client/test/board.test.ts` (5 reducer tests). CONVENTIONS.md updated for
+  `GET /projects/{id}/board`, `POST /epics/{id}/lane`, the `board_updated`
+  frame, and the permitted lane-transition table.
 
 - [ ] **T-402 — Epic-detail kanban (tasks within an epic).** *deps: T-401, T-302*
   Drill into an epic to a task kanban reflecting DAG status. **AC:** task statuses

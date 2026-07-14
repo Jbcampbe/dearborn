@@ -652,6 +652,25 @@ async fn task_epic(conn: &Connection, task_id: &str) -> AppResult<Option<String>
     }
 }
 
+/// Standalone (parentless, `epic_id IS NULL`) tasks for a project, newest
+/// first. Reused by the board loader (T-401) so the kanban shows tasks that are
+/// not part of any epic's DAG.
+pub(crate) async fn list_standalone_tasks(
+    conn: &Connection,
+    project_id: &str,
+) -> AppResult<Vec<Task>> {
+    let sql = format!(
+        "SELECT {TASK_COLUMNS} FROM task WHERE project_id = ?1 AND epic_id IS NULL \
+         ORDER BY created_at DESC, id DESC"
+    );
+    let mut rows = conn.query(&sql, params![project_id]).await?;
+    let mut items = Vec::new();
+    while let Some(row) = rows.next().await? {
+        items.push(row_to_task(&row)?);
+    }
+    Ok(items)
+}
+
 fn row_to_task(row: &Row) -> Result<Task, libsql::Error> {
     Ok(Task {
         id: row.get(0)?,

@@ -104,6 +104,37 @@ existing edges (adding `blocker → blocked` is rejected iff `blocked` already
 reaches `blocker`) — the same guard the breakdown `link_dependency` MCP tool
 uses (T-301).
 
+#### Project board & epic lanes (T-401)
+
+The project board is the kanban view at the project level — the project's epics
+(each in its lane) plus its standalone (parentless, `epic_id IS NULL`) tasks.
+
+| Action | Method + path | Success status |
+| ------ | ------------- | -------------- |
+| read the board | `GET /projects/{id}/board` | `200` (`{ epics: [Epic], tasks: [Task] }` where `tasks` are standalone) |
+| move an epic between lanes | `POST /epics/{id}/lane` | `200` (the updated epic) |
+
+`POST /epics/{id}/lane` takes `{ status }` where `status` is one of
+`Planning | Ready | InProgress | Completed | Cancelled | Blocked`. Not every
+transition is permitted — the server validates the table below and rejects a
+disallowed move as `409 conflict`; an unknown lane value is `400 bad_request`;
+`404` if the epic does not exist. On success the updated epic is published as
+`epic_updated` on `epic:<id>` and the board as `board_updated` on `project:<id>`.
+
+**Permitted epic lane transitions:**
+
+| From | To |
+| ---- | -- |
+| `Planning`    | `Cancelled` |
+| `Ready`       | `InProgress`, `Cancelled` |
+| `InProgress`  | `Cancelled`, `Blocked` |
+| `Blocked`     | `Ready`, `Cancelled` |
+| `Completed`   | *(terminal)* |
+| `Cancelled`   | *(terminal)* |
+
+`Planning → Ready` is owned by breakdown; `InProgress → Completed` will be
+owned by the stub worker (T-403). Both are rejected by `POST /epics/{id}/lane`.
+
 ## Identifiers & timestamps
 
 - **IDs** are opaque strings (ULID/UUID) generated server-side.
@@ -214,8 +245,9 @@ malformed frames get an `error` frame back (the connection stays open).
 | `subscribed`   | Ack of a `subscribe`. Sent **after** the subscription is live, so a client may wait for it before triggering a publish (avoids a subscribe/publish race). |
 | `unsubscribed` | Ack of an `unsubscribe`. |
 | `error`        | Protocol error; `payload.message` explains it. `topic` is `""`. |
-| `epic_updated` | An epic's record changed (planning `update_epic`, or the breakdown `Planning → Ready` transition). `payload` = the updated epic. |
+| `epic_updated` | An epic's record changed (planning `update_epic`, the breakdown `Planning → Ready` transition, or a lane transition via `POST /epics/{id}/lane`). `payload` = the updated epic. |
 | `dag_updated`  | A task or dependency changed under the epic (T-301). `payload` = `{ nodes: [DagNode], edges: [{ blocker_id, blocked_id }] }` (same shape as `GET /epics/{id}/dag`; nodes carry `ready` + `blocked_by`). |
+| `board_updated` | The project board changed (epic lane transition via `POST /epics/{id}/lane`, or breakdown's `Planning → Ready`). `payload` = `{ epics: [Epic], tasks: [Task] }` (same shape as `GET /projects/{id}/board`; `tasks` are standalone). Published on `project:<id>`. |
 | *(any other)*  | A published event, delivered only to connections subscribed to its `topic`. |
 
 ### Planning `RunEvent` stream (T-202)

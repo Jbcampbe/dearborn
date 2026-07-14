@@ -5,6 +5,7 @@
 //! cleanly.
 
 pub mod auth;
+pub mod board;
 pub mod breakdown;
 pub mod config;
 pub mod crypto;
@@ -13,6 +14,7 @@ pub mod epics;
 pub mod error;
 pub mod git;
 pub mod hub;
+pub mod lanes;
 pub mod mcp;
 pub mod planning;
 pub mod projects;
@@ -226,6 +228,7 @@ pub fn app(state: AppState) -> Router {
             "/projects/:id/refresh",
             axum::routing::post(projects::refresh_project),
         )
+        .route("/projects/:id/board", get(board::get_board))
         .route(
             "/projects/:id/epics",
             get(epics::list_epics).post(epics::create_epic),
@@ -246,6 +249,10 @@ pub fn app(state: AppState) -> Router {
             axum::routing::post(breakdown::trigger_breakdown),
         )
         .route("/epics/:id/dag", get(tasks::get_dag))
+        .route(
+            "/epics/:id/lane",
+            axum::routing::post(lanes::set_epic_lane),
+        )
         .route(
             "/epics/:id/tasks",
             axum::routing::post(tasks::create_epic_task),

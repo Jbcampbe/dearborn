@@ -173,16 +173,7 @@ pub async fn list_epics(
         return Err(AppError::NotFound(format!("project {project_id} not found")));
     }
 
-    let sql = format!(
-        "SELECT {EPIC_COLUMNS} FROM epic WHERE project_id = ?1 \
-         ORDER BY created_at DESC, id DESC"
-    );
-    let mut rows = conn.query(&sql, params![project_id]).await?;
-
-    let mut items = Vec::new();
-    while let Some(row) = rows.next().await? {
-        items.push(row_to_epic(&row)?);
-    }
+    let items = list_epics_by_project(conn, &project_id).await?;
     Ok(Json(json!({ "items": items })))
 }
 
@@ -539,6 +530,24 @@ pub(crate) async fn get_epic_clone_path(
 
 // ---- row / value plumbing ----------------------------------------------
 
+/// List a project's epics, newest first (same ordering as `list_epics`).
+/// Reused by the board loader (T-401) so the board and the epics list agree.
+pub(crate) async fn list_epics_by_project(
+    conn: &Connection,
+    project_id: &str,
+) -> AppResult<Vec<Epic>> {
+    let sql = format!(
+        "SELECT {EPIC_COLUMNS} FROM epic WHERE project_id = ?1 \
+         ORDER BY created_at DESC, id DESC"
+    );
+    let mut rows = conn.query(&sql, params![project_id]).await?;
+    let mut items = Vec::new();
+    while let Some(row) = rows.next().await? {
+        items.push(row_to_epic(&row)?);
+    }
+    Ok(items)
+}
+
 pub(crate) async fn fetch_epic(conn: &Connection, id: &str) -> AppResult<Option<Epic>> {
     let sql = format!("SELECT {EPIC_COLUMNS} FROM epic WHERE id = ?1");
     let mut rows = conn.query(&sql, params![id]).await?;
@@ -592,7 +601,7 @@ fn row_to_message(row: &Row) -> Result<TranscriptMessage, libsql::Error> {
     })
 }
 
-async fn project_exists(conn: &Connection, project_id: &str) -> AppResult<bool> {
+pub(crate) async fn project_exists(conn: &Connection, project_id: &str) -> AppResult<bool> {
     let mut rows = conn
         .query("SELECT 1 FROM project WHERE id = ?1", params![project_id])
         .await?;

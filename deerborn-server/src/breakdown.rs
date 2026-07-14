@@ -384,6 +384,10 @@ pub fn spawn_breakdown(state: AppState, epic_id: String, guard: InflightGuard) {
             state
                 .hub
                 .publish(&format!("epic:{epic_id}"), "epic_updated", payload);
+
+            // Also publish the project board so a subscribed kanban re-renders
+            // when breakdown lands an epic in Ready (T-401).
+            crate::board::publish_board(&state, &epic.project_id).await;
         }
     });
 }

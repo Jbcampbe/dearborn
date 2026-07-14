@@ -6,6 +6,7 @@ import { ApiError } from "../api/client";
 import { getProject, refreshProject, type Project } from "../api/projects";
 import { createEpic, listEpics, type Epic } from "../api/epics";
 import CloneStatusBadge from "./CloneStatusBadge.vue";
+import ProjectKanbanView from "./ProjectKanbanView.vue";
 
 // Project detail shell (T-104). Shows the project's identity + clone lifecycle,
 // the project's epics, and a "Start planning" entry point (T-204) that creates
@@ -176,10 +177,7 @@ onMounted(load);
         </ul>
       </section>
 
-      <section class="board">
-        <h2>Board</h2>
-        <div class="placeholder">Kanban coming soon (T-401).</div>
-      </section>
+      <ProjectKanbanView :id="project.id" />
     </template>
   </main>
 </template>
