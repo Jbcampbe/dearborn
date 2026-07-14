@@ -422,10 +422,26 @@ Only the **planning** and **breakdown** phases exist in Half 1:
   args ignored), and the route (202 + Ready transition + `agent_run` row + live
   frames; 409/404 rejections); a live `claude` smoke test is `#[ignore]`d.
 
-- [ ] **T-302 — DAG validation & readiness API.** *deps: T-301*
+- [x] **T-302 — DAG validation & readiness API.** *deps: T-301*
   Reject cycles; compute per-task readiness (§2.3); expose the DAG (nodes + edges)
   and each task's ready/blocked state via API. **AC:** a cyclic edit is rejected
   with a clear error; the API returns a correct topological readiness set.
+  **Done:** `src/tasks.rs` gained `compute_dag` (a `Dag { epic_id, nodes, edges }`
+  where each `DagNode` is the `Task` flattened + `ready: bool` + `blocked_by:
+  [string]`). Readiness follows §2.3 exactly: `ready` iff `status='Todo'` and
+  every blocker is `Done`; `blocked_by` lists the not-yet-`Done` blockers (only
+  non-empty when `Todo` and not ready). Cycle rejection (a forward DFS — adding
+  `blocker → blocked` is rejected iff `blocked` already reaches `blocker`) is
+  shared by the breakdown MCP `link_dependency` (T-301) and the REST `POST
+  /epics/:id/dependencies` (`409 conflict`). REST task CRUD + DAG API:
+  `GET /epics/:id/dag`, `GET /tasks/:id`, `POST /epics/:id/tasks` (with optional
+  `blocks`), `PATCH /tasks/:id` (double-option for nullable `description`/
+  `acceptance`; `status` validated), `DELETE /tasks/:id` (cleans its edges),
+  `POST`/`DELETE /epics/:id/dependencies` (unlink takes query params). Every
+  mutating endpoint publishes `dag_updated` on `epic:<id>` (reuses
+  `mcp::publish_dag`) so a live editor re-renders. Hermetic gate covers the
+  readiness contract (Todo/Done/InProgress transitions), the DAG read, full CRUD,
+  cycle + cross-epic + self-edge rejection, and the `dag_updated` publishes.
 
 - [ ] **T-303 — Ready-lane DAG editor UI.** *deps: T-104, T-302*
   Visualize the task DAG; task CRUD; rewire dependencies by hand; surface

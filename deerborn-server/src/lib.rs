@@ -245,6 +245,22 @@ pub fn app(state: AppState) -> Router {
             "/epics/:id/breakdown",
             axum::routing::post(breakdown::trigger_breakdown),
         )
+        .route("/epics/:id/dag", get(tasks::get_dag))
+        .route(
+            "/epics/:id/tasks",
+            axum::routing::post(tasks::create_epic_task),
+        )
+        .route(
+            "/epics/:id/dependencies",
+            axum::routing::post(tasks::post_dependency)
+                .delete(tasks::remove_dependency),
+        )
+        .route(
+            "/tasks/:id",
+            get(tasks::get_task_by_id)
+                .patch(tasks::patch_task)
+                .delete(tasks::remove_task),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_bearer,

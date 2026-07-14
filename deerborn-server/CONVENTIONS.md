@@ -80,6 +80,30 @@ write to `transcript_message` — its durable output is the `task` rows +
 Deerborn owns. Breakdown shares the planning in-flight slot, so a planning run
 and a breakdown run never overlap on one epic.
 
+#### Task DAG & readiness API (T-302)
+
+The task DAG under an epic is read with readiness and edited by hand in the
+Ready lane (T-303). Readiness is **computed**, not stored: a task is `ready`
+iff `status='Todo'` and every blocker (a task with an edge into it) is `Done`.
+
+| Action | Method + path | Success status |
+| ------ | ------------- | -------------- |
+| read the DAG (nodes + readiness + edges) | `GET /epics/{id}/dag` | `200` (`{ epic_id, nodes: [DagNode], edges: [{blocker_id, blocked_id}] }`) |
+| get one task | `GET /tasks/{id}` | `200` |
+| create a task under the epic | `POST /epics/{id}/tasks` | `201` (task; body `{ title, description?, acceptance?, blocks?: [ids] }`) |
+| partially update a task | `PATCH /tasks/{id}` | `200` (double-option for `description`/`acceptance`: absent=untouched, `null`=clear, value=set; `status` validated) |
+| delete a task (and its edges) | `DELETE /tasks/{id}` | `204` |
+| link a dependency | `POST /epics/{id}/dependencies` | `201` (`{ blocker_id, blocked_id }`); `409` on a cycle, `400` on self/cross-epic |
+| unlink a dependency | `DELETE /epics/{id}/dependencies?blocker_id=X&blocked_id=Y` | `204` (idempotent) |
+
+A `DagNode` is the `Task` object (flattened) plus `ready: bool` and `blocked_by:
+[string]` (blocker ids not yet `Done`; non-empty only when `Todo` and not
+ready). Every mutating endpoint publishes a `dag_updated` frame on `epic:<id>`
+so a subscribed editor re-renders. Cycle rejection uses a forward DFS over the
+existing edges (adding `blocker → blocked` is rejected iff `blocked` already
+reaches `blocker`) — the same guard the breakdown `link_dependency` MCP tool
+uses (T-301).
+
 ## Identifiers & timestamps
 
 - **IDs** are opaque strings (ULID/UUID) generated server-side.
