@@ -443,11 +443,29 @@ Only the **planning** and **breakdown** phases exist in Half 1:
   readiness contract (Todo/Done/InProgress transitions), the DAG read, full CRUD,
   cycle + cross-epic + self-edge rejection, and the `dag_updated` publishes.
 
-- [ ] **T-303 — Ready-lane DAG editor UI.** *deps: T-104, T-302*
+- [x] **T-303 — Ready-lane DAG editor UI.** *deps: T-104, T-302*
   Visualize the task DAG; task CRUD; rewire dependencies by hand; surface
   validation errors (cycles, orphaned deps). This is **the highest-ROI human
   checkpoint** before execution. **AC:** a user edits tasks and dependencies of a
   `Ready` epic and the persisted DAG reflects it; invalid edits are blocked.
+  **Done:** `client/src/api/tasks.ts` (typed REST client: `getDag`, `getTask`,
+  `createTask`, `patchTask` double-option, `deleteTask`, `linkDependency`,
+  `unlinkDependency`, `triggerBreakdown`). `client/src/dag/stream.ts` (pure
+  WS-event reducer: `initialDagState`, `hydrateDag`, `applyDagFrame`, `blockersOf`/
+  `blocksOf`/`nodeById`); `client/src/dag/useDagStream.ts` (WS composable mirroring
+  `useEpicStream` — subscribe to `epic:<id>`, bounded reconnect/backoff).
+  `client/src/components/DagEditorView.vue` (two-column editor: task list with
+  readiness badges + inline edit/delete, add-task form, dependency list with
+  add/remove; live `dag_updated`/`epic_updated` folding; `ApiError.isAuth` bounce).
+  Route `/epic/:id/tasks` (`epic-dag`); `/tasks` dev proxy. `PlanningView.vue`
+  gained a "Break down into tasks" control (offered once technical planning has
+  begun) that `POST /epics/:id/breakdown` and drops the user in the live editor.
+  Editing is gated on `epic.status==='Ready'` (forms disabled otherwise).
+  `client/test/dag.test.ts` (7 reducer tests). **Server fix from review:**
+  `mcp::publish_dag` now uses `tasks::compute_dag`, so `dag_updated` frames carry
+  `DagNode`s (with `ready`/`blocked_by`) — the same shape as `GET /epics/:id/dag`
+  — not plain `Task`s; the reducer defensively normalizes missing readiness
+  fields. CONVENTIONS.md updated for the `dag_updated` `DagNode` shape.
 
 ---
 

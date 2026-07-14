@@ -191,9 +191,11 @@ existence at the transport layer):
   `clone_status` event (T-103) published when a background clone/refresh reaches
   `ready`/`error` (`payload`: `{ id, clone_status, clone_error, clone_path }`).
 - `epic:<id>` also carries `dag_updated` (T-301), published whenever a task or
-  dependency is created/changed under the epic (`payload`: `{ nodes: [Task],
-  edges: [{ blocker_id, blocked_id }] }`), and `epic_updated` (payload = the
-  updated epic) on the `Planning → Ready` breakdown transition.
+  dependency is created/changed under the epic (`payload`: `{ nodes: [DagNode],
+  edges: [{ blocker_id, blocked_id }] }` — the same shape as `GET
+  /epics/{id}/dag`, so nodes carry computed `ready`/`blocked_by`), and
+  `epic_updated` (payload = the updated epic) on the `Planning → Ready`
+  breakdown transition.
 
 ### Client → server (control frames)
 
@@ -213,7 +215,7 @@ malformed frames get an `error` frame back (the connection stays open).
 | `unsubscribed` | Ack of an `unsubscribe`. |
 | `error`        | Protocol error; `payload.message` explains it. `topic` is `""`. |
 | `epic_updated` | An epic's record changed (planning `update_epic`, or the breakdown `Planning → Ready` transition). `payload` = the updated epic. |
-| `dag_updated`  | A task or dependency changed under the epic (T-301). `payload` = `{ nodes: [Task], edges: [{ blocker_id, blocked_id }] }`. |
+| `dag_updated`  | A task or dependency changed under the epic (T-301). `payload` = `{ nodes: [DagNode], edges: [{ blocker_id, blocked_id }] }` (same shape as `GET /epics/{id}/dag`; nodes carry `ready` + `blocked_by`). |
 | *(any other)*  | A published event, delivered only to connections subscribed to its `topic`. |
 
 ### Planning `RunEvent` stream (T-202)

@@ -1,0 +1,39 @@
+{
+  "runId": "63ccd37b",
+  "agent": "reviewer",
+  "task": "Review the **T-303 — Ready-lane DAG editor UI** change for the Deerborn project (uncommitted in the worktree). This is MILESTONE_1.md §6 Phase 3, task T-303. Read MILESTONE_1.md §6 (T-303 AC), deerborn-server/CONVENTIONS.md (the task/DAG REST routes and the `dag_updated`/`epic_updated` WS frames), and the existing client patterns (client/src/components/PlanningView.vue, client/src/planning/stream.ts, client/src/planning/useEpicStream.ts, client/src/api/epics.ts) to judge consistency.\n\nFocus your review on these NEW/changed files (read them in full):\n- client/src/api/tasks.ts — the task DAG REST client (getDag, getTask, createTask, patchTask, deleteTask, linkDependency, unlinkDependency, triggerBreakdown).\n- client/src/dag/stream.ts — the pure WS-event reducer (initialDagState, hydrateDag, applyDagFrame, blockersOf, blocksOf, nodeById).\n- client/src/dag/useDagStream.ts — the WS composable (mirrors useEpicStream).\n- client/src/components/DagEditorView.vue — the editor component.\n- client/test/dag.test.ts — the reducer unit tests.\n- client/src/router/index.ts — the new `/epic/:id/tasks` route.\n- client/src/components/PlanningView.vue — the added breakdown trigger + button.\n- client/vite.config.ts — the `/tasks` dev proxy.\n\nCheck specifically:\n1. **AC compliance**: a user can edit tasks and dependencies of a `Ready` epic and the persisted DAG reflects it; invalid edits (cycles, orphaned deps, missing title) are blocked/surfaced. Does the UI call the right endpoints and surface server errors (409 cycle, 400 cross-epic/self-edge)?\n2. **Live updates**: does the editor subscribe to `epic:<id>` and fold `dag_updated`/`epic_updated` frames so two browsers see the same board update in real time (T-303 AC)? Does it match the planning stream's reconnect/backoff pattern?\n3. **Wire-shape consistency**: do the TS DTOs match the server's Rust DTOs in deerborn-server/src/tasks.rs (DagNode flattened fields: `ready`, `blocked_by`; Dependency `blocker_id`/`blocked_id`)? Does `patchTask` correctly use the double-option (null = clear, string = set, absent = untouched)?\n4. **Reducer correctness**: does `applyDagFrame` replace nodes+edges atomically on `dag_updated` and ignore malformed/unrelated frames? Are the dag.test.ts cases sufficient?\n5. **Style/discipline**: does it mirror the existing code style (module comments, ApiError.isAuth bounce, onBeforeUnmount cleanup, scoped CSS)?\n6. **Any bugs, type holes, or missing edge cases** (e.g. editing a task whose epic_id is null; the `props.id` template reference in Vue; race between REST hydrate and WS frames).\n\nDo NOT modify any files — this is a read-only review. Return a concise findings report: a verdict (ship / fix-first), a bulleted list of any issues by severity (blocker / minor / nit), and any AC gaps. Be specific with file:line where possible.\n\n---\n**Output:**\nWrite your findings to exactly this path: /Users/josiahcampbell/projects/personal/deerborn/.pi-subagents/artifacts/outputs/63ccd37b/file-only:/Users/josiahcampbell/projects/personal/deerborn/.pi-subagents/t303-review.md\nThis path is authoritative for this run.\nIgnore any other output filename or output path mentioned elsewhere, including output destinations in the base agent prompt, system prompt, or task instructions.",
+  "exitCode": 1,
+  "usage": {
+    "input": 0,
+    "output": 0,
+    "cacheRead": 0,
+    "cacheWrite": 0,
+    "cost": 0,
+    "turns": 1
+  },
+  "model": "anthropic/claude-opus-4.8:high",
+  "attemptedModels": [
+    "anthropic/claude-opus-4.8:high"
+  ],
+  "modelAttempts": [
+    {
+      "model": "anthropic/claude-opus-4.8:high",
+      "success": false,
+      "exitCode": 1,
+      "error": "404: {\"message\":\"No endpoints available matching your guardrail restrictions and data policy. Configure: https://openrouter.ai/settings/privacy\",\"code\":404}",
+      "usage": {
+        "input": 0,
+        "output": 0,
+        "cacheRead": 0,
+        "cacheWrite": 0,
+        "cost": 0,
+        "turns": 1
+      }
+    }
+  ],
+  "durationMs": 1462,
+  "toolCount": 0,
+  "error": "404: {\"message\":\"No endpoints available matching your guardrail restrictions and data policy. Configure: https://openrouter.ai/settings/privacy\",\"code\":404}",
+  "transcriptPath": "/Users/josiahcampbell/projects/personal/deerborn/.pi-subagents/artifacts/63ccd37b_reviewer_0_transcript.jsonl",
+  "timestamp": 1783990379621
+}

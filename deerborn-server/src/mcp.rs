@@ -564,26 +564,20 @@ async fn tool_link_dependency(
     Ok(format!("Linked {blocker_id} → {blocked_id}."))
 }
 
-/// Build the epic's task DAG (`{ nodes, edges }`) and publish it on `epic:<id>`
-/// under the `dag_updated` type, so a subscribed client re-renders the graph.
-/// Best-effort: a read error is logged and the publish is skipped.
+/// Build the epic's task DAG (`{ nodes, edges }`) — nodes carry computed
+/// readiness (`DagNode`, same shape as `GET /epics/:id/dag`) — and publish it
+/// on `epic:<id>` under the `dag_updated` type, so a subscribed client re-renders
+/// with correct ready/blocked state. Best-effort: a read error is logged and the
+/// publish is skipped.
 pub async fn publish_dag(state: &AppState, epic_id: &str) {
-    let conn = state.db.conn();
-    let nodes = match tasks::list_tasks_for_epic(conn, epic_id).await {
-        Ok(n) => n,
+    let dag = match tasks::compute_dag(state.db.conn(), epic_id).await {
+        Ok(dag) => dag,
         Err(err) => {
-            tracing::warn!(epic = %epic_id, error = %err, "dag publish: failed to load tasks");
+            tracing::warn!(epic = %epic_id, error = %err, "dag publish: failed to load DAG");
             return;
         }
     };
-    let edges = match tasks::list_dependencies_for_epic(conn, epic_id).await {
-        Ok(e) => e,
-        Err(err) => {
-            tracing::warn!(epic = %epic_id, error = %err, "dag publish: failed to load edges");
-            return;
-        }
-    };
-    let payload = json!({ "nodes": nodes, "edges": edges });
+    let payload = json!({ "nodes": dag.nodes, "edges": dag.edges });
     state
         .hub
         .publish(&format!("epic:{epic_id}"), "dag_updated", payload);
@@ -1265,12 +1259,18 @@ mod tests {
         assert_eq!(tasks[0].project_id, project_id);
         assert_eq!(tasks[0].epic_id.as_deref(), Some(epic_id.as_str()));
 
-        // A dag_updated frame carried the new DAG.
+        // A dag_updated frame carried the new DAG — nodes carry readiness
+        // (DagNode shape, matching GET /epics/:id/dag), not plain Tasks.
         let frame = sub.recv().await.unwrap();
         let value: Value = serde_json::from_str(&frame).unwrap();
         assert_eq!(value["type"], "dag_updated");
         assert_eq!(value["topic"], format!("epic:{epic_id}"));
-        assert_eq!(value["payload"]["nodes"].as_array().unwrap().len(), 1);
+        let nodes = value["payload"]["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 1);
+        // A parentless Todo task is ready, with no blockers.
+        assert_eq!(nodes[0]["ready"], true);
+        assert_eq!(nodes[0]["blocked_by"].as_array().unwrap().len(), 0);
+        assert_eq!(nodes[0]["title"], "Slice one");
     }
 
     #[tokio::test]

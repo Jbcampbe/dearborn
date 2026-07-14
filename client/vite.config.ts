@@ -16,6 +16,9 @@ export default defineConfig({
       // Epics + planning transcript REST surface (T-201/T-204). Singular
       // `/epic/:id` is a client route (see router) so it does not clash here.
       "/epics": "http://127.0.0.1:8787",
+      // Tasks + DAG REST surface (T-302/T-303). Singular `/tasks/:id` client
+      // calls are proxied here too.
+      "/tasks": "http://127.0.0.1:8787",
       // WebSocket — planning `RunEvent` live stream (T-202/T-204). `ws:true`
       // makes the dev proxy forward the Upgrade handshake to the Rust server.
       "/ws": { target: "ws://127.0.0.1:8787", ws: true },

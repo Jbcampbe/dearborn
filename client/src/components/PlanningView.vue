@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, nextTick, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
-import { RouterLink } from "vue-router";
+import { RouterLink, useRouter } from "vue-router";
 
 import { useAuthStore } from "../stores/auth";
 import { ApiError } from "../api/client";
@@ -13,6 +13,7 @@ import {
   type PlanningPhase,
   type PlanningSession,
 } from "../api/epics";
+import { triggerBreakdown } from "../api/tasks";
 import {
   appendUserTurn,
   hydrate,
@@ -32,12 +33,14 @@ import { useEpicStream, type EpicStream, type StreamStatus } from "../planning/u
 const props = defineProps<{ id: string }>();
 
 const auth = useAuthStore();
+const router = useRouter();
 const state = reactive<PlanningState>(initialState());
 const loading = ref(true);
 const error = ref<string | null>(null);
 const draft = ref("");
 const sending = ref(false);
 const advancing = ref(false);
+const breakingDown = ref(false);
 const sessions = ref<PlanningSession[]>([]);
 const streamStatus = ref<StreamStatus>("connecting");
 const scroller = ref<HTMLElement | null>(null);
@@ -159,7 +162,38 @@ async function advance() {
   }
 }
 
-// Enter sends; Shift+Enter inserts a newline.
+// Breakdown is offered once the epic has advanced to technical planning and is
+// still in the Planning lane. It runs the one-shot breakdown agent (T-301);
+// the DAG populates live in the editor (`epic:<id>` `dag_updated` frames), so we
+// navigate there immediately on 202. Disabled while a run/advance/breakdown is
+// in flight.
+const canBreakDown = computed(
+  () => state.epic !== null && state.epic.status === "Planning" && hasTechnical.value,
+);
+const breakDownDisabled = computed(
+  () => advancing.value || runInFlight.value || breakingDown.value,
+);
+async function breakDown() {
+  const token = auth.token;
+  if (token === null || !canBreakDown.value || breakDownDisabled.value) {
+    return;
+  }
+  breakingDown.value = true;
+  error.value = null;
+  try {
+    await triggerBreakdown(token, props.id);
+    // The breakdown run streams on `epic:<id>` and populates the DAG live; the
+    // editor subscribes to that same topic, so drop the user there to watch it.
+    await router.push({ name: "epic-dag", params: { id: props.id } });
+  } catch (err) {
+    if (bounceIfAuth(err)) {
+      return;
+    }
+    error.value = err instanceof Error ? err.message : "failed to start breakdown";
+  } finally {
+    breakingDown.value = false;
+  }
+}
 function onKeydown(event: KeyboardEvent) {
   if (event.key === "Enter" && !event.shiftKey) {
     event.preventDefault();
@@ -223,6 +257,19 @@ onMounted(load);
         </p>
         <button :disabled="advanceDisabled" @click="advance">
           {{ advancing ? "Advancing…" : "Advance to technical planning" }}
+        </button>
+      </div>
+
+      <!-- Breakdown: offered once technical planning has begun and the epic is
+           still in the Planning lane (T-301/T-303). Runs the one-shot
+           breakdown agent and drops the user in the live DAG editor. -->
+      <div v-if="canBreakDown" class="advance-bar breakdown-bar">
+        <p>
+          Planning look good? Run <strong>breakdown</strong> — the agent turns this epic into a
+          task DAG you can hand-edit in the Ready lane before execution.
+        </p>
+        <button :disabled="breakDownDisabled" @click="breakDown">
+          {{ breakingDown ? "Starting…" : "Break down into tasks" }}
         </button>
       </div>
 
@@ -403,6 +450,22 @@ header h1 {
   cursor: pointer;
 }
 .advance-bar button:disabled {
+  opacity: 0.5;
+  cursor: not-allowed;
+}
+.breakdown-bar {
+  border-color: #d1fae5;
+  background: #ecfdf5;
+}
+.breakdown-bar p {
+  color: #065f46;
+}
+.breakdown-bar button {
+  border-color: #059669;
+  background: #059669;
+  color: white;
+}
+.breakdown-bar button:disabled {
   opacity: 0.5;
   cursor: not-allowed;
 }
