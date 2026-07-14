@@ -284,6 +284,9 @@ onMounted(load);
         <p v-if="!isReady" class="hint">
           The epic isn't <strong>Ready</strong> yet — the editor is read-mostly until breakdown completes.
         </p>
+        <RouterLink class="board-link" :to="{ name: 'epic-board', params: { id: props.id } }">
+          Board view
+        </RouterLink>
       </header>
 
       <p v-if="error" class="error inline" role="alert">{{ error }}</p>
@@ -411,6 +414,8 @@ header h1 { margin: 0 0 0.3rem; }
 }
 .conn[data-status="open"] { color: #059669; }
 .hint { font-size: 0.85rem; color: #6b7280; max-width: 24rem; text-align: right; }
+.board-link { font-size: 0.85rem; color: #2563eb; text-decoration: none; white-space: nowrap; }
+.board-link:hover { text-decoration: underline; }
 .error { color: #b91c1c; }
 .error.inline { margin: 1rem 0; }
 

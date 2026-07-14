@@ -163,12 +163,20 @@ onMounted(load);
 
         <template v-if="epicsByLane[lane.key]?.length || tasksByLane[lane.key]?.length">
           <div v-for="epic in epicsByLane[lane.key]" :key="epic.id" class="card epic-card">
-            <RouterLink
-              class="card-title"
-              :to="{ name: 'epic-planning', params: { id: epic.id } }"
-            >
-              {{ epic.title }}
-            </RouterLink>
+            <div class="card-links">
+              <RouterLink
+                class="card-title"
+                :to="{ name: 'epic-planning', params: { id: epic.id } }"
+              >
+                {{ epic.title }}
+              </RouterLink>
+              <RouterLink
+                class="board-link"
+                :to="{ name: 'epic-board', params: { id: epic.id } }"
+              >
+                Board
+              </RouterLink>
+            </div>
             <span class="tag">Epic</span>
             <div v-if="permittedTargets(epic.status).length" class="lane-move">
               <select
@@ -262,6 +270,19 @@ onMounted(load);
   color: #1f2937;
 }
 .card-title:hover {
+  text-decoration: underline;
+}
+.card-links {
+  display: flex;
+  align-items: baseline;
+  gap: 0.5rem;
+}
+.board-link {
+  font-size: 0.75rem;
+  color: #2563eb;
+  text-decoration: none;
+}
+.board-link:hover {
   text-decoration: underline;
 }
 .tag {

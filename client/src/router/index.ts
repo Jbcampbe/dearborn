@@ -4,6 +4,7 @@ import ProjectsView from "../components/ProjectsView.vue";
 import ProjectDetailView from "../components/ProjectDetailView.vue";
 import PlanningView from "../components/PlanningView.vue";
 import DagEditorView from "../components/DagEditorView.vue";
+import EpicKanbanView from "../components/EpicKanbanView.vue";
 
 // Client-side routes. The top-level token gate lives in App.vue (an
 // unauthenticated user sees the token screen regardless of route), so these
@@ -35,6 +36,15 @@ const routes: RouteRecordRaw[] = [
     path: "/epic/:id/tasks",
     name: "epic-dag",
     component: DagEditorView,
+    props: true,
+  },
+  {
+    // The epic-detail task kanban (T-402): a task-lane view of the same DAG
+    // the editor above uses. Singular `/epic/:id/board` keeps it under the
+    // epic client route; the API owns `/epics`.
+    path: "/epic/:id/board",
+    name: "epic-board",
+    component: EpicKanbanView,
     props: true,
   },
   // Unknown paths fall back to the projects list.

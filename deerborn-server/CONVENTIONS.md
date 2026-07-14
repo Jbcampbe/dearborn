@@ -135,6 +135,13 @@ disallowed move as `409 conflict`; an unknown lane value is `400 bad_request`;
 `Planning → Ready` is owned by breakdown; `InProgress → Completed` will be
 owned by the stub worker (T-403). Both are rejected by `POST /epics/{id}/lane`.
 
+#### Epic-detail task kanban (T-402)
+
+The client route `/epic/:id/board` renders a task-lane kanban (Todo / In
+Progress / Done / Failed / Cancelled) for a single epic. It reuses `GET
+/epics/{id}/dag` + the `dag_updated`/`epic_updated` frames on `epic:<id>` —
+no new server route.
+
 ## Identifiers & timestamps
 
 - **IDs** are opaque strings (ULID/UUID) generated server-side.

@@ -497,9 +497,29 @@ Only the **planning** and **breakdown** phases exist in Half 1:
   `GET /projects/{id}/board`, `POST /epics/{id}/lane`, the `board_updated`
   frame, and the permitted lane-transition table.
 
-- [ ] **T-402 — Epic-detail kanban (tasks within an epic).** *deps: T-401, T-302*
+- [x] **T-402 — Epic-detail kanban (tasks within an epic).** *deps: T-401, T-302*
   Drill into an epic to a task kanban reflecting DAG status. **AC:** task statuses
   render correctly; drilling in/out preserves state.
+  **Done:** `client/src/board/epicLanes.ts` (pure `tasksByStatus(nodes)`
+  grouping helper + `readinessLabel` + `TASK_LANES` lane defs — the only
+  board-specific logic; the view reuses `dag/stream.ts` + `dag/useDagStream.ts`
+  unchanged, no new reducer/composable). `client/src/components/EpicKanbanView.vue`
+  (five-lane task kanban: `Todo | In Progress | Done | Failed | Cancelled`;
+  `onMounted` loads `getEpic` + `getDag`, `hydrateDag`s into a reactive
+  `DagState`, then `useDagStream` subscribes to `epic:<id>`; cards show title,
+  a readiness badge (`ready` / `blocked (N)` for Todo, status otherwise), an
+  acceptance snippet, and blocker titles for blocked Todo tasks; `dag_updated`
+  replaces nodes+edges live, `epic_updated` replaces the epic; empty-epic
+  placeholder; WS status line; `ApiError.isAuth` bounce; "Edit DAG" link to the
+  DAG editor). Route `/epic/:id/board` (`epic-board`). Entry points:
+  `ProjectKanbanView.vue` epic cards gained a "Board" `<RouterLink>` to
+  `epic-board` (alongside the existing title link to `epic-planning`);
+  `DagEditorView.vue` gained a "Board view" `<RouterLink>` near the header.
+  `client/test/epic-kanban.test.ts` (7 tests: groups by status, all five lanes
+  present when empty, every status distributed, readiness preserved on grouped
+  nodes, `readinessLabel` ready/blocked/non-Todo). No server change — `GET
+  /epics/{id}/dag` + the `dag_updated`/`epic_updated` frames already cover what
+  the kanban needs. CONVENTIONS.md updated for the `/epic/:id/board` reuse note.
 
 - [ ] **T-403 — Enqueue on In Progress + stub worker (the seam).** *deps: T-401, T-303*
   Moving an epic **Ready → In Progress** writes the queue/lease shape from §2.2/§2.3
