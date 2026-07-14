@@ -19,6 +19,7 @@ pub mod mcp;
 pub mod planning;
 pub mod projects;
 pub mod tasks;
+pub mod worker;
 pub mod ws;
 
 use std::collections::HashSet;

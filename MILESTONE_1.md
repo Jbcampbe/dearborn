@@ -521,13 +521,43 @@ Only the **planning** and **breakdown** phases exist in Half 1:
   /epics/{id}/dag` + the `dag_updated`/`epic_updated` frames already cover what
   the kanban needs. CONVENTIONS.md updated for the `/epic/:id/board` reuse note.
 
-- [ ] **T-403 — Enqueue on In Progress + stub worker (the seam).** *deps: T-401, T-303*
+- [x] **T-403 — Enqueue on In Progress + stub worker (the seam).** *deps: T-401, T-303*
   Moving an epic **Ready → In Progress** writes the queue/lease shape from §2.2/§2.3
   (`epic.status='InProgress'`, lease NULL, tasks claimable). Ship a **stub worker**
   that claims ready tasks in dependency order and marks them `Done` (no real
   agent, no git). **AC:** hitting In Progress drives the board through the DAG to
   `Completed` via the stub, end-to-end; the rows written are exactly what Half 2's
   claim predicate will read. **This is the Milestone-1 finish line.**
+  **Done:** `deerborn-server/src/worker.rs` — the stub worker (`run_stub_worker` +
+  `spawn_stub_worker`). It re-fetches the epic each iteration (clean Cancel-during-
+  walk no-op), computes the DAG via `tasks::compute_dag`, claims one ready task at
+  a time (`Todo → InProgress → Done` with a `dag_updated` publish per transition),
+  and when all tasks are `Done` sets `epic.status='Completed'` + publishes
+  `epic_updated` on `epic:<id>` and `board_updated` on `project:<id>`. If no task
+  is ready but not all are `Done` (all blocked, none InProgress), it logs a warning
+  and stops (no infinite-loop; a valid acyclic DAG never hits this). The worker
+  owns `InProgress → Completed` — manual lane moves to `Completed` stay `409`.
+  `deerborn-server/src/lanes.rs` — the `Ready → InProgress` arm now explicitly
+  writes `lease_owner=NULL, lease_expires_at=NULL` (the §2.3 enqueue shape) and
+  `spawn_stub_worker`s (fire-and-forget). The HTTP response is unchanged (`200`
+  with the updated epic). `deerborn-server/src/config.rs` — added
+  `stub_worker_delay_ms: u64` (default `600` in production, `0` in tests; optional
+  env override `DEERBORN_STUB_WORKER_DELAY_MS`). `lib.rs` — `pub mod worker`. No
+  new routes, no new migration, no schema change. 6 hermetic tests in `worker.rs`
+  (linear DAG, branching DAG, empty epic, non-InProgress no-op, no-sibling-
+  InProgress invariant, end-to-end AC via the lane endpoint with §2.3 contract
+  shape assertions). Client: `EpicKanbanView.vue` gained a tiny "worker running…"
+  hint when `epic.status==='InProgress'` (the live card movement already shows the
+  walk). Server: 130 tests green (+6); client: 31 tests green; clippy clean.
+  CONVENTIONS.md updated for the enqueue + worker contract.
+
+**Phase 4 complete** — T-401 through T-403 all merged; the kanban, the epic-detail
+  task board, and the In Progress enqueue seam all work end to end. The stub
+  worker walks a Ready epic's DAG to Completed, writing the exact queue/lease rows
+  Half 2's claim predicate will read. The §8 Definition of Done is met: a user can
+  create a project, plan an epic (product + technical), break it into a task DAG,
+  hand-edit it in Ready, hit In Progress, and watch the stub walk it to Completed
+  — all in the browser, all durable.
 
 ---
 

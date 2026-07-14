@@ -30,6 +30,7 @@ async fn serve() -> (SocketAddr, Arc<Hub>) {
         clone_root: "./clones".to_string(),
         static_dir: "./client/dist".to_string(),
         auto_clone: false,
+        stub_worker_delay_ms: 0,
     };
     let state = AppState::new(config, db);
     let hub = state.hub.clone();

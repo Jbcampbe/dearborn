@@ -44,6 +44,10 @@ pub struct Config {
     /// (T-103). Always `true` in production; tests default it `false` so plain
     /// CRUD tests never shell out to git. Not env-configurable — an internal seam.
     pub auto_clone: bool,
+    /// Milliseconds the stub worker (T-403) sleeps between task transitions so a
+    /// browser can watch the walk. `0` in tests (hermetic + fast); `600` in
+    /// production. Optional env override: `DEERBORN_STUB_WORKER_DELAY_MS`.
+    pub stub_worker_delay_ms: u64,
 }
 
 /// Errors that prevent the server from booting with a valid configuration.
@@ -84,6 +88,10 @@ impl Config {
         let static_dir = resolve(&file, "DEERBORN_STATIC_DIR")
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| DEFAULT_STATIC_DIR.to_string());
+        let stub_worker_delay_ms = resolve(&file, "DEERBORN_STUB_WORKER_DELAY_MS")
+            .filter(|v| !v.is_empty())
+            .and_then(|v| v.parse::<u64>().ok())
+            .unwrap_or(600);
 
         Ok(Config {
             bind,
@@ -93,6 +101,7 @@ impl Config {
             clone_root,
             static_dir,
             auto_clone: true,
+            stub_worker_delay_ms,
         })
     }
 }
@@ -172,6 +181,8 @@ impl Config {
             // Plain CRUD tests must not shell out to git; T-103 tests that
             // exercise cloning flip this on explicitly.
             auto_clone: false,
+            // Tests want the stub worker to be instant (no visible delay).
+            stub_worker_delay_ms: 0,
         }
     }
 }

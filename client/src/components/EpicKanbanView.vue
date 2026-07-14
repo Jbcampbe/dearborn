@@ -113,6 +113,7 @@ onMounted(load);
         <div>
           <h1>{{ epic.title }}</h1>
           <span class="status" :data-status="epic.status">{{ epic.status }}</span>
+          <span v-if="epic.status === 'InProgress'" class="worker-hint">worker running…</span>
           <span class="conn" :data-status="streamStatus">{{ streamStatus === "open" ? "live" : streamStatus }}</span>
         </div>
         <RouterLink class="edit-link" :to="{ name: 'epic-dag', params: { id: props.id } }">
@@ -182,6 +183,12 @@ header h1 { margin: 0 0 0.3rem; }
   color: #6b7280;
 }
 .conn[data-status="open"] { color: #059669; }
+.worker-hint {
+  font-size: 0.75rem;
+  margin-left: 0.5rem;
+  color: #92400e;
+  font-style: italic;
+}
 .edit-link {
   font-size: 0.85rem;
   color: #2563eb;

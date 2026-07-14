@@ -18,6 +18,7 @@ use serde::Deserialize;
 
 use crate::board;
 use crate::epics::{fetch_epic, Epic};
+use crate::worker;
 use crate::{AppError, AppResult, AppState};
 
 /// The epic lane set (§2.2 stored values — no spaces: `InProgress`/`Completed`).
@@ -119,6 +120,23 @@ pub async fn set_epic_lane(
         .publish(&format!("epic:{id}"), "epic_updated", payload);
     // ... and the board on project:<id>.
     board::publish_board(&state, &updated.project_id).await;
+
+    // T-403: the Ready → InProgress enqueue. Explicitly write the queue/lease
+    // shape from §2.3 (lease columns are NULL from creation, but this makes the
+    // enqueue explicit — "Half 1's enqueue sets epic.status='InProgress' and
+    // leaves lease_owner NULL"), then fire-and-forget the stub worker. The
+    // worker claims ready tasks one at a time (no sibling InProgress, per §2.3)
+    // and drives the epic to Completed; its progress streams over WS via
+    // dag_updated / epic_updated / board_updated. The HTTP response is still
+    // the updated epic — the worker runs in the background.
+    if epic.status == "Ready" && target == "InProgress" {
+        conn.execute(
+            "UPDATE epic SET lease_owner = NULL, lease_expires_at = NULL WHERE id = ?1",
+            params![id.clone()],
+        )
+        .await?;
+        worker::spawn_stub_worker(state.clone(), id.clone());
+    }
 
     Ok(Json(updated))
 }

@@ -135,6 +135,39 @@ disallowed move as `409 conflict`; an unknown lane value is `400 bad_request`;
 `Planning → Ready` is owned by breakdown; `InProgress → Completed` will be
 owned by the stub worker (T-403). Both are rejected by `POST /epics/{id}/lane`.
 
+#### Enqueue on In Progress + stub worker (T-403)
+
+Moving an epic **Ready → In Progress** via `POST /epics/{id}/lane` does more
+than set `epic.status='InProgress'`: it writes the queue/lease shape from §2.3
+— `lease_owner = NULL`, `lease_expires_at = NULL` (explicit even though they
+are NULL from creation) — and **spawns the stub worker** in the background.
+
+The stub worker is a **stub**: no real agent, no git, no shell-out — pure DB
+writes and WS publishes. It claims **ready** tasks one at a time (a task is
+ready when `status='Todo'` and every blocker is `Done`, per §2.3), flips each
+`Todo → InProgress → Done`, and when the DAG is fully `Done` sets
+`epic.status='Completed'`. Because it serializes (one task at a time), there is
+never a sibling `InProgress` task — exactly the invariant Half 2's claim
+predicate requires (§2.3).
+
+The stub worker **owns `InProgress → Completed`**: manual lane moves to
+`Completed` stay `409 conflict` (only the worker sets it). If the epic is moved
+to `Cancelled` or `Blocked` during the walk, the worker's next iteration sees
+the epic is no longer `InProgress` and stops cleanly (a no-op).
+
+The worker publishes live over WS so the browser watches the walk:
+
+- `dag_updated` on `epic:<id>` per task transition (`Todo → InProgress` and
+  `InProgress → Done`) — so the epic kanban (`/epic/:id/board`) and DAG editor
+  re-render cards moving in real time.
+- `epic_updated` on `epic:<id>` + `board_updated` on `project:<id>` when the
+  epic reaches `Completed` — so the project kanban re-renders the card into the
+  Completed lane.
+
+The HTTP response to the lane `POST` is still `200` with the updated epic
+(`status='InProgress'`); the worker runs in the background. The real executor
+replaces the stub in Half 2.
+
 #### Epic-detail task kanban (T-402)
 
 The client route `/epic/:id/board` renders a task-lane kanban (Todo / In
