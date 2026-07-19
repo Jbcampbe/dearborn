@@ -25,3 +25,6 @@ dist/
 
 # pi subagent run artifacts
 .pi-subagents/
+
+# project
+clones
