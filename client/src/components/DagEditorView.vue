@@ -22,6 +22,9 @@ import {
   type DagState,
 } from "../dag/stream";
 import { useDagStream, type StreamStatus } from "../dag/useDagStream";
+import AppIcon from "./AppIcon.vue";
+import StatusIcon from "./StatusIcon.vue";
+import ConfirmModal from "./ConfirmModal.vue";
 
 // Ready-lane DAG editor (T-303). Loads an epic's task DAG, subscribes to
 // `epic:<id>` for live `dag_updated`/`epic_updated` frames, and lets the user
@@ -51,6 +54,7 @@ const editAcceptance = ref<string | null>(null);
 const editStatus = ref<TaskStatus>("Todo");
 const saving = ref(false);
 const deleting = ref(false);
+const confirmDeleteId = ref<string | null>(null);
 
 // --- add-dependency form ---
 const depBlocker = ref("");
@@ -187,12 +191,14 @@ async function saveEdit() {
   }
 }
 
-async function removeTask(id: string) {
+function askRemoveTask(id: string) {
+  confirmDeleteId.value = id;
+}
+
+async function confirmRemoveTask() {
   const token = auth.token;
-  if (token === null || deleting.value) {
-    return;
-  }
-  if (!window.confirm("Delete this task and its dependency edges?")) {
+  const id = confirmDeleteId.value;
+  if (token === null || id === null || deleting.value) {
     return;
   }
   deleting.value = true;
@@ -202,6 +208,7 @@ async function removeTask(id: string) {
     if (editingId.value === id) {
       editingId.value = null;
     }
+    confirmDeleteId.value = null;
   } catch (err) {
     if (bounceIfAuth(err)) {
       return;
@@ -260,90 +267,121 @@ async function removeDependency(blockerId: string, blockedId: string) {
 
 onMounted(load);
 </script>
-
 <template>
-  <main>
-    <p class="crumb">
-      <RouterLink :to="{ name: 'projects' }">← Projects</RouterLink>
-      <template v-if="epic">
-        <span class="sep">/</span>
-        <RouterLink :to="{ name: 'epic-planning', params: { id: props.id } }">Planning</RouterLink>
-      </template>
-    </p>
+  <main class="page page-wide">
+    <nav class="crumbs">
+      <RouterLink :to="{ name: 'projects' }">Projects</RouterLink>
+      <span class="sep">/</span>
+      <RouterLink :to="{ name: 'epic-planning', params: { id: props.id } }">Planning</RouterLink>
+      <span class="sep">/</span>
+      <span class="current">DAG editor</span>
+    </nav>
 
-    <p v-if="loading">Loading…</p>
-    <p v-else-if="error && !epic" class="error" role="alert">{{ error }}</p>
+    <div v-if="loading" class="loading-stack" aria-label="Loading DAG">
+      <div class="skeleton sk-title" />
+      <div class="skeleton sk-block" />
+    </div>
+    <p v-else-if="error && !epic" class="banner banner-error" role="alert">{{ error }}</p>
 
     <template v-else-if="epic">
-      <header>
-        <div>
-          <h1>{{ epic.title }}</h1>
-          <span class="status" :data-status="epic.status">{{ epic.status }}</span>
-          <span class="conn" :data-status="streamStatus">{{ streamStatus === "open" ? "live" : streamStatus }}</span>
+      <header class="head fade-in">
+        <div class="head-main">
+          <h1 class="page-title">{{ epic.title }}</h1>
+          <div class="head-badges">
+            <span class="badge">
+              <StatusIcon :status="epic.status" :size="11" />
+              {{ epic.status }}
+            </span>
+            <span v-if="!isReady" class="head-hint">
+              The epic isn't <strong>Ready</strong> yet — the editor is read-mostly until
+              breakdown completes.
+            </span>
+          </div>
         </div>
-        <p v-if="!isReady" class="hint">
-          The epic isn't <strong>Ready</strong> yet — the editor is read-mostly until breakdown completes.
-        </p>
-        <RouterLink class="board-link" :to="{ name: 'epic-board', params: { id: props.id } }">
-          Board view
-        </RouterLink>
+        <div class="head-side">
+          <span class="conn" :data-status="streamStatus">{{ streamStatus === "open" ? "live" : streamStatus }}</span>
+          <RouterLink class="btn btn-ghost" :to="{ name: 'epic-board', params: { id: props.id } }">
+            <AppIcon name="board" :size="13" />
+            Board view
+          </RouterLink>
+        </div>
       </header>
 
-      <p v-if="error" class="error inline" role="alert">{{ error }}</p>
+      <p v-if="error" class="banner banner-error" role="alert">{{ error }}</p>
 
       <div class="columns">
         <!-- Tasks ---------------------------------------------------------- -->
         <section class="tasks">
-          <h2>Tasks ({{ nodes.length }})</h2>
+          <div class="section-head">
+            <h2>Tasks</h2>
+            <span class="count">{{ nodes.length }}</span>
+          </div>
 
           <details class="add-form">
-            <summary>Add a task{{ !isReady ? " (Ready lane only)" : "" }}</summary>
+            <summary>
+              <AppIcon name="plus" :size="13" />
+              Add a task{{ !isReady ? " (Ready lane only)" : "" }}
+            </summary>
             <form @submit.prevent="addTask">
-              <input v-model="newTitle" placeholder="Title" :disabled="creating || !isReady" />
-              <textarea v-model="newDescription" rows="2" placeholder="Description (end-to-end behavior)" :disabled="creating || !isReady" />
-              <textarea v-model="newAcceptance" rows="2" placeholder="Acceptance criteria" :disabled="creating || !isReady" />
-              <button :disabled="creating || !isReady || newTitle.trim().length === 0">
-                {{ creating ? "Adding…" : "Add task" }}
-              </button>
+              <input v-model="newTitle" class="input" placeholder="Title" :disabled="creating || !isReady" />
+              <textarea v-model="newDescription" class="textarea" rows="2" placeholder="Description (end-to-end behavior)" :disabled="creating || !isReady" />
+              <textarea v-model="newAcceptance" class="textarea" rows="2" placeholder="Acceptance criteria" :disabled="creating || !isReady" />
+              <div class="form-actions">
+                <button class="btn btn-primary" :disabled="creating || !isReady || newTitle.trim().length === 0">
+                  {{ creating ? "Adding…" : "Add task" }}
+                </button>
+              </div>
             </form>
           </details>
 
-          <p v-if="nodes.length === 0" class="empty">
-            No tasks yet. Run breakdown from the planning view, or add one by hand.
-          </p>
+          <div v-if="nodes.length === 0" class="empty-state">
+            <AppIcon name="diagram" :size="20" />
+            <p>No tasks yet. Run breakdown from the planning view, or add one by hand.</p>
+          </div>
 
-          <ul class="task-list">
-            <li v-for="n in nodes" :key="n.id" class="task" :data-status="n.status" :data-ready="n.ready">
+          <ul v-else class="task-list">
+            <li v-for="n in nodes" :key="n.id" class="card task" :data-status="n.status" :data-ready="n.ready">
               <div class="task-head">
+                <StatusIcon :status="n.status" :size="13" />
                 <span class="task-title">{{ n.title }}</span>
-                <span class="badge" :data-ready="n.ready">{{ readinessLabel(n) }}</span>
+                <span class="badge" :data-tone="n.status === 'Todo' && n.ready ? 'green' : 'neutral'">
+                  {{ readinessLabel(n) }}
+                </span>
               </div>
               <p v-if="n.description" class="task-desc">{{ n.description }}</p>
               <p v-if="n.acceptance" class="task-acc"><strong>Acceptance:</strong> {{ n.acceptance }}</p>
-              <p v-if="n.blocked_by.length" class="task-blockers">
-                <strong>Blocked by:</strong>
+              <div v-if="n.blocked_by.length" class="task-blockers">
+                <span class="blockers-label">Blocked by</span>
                 <span v-for="b in n.blocked_by" :key="b" class="chip">{{ titleOf(b) }}</span>
-              </p>
+              </div>
 
               <div v-if="editingId === n.id" class="edit-panel">
-                <input v-model="editTitle" placeholder="Title" :disabled="saving" />
-                <textarea v-model="editDescription" rows="2" placeholder="Description (empty to clear)" :disabled="saving" />
-                <textarea v-model="editAcceptance" rows="2" placeholder="Acceptance (empty to clear)" :disabled="saving" />
-                <label>
-                  Status
-                  <select v-model="editStatus" :disabled="saving">
+                <input v-model="editTitle" class="input" placeholder="Title" :disabled="saving" />
+                <textarea v-model="editDescription" class="textarea" rows="2" placeholder="Description (empty to clear)" :disabled="saving" />
+                <textarea v-model="editAcceptance" class="textarea" rows="2" placeholder="Acceptance (empty to clear)" :disabled="saving" />
+                <label class="edit-status">
+                  <span class="label">Status</span>
+                  <select v-model="editStatus" class="select" :disabled="saving">
                     <option v-for="s in statusOptions" :key="s" :value="s">{{ s }}</option>
                   </select>
                 </label>
                 <div class="row">
-                  <button :disabled="saving" @click="saveEdit">{{ saving ? "Saving…" : "Save" }}</button>
-                  <button :disabled="saving" @click="cancelEdit">Cancel</button>
+                  <button class="btn btn-white" :disabled="saving" @click="saveEdit">
+                    {{ saving ? "Saving…" : "Save" }}
+                  </button>
+                  <button class="btn" :disabled="saving" @click="cancelEdit">Cancel</button>
                 </div>
               </div>
 
               <div v-else class="row">
-                <button :disabled="!isReady || deleting || saving" @click="startEdit(n)">Edit</button>
-                <button :disabled="!isReady || deleting || saving" class="danger" @click="removeTask(n.id)">Delete</button>
+                <button class="btn btn-ghost btn-sm" :disabled="!isReady || deleting || saving" @click="startEdit(n)">
+                  <AppIcon name="pencil" :size="12" />
+                  Edit
+                </button>
+                <button class="btn btn-danger btn-sm" :disabled="!isReady || deleting || saving" @click="askRemoveTask(n.id)">
+                  <AppIcon name="trash" :size="12" />
+                  Delete
+                </button>
               </div>
             </li>
           </ul>
@@ -351,184 +389,316 @@ onMounted(load);
 
         <!-- Dependencies --------------------------------------------------- -->
         <aside class="deps">
-          <h2>Dependencies ({{ edges.length }})</h2>
+          <div class="section-head">
+            <h2>Dependencies</h2>
+            <span class="count">{{ edges.length }}</span>
+          </div>
 
           <details class="add-form">
-            <summary>Add a dependency{{ !isReady ? " (Ready lane only)" : "" }}</summary>
+            <summary>
+              <AppIcon name="plus" :size="13" />
+              Add a dependency{{ !isReady ? " (Ready lane only)" : "" }}
+            </summary>
             <form @submit.prevent="addDependency">
-              <label>
-                Blocker (must finish first)
-                <select v-model="depBlocker" :disabled="linking || !isReady">
+              <label class="dep-field">
+                <span class="label">Blocker (must finish first)</span>
+                <select v-model="depBlocker" class="select" :disabled="linking || !isReady">
                   <option value="" disabled>pick…</option>
                   <option v-for="n in nodes" :key="n.id" :value="n.id">{{ n.title }}</option>
                 </select>
               </label>
-              <label>
-                Blocked (waits on the blocker)
-                <select v-model="depBlocked" :disabled="linking || !isReady">
+              <label class="dep-field">
+                <span class="label">Blocked (waits on the blocker)</span>
+                <select v-model="depBlocked" class="select" :disabled="linking || !isReady">
                   <option value="" disabled>pick…</option>
                   <option v-for="n in nodes" :key="n.id" :value="n.id">{{ n.title }}</option>
                 </select>
               </label>
-              <button :disabled="linking || !isReady || !depBlocker || !depBlocked">{{ linking ? "Linking…" : "Link" }}</button>
+              <div class="form-actions">
+                <button class="btn btn-white" :disabled="linking || !isReady || !depBlocker || !depBlocked">
+                  {{ linking ? "Linking…" : "Link" }}
+                </button>
+              </div>
             </form>
           </details>
 
-          <p v-if="edges.length === 0" class="empty">No dependencies.</p>
-          <ul class="edge-list">
+          <p v-if="edges.length === 0" class="deps-empty">No dependencies.</p>
+          <ul v-else class="edge-list">
             <li v-for="e in edges" :key="`${e.blocker_id}-${e.blocked_id}`" class="edge">
-              <span class="edge-names">{{ titleOf(e.blocker_id) }} → {{ titleOf(e.blocked_id) }}</span>
-              <button class="danger" @click="removeDependency(e.blocker_id, e.blocked_id)">Remove</button>
+              <span class="edge-names">
+                {{ titleOf(e.blocker_id) }}
+                <AppIcon name="arrow-right" :size="12" />
+                {{ titleOf(e.blocked_id) }}
+              </span>
+              <button class="btn btn-icon" aria-label="Remove dependency" @click="removeDependency(e.blocker_id, e.blocked_id)">
+                <AppIcon name="x" :size="12" />
+              </button>
             </li>
           </ul>
         </aside>
       </div>
     </template>
+
+    <ConfirmModal
+      :open="confirmDeleteId !== null"
+      title="Delete task"
+      message="Delete this task and its dependency edges? This cannot be undone."
+      :busy="deleting"
+      @confirm="confirmRemoveTask"
+      @cancel="confirmDeleteId = null"
+    />
   </main>
 </template>
 
 <style scoped>
-main {
-  max-width: 72rem;
-  margin: 2rem auto;
-  padding: 0 1rem;
+.head {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: var(--spacing-16);
+  margin-bottom: var(--spacing-20);
 }
-.crumb { margin: 0 0 1rem; }
-.crumb a { color: #2563eb; text-decoration: none; }
-.crumb .sep { margin: 0 0.5rem; color: #9ca3af; }
-header { display: flex; align-items: flex-start; justify-content: space-between; gap: 1rem; }
-header h1 { margin: 0 0 0.3rem; }
-.status {
-  font-size: 0.8rem;
-  padding: 0.1rem 0.5rem;
-  border-radius: 999px;
-  background: #eef2ff;
-  color: #3730a3;
+
+.head-main {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-8);
+  min-width: 0;
 }
-.status[data-status="Ready"] { background: #ecfdf5; color: #065f46; }
-.status[data-status="InProgress"] { background: #fef3c7; color: #92400e; }
-.conn {
-  font-size: 0.75rem;
-  margin-left: 0.5rem;
-  color: #6b7280;
+
+.head-badges {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-12);
+  flex-wrap: wrap;
 }
-.conn[data-status="open"] { color: #059669; }
-.hint { font-size: 0.85rem; color: #6b7280; max-width: 24rem; text-align: right; }
-.board-link { font-size: 0.85rem; color: #2563eb; text-decoration: none; white-space: nowrap; }
-.board-link:hover { text-decoration: underline; }
-.error { color: #b91c1c; }
-.error.inline { margin: 1rem 0; }
+
+.head-hint {
+  font-size: var(--text-label);
+  color: var(--text-faint);
+  line-height: 1.4;
+}
+
+.head-hint strong {
+  color: var(--text-muted);
+  font-weight: var(--weight-medium);
+}
+
+.head-side {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-16);
+  flex-shrink: 0;
+}
 
 .columns {
   display: grid;
-  grid-template-columns: 2fr 1fr;
-  gap: 1.5rem;
-  margin-top: 1rem;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+  gap: var(--spacing-32);
+  margin-top: var(--spacing-16);
 }
+
 @media (max-width: 60rem) {
-  .columns { grid-template-columns: 1fr; }
+  .columns {
+    grid-template-columns: 1fr;
+  }
 }
-h2 { font-size: 1.1rem; margin: 0 0 0.75rem; }
+
+.section-head {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-8);
+  margin-bottom: var(--spacing-12);
+}
+
+.section-head h2 {
+  font-size: var(--text-body-sm);
+  font-weight: var(--weight-medium);
+}
+
+.count {
+  font-size: var(--text-label);
+  color: var(--text-faint);
+}
 
 .add-form {
-  border: 1px solid #e5e7eb;
-  border-radius: 8px;
-  padding: 0.5rem 0.75rem;
-  margin-bottom: 1rem;
-  background: #f9fafb;
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-cards);
+  padding: 10px var(--spacing-12);
+  margin-bottom: var(--spacing-16);
+  background: var(--surface-carbon);
 }
-.add-form summary { cursor: pointer; font-weight: 600; color: #374151; }
-.add-form form { display: flex; flex-direction: column; gap: 0.5rem; margin-top: 0.75rem; }
-.add-form input,
-.add-form textarea,
-.add-form select {
-  font: inherit;
-  padding: 0.4rem 0.5rem;
-  border: 1px solid #d1d5db;
-  border-radius: 6px;
-}
-.add-form button {
-  font: inherit;
-  padding: 0.4rem 0.9rem;
-  border: 1px solid #2563eb;
-  border-radius: 6px;
-  background: #2563eb;
-  color: white;
-  cursor: pointer;
-}
-.add-form button:disabled { opacity: 0.5; cursor: not-allowed; }
 
-.empty { color: #6b7280; font-size: 0.9rem; }
-.task-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.75rem; }
-.task {
-  border: 1px solid #e5e7eb;
-  border-radius: 8px;
-  padding: 0.75rem 1rem;
-  background: white;
-}
-.task[data-ready="true"] { border-color: #a7f3d0; }
-.task-head { display: flex; align-items: center; justify-content: space-between; gap: 0.5rem; }
-.task-title { font-weight: 600; }
-.badge {
-  font-size: 0.7rem;
-  padding: 0.1rem 0.5rem;
-  border-radius: 999px;
-  background: #f3f4f6;
-  color: #374151;
-}
-.badge[data-ready="true"] { background: #ecfdf5; color: #065f46; }
-.task-desc { margin: 0.4rem 0 0; font-size: 0.9rem; color: #374151; white-space: pre-wrap; }
-.task-acc { margin: 0.3rem 0 0; font-size: 0.85rem; color: #6b7280; }
-.task-blockers { margin: 0.3rem 0 0; font-size: 0.8rem; color: #6b7280; }
-.chip {
-  display: inline-block;
-  margin-left: 0.3rem;
-  padding: 0.05rem 0.4rem;
-  border-radius: 6px;
-  background: #fef3c7;
-  color: #92400e;
-  font-size: 0.75rem;
-}
-.row { display: flex; gap: 0.5rem; margin-top: 0.6rem; }
-.row button, .edge button {
-  font: inherit;
-  padding: 0.3rem 0.8rem;
-  border: 1px solid #d1d5db;
-  border-radius: 6px;
-  background: white;
+.add-form summary {
   cursor: pointer;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--text-caption);
+  font-weight: var(--weight-medium);
+  color: var(--text-muted);
+  user-select: none;
+  list-style: none;
 }
-.row button.danger, .edge button.danger { color: #b91c1c; border-color: #fca5a5; }
-button:disabled { opacity: 0.5; cursor: not-allowed; }
 
-.edit-panel {
-  margin-top: 0.6rem;
+.add-form summary:hover {
+  color: var(--text-primary);
+}
+
+.add-form form {
   display: flex;
   flex-direction: column;
-  gap: 0.5rem;
+  gap: var(--spacing-8);
+  margin-top: var(--spacing-12);
 }
-.edit-panel input,
-.edit-panel textarea,
-.edit-panel select {
-  font: inherit;
-  padding: 0.4rem 0.5rem;
-  border: 1px solid #d1d5db;
-  border-radius: 6px;
-}
-.edit-panel label { display: flex; flex-direction: column; gap: 0.2rem; font-size: 0.8rem; color: #6b7280; }
 
-.deps { border-left: 1px solid #e5e7eb; padding-left: 1.5rem; }
-@media (max-width: 60rem) { .deps { border-left: none; padding-left: 0; } }
-.edge-list { list-style: none; margin: 0; padding: 0; display: flex; flex-direction: column; gap: 0.4rem; }
+.form-actions {
+  display: flex;
+  justify-content: flex-end;
+}
+
+.dep-field {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
+.task-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-8);
+}
+
+.task {
+  padding: var(--spacing-12) var(--spacing-16);
+  transition: border-color var(--duration-fast) var(--ease-out);
+}
+
+.task[data-ready="true"][data-status="Todo"] {
+  border-color: rgba(39, 166, 68, 0.35);
+}
+
+.task-head {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-8);
+}
+
+.task-title {
+  flex: 1;
+  min-width: 0;
+  font-size: 13.5px;
+  font-weight: var(--weight-medium);
+  color: var(--text-primary);
+}
+
+.task-desc {
+  margin-top: var(--spacing-8);
+  font-size: var(--text-caption);
+  color: var(--text-muted);
+  line-height: 1.5;
+  white-space: pre-wrap;
+}
+
+.task-acc {
+  margin-top: var(--spacing-8);
+  font-size: var(--text-label);
+  color: var(--text-faint);
+  line-height: 1.5;
+}
+
+.task-acc strong {
+  color: var(--text-muted);
+  font-weight: var(--weight-medium);
+}
+
+.task-blockers {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
+  margin-top: var(--spacing-8);
+}
+
+.blockers-label {
+  font-size: 11px;
+  font-weight: var(--weight-medium);
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.row {
+  display: flex;
+  gap: var(--spacing-8);
+  margin-top: var(--spacing-12);
+}
+
+.edit-panel {
+  margin-top: var(--spacing-12);
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-8);
+  padding-top: var(--spacing-12);
+  border-top: 1px solid var(--border-hairline);
+}
+
+.edit-status {
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+  max-width: 200px;
+}
+
+.deps-empty {
+  font-size: var(--text-caption);
+  color: var(--text-faint);
+}
+
+.edge-list {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
+}
+
 .edge {
   display: flex;
   align-items: center;
   justify-content: space-between;
-  gap: 0.5rem;
-  font-size: 0.9rem;
-  padding: 0.3rem 0.5rem;
-  border: 1px solid #f3f4f6;
-  border-radius: 6px;
+  gap: var(--spacing-8);
+  padding: 6px 10px;
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-buttons);
+  background: rgba(255, 255, 255, 0.015);
+  font-size: var(--text-caption);
 }
-.edge-names { color: #374151; }
+
+.edge-names {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-body);
+  min-width: 0;
+}
+
+.loading-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-16);
+}
+
+.sk-title {
+  height: 28px;
+  width: 280px;
+}
+
+.sk-block {
+  height: 320px;
+}
 </style>

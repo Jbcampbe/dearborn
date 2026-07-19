@@ -2,19 +2,23 @@
 import { onMounted, ref } from "vue";
 import { RouterLink } from "vue-router";
 import { useAuthStore } from "../stores/auth";
+import { useProjectsStore } from "../stores/projects";
 import { ApiError } from "../api/client";
-import { listProjects, type Project } from "../api/projects";
+import type { Project } from "../api/projects";
 import CreateProjectForm from "./CreateProjectForm.vue";
 import CloneStatusBadge from "./CloneStatusBadge.vue";
+import AppModal from "./AppModal.vue";
+import AppIcon from "./AppIcon.vue";
 
-// The projects home: a create form beside the live list. Fetches `GET /projects`
-// with the stored bearer token; a `401` bounces back to the token screen with a
-// message (never a silent failure). A newly created project is prepended to the
-// list without a round trip.
+// The projects home: a Linear-style row list behind a modal create form. The
+// list itself lives in the shared projects store (the sidebar consumes it
+// too); a `401` bounces back to the token screen with a message (never a
+// silent failure). A newly created project is prepended without a round trip.
 const auth = useAuthStore();
-const projects = ref<Project[]>([]);
+const store = useProjectsStore();
 const loading = ref(true);
 const error = ref<string | null>(null);
+const createOpen = ref(false);
 
 async function load() {
   const token = auth.token;
@@ -24,7 +28,7 @@ async function load() {
   loading.value = true;
   error.value = null;
   try {
-    projects.value = await listProjects(token);
+    await store.load(token);
   } catch (err) {
     if (err instanceof ApiError && err.isAuth) {
       auth.logout(`Token rejected (401): ${err.message}. Please re-enter it.`);
@@ -37,146 +41,139 @@ async function load() {
 }
 
 function onCreated(project: Project) {
-  projects.value = [project, ...projects.value];
+  store.add(project);
+  createOpen.value = false;
 }
 
 onMounted(load);
 </script>
 
 <template>
-  <main>
-    <header>
-      <h1>Deerborn</h1>
-      <button class="logout" @click="auth.logout()">Log out</button>
+  <main class="page">
+    <header class="head">
+      <div>
+        <h1 class="page-title">Projects</h1>
+        <p class="page-sub">{{ store.projects.length }} total</p>
+      </div>
+      <button class="btn btn-primary" @click="createOpen = true">
+        <AppIcon name="plus" :size="13" />
+        New project
+      </button>
     </header>
 
-    <div class="layout">
-      <CreateProjectForm @created="onCreated" />
-
-      <section class="list-panel">
-        <div class="row">
-          <h2>Projects ({{ projects.length }})</h2>
-          <button class="refresh" :disabled="loading" @click="load">Reload</button>
-        </div>
-
-        <p v-if="loading">Loading…</p>
-        <p v-else-if="error" class="error" role="alert">{{ error }}</p>
-        <p v-else-if="projects.length === 0" class="empty">
-          No projects yet. Create one to get started.
-        </p>
-        <ul v-else class="projects">
-          <li v-for="project in projects" :key="project.id">
-            <RouterLink
-              class="project-link"
-              :to="{ name: 'project-detail', params: { id: project.id } }"
-            >
-              <span class="name">{{ project.name }}</span>
-              <span class="repo">{{ project.repo_url }}</span>
-              <CloneStatusBadge :status="project.clone_status" />
-            </RouterLink>
-            <p v-if="project.clone_status === 'error' && project.clone_error" class="clone-error">
-              {{ project.clone_error }}
-            </p>
-          </li>
-        </ul>
-      </section>
+    <div v-if="loading" class="rows-skeleton" aria-label="Loading projects">
+      <div v-for="i in 4" :key="i" class="skeleton sk-row" />
     </div>
+
+    <p v-else-if="error" class="banner banner-error" role="alert">{{ error }}</p>
+
+    <div v-else-if="store.projects.length === 0" class="empty-state">
+      <AppIcon name="box" :size="20" />
+      <p>No projects yet. Create one to start planning epics.</p>
+      <button class="btn btn-ghost" @click="createOpen = true">
+        <AppIcon name="plus" :size="13" />
+        New project
+      </button>
+    </div>
+
+    <ul v-else class="rows fade-in">
+      <li v-for="project in store.projects" :key="project.id">
+        <RouterLink
+          class="row card-interactive"
+          :to="{ name: 'project-detail', params: { id: project.id } }"
+        >
+          <span class="row-name">{{ project.name }}</span>
+          <span class="row-repo mono">{{ project.repo_url }}</span>
+          <CloneStatusBadge :status="project.clone_status" />
+          <AppIcon class="row-chevron" name="chevron-right" :size="14" />
+        </RouterLink>
+        <p v-if="project.clone_status === 'error' && project.clone_error" class="clone-error">
+          {{ project.clone_error }}
+        </p>
+      </li>
+    </ul>
+
+    <AppModal :open="createOpen" title="New project" :width="480" @close="createOpen = false">
+      <CreateProjectForm @created="onCreated" @cancel="createOpen = false" />
+    </AppModal>
   </main>
 </template>
 
 <style scoped>
-main {
-  max-width: 60rem;
-  margin: 3rem auto;
-  padding: 0 1rem;
-}
-header {
+.head {
   display: flex;
-  align-items: baseline;
+  align-items: center;
   justify-content: space-between;
+  gap: var(--spacing-16);
+  margin-bottom: var(--spacing-24);
 }
-.logout {
-  font: inherit;
-  padding: 0.3rem 0.7rem;
-  border: 1px solid #ccc;
-  border-radius: 6px;
-  background: #f3f4f6;
-  cursor: pointer;
+
+.rows {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-cards);
+  background: var(--surface-carbon);
+  overflow: hidden;
 }
-.layout {
-  display: grid;
-  grid-template-columns: 22rem 1fr;
-  gap: 2rem;
-  align-items: start;
+
+.rows li + li {
+  border-top: 1px solid var(--border-hairline);
 }
-@media (max-width: 46rem) {
-  .layout {
-    grid-template-columns: 1fr;
-  }
-}
+
 .row {
   display: flex;
   align-items: center;
-  gap: 1rem;
+  gap: var(--spacing-16);
+  padding: var(--spacing-12) var(--spacing-16);
 }
-.refresh {
-  font: inherit;
-  padding: 0.3rem 0.7rem;
-  border: 1px solid #ccc;
-  border-radius: 6px;
-  background: #f3f4f6;
-  cursor: pointer;
+
+.row-name {
+  font-weight: var(--weight-medium);
+  font-size: 13.5px;
+  color: var(--text-primary);
+  min-width: 10rem;
 }
-.refresh:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
-}
-.empty {
-  color: #555;
-}
-.error {
-  padding: 0.6rem 0.75rem;
-  color: #991b1b;
-  background: #fee2e2;
-  border: 1px solid #fca5a5;
-  border-radius: 6px;
-}
-.projects {
-  list-style: none;
-  padding: 0;
-  margin: 0;
-}
-.projects li {
-  border-bottom: 1px solid #eee;
-}
-.project-link {
-  display: flex;
-  gap: 1rem;
-  align-items: center;
-  padding: 0.7rem 0.4rem;
-  text-decoration: none;
-  color: inherit;
-  border-radius: 6px;
-}
-.project-link:hover {
-  background: #f3f4f6;
-}
-.name {
-  font-weight: 600;
-}
-.repo {
-  color: #555;
-  font-size: 0.9rem;
+
+.row-repo {
+  flex: 1;
+  min-width: 0;
   overflow: hidden;
   text-overflow: ellipsis;
   white-space: nowrap;
+  color: var(--text-faint);
 }
-.project-link :deep(.badge) {
-  margin-left: auto;
+
+.row-chevron {
+  color: var(--text-faint);
+  transition:
+    color var(--duration-fast) var(--ease-out),
+    transform var(--duration-fast) var(--ease-out);
 }
+
+.row:hover .row-chevron {
+  color: var(--text-muted);
+  transform: translateX(2px);
+}
+
 .clone-error {
-  margin: 0 0.4rem 0.5rem;
-  font-size: 0.8rem;
-  color: #991b1b;
+  padding: 0 var(--spacing-16) var(--spacing-12);
+  font-size: var(--text-label);
+  color: var(--color-coral-red);
+}
+
+.rows-skeleton {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-8);
+}
+
+.sk-row {
+  height: 46px;
+}
+
+.empty-state .btn {
+  margin-top: var(--spacing-8);
 }
 </style>

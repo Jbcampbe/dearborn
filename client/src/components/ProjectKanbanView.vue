@@ -9,6 +9,7 @@ import type { Epic } from "../api/epics";
 import type { Task } from "../api/tasks";
 import { hydrateBoard, initialBoardState, type BoardState } from "../board/stream";
 import { useBoardStream, type StreamStatus } from "../board/useBoardStream";
+import StatusIcon from "./StatusIcon.vue";
 
 // Project-detail kanban (T-401). Loads the project board (epics + standalone
 // tasks), subscribes to `project:<id>` for live `board_updated` frames, and
@@ -97,6 +98,10 @@ function permittedTargets(currentStatus: string): EpicLane[] {
   return PERMITTED_TRANSITIONS[currentStatus] ?? [];
 }
 
+function laneLabel(key: string): string {
+  return LANES.find((l) => l.key === key)?.label ?? key;
+}
+
 function bounceIfAuth(err: unknown): boolean {
   if (err instanceof ApiError && err.isAuth) {
     auth.logout(`Token rejected (401): ${err.message}. Please re-enter it.`);
@@ -149,53 +154,78 @@ onMounted(load);
 
 <template>
   <section class="kanban">
-    <div class="kanban-head">
+    <div class="section-head">
       <h2>Board</h2>
       <span class="conn" :data-status="streamStatus">{{ streamStatus === "open" ? "live" : streamStatus }}</span>
     </div>
 
-    <p v-if="loading">Loading board…</p>
-    <p v-else-if="error" class="error" role="alert">{{ error }}</p>
+    <div v-if="loading" class="lanes-skeleton" aria-label="Loading board">
+      <div v-for="i in 4" :key="i" class="skeleton sk-lane" />
+    </div>
+    <p v-else-if="error" class="banner banner-error" role="alert">{{ error }}</p>
 
-    <div v-else class="lanes">
+    <div v-else class="lanes fade-in">
       <div v-for="lane in LANES" :key="lane.key" class="lane" :data-lane="lane.key">
-        <h3>{{ lane.label }}</h3>
+        <header class="lane-head">
+          <StatusIcon :status="lane.key" :size="13" />
+          <h3>{{ lane.label }}</h3>
+          <span class="lane-count">
+            {{ (epicsByLane[lane.key]?.length ?? 0) + (tasksByLane[lane.key]?.length ?? 0) }}
+          </span>
+        </header>
 
-        <template v-if="epicsByLane[lane.key]?.length || tasksByLane[lane.key]?.length">
-          <div v-for="epic in epicsByLane[lane.key]" :key="epic.id" class="card epic-card">
-            <div class="card-links">
+        <div class="lane-body">
+          <div
+            v-for="epic in epicsByLane[lane.key]"
+            :key="epic.id"
+            class="card card-interactive epic-card"
+          >
+            <RouterLink
+              class="card-title"
+              :to="{ name: 'epic-planning', params: { id: epic.id } }"
+            >
+              {{ epic.title }}
+            </RouterLink>
+            <div class="card-foot">
+              <span class="badge">
+                <StatusIcon :status="epic.status" :size="11" />
+                Epic
+              </span>
               <RouterLink
-                class="card-title"
-                :to="{ name: 'epic-planning', params: { id: epic.id } }"
-              >
-                {{ epic.title }}
-              </RouterLink>
-              <RouterLink
-                class="board-link"
+                class="card-open"
                 :to="{ name: 'epic-board', params: { id: epic.id } }"
               >
                 Board
               </RouterLink>
-            </div>
-            <span class="tag">Epic</span>
-            <div v-if="permittedTargets(epic.status).length" class="lane-move">
               <select
+                v-if="permittedTargets(epic.status).length"
+                class="lane-move select"
                 :value="epic.status"
+                aria-label="Move epic to lane"
                 @change="moveLane(epic, ($event.target as HTMLSelectElement).value as EpicLane)"
               >
-                <option :value="epic.status" disabled>{{ epic.status }}</option>
-                <option v-for="t in permittedTargets(epic.status)" :key="t" :value="t">{{ t }}</option>
+                <option :value="epic.status" disabled>Move to…</option>
+                <option v-for="t in permittedTargets(epic.status)" :key="t" :value="t">
+                  {{ laneLabel(t) }}
+                </option>
               </select>
             </div>
           </div>
 
           <div v-for="task in tasksByLane[lane.key]" :key="task.id" class="card task-card">
             <span class="card-title">{{ task.title }}</span>
-            <span class="tag task-tag">Task</span>
+            <div class="card-foot">
+              <span class="badge">
+                <StatusIcon :status="task.status" :size="11" />
+                Task
+              </span>
+            </div>
           </div>
-        </template>
 
-        <p v-else class="empty-lane">—</p>
+          <p v-if="!epicsByLane[lane.key]?.length && !tasksByLane[lane.key]?.length" class="empty-lane">
+            No cards
+          </p>
+        </div>
       </div>
     </div>
   </section>
@@ -203,110 +233,137 @@ onMounted(load);
 
 <style scoped>
 .kanban {
-  margin-top: 2rem;
+  margin-bottom: var(--spacing-32);
 }
-.kanban-head {
+
+.section-head {
   display: flex;
   align-items: center;
-  gap: 0.75rem;
+  gap: var(--spacing-12);
+  margin-bottom: var(--spacing-12);
 }
-.kanban-head h2 {
-  margin: 0;
+
+.section-head h2 {
+  font-size: var(--text-body-sm);
+  font-weight: var(--weight-medium);
 }
-.conn {
-  font-size: 0.75rem;
-  color: #6b7280;
-}
-.conn[data-status="open"] {
-  color: #059669;
-}
-.error {
-  color: #b91c1c;
-}
+
 .lanes {
   display: flex;
-  gap: 0.75rem;
+  gap: var(--spacing-12);
   overflow-x: auto;
-  padding-bottom: 0.5rem;
-  margin-top: 1rem;
+  padding-bottom: var(--spacing-8);
+  align-items: flex-start;
 }
+
 .lane {
-  flex: 0 0 16rem;
-  min-height: 8rem;
-  border: 1px solid #e5e7eb;
-  border-radius: 10px;
-  background: #f9fafb;
-  padding: 0.5rem 0.6rem;
-}
-.lane h3 {
-  margin: 0 0 0.5rem;
-  font-size: 0.9rem;
-  color: #374151;
-  border-bottom: 1px solid #e5e7eb;
-  padding-bottom: 0.3rem;
-}
-.empty-lane {
-  color: #d1d5db;
-  text-align: center;
-  margin: 1rem 0;
-}
-.card {
-  border: 1px solid #e5e7eb;
-  border-radius: 8px;
-  background: white;
-  padding: 0.5rem 0.6rem;
-  margin-bottom: 0.5rem;
-}
-.epic-card {
-  border-left: 3px solid #6366f1;
-}
-.task-card {
-  border-left: 3px solid #f59e0b;
-}
-.card-title {
-  font-weight: 600;
-  font-size: 0.9rem;
-  text-decoration: none;
-  color: #1f2937;
-}
-.card-title:hover {
-  text-decoration: underline;
-}
-.card-links {
+  flex: 0 0 264px;
   display: flex;
-  align-items: baseline;
-  gap: 0.5rem;
+  flex-direction: column;
+  max-height: 70vh;
+  border-radius: var(--radius-cards);
+  background: rgba(255, 255, 255, 0.015);
+  border: 1px solid var(--border-hairline);
 }
-.board-link {
-  font-size: 0.75rem;
-  color: #2563eb;
-  text-decoration: none;
+
+.lane-head {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-8);
+  padding: 10px var(--spacing-12);
+  border-bottom: 1px solid var(--border-hairline);
 }
-.board-link:hover {
-  text-decoration: underline;
+
+.lane-head h3 {
+  font-size: var(--text-caption);
+  font-weight: var(--weight-medium);
+  color: var(--text-body);
 }
-.tag {
-  display: inline-block;
-  margin-left: 0.4rem;
-  font-size: 0.65rem;
-  padding: 0.05rem 0.4rem;
-  border-radius: 999px;
-  background: #eef2ff;
-  color: #3730a3;
+
+.lane-count {
+  margin-left: auto;
+  font-size: var(--text-label);
+  color: var(--text-faint);
 }
-.task-tag {
-  background: #fef3c7;
-  color: #92400e;
+
+.lane-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-8);
+  padding: var(--spacing-8);
+  overflow-y: auto;
+  min-height: 72px;
 }
+
+.epic-card,
+.task-card {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-8);
+  padding: 10px var(--spacing-12);
+}
+
+.card-title {
+  font-size: var(--text-caption);
+  font-weight: var(--weight-regular);
+  color: var(--text-primary);
+  line-height: 1.4;
+}
+
+.card-foot {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: var(--spacing-8);
+}
+
 .lane-move {
-  margin-top: 0.35rem;
+  width: auto;
+  padding: 2px 22px 2px 8px;
+  font-size: 11.5px;
+  line-height: 1.5;
+  background-position: right 6px center;
+  opacity: 0;
+  transition:
+    opacity var(--duration-fast) var(--ease-out),
+    border-color var(--duration-fast) var(--ease-out);
 }
-.lane-move select {
-  font: inherit;
-  font-size: 0.8rem;
-  padding: 0.15rem 0.3rem;
-  border: 1px solid #d1d5db;
-  border-radius: 6px;
-  width: 100%;
+
+.card-open {
+  font-size: 11.5px;
+  color: var(--text-faint);
+  opacity: 0;
+  transition:
+    opacity var(--duration-fast) var(--ease-out),
+    color var(--duration-fast) var(--ease-out);
+}
+
+.card-open:hover {
+  color: var(--text-primary);
+}
+
+.epic-card:hover .lane-move,
+.epic-card:hover .card-open,
+.lane-move:focus,
+.card-open:focus {
+  opacity: 1;
+}
+
+.empty-lane {
+  padding: var(--spacing-16) 0;
+  text-align: center;
+  font-size: var(--text-label);
+  color: var(--text-faint);
+}
+
+.lanes-skeleton {
+  display: flex;
+  gap: var(--spacing-12);
+  overflow: hidden;
+}
+
+.sk-lane {
+  flex: 0 0 264px;
+  height: 240px;
 }
 </style>

@@ -19,6 +19,8 @@ import {
   tasksByStatus,
   TASK_LANES,
 } from "../board/epicLanes";
+import AppIcon from "./AppIcon.vue";
+import StatusIcon from "./StatusIcon.vue";
 
 // Epic-detail task kanban (T-402). A different *view* of the same `DagState` the
 // DAG editor (T-303) uses: it loads an epic's task DAG via `GET /epics/:id/dag`
@@ -92,60 +94,80 @@ async function load() {
 
 onMounted(load);
 </script>
-
 <template>
-  <main>
-    <p class="crumb">
-      <RouterLink :to="{ name: 'projects' }">← Projects</RouterLink>
+  <main class="page page-wide">
+    <nav class="crumbs">
+      <RouterLink :to="{ name: 'projects' }">Projects</RouterLink>
       <template v-if="epic">
         <span class="sep">/</span>
         <RouterLink :to="{ name: 'epic-planning', params: { id: props.id } }">Planning</RouterLink>
         <span class="sep">/</span>
         <RouterLink :to="{ name: 'epic-dag', params: { id: props.id } }">DAG</RouterLink>
       </template>
-    </p>
+      <span class="sep">/</span>
+      <span class="current">Board</span>
+    </nav>
 
-    <p v-if="loading">Loading…</p>
-    <p v-else-if="error && !epic" class="error" role="alert">{{ error }}</p>
+    <div v-if="loading" class="lanes-skeleton" aria-label="Loading board">
+      <div v-for="i in 5" :key="i" class="skeleton sk-lane" />
+    </div>
+    <p v-else-if="error && !epic" class="banner banner-error" role="alert">{{ error }}</p>
 
     <template v-else-if="epic">
-      <header>
-        <div>
-          <h1>{{ epic.title }}</h1>
-          <span class="status" :data-status="epic.status">{{ epic.status }}</span>
-          <span v-if="epic.status === 'InProgress'" class="worker-hint">worker running…</span>
-          <span class="conn" :data-status="streamStatus">{{ streamStatus === "open" ? "live" : streamStatus }}</span>
+      <header class="head fade-in">
+        <div class="head-main">
+          <h1 class="page-title">{{ epic.title }}</h1>
+          <div class="head-badges">
+            <span class="badge">
+              <StatusIcon :status="epic.status" :size="11" />
+              {{ epic.status }}
+            </span>
+            <span v-if="epic.status === 'InProgress'" class="worker-hint">
+              <span class="worker-dot" />
+              worker running
+            </span>
+          </div>
         </div>
-        <RouterLink class="edit-link" :to="{ name: 'epic-dag', params: { id: props.id } }">
-          Edit DAG
-        </RouterLink>
+        <div class="head-side">
+          <span class="conn" :data-status="streamStatus">{{ streamStatus === "open" ? "live" : streamStatus }}</span>
+          <RouterLink class="btn btn-ghost" :to="{ name: 'epic-dag', params: { id: props.id } }">
+            <AppIcon name="diagram" :size="13" />
+            Edit DAG
+          </RouterLink>
+        </div>
       </header>
 
-      <p v-if="error" class="error inline" role="alert">{{ error }}</p>
+      <p v-if="error" class="banner banner-error" role="alert">{{ error }}</p>
 
-      <p v-if="nodes.length === 0" class="empty">
-        No tasks yet. Break the epic down from the planning view.
-      </p>
+      <div v-if="nodes.length === 0" class="empty-state">
+        <AppIcon name="board" :size="20" />
+        <p>No tasks yet. Break the epic down from the planning view.</p>
+      </div>
 
       <div v-else class="lanes">
         <div v-for="lane in TASK_LANES" :key="lane.key" class="lane" :data-lane="lane.key">
-          <h3>{{ lane.label }}</h3>
+          <header class="lane-head">
+            <StatusIcon :status="lane.key" :size="13" />
+            <h3>{{ lane.label }}</h3>
+            <span class="lane-count">{{ byLane[lane.key]?.length ?? 0 }}</span>
+          </header>
 
-          <template v-if="byLane[lane.key]?.length">
-            <div v-for="n in byLane[lane.key]" :key="n.id" class="card" :data-ready="n.ready" :data-status="n.status">
+          <div class="lane-body">
+            <div v-for="n in byLane[lane.key]" :key="n.id" class="card card-interactive task-card" :data-status="n.status">
               <div class="card-head">
                 <span class="card-title">{{ n.title }}</span>
-                <span class="badge" :data-ready="n.ready">{{ readinessLabel(n) }}</span>
+                <span class="badge" :data-tone="n.status === 'Todo' && n.ready ? 'green' : 'neutral'">
+                  {{ readinessLabel(n) }}
+                </span>
               </div>
               <p v-if="snippet(n.acceptance)" class="card-acc">{{ snippet(n.acceptance) }}</p>
-              <p v-if="n.status === 'Todo' && n.blocked_by.length" class="card-blockers">
-                <strong>Blocked by:</strong>
+              <div v-if="n.status === 'Todo' && n.blocked_by.length" class="card-blockers">
+                <span class="blockers-label">Blocked by</span>
                 <span v-for="title in blockerTitles(n)" :key="title" class="chip">{{ title }}</span>
-              </p>
+              </div>
             </div>
-          </template>
-
-          <p v-else class="empty-lane">—</p>
+            <p v-if="!byLane[lane.key]?.length" class="empty-lane">No tasks</p>
+          </div>
         </div>
       </div>
     </template>
@@ -153,134 +175,155 @@ onMounted(load);
 </template>
 
 <style scoped>
-main {
-  max-width: 96rem;
-  margin: 2rem auto;
-  padding: 0 1rem;
-}
-.crumb { margin: 0 0 1rem; }
-.crumb a { color: #2563eb; text-decoration: none; }
-.crumb .sep { margin: 0 0.5rem; color: #9ca3af; }
-header {
+.head {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 1rem;
+  gap: var(--spacing-16);
+  margin-bottom: var(--spacing-20);
 }
-header h1 { margin: 0 0 0.3rem; }
-.status {
-  font-size: 0.8rem;
-  padding: 0.1rem 0.5rem;
-  border-radius: 999px;
-  background: #eef2ff;
-  color: #3730a3;
+
+.head-main {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-8);
+  min-width: 0;
 }
-.status[data-status="Ready"] { background: #ecfdf5; color: #065f46; }
-.status[data-status="InProgress"] { background: #fef3c7; color: #92400e; }
-.conn {
-  font-size: 0.75rem;
-  margin-left: 0.5rem;
-  color: #6b7280;
+
+.head-badges {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-12);
+  flex-wrap: wrap;
 }
-.conn[data-status="open"] { color: #059669; }
+
 .worker-hint {
-  font-size: 0.75rem;
-  margin-left: 0.5rem;
-  color: #92400e;
-  font-style: italic;
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: var(--text-label);
+  color: var(--color-signal-teal);
 }
-.edit-link {
-  font-size: 0.85rem;
-  color: #2563eb;
-  text-decoration: none;
+
+.worker-dot {
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-pills);
+  background: var(--color-signal-teal);
+  animation: pulse-dot 1.2s ease-in-out infinite;
 }
-.edit-link:hover { text-decoration: underline; }
-.error { color: #b91c1c; }
-.error.inline { margin: 1rem 0; }
-.empty {
-  color: #6b7280;
-  padding: 2rem 1rem;
-  text-align: center;
-  border: 2px dashed #d1d5db;
-  border-radius: 10px;
+
+.head-side {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-16);
+  flex-shrink: 0;
 }
 
 .lanes {
   display: flex;
-  gap: 0.75rem;
+  gap: var(--spacing-12);
   overflow-x: auto;
-  padding-bottom: 0.5rem;
-  margin-top: 1rem;
+  padding-bottom: var(--spacing-8);
+  align-items: flex-start;
 }
+
 .lane {
-  flex: 0 0 16rem;
-  min-height: 8rem;
-  border: 1px solid #e5e7eb;
-  border-radius: 10px;
-  background: #f9fafb;
-  padding: 0.5rem 0.6rem;
+  flex: 0 0 264px;
+  display: flex;
+  flex-direction: column;
+  max-height: 72vh;
+  border-radius: var(--radius-cards);
+  background: rgba(255, 255, 255, 0.015);
+  border: 1px solid var(--border-hairline);
 }
-.lane h3 {
-  margin: 0 0 0.5rem;
-  font-size: 0.9rem;
-  color: #374151;
-  border-bottom: 1px solid #e5e7eb;
-  padding-bottom: 0.3rem;
+
+.lane-head {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-8);
+  padding: 10px var(--spacing-12);
+  border-bottom: 1px solid var(--border-hairline);
 }
-.empty-lane {
-  color: #d1d5db;
-  text-align: center;
-  margin: 1rem 0;
+
+.lane-head h3 {
+  font-size: var(--text-caption);
+  font-weight: var(--weight-medium);
+  color: var(--text-body);
 }
-.card {
-  border: 1px solid #e5e7eb;
-  border-radius: 8px;
-  background: white;
-  padding: 0.5rem 0.6rem;
-  margin-bottom: 0.5rem;
+
+.lane-count {
+  margin-left: auto;
+  font-size: var(--text-label);
+  color: var(--text-faint);
 }
-.card[data-ready="true"] { border-left: 3px solid #a7f3d0; }
-.card[data-status="Done"] { border-left: 3px solid #a7f3d0; }
-.card[data-status="InProgress"] { border-left: 3px solid #fbbf24; }
-.card[data-status="Failed"] { border-left: 3px solid #fca5a5; }
-.card[data-status="Cancelled"] { border-left: 3px solid #d1d5db; }
+
+.lane-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-8);
+  padding: var(--spacing-8);
+  overflow-y: auto;
+  min-height: 72px;
+}
+
+.task-card {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  padding: 10px var(--spacing-12);
+}
+
 .card-head {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 0.5rem;
+  gap: var(--spacing-8);
 }
+
 .card-title {
-  font-weight: 600;
-  font-size: 0.9rem;
-  color: #1f2937;
+  font-size: var(--text-caption);
+  font-weight: var(--weight-regular);
+  color: var(--text-primary);
+  line-height: 1.4;
 }
-.badge {
-  font-size: 0.7rem;
-  padding: 0.1rem 0.5rem;
-  border-radius: 999px;
-  background: #f3f4f6;
-  color: #374151;
-  white-space: nowrap;
-}
-.badge[data-ready="true"] { background: #ecfdf5; color: #065f46; }
+
 .card-acc {
-  margin: 0.3rem 0 0;
-  font-size: 0.8rem;
-  color: #6b7280;
+  font-size: var(--text-label);
+  color: var(--text-faint);
+  line-height: 1.45;
 }
+
 .card-blockers {
-  margin: 0.3rem 0 0;
-  font-size: 0.78rem;
-  color: #6b7280;
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: 6px;
 }
-.chip {
-  display: inline-block;
-  margin-left: 0.3rem;
-  padding: 0.05rem 0.4rem;
-  border-radius: 6px;
-  background: #fef3c7;
-  color: #92400e;
-  font-size: 0.72rem;
+
+.blockers-label {
+  font-size: 10px;
+  font-weight: var(--weight-medium);
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
+}
+
+.empty-lane {
+  padding: var(--spacing-16) 0;
+  text-align: center;
+  font-size: var(--text-label);
+  color: var(--text-faint);
+}
+
+.lanes-skeleton {
+  display: flex;
+  gap: var(--spacing-12);
+  overflow: hidden;
+}
+
+.sk-lane {
+  flex: 0 0 264px;
+  height: 280px;
 }
 </style>

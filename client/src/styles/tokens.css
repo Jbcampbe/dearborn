@@ -1,0 +1,127 @@
+/* Deerborn design tokens — derived from DESIGN.md (Linear "midnight precision
+   instrument" system). Dark-only. Every component should consume these custom
+   properties rather than hard-coding values. */
+:root {
+  /* Colors */
+  --color-void: #08090a;
+  --color-carbon: #0f1011;
+  --color-obsidian: #161718;
+  --color-graphite: #23252a;
+  --color-smoke: #383b3f;
+  --color-ash: #62666d;
+  --color-fog: #8a8f98;
+  --color-mist: #d0d6e0;
+  --color-bone: #e5e5e6;
+  --color-paper: #ffffff;
+  --color-acid-lime: #e4f222;
+  --color-pulse-green: #27a644;
+  --color-coral-red: #eb5757;
+  --color-signal-teal: #02b8cc;
+  --color-iris-violet: #6366f1;
+  --color-lavender: #8b5cf6;
+
+  /* Surfaces (level progression 0 → 3) */
+  --surface-void: var(--color-void);
+  --surface-carbon: var(--color-carbon);
+  --surface-obsidian: var(--color-obsidian);
+  --surface-slate: var(--color-graphite);
+
+  /* Semantic roles */
+  --text-primary: var(--color-paper);
+  --text-body: var(--color-mist);
+  --text-muted: var(--color-fog);
+  --text-faint: var(--color-ash);
+  --border-hairline: var(--color-graphite);
+  --border-strong: var(--color-smoke);
+
+  /* Typography — families */
+  --font-sans: "Inter Variable", ui-sans-serif, system-ui, -apple-system,
+    BlinkMacSystemFont, "Segoe UI", Roboto, sans-serif;
+  --font-mono: "JetBrains Mono", ui-monospace, SFMono-Regular, Menlo, Monaco,
+    Consolas, monospace;
+
+  /* Typography — scale (size / line-height / letter-spacing) */
+  --text-micro: 10px;
+  --text-label: 12px;
+  --text-caption: 13px;
+  --text-body-sm: 15px;
+  --text-body: 16px;
+  --text-body-lg: 20px;
+  --text-subheading: 24px;
+  --text-heading-sm: 32px;
+  --text-heading: 48px;
+  --text-heading-lg: 64px;
+  --text-display: 72px;
+
+  --leading-tight: 1;
+  --leading-heading-sm: 1.13;
+  --leading-caption: 1.2;
+  --leading-subheading: 1.33;
+  --leading-mono: 1.5;
+  --leading-body: 1.5;
+  --leading-body-sm: 1.6;
+
+  --tracking-tightest: -0.022em;
+  --tracking-heading: -0.012em;
+  --tracking-body-sm: -0.011em;
+  --tracking-body: -0.01em;
+  --tracking-mono: -0.013em;
+
+  /* Typography — weights (the system deliberately caps at 590) */
+  --weight-light: 300;
+  --weight-regular: 400;
+  --weight-medium: 510;
+  --weight-strong: 590;
+
+  /* Spacing (4px base unit) */
+  --spacing-4: 4px;
+  --spacing-8: 8px;
+  --spacing-12: 12px;
+  --spacing-16: 16px;
+  --spacing-20: 20px;
+  --spacing-24: 24px;
+  --spacing-28: 28px;
+  --spacing-32: 32px;
+  --spacing-36: 36px;
+  --spacing-40: 40px;
+  --spacing-48: 48px;
+  --spacing-56: 56px;
+  --spacing-64: 64px;
+  --spacing-80: 80px;
+  --spacing-96: 96px;
+  --spacing-128: 128px;
+
+  /* Radii — the entire vocabulary */
+  --radius-small: 2px;
+  --radius-badges: 4px;
+  --radius-buttons: 6px;
+  --radius-inputs: 6px;
+  --radius-cards: 12px;
+  --radius-pills: 9999px;
+
+  /* Shadows — elevation comes from hairline borders, not shadow stacks */
+  --shadow-sm: rgba(0, 0, 0, 0.4) 0px 2px 4px 0px;
+  --shadow-md: rgba(0, 0, 0, 0.2) 0px 0px 12px 0px inset;
+  --shadow-subtle: rgb(35, 37, 42) 0px 0px 0px 1px inset;
+  --shadow-xl: rgba(8, 9, 10, 0.6) 0px 4px 32px 0px;
+  --shadow-button: rgba(0, 0, 0, 0.01) 0px 5px 2px 0px,
+    rgba(0, 0, 0, 0.04) 0px 3px 2px 0px, rgba(0, 0, 0, 0.07) 0px 1px 1px 0px,
+    rgba(0, 0, 0, 0.08) 0px 0px 1px 0px;
+
+  /* Layout */
+  --page-max-width: 1200px;
+  --sidebar-width: 232px;
+
+  /* Motion — short, quiet, functional */
+  --duration-fast: 100ms;
+  --duration-normal: 150ms;
+  --ease-out: cubic-bezier(0.25, 0.46, 0.45, 0.94);
+
+  /* Status hues (badge/tag color-coding only — never actions) */
+  --status-planning: var(--color-lavender);
+  --status-ready: var(--color-fog);
+  --status-active: var(--color-signal-teal);
+  --status-done: var(--color-pulse-green);
+  --status-failed: var(--color-coral-red);
+  --status-cancelled: var(--color-ash);
+}

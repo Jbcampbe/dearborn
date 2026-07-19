@@ -1,28 +1,30 @@
 <script setup lang="ts">
 import { onMounted, ref } from "vue";
-import { RouterLink, useRouter } from "vue-router";
+import { RouterLink } from "vue-router";
 import { useAuthStore } from "../stores/auth";
 import { ApiError } from "../api/client";
 import { getProject, refreshProject, type Project } from "../api/projects";
-import { createEpic, listEpics, type Epic } from "../api/epics";
+import { listEpics, type Epic } from "../api/epics";
 import CloneStatusBadge from "./CloneStatusBadge.vue";
 import ProjectKanbanView from "./ProjectKanbanView.vue";
+import CreateEpicModal from "./CreateEpicModal.vue";
+import StatusIcon from "./StatusIcon.vue";
+import AppIcon from "./AppIcon.vue";
 
 // Project detail shell (T-104). Shows the project's identity + clone lifecycle,
-// the project's epics, and a "Start planning" entry point (T-204) that creates
-// an epic and drops the user into the planning chat. The kanban board lands in
-// T-401. A "Re-clone" action triggers a background `git fetch`; because the
-// clone settles asynchronously, the user reloads to watch pending → ready/error.
+// the project's epics, and a "New epic" entry point (T-204) that creates an
+// epic and drops the user into the planning chat. "Re-clone" triggers a
+// background `git fetch`; because the clone settles asynchronously, the user
+// reloads to watch pending → ready/error.
 const props = defineProps<{ id: string }>();
 
 const auth = useAuthStore();
-const router = useRouter();
 const project = ref<Project | null>(null);
 const epics = ref<Epic[]>([]);
 const loading = ref(true);
 const error = ref<string | null>(null);
 const refreshing = ref(false);
-const planning = ref(false);
+const epicModalOpen = ref(false);
 
 async function load() {
   const token = auth.token;
@@ -46,32 +48,6 @@ async function load() {
     error.value = err instanceof Error ? err.message : "failed to load project";
   } finally {
     loading.value = false;
-  }
-}
-
-// Create a fresh epic (lands in the Planning lane) and open the planning chat.
-async function startPlanning() {
-  const token = auth.token;
-  if (token === null || planning.value) {
-    return;
-  }
-  const title = window.prompt("What do you want to build? (epic title)")?.trim();
-  if (!title) {
-    return;
-  }
-  planning.value = true;
-  error.value = null;
-  try {
-    const epic = await createEpic(token, props.id, title);
-    await router.push({ name: "epic-planning", params: { id: epic.id } });
-  } catch (err) {
-    if (err instanceof ApiError && err.isAuth) {
-      auth.logout(`Token rejected (401): ${err.message}. Please re-enter it.`);
-      return;
-    }
-    error.value = err instanceof Error ? err.message : "failed to start planning";
-  } finally {
-    planning.value = false;
   }
 }
 
@@ -99,240 +75,252 @@ onMounted(load);
 </script>
 
 <template>
-  <main>
-    <p class="crumb">
-      <RouterLink :to="{ name: 'projects' }">← Projects</RouterLink>
-    </p>
+  <main class="page">
+    <nav class="crumbs">
+      <RouterLink :to="{ name: 'projects' }">Projects</RouterLink>
+      <span class="sep">/</span>
+      <span class="current">{{ project?.name ?? "…" }}</span>
+    </nav>
 
-    <p v-if="loading">Loading…</p>
-    <p v-else-if="error" class="error" role="alert">{{ error }}</p>
+    <div v-if="loading" class="loading-stack" aria-label="Loading project">
+      <div class="skeleton sk-title" />
+      <div class="skeleton sk-block" />
+      <div class="skeleton sk-block" />
+    </div>
+    <p v-else-if="error" class="banner banner-error" role="alert">{{ error }}</p>
 
     <template v-else-if="project">
-      <header>
-        <div>
-          <h1>{{ project.name }}</h1>
-          <a class="repo" :href="project.repo_url" target="_blank" rel="noopener noreferrer">
+      <header class="head fade-in">
+        <div class="head-main">
+          <h1 class="page-title">{{ project.name }}</h1>
+          <a class="repo mono" :href="project.repo_url" target="_blank" rel="noopener noreferrer">
+            <AppIcon name="link" :size="12" />
             {{ project.repo_url }}
           </a>
         </div>
-        <CloneStatusBadge :status="project.clone_status" />
-      </header>
-
-      <section class="meta">
-        <dl>
-          <div>
-            <dt>Clone status</dt>
-            <dd><CloneStatusBadge :status="project.clone_status" /></dd>
-          </div>
-          <div v-if="project.clone_path">
-            <dt>Clone path</dt>
-            <dd class="mono">{{ project.clone_path }}</dd>
-          </div>
-          <div v-if="project.clone_status === 'error' && project.clone_error">
-            <dt>Clone error</dt>
-            <dd class="error-text">{{ project.clone_error }}</dd>
-          </div>
-          <div v-if="project.setup_cmd">
-            <dt>Setup</dt>
-            <dd class="mono">{{ project.setup_cmd }}</dd>
-          </div>
-          <div v-if="project.test_cmd">
-            <dt>Test</dt>
-            <dd class="mono">{{ project.test_cmd }}</dd>
-          </div>
-          <div v-if="project.run_cmd">
-            <dt>Run</dt>
-            <dd class="mono">{{ project.run_cmd }}</dd>
-          </div>
-        </dl>
-        <div class="actions">
-          <button :disabled="loading" @click="load">Reload</button>
-          <button :disabled="refreshing" @click="reclone">
+        <div class="head-actions">
+          <button class="btn btn-ghost" :disabled="refreshing" @click="reclone">
+            <AppIcon name="refresh" :size="13" />
             {{ refreshing ? "Re-cloning…" : "Re-clone" }}
           </button>
+          <button class="btn btn-primary" @click="epicModalOpen = true">
+            <AppIcon name="plus" :size="13" />
+            New epic
+          </button>
+        </div>
+      </header>
+
+      <section class="meta card card-pad">
+        <div class="prop">
+          <span class="prop-label">Clone status</span>
+          <span class="prop-value"><CloneStatusBadge :status="project.clone_status" /></span>
+        </div>
+        <div v-if="project.clone_path" class="prop">
+          <span class="prop-label">Clone path</span>
+          <span class="prop-value mono">{{ project.clone_path }}</span>
+        </div>
+        <div v-if="project.clone_status === 'error' && project.clone_error" class="prop">
+          <span class="prop-label">Clone error</span>
+          <span class="prop-value error-text">{{ project.clone_error }}</span>
+        </div>
+        <div v-if="project.setup_cmd" class="prop">
+          <span class="prop-label">Setup</span>
+          <span class="prop-value mono">{{ project.setup_cmd }}</span>
+        </div>
+        <div v-if="project.test_cmd" class="prop">
+          <span class="prop-label">Test</span>
+          <span class="prop-value mono">{{ project.test_cmd }}</span>
+        </div>
+        <div v-if="project.run_cmd" class="prop">
+          <span class="prop-label">Run</span>
+          <span class="prop-value mono">{{ project.run_cmd }}</span>
         </div>
       </section>
 
       <section class="epics">
-        <div class="epics-head">
-          <h2>Epics ({{ epics.length }})</h2>
-          <button class="primary" :disabled="planning" @click="startPlanning">
-            {{ planning ? "Starting…" : "Start planning" }}
-          </button>
+        <div class="section-head">
+          <h2>Epics</h2>
+          <span class="count">{{ epics.length }}</span>
         </div>
 
-        <p v-if="epics.length === 0" class="empty">
-          No epics yet. Start planning to create the first one.
-        </p>
+        <div v-if="epics.length === 0" class="empty-state">
+          <AppIcon name="layers" :size="20" />
+          <p>No epics yet. Start planning to create the first one.</p>
+        </div>
         <ul v-else class="epic-list">
           <li v-for="epic in epics" :key="epic.id">
             <RouterLink
-              class="epic-link"
+              class="epic-row card-interactive"
               :to="{ name: 'epic-planning', params: { id: epic.id } }"
             >
+              <StatusIcon :status="epic.status" :size="14" />
               <span class="epic-title">{{ epic.title }}</span>
-              <span class="epic-status">{{ epic.status }}</span>
+              <span class="badge epic-status">{{ epic.status }}</span>
+              <AppIcon class="row-chevron" name="chevron-right" :size="14" />
             </RouterLink>
           </li>
         </ul>
       </section>
 
       <ProjectKanbanView :id="project.id" />
+
+      <CreateEpicModal
+        :open="epicModalOpen"
+        :project-id="project.id"
+        @close="epicModalOpen = false"
+      />
     </template>
   </main>
 </template>
 
 <style scoped>
-main {
-  max-width: 60rem;
-  margin: 3rem auto;
-  padding: 0 1rem;
-}
-.crumb {
-  margin: 0 0 1rem;
-}
-.crumb a {
-  color: #2563eb;
-  text-decoration: none;
-}
-header {
+.head {
   display: flex;
   align-items: flex-start;
   justify-content: space-between;
-  gap: 1rem;
+  gap: var(--spacing-16);
+  margin-bottom: var(--spacing-20);
 }
-header h1 {
-  margin: 0;
-}
-.repo {
-  color: #555;
-  font-size: 0.9rem;
-  text-decoration: none;
-}
-.repo:hover {
-  text-decoration: underline;
-}
-.meta {
-  margin-top: 1.5rem;
-  padding: 1.25rem;
-  border: 1px solid #e5e7eb;
-  border-radius: 10px;
-  background: #fafafa;
-}
-dl {
-  margin: 0 0 1rem;
-  display: grid;
-  gap: 0.75rem;
-}
-dl > div {
-  display: grid;
-  grid-template-columns: 8rem 1fr;
-  gap: 1rem;
-  align-items: baseline;
-}
-dt {
-  font-size: 0.85rem;
-  font-weight: 600;
-  color: #374151;
-}
-dd {
-  margin: 0;
-}
-.mono {
-  font-family: ui-monospace, SFMono-Regular, Menlo, monospace;
-  font-size: 0.85rem;
-  word-break: break-all;
-}
-.error-text {
-  color: #991b1b;
-}
-.actions {
+
+.head-main {
   display: flex;
-  gap: 0.6rem;
+  flex-direction: column;
+  gap: var(--spacing-8);
+  min-width: 0;
 }
-.actions button {
-  font: inherit;
-  padding: 0.35rem 0.8rem;
-  border: 1px solid #ccc;
-  border-radius: 6px;
-  background: #f3f4f6;
-  cursor: pointer;
+
+.repo {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  color: var(--text-faint);
+  font-size: 12px;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
 }
-.actions button:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
+
+.repo:hover {
+  color: var(--text-muted);
 }
-.epics {
-  margin-top: 2rem;
-}
-.epics-head {
+
+.head-actions {
   display: flex;
   align-items: center;
-  justify-content: space-between;
-  gap: 1rem;
+  gap: var(--spacing-8);
+  flex-shrink: 0;
 }
-.primary {
-  font: inherit;
-  padding: 0.4rem 0.9rem;
-  border: 1px solid #2563eb;
-  border-radius: 6px;
-  background: #2563eb;
-  color: #fff;
-  cursor: pointer;
+
+.meta {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(220px, 1fr));
+  gap: var(--spacing-16) var(--spacing-24);
+  margin-bottom: var(--spacing-32);
 }
-.primary:disabled {
-  opacity: 0.5;
-  cursor: not-allowed;
+
+.prop {
+  display: flex;
+  flex-direction: column;
+  gap: 5px;
+  min-width: 0;
 }
-.empty {
-  color: #6b7280;
+
+.prop-label {
+  font-size: 11px;
+  font-weight: var(--weight-medium);
+  color: var(--text-faint);
+  text-transform: uppercase;
+  letter-spacing: 0.04em;
 }
+
+.prop-value {
+  font-size: var(--text-caption);
+  color: var(--text-body);
+  overflow-wrap: break-word;
+}
+
+.error-text {
+  color: var(--color-coral-red);
+}
+
+.epics {
+  margin-bottom: var(--spacing-32);
+}
+
+.section-head {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-8);
+  margin-bottom: var(--spacing-12);
+}
+
+.section-head h2 {
+  font-size: var(--text-body-sm);
+  font-weight: var(--weight-medium);
+}
+
+.count {
+  font-size: var(--text-label);
+  color: var(--text-faint);
+}
+
 .epic-list {
   list-style: none;
+  margin: 0;
   padding: 0;
-  margin: 0.5rem 0 0;
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-cards);
+  background: var(--surface-carbon);
+  overflow: hidden;
 }
-.epic-list li {
-  border-bottom: 1px solid #eee;
+
+.epic-list li + li {
+  border-top: 1px solid var(--border-hairline);
 }
-.epic-link {
+
+.epic-row {
   display: flex;
   align-items: center;
-  gap: 1rem;
-  padding: 0.7rem 0.4rem;
-  text-decoration: none;
-  color: inherit;
-  border-radius: 6px;
+  gap: var(--spacing-12);
+  padding: 10px var(--spacing-16);
 }
-.epic-link:hover {
-  background: #f3f4f6;
-}
+
 .epic-title {
-  font-weight: 600;
+  flex: 1;
+  min-width: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: 13.5px;
+  font-weight: var(--weight-regular);
+  color: var(--text-primary);
 }
+
 .epic-status {
-  margin-left: auto;
-  font-size: 0.8rem;
-  padding: 0.1rem 0.5rem;
-  border-radius: 999px;
-  background: #eef2ff;
-  color: #3730a3;
+  flex-shrink: 0;
 }
-.board {
-  margin-top: 2rem;
+
+.row-chevron {
+  color: var(--text-faint);
 }
-.placeholder {
-  padding: 3rem 1rem;
-  text-align: center;
-  color: #6b7280;
-  border: 2px dashed #d1d5db;
-  border-radius: 10px;
+
+.epic-row:hover .row-chevron {
+  color: var(--text-muted);
+  transform: translateX(2px);
 }
-.error {
-  padding: 0.6rem 0.75rem;
-  color: #991b1b;
-  background: #fee2e2;
-  border: 1px solid #fca5a5;
-  border-radius: 6px;
+
+.loading-stack {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-16);
+}
+
+.sk-title {
+  height: 28px;
+  width: 240px;
+}
+
+.sk-block {
+  height: 96px;
 }
 </style>

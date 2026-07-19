@@ -1,0 +1,514 @@
+/* Shared UI primitives (unscoped, consumed by every view). Class names are
+   deliberately small and composable; view-specific layout stays in the SFCs'
+   scoped styles. */
+
+/* ---------------------------------------------------------------- buttons */
+
+.btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  gap: var(--spacing-8);
+  padding: 6px 12px;
+  border: 1px solid transparent;
+  border-radius: var(--radius-buttons);
+  background: transparent;
+  color: var(--text-body);
+  font-size: var(--text-caption);
+  font-weight: var(--weight-regular);
+  letter-spacing: var(--tracking-body-sm);
+  line-height: 20px;
+  cursor: pointer;
+  user-select: none;
+  white-space: nowrap;
+  transition:
+    background-color var(--duration-fast) var(--ease-out),
+    border-color var(--duration-fast) var(--ease-out),
+    color var(--duration-fast) var(--ease-out),
+    opacity var(--duration-fast) var(--ease-out);
+}
+
+.btn:hover:not(:disabled) {
+  background: rgba(255, 255, 255, 0.06);
+  color: var(--text-primary);
+}
+
+.btn:disabled {
+  opacity: 0.4;
+  cursor: not-allowed;
+}
+
+/* The one chromatic button in the system — at most one per view. */
+.btn-primary {
+  background: var(--color-acid-lime);
+  color: var(--color-void);
+  font-weight: var(--weight-medium);
+  box-shadow: var(--shadow-button);
+}
+
+.btn-primary:hover:not(:disabled) {
+  background: var(--color-acid-lime);
+  filter: brightness(0.93);
+  color: var(--color-void);
+}
+
+/* White neutral button — second-highest emphasis (e.g. workflow actions). */
+.btn-white {
+  background: var(--color-paper);
+  color: var(--color-void);
+  font-weight: var(--weight-medium);
+}
+
+.btn-white:hover:not(:disabled) {
+  background: var(--color-bone);
+  color: var(--color-void);
+}
+
+/* Ghost/outline — secondary actions. */
+.btn-ghost {
+  border-color: var(--border-hairline);
+  color: var(--text-body);
+}
+
+.btn-ghost:hover:not(:disabled) {
+  border-color: var(--border-strong);
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.btn-danger {
+  color: var(--color-coral-red);
+}
+
+.btn-danger:hover:not(:disabled) {
+  background: rgba(235, 87, 87, 0.12);
+  color: var(--color-coral-red);
+}
+
+.btn-sm {
+  padding: 3px 10px;
+  font-size: var(--text-label);
+  line-height: 18px;
+}
+
+/* Icon-only square button */
+.btn-icon {
+  padding: 5px;
+  border-radius: var(--radius-buttons);
+  color: var(--text-muted);
+}
+
+.btn-icon:hover:not(:disabled) {
+  color: var(--text-primary);
+}
+
+/* ----------------------------------------------------------------- inputs */
+
+.input,
+.textarea,
+.select {
+  width: 100%;
+  padding: 7px 10px;
+  background: rgba(255, 255, 255, 0.02);
+  border: 1px solid rgba(255, 255, 255, 0.08);
+  border-radius: var(--radius-inputs);
+  color: var(--text-body);
+  font-size: 13.5px;
+  line-height: 1.45;
+  letter-spacing: var(--tracking-body-sm);
+  transition:
+    border-color var(--duration-fast) var(--ease-out),
+    background-color var(--duration-fast) var(--ease-out);
+}
+
+.input::placeholder,
+.textarea::placeholder {
+  color: var(--text-faint);
+}
+
+.input:hover:not(:disabled),
+.textarea:hover:not(:disabled),
+.select:hover:not(:disabled) {
+  border-color: rgba(255, 255, 255, 0.14);
+}
+
+.input:focus,
+.textarea:focus,
+.select:focus {
+  outline: none;
+  border-color: var(--color-mist);
+  background: rgba(255, 255, 255, 0.035);
+}
+
+.input:disabled,
+.textarea:disabled,
+.select:disabled {
+  opacity: 0.45;
+  cursor: not-allowed;
+}
+
+.textarea {
+  resize: vertical;
+  min-height: 60px;
+}
+
+.select {
+  appearance: none;
+  padding-right: 28px;
+  background-image: url("data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' width='12' height='12' viewBox='0 0 16 16' fill='none'%3E%3Cpath d='M4 6l4 4 4-4' stroke='%238a8f98' stroke-width='1.5' stroke-linecap='round' stroke-linejoin='round'/%3E%3C/svg%3E");
+  background-repeat: no-repeat;
+  background-position: right 9px center;
+  cursor: pointer;
+}
+
+.select option {
+  background: var(--surface-obsidian);
+  color: var(--text-body);
+}
+
+.label {
+  display: block;
+  font-size: var(--text-label);
+  font-weight: var(--weight-medium);
+  color: var(--text-muted);
+  margin-bottom: var(--spacing-8);
+}
+
+.label .req {
+  color: var(--color-coral-red);
+}
+
+.hint {
+  font-size: var(--text-label);
+  color: var(--text-faint);
+  line-height: 1.4;
+}
+
+.field-error {
+  font-size: var(--text-label);
+  color: var(--color-coral-red);
+  line-height: 1.4;
+}
+
+/* ------------------------------------------------------------------ cards */
+
+.card {
+  background: var(--surface-carbon);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-cards);
+}
+
+.card-pad {
+  padding: var(--spacing-16) var(--spacing-20);
+}
+
+/* Interactive card (kanban cards, list rows) */
+.card-interactive {
+  transition:
+    border-color var(--duration-fast) var(--ease-out),
+    background-color var(--duration-fast) var(--ease-out);
+}
+
+.card-interactive:hover {
+  border-color: var(--border-strong);
+  background: var(--surface-obsidian);
+}
+
+/* ----------------------------------------------------------------- badges */
+
+.badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 1px 7px;
+  border-radius: var(--radius-badges);
+  background: rgba(255, 255, 255, 0.05);
+  color: var(--text-muted);
+  font-size: var(--text-label);
+  font-weight: var(--weight-regular);
+  line-height: 18px;
+  white-space: nowrap;
+}
+
+/* Color-coded badge variants — dot + tinted text */
+.badge[data-tone] {
+  background: rgba(255, 255, 255, 0.05);
+}
+
+.badge[data-tone="violet"] { color: var(--color-lavender); }
+.badge[data-tone="teal"] { color: var(--color-signal-teal); }
+.badge[data-tone="green"] { color: #4ec96b; }
+.badge[data-tone="red"] { color: var(--color-coral-red); }
+.badge[data-tone="neutral"] { color: var(--text-muted); }
+.badge[data-tone="lime"] { color: var(--color-acid-lime); }
+
+.badge[data-tone="violet"] { background: rgba(139, 92, 246, 0.1); }
+.badge[data-tone="teal"] { background: rgba(2, 184, 204, 0.1); }
+.badge[data-tone="green"] { background: rgba(39, 166, 68, 0.12); }
+.badge[data-tone="red"] { background: rgba(235, 87, 87, 0.1); }
+
+/* ------------------------------------------------------------------ chips */
+
+.chip {
+  display: inline-flex;
+  align-items: center;
+  padding: 1px 7px;
+  border-radius: var(--radius-badges);
+  background: rgba(255, 255, 255, 0.05);
+  border: 1px solid var(--border-hairline);
+  color: var(--text-muted);
+  font-size: 11.5px;
+  line-height: 17px;
+}
+
+/* ------------------------------------------------------- banners & alerts */
+
+.banner {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-12);
+  padding: var(--spacing-12) var(--spacing-16);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-cards);
+  background: var(--surface-carbon);
+  font-size: var(--text-caption);
+  color: var(--text-body);
+  line-height: 1.5;
+}
+
+.banner-error {
+  border-color: rgba(235, 87, 87, 0.35);
+  background: rgba(235, 87, 87, 0.06);
+  color: var(--color-coral-red);
+}
+
+/* ------------------------------------------------------------ page header */
+
+.page {
+  padding: var(--spacing-24) var(--spacing-32) var(--spacing-64);
+  max-width: var(--page-max-width);
+  margin: 0 auto;
+}
+
+.page-wide {
+  max-width: none;
+}
+
+.crumbs {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-8);
+  font-size: var(--text-caption);
+  color: var(--text-faint);
+  margin-bottom: var(--spacing-16);
+}
+
+.crumbs a {
+  color: var(--text-muted);
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.crumbs a:hover {
+  color: var(--text-primary);
+}
+
+.crumbs .sep {
+  color: var(--color-graphite);
+}
+
+.crumbs .current {
+  color: var(--text-body);
+}
+
+.page-title {
+  font-size: var(--text-body-lg);
+  font-weight: var(--weight-medium);
+  letter-spacing: var(--tracking-body-lg, -0.24px);
+  line-height: 1.33;
+}
+
+.page-sub {
+  font-size: var(--text-caption);
+  color: var(--text-muted);
+  margin-top: 2px;
+}
+
+/* ------------------------------------------------------------- live status */
+
+.conn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  font-size: 11.5px;
+  color: var(--text-faint);
+  line-height: 1;
+  white-space: nowrap;
+}
+
+.conn::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: var(--radius-pills);
+  background: var(--color-ash);
+}
+
+.conn[data-status="open"] {
+  color: #4ec96b;
+}
+
+.conn[data-status="open"]::before {
+  background: var(--color-pulse-green);
+  box-shadow: 0 0 6px rgba(39, 166, 68, 0.7);
+}
+
+.conn[data-status="connecting"]::before {
+  background: var(--color-fog);
+  animation: pulse-dot 1.2s ease-in-out infinite;
+}
+
+@keyframes pulse-dot {
+  0%, 100% { opacity: 1; }
+  50% { opacity: 0.3; }
+}
+
+/* --------------------------------------------------------------- skeleton */
+
+.skeleton {
+  border-radius: var(--radius-buttons);
+  background: linear-gradient(
+    100deg,
+    rgba(255, 255, 255, 0.03) 40%,
+    rgba(255, 255, 255, 0.07) 50%,
+    rgba(255, 255, 255, 0.03) 60%
+  );
+  background-size: 200% 100%;
+  animation: skeleton-shimmer 1.4s ease infinite;
+}
+
+@keyframes skeleton-shimmer {
+  to {
+    background-position: -200% 0;
+  }
+}
+
+/* ------------------------------------------------------------------ misc */
+
+.mono {
+  font-family: var(--font-mono);
+  font-size: 12.5px;
+  letter-spacing: var(--tracking-mono);
+  font-feature-settings: "cv01" on, "ss03" on;
+}
+
+.empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--spacing-8);
+  padding: var(--spacing-48) var(--spacing-24);
+  border: 1px dashed var(--border-hairline);
+  border-radius: var(--radius-cards);
+  color: var(--text-faint);
+  font-size: var(--text-caption);
+  text-align: center;
+  line-height: 1.5;
+}
+
+.divider {
+  height: 1px;
+  background: var(--border-hairline);
+  border: none;
+  margin: 0;
+}
+
+/* ----------------------------------------------------- markdown content */
+
+/* Rendered agent markdown (see lib/markdown.ts). Applies inside v-html
+   containers, so these selectors must stay global. */
+.md p {
+  margin: 0 0 var(--spacing-12);
+}
+
+.md p:last-child {
+  margin-bottom: 0;
+}
+
+.md strong {
+  color: var(--text-primary);
+  font-weight: var(--weight-medium);
+}
+
+.md em {
+  color: var(--text-body);
+}
+
+.md code {
+  font-family: var(--font-mono);
+  font-size: 0.86em;
+  letter-spacing: var(--tracking-mono);
+  background: rgba(255, 255, 255, 0.06);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-badges);
+  padding: 1px 5px;
+}
+
+.md .md-pre {
+  margin: 0 0 var(--spacing-12);
+  padding: var(--spacing-12);
+  background: var(--surface-void);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-buttons);
+  overflow-x: auto;
+}
+
+.md .md-pre code {
+  background: none;
+  border: none;
+  padding: 0;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-body);
+}
+
+.md ul,
+.md ol {
+  margin: 0 0 var(--spacing-12);
+  padding-left: var(--spacing-20);
+}
+
+.md li {
+  margin-bottom: 3px;
+}
+
+.md li::marker {
+  color: var(--text-faint);
+}
+
+.md .md-h {
+  display: block;
+  font-weight: var(--weight-medium);
+  color: var(--text-primary);
+  margin: var(--spacing-12) 0 var(--spacing-8);
+}
+
+.md .md-h:first-child {
+  margin-top: 0;
+}
+
+/* Fade/slide for view transitions and appearing elements */
+@keyframes fade-in-up {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0);
+  }
+}
+
+.fade-in {
+  animation: fade-in-up var(--duration-normal) var(--ease-out);
+}

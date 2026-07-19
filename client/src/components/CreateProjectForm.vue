@@ -4,11 +4,12 @@ import { useAuthStore } from "../stores/auth";
 import { ApiError } from "../api/client";
 import { createProject, type CreateProjectInput, type Project } from "../api/projects";
 
-// Create-project form (T-104). Required: name + repo URL. Optional: a GitHub
-// PAT (password field, sent once, never returned) and the setup/test/run
-// commands. Required fields are validated client-side; the server's structured
-// validation errors ({ error: { code, message } }) surface inline on submit.
-const emit = defineEmits<{ created: [project: Project] }>();
+// Create-project form body (T-104), rendered inside AppModal from the Projects
+// view. Required: name + repo URL. Optional: a GitHub PAT (password field,
+// sent once, never returned) and the setup/test/run commands. Required fields
+// are validated client-side; the server's structured validation errors
+// ({ error: { code, message } }) surface inline on submit.
+const emit = defineEmits<{ created: [project: Project]; cancel: [] }>();
 
 const auth = useAuthStore();
 
@@ -91,21 +92,20 @@ async function submit() {
 
 <template>
   <form class="create" @submit.prevent="submit">
-    <h2>New project</h2>
-
-    <p v-if="error" class="error" role="alert">{{ error }}</p>
+    <p v-if="error" class="banner banner-error" role="alert">{{ error }}</p>
 
     <div class="field">
-      <label for="name">Name <span class="req">*</span></label>
-      <input id="name" v-model="form.name" type="text" placeholder="my-service" />
+      <label class="label" for="name">Name <span class="req">*</span></label>
+      <input id="name" v-model="form.name" class="input" type="text" placeholder="my-service" />
       <p v-if="fieldErrors.name" class="field-error">{{ fieldErrors.name }}</p>
     </div>
 
     <div class="field">
-      <label for="repo_url">Repository URL <span class="req">*</span></label>
+      <label class="label" for="repo_url">Repository URL <span class="req">*</span></label>
       <input
         id="repo_url"
         v-model="form.repo_url"
+        class="input"
         type="text"
         placeholder="https://github.com/owner/repo.git"
       />
@@ -113,10 +113,11 @@ async function submit() {
     </div>
 
     <div class="field">
-      <label for="pat">GitHub PAT (optional)</label>
+      <label class="label" for="pat">GitHub PAT <span class="opt">(optional)</span></label>
       <input
         id="pat"
         v-model="form.pat"
+        class="input"
         type="password"
         autocomplete="off"
         placeholder="required only for private repos"
@@ -126,94 +127,94 @@ async function submit() {
 
     <details class="advanced">
       <summary>Optional commands</summary>
-      <div class="field">
-        <label for="setup_cmd">Setup command</label>
-        <input id="setup_cmd" v-model="form.setup_cmd" type="text" placeholder="npm install" />
-      </div>
-      <div class="field">
-        <label for="test_cmd">Test command</label>
-        <input id="test_cmd" v-model="form.test_cmd" type="text" placeholder="npm test" />
-      </div>
-      <div class="field">
-        <label for="run_cmd">Run command</label>
-        <input id="run_cmd" v-model="form.run_cmd" type="text" placeholder="npm run dev" />
+      <div class="advanced-grid">
+        <div class="field">
+          <label class="label" for="setup_cmd">Setup command</label>
+          <input id="setup_cmd" v-model="form.setup_cmd" class="input mono" type="text" placeholder="npm install" />
+        </div>
+        <div class="field">
+          <label class="label" for="test_cmd">Test command</label>
+          <input id="test_cmd" v-model="form.test_cmd" class="input mono" type="text" placeholder="npm test" />
+        </div>
+        <div class="field">
+          <label class="label" for="run_cmd">Run command</label>
+          <input id="run_cmd" v-model="form.run_cmd" class="input mono" type="text" placeholder="npm run dev" />
+        </div>
       </div>
     </details>
 
-    <button type="submit" :disabled="submitting">
-      {{ submitting ? "Creating…" : "Create project" }}
-    </button>
+    <div class="form-actions">
+      <button type="button" class="btn" :disabled="submitting" @click="emit('cancel')">
+        Cancel
+      </button>
+      <button type="submit" class="btn btn-primary" :disabled="submitting">
+        {{ submitting ? "Creating…" : "Create project" }}
+      </button>
+    </div>
   </form>
 </template>
 
 <style scoped>
 .create {
-  border: 1px solid #e5e7eb;
-  border-radius: 10px;
-  padding: 1.25rem;
-  background: #fafafa;
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-16);
 }
-.create h2 {
-  margin: 0 0 1rem;
-  font-size: 1.1rem;
-}
+
 .field {
   display: flex;
   flex-direction: column;
-  gap: 0.3rem;
-  margin-bottom: 0.9rem;
+  gap: 2px;
 }
-label {
-  font-size: 0.85rem;
-  font-weight: 600;
+
+.opt {
+  color: var(--text-faint);
+  font-weight: var(--weight-regular);
 }
-.req {
-  color: #dc2626;
-}
-input {
-  padding: 0.5rem 0.6rem;
-  font: inherit;
-  border: 1px solid #ccc;
-  border-radius: 6px;
-}
-.hint {
-  margin: 0;
-  font-size: 0.75rem;
-  color: #6b7280;
-}
-.field-error {
-  margin: 0;
-  font-size: 0.8rem;
-  color: #b91c1c;
-}
-.advanced {
-  margin-bottom: 1rem;
-}
+
 .advanced summary {
   cursor: pointer;
-  font-size: 0.85rem;
-  font-weight: 600;
-  margin-bottom: 0.6rem;
+  font-size: var(--text-caption);
+  font-weight: var(--weight-medium);
+  color: var(--text-muted);
+  user-select: none;
+  list-style: none;
+  display: flex;
+  align-items: center;
+  gap: 6px;
 }
-button {
-  font: inherit;
-  font-weight: 600;
-  padding: 0.55rem 1rem;
-  color: #fff;
-  background: #2563eb;
-  border: none;
-  border-radius: 6px;
-  cursor: pointer;
+
+.advanced summary::before {
+  content: "";
+  width: 5px;
+  height: 5px;
+  border-right: 1.5px solid currentColor;
+  border-bottom: 1.5px solid currentColor;
+  transform: rotate(-45deg);
+  transition: transform var(--duration-fast) var(--ease-out);
 }
-button:disabled {
-  background: #9db8f0;
-  cursor: not-allowed;
+
+.advanced[open] summary::before {
+  transform: rotate(45deg);
 }
-.error {
-  padding: 0.6rem 0.75rem;
-  color: #991b1b;
-  background: #fee2e2;
-  border: 1px solid #fca5a5;
-  border-radius: 6px;
+
+.advanced summary:hover {
+  color: var(--text-primary);
+}
+
+.advanced-grid {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-12);
+  margin-top: var(--spacing-12);
+  padding-top: var(--spacing-12);
+  border-top: 1px solid var(--border-hairline);
+}
+
+.form-actions {
+  display: flex;
+  justify-content: flex-end;
+  gap: var(--spacing-8);
+  padding-top: var(--spacing-4);
 }
 </style>
