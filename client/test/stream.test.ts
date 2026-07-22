@@ -144,6 +144,50 @@ describe("planning stream reducer", () => {
     expect(state.turns[2]).toMatchObject({ role: "agent", text: "here is the plan" });
   });
 
+  it("folds a persisted toolStart/toolEnd pair into one chip with the terminal status", () => {
+    // The server stores each tool call as TWO messages (toolStart, then
+    // toolEnd); hydrate must pair them so history doesn't show a "running"
+    // chip next to the finished one.
+    const messages: TranscriptMessage[] = [
+      msg("m1", "tool", JSON.stringify({ kind: "toolStart", toolCallId: "t1", name: "Read" })),
+      msg("m2", "tool", JSON.stringify({ kind: "toolEnd", toolCallId: "t1", ok: true, output: "file.rs" })),
+      msg("m3", "tool", JSON.stringify({ kind: "toolStart", toolCallId: "t2", name: "Bash" })),
+      msg("m4", "tool", JSON.stringify({ kind: "toolEnd", toolCallId: "t2", ok: false })),
+    ];
+    const state = initialState();
+    hydrate(state, makeEpic(), messages);
+
+    expect(state.turns).toHaveLength(2);
+    expect(state.turns[0].tool).toMatchObject({ toolCallId: "t1", name: "Read", status: "ok", output: "file.rs" });
+    expect(state.turns[1].tool).toMatchObject({ toolCallId: "t2", name: "Bash", status: "error", output: null });
+  });
+
+  it("pairs interleaved tool events by toolCallId", () => {
+    const messages: TranscriptMessage[] = [
+      msg("m1", "tool", JSON.stringify({ kind: "toolStart", toolCallId: "t1", name: "Read" })),
+      msg("m2", "tool", JSON.stringify({ kind: "toolStart", toolCallId: "t2", name: "Bash" })),
+      msg("m3", "tool", JSON.stringify({ kind: "toolEnd", toolCallId: "t1", ok: true })),
+      msg("m4", "tool", JSON.stringify({ kind: "toolEnd", toolCallId: "t2", ok: true })),
+    ];
+    const state = initialState();
+    hydrate(state, makeEpic(), messages);
+
+    expect(state.turns).toHaveLength(2);
+    expect(state.turns[0].tool).toMatchObject({ toolCallId: "t1", status: "ok" });
+    expect(state.turns[1].tool).toMatchObject({ toolCallId: "t2", status: "ok" });
+  });
+
+  it("degrades an orphaned toolStart (run died mid-tool) to error, not running", () => {
+    const messages: TranscriptMessage[] = [
+      msg("m1", "tool", JSON.stringify({ kind: "toolStart", toolCallId: "t1", name: "Bash" })),
+    ];
+    const state = initialState();
+    hydrate(state, makeEpic(), messages);
+
+    expect(state.turns).toHaveLength(1);
+    expect(state.turns[0].tool).toMatchObject({ toolCallId: "t1", name: "Bash", status: "error" });
+  });
+
   it("appends an optimistic user turn", () => {
     const state = initialState();
     hydrate(state, makeEpic(), []);

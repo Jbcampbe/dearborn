@@ -13,7 +13,10 @@
 // Convergence note: on `exited` we finalize the streaming turn into `turns` in
 // the SAME order the server persists them (tool messages first, then the agent
 // text), so a live-finalized transcript is identical to one re-fetched from
-// `GET /epics/:id/transcript` after a reload.
+// `GET /epics/:id/transcript` after a reload. One wrinkle: the server persists
+// each tool call as TWO `role: "tool"` messages (the serialized `toolStart`,
+// then the `toolEnd`), so `hydrate` folds each pair by `toolCallId` into the
+// single turn the live path produces.
 
 import type { Epic, PlanningPhase, TranscriptMessage, TranscriptRole } from "../api/epics";
 
@@ -121,21 +124,52 @@ export function initialState(): PlanningState {
  */
 export function hydrate(state: PlanningState, epic: Epic, messages: TranscriptMessage[]): void {
   state.epic = epic;
-  state.turns = messages.map((m) => messageToTurn(m));
+  state.turns = foldMessages(messages);
   state.streaming = null;
 }
 
-/** Map a persisted transcript message to a display turn. */
-function messageToTurn(message: TranscriptMessage): Turn {
-  if (message.role === "tool") {
-    return {
-      id: message.id,
-      role: "tool",
-      text: "",
-      tool: parseToolContent(message.content),
-      phase: message.phase,
-    };
+/**
+ * Fold persisted messages into display turns. The server stores each tool call
+ * as TWO `role: "tool"` messages — the serialized `toolStart`, then the
+ * `toolEnd` — so pair them by `toolCallId`: one call renders as ONE chip with
+ * its terminal status. A start left unpaired means the run died mid-tool (tool
+ * events persist only after the run drains, so no end is coming); it degrades
+ * to `error` rather than spinning "running" forever.
+ */
+function foldMessages(messages: TranscriptMessage[]): Turn[] {
+  const turns: Turn[] = [];
+  const open = new Map<string, Turn>();
+  for (const m of messages) {
+    if (m.role !== "tool") {
+      turns.push(messageToTurn(m));
+      continue;
+    }
+    const parsed = parseToolEvent(m.content);
+    if (parsed.kind === "toolEnd") {
+      const startTurn = open.get(parsed.call.toolCallId);
+      if (startTurn?.tool) {
+        startTurn.tool.status = parsed.call.status;
+        startTurn.tool.output = parsed.call.output;
+        open.delete(parsed.call.toolCallId);
+        continue;
+      }
+    }
+    const turn: Turn = { id: m.id, role: "tool", text: "", tool: parsed.call, phase: m.phase };
+    if (parsed.kind === "toolStart" && parsed.call.toolCallId !== "") {
+      open.set(parsed.call.toolCallId, turn);
+    }
+    turns.push(turn);
   }
+  for (const turn of open.values()) {
+    if (turn.tool) {
+      turn.tool.status = "error";
+    }
+  }
+  return turns;
+}
+
+/** Map a persisted non-tool transcript message to a display turn. */
+function messageToTurn(message: TranscriptMessage): Turn {
   return {
     id: message.id,
     role: message.role,
@@ -145,12 +179,18 @@ function messageToTurn(message: TranscriptMessage): Turn {
   };
 }
 
+/** A `role: "tool"` message parsed back into its event kind + display chip. */
+interface ParsedToolEvent {
+  kind: "toolStart" | "toolEnd" | "unknown";
+  call: ToolCall;
+}
+
 /**
  * A `role: "tool"` message stores a serialized `RunEvent` (`toolStart`/
- * `toolEnd`). Recover a display `ToolCall` from it; fall back to a generic chip
- * if it is not the expected shape.
+ * `toolEnd`). Recover the kind + display `ToolCall` from it; fall back to a
+ * generic chip if it is not the expected shape.
  */
-function parseToolContent(content: string): ToolCall {
+function parseToolEvent(content: string): ParsedToolEvent {
   try {
     const raw = JSON.parse(content) as Record<string, unknown>;
     const kind = typeof raw.kind === "string" ? raw.kind : "";
@@ -159,11 +199,14 @@ function parseToolContent(content: string): ToolCall {
     if (kind === "toolEnd") {
       const ok = raw.ok === true;
       const output = typeof raw.output === "string" ? raw.output : null;
-      return { toolCallId, name, status: ok ? "ok" : "error", output };
+      return { kind: "toolEnd", call: { toolCallId, name, status: ok ? "ok" : "error", output } };
     }
-    return { toolCallId, name, status: "running", output: null };
+    if (kind === "toolStart") {
+      return { kind: "toolStart", call: { toolCallId, name, status: "running", output: null } };
+    }
+    return { kind: "unknown", call: { toolCallId, name, status: "ok", output: null } };
   } catch {
-    return { toolCallId: "", name: "tool", status: "ok", output: content };
+    return { kind: "unknown", call: { toolCallId: "", name: "tool", status: "ok", output: content } };
   }
 }
 

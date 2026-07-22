@@ -31,8 +31,8 @@ use axum::{
     http::StatusCode,
     Json,
 };
-use libsql::{params, Connection, Row};
-use serde::{Deserialize, Serialize};
+use libsql::{params, params_from_iter, Connection, Row, Value};
+use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
 
 use crate::planning::config_for_phase;
@@ -117,6 +117,32 @@ pub struct AppendMessage {
     content: Option<String>,
 }
 
+/// `PATCH /epics/{id}` body — manual edits to the epic's user-facing fields
+/// (the Details tab). Every field is optional; absent fields are left
+/// untouched. The context fields are double-options: absent → untouched,
+/// `null` → clear to `NULL`, value → set. `title` must be non-empty when
+/// present (validated in the handler).
+#[derive(Debug, Deserialize)]
+pub struct UpdateEpic {
+    #[serde(default)]
+    title: Option<String>,
+    #[serde(default, deserialize_with = "double_option")]
+    product_context: Option<Option<String>>,
+    #[serde(default, deserialize_with = "double_option")]
+    technical_context: Option<Option<String>>,
+}
+
+/// Deserialize a present-but-maybe-null field into `Some(_)`, leaving an absent
+/// field as `None` (via `#[serde(default)]`). This distinguishes "set to null"
+/// from "not provided" for partial updates (mirrors `projects.rs`).
+fn double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    D: Deserializer<'de>,
+    T: Deserialize<'de>,
+{
+    Deserialize::deserialize(deserializer).map(Some)
+}
+
 /// `POST /projects/{id}/epics` — create an epic and start its planning session.
 ///
 /// Lands the epic in `status='Planning'` and creates the `product`-phase
@@ -185,6 +211,69 @@ pub async fn get_epic(
     let epic = fetch_epic(state.db.conn(), &id)
         .await?
         .ok_or_else(|| epic_not_found(&id))?;
+    Ok(Json(epic))
+}
+
+/// `PATCH /epics/{id}` — manually edit an epic's title and/or context fields.
+///
+/// The write path mirrors `projects::update_project`: a dynamic SET list so
+/// absent fields stay untouched, `updated_at` always bumped, `404` if the epic
+/// does not exist, `400` on an empty `title`. `200` with the updated epic.
+///
+/// On success the updated epic is published as `epic_updated` on `epic:<id>` —
+/// the same frame the planning agent's `update_epic` tool emits — so any
+/// subscribed view (planning record, DAG editor, kanban, or a second Details
+/// tab) re-renders live with the manual edit.
+pub async fn update_epic(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<UpdateEpic>,
+) -> AppResult<Json<Epic>> {
+    let conn = state.db.conn();
+
+    // Build the SET list dynamically so absent fields are left untouched.
+    let mut assignments: Vec<&str> = Vec::new();
+    let mut values: Vec<Value> = Vec::new();
+
+    if let Some(title) = req.title {
+        assignments.push("title = ?");
+        values.push(Value::Text(require_field(Some(title), "title")?));
+    }
+    for (column, field) in [
+        ("product_context = ?", req.product_context),
+        ("technical_context = ?", req.technical_context),
+    ] {
+        if let Some(value) = field {
+            assignments.push(column);
+            values.push(match value {
+                Some(text) => Value::Text(text),
+                None => Value::Null,
+            });
+        }
+    }
+
+    // Always bump updated_at, even for an otherwise-empty patch.
+    assignments.push("updated_at = ?");
+    values.push(Value::Integer(now_ms()));
+    // Bind the id last, matching the trailing `WHERE id = ?`.
+    values.push(Value::Text(id.clone()));
+
+    let sql = format!("UPDATE epic SET {} WHERE id = ?", assignments.join(", "));
+    let affected = conn.execute(&sql, params_from_iter(values)).await?;
+    if affected == 0 {
+        return Err(epic_not_found(&id));
+    }
+
+    let epic = fetch_epic(conn, &id)
+        .await?
+        .ok_or_else(|| AppError::Internal(format!("epic {id} vanished after update")))?;
+
+    // Live-publish the manual edit on epic:<id> (payload = the updated epic).
+    let payload = serde_json::to_value(&epic).unwrap_or(serde_json::Value::Null);
+    state
+        .hub
+        .publish(&format!("epic:{id}"), "epic_updated", payload);
+
     Ok(Json(epic))
 }
 
@@ -827,6 +916,116 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
         assert_eq!(body_json(response).await["error"]["code"], "not_found");
+    }
+
+    #[tokio::test]
+    async fn update_epic_patches_title_and_contexts_and_publishes() {
+        let db = Db::connect(":memory:").await.unwrap();
+        db.run_migrations().await.unwrap();
+        let state = AppState::new(Config::for_test(TOKEN), db);
+        let app = app(state.clone());
+        let project_id = seed_project(&app).await;
+        let created = create_epic_via_api(&app, &project_id, "Old title").await;
+        let id = created["id"].as_str().unwrap().to_string();
+        let created_updated_at = created["updated_at"].as_i64().unwrap();
+
+        let mut sub = state.hub.subscribe(&format!("epic:{id}"));
+
+        let patched = app
+            .oneshot(req(
+                "PATCH",
+                &format!("/epics/{id}"),
+                Some(json!({
+                    "title": "New title",
+                    "product_context": "## Why\nShip it.",
+                    "technical_context": "Use the thing.",
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(patched.status(), StatusCode::OK);
+        let epic = body_json(patched).await;
+        assert_eq!(epic["title"], "New title");
+        assert_eq!(epic["product_context"], "## Why\nShip it.");
+        assert_eq!(epic["technical_context"], "Use the thing.");
+        assert!(epic["updated_at"].as_i64().unwrap() >= created_updated_at);
+
+        // The manual edit is live-published on epic:<id> (same frame the
+        // planning agent's update_epic tool emits).
+        let frame = sub.recv().await.unwrap();
+        let v: Json = serde_json::from_str(&frame).unwrap();
+        assert_eq!(v["type"], "epic_updated");
+        assert_eq!(v["payload"]["title"], "New title");
+    }
+
+    #[tokio::test]
+    async fn update_epic_partial_patch_leaves_absent_fields_untouched() {
+        let app = test_app().await;
+        let project_id = seed_project(&app).await;
+        let id = create_epic_via_api(&app, &project_id, "Keep me").await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let patched = app
+            .clone()
+            .oneshot(req(
+                "PATCH",
+                &format!("/epics/{id}"),
+                Some(json!({ "product_context": "ctx" })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(patched.status(), StatusCode::OK);
+        let epic = body_json(patched).await;
+        assert_eq!(epic["title"], "Keep me", "absent title untouched");
+        assert_eq!(epic["product_context"], "ctx");
+
+        // An explicit null clears a context back to NULL.
+        let cleared = app
+            .oneshot(req(
+                "PATCH",
+                &format!("/epics/{id}"),
+                Some(json!({ "product_context": null })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cleared.status(), StatusCode::OK);
+        assert_eq!(body_json(cleared).await["product_context"], Json::Null);
+    }
+
+    #[tokio::test]
+    async fn update_epic_validates_title_and_unknown_epic() {
+        let app = test_app().await;
+        let project_id = seed_project(&app).await;
+        let id = create_epic_via_api(&app, &project_id, "E").await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Empty title -> 400.
+        let empty = app
+            .clone()
+            .oneshot(req(
+                "PATCH",
+                &format!("/epics/{id}"),
+                Some(json!({ "title": "   " })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(empty).await["error"]["code"], "bad_request");
+
+        // Unknown epic -> 404.
+        let missing = app
+            .oneshot(req(
+                "PATCH",
+                "/epics/nope",
+                Some(json!({ "title": "x" })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     }
 
     #[tokio::test]

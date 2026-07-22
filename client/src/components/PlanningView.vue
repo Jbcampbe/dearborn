@@ -13,6 +13,7 @@ import {
   type PlanningPhase,
   type PlanningSession,
 } from "../api/epics";
+import { getProject } from "../api/projects";
 import { triggerBreakdown } from "../api/tasks";
 import {
   appendUserTurn,
@@ -22,6 +23,7 @@ import {
 } from "../planning/stream";
 import { useEpicStream, type EpicStream, type StreamStatus } from "../planning/useEpicStream";
 import AppIcon from "./AppIcon.vue";
+import EpicTabs from "./EpicTabs.vue";
 import StatusIcon from "./StatusIcon.vue";
 import { renderMarkdown } from "../lib/markdown";
 
@@ -47,6 +49,9 @@ const breakingDown = ref(false);
 const sessions = ref<PlanningSession[]>([]);
 const streamStatus = ref<StreamStatus>("connecting");
 const scroller = ref<HTMLElement | null>(null);
+// The breadcrumb's project name (the epic only carries `project_id`); fills in
+// after load and falls back to "…" if the fetch fails.
+const projectName = ref<string | null>(null);
 
 // A run is in flight while the reducer holds a streaming turn; gate the composer.
 const runInFlight = computed(() => state.streaming !== null);
@@ -111,6 +116,10 @@ async function load() {
     // status ref so no extra watcher is needed (we're past an `await`, so the
     // setup effect scope is no longer current).
     stream = useEpicStream(props.id, token, state, streamStatus);
+    // Non-blocking + non-fatal: the breadcrumb falls back to "…" without it.
+    void getProject(token, epic.project_id)
+      .then((p) => (projectName.value = p.name))
+      .catch((err) => bounceIfAuth(err));
   } catch (err) {
     if (bounceIfAuth(err)) {
       return;
@@ -226,11 +235,9 @@ onMounted(load);
       <template v-if="projectId">
         <span class="sep">/</span>
         <RouterLink :to="{ name: 'project-detail', params: { id: projectId } }">
-          Project
+          {{ projectName ?? "…" }}
         </RouterLink>
       </template>
-      <span class="sep">/</span>
-      <span class="current">{{ state.epic?.title ?? "…" }}</span>
     </nav>
 
     <div v-if="loading" class="loading-stack" aria-label="Loading epic">
@@ -258,6 +265,8 @@ onMounted(load);
           {{ streamStatus === "open" ? "live" : streamStatus }}
         </span>
       </header>
+
+      <EpicTabs :id="props.id" tab="planning" />
 
       <!-- Advance product → technical planning (T-205). Shown only while still in
            product planning; disappears once the technical phase is active. -->

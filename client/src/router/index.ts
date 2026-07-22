@@ -3,6 +3,7 @@ import { createRouter, createWebHistory, type RouteRecordRaw } from "vue-router"
 import ProjectsView from "../components/ProjectsView.vue";
 import ProjectDetailView from "../components/ProjectDetailView.vue";
 import PlanningView from "../components/PlanningView.vue";
+import EpicDetailView from "../components/EpicDetailView.vue";
 import DagEditorView from "../components/DagEditorView.vue";
 import EpicKanbanView from "../components/EpicKanbanView.vue";
 
@@ -28,6 +29,15 @@ const routes: RouteRecordRaw[] = [
     path: "/epic/:id",
     name: "epic-planning",
     component: PlanningView,
+    props: true,
+  },
+  {
+    // Manual epic-details editor: view/edit the epic's title and product /
+    // technical context. Singular `/epic/:id/details` keeps it under the epic
+    // client route; the API owns `/epics/:id` (GET/PATCH).
+    path: "/epic/:id/details",
+    name: "epic-details",
+    component: EpicDetailView,
     props: true,
   },
   {

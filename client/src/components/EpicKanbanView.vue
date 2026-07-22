@@ -5,6 +5,7 @@ import { RouterLink } from "vue-router";
 import { useAuthStore } from "../stores/auth";
 import { ApiError } from "../api/client";
 import { getEpic } from "../api/epics";
+import { getProject } from "../api/projects";
 import type { DagNode } from "../api/tasks";
 import { getDag } from "../api/tasks";
 import {
@@ -20,6 +21,7 @@ import {
   TASK_LANES,
 } from "../board/epicLanes";
 import AppIcon from "./AppIcon.vue";
+import EpicTabs from "./EpicTabs.vue";
 import StatusIcon from "./StatusIcon.vue";
 
 // Epic-detail task kanban (T-402). A different *view* of the same `DagState` the
@@ -37,6 +39,9 @@ const state = reactive<DagState>(initialDagState());
 const loading = ref(true);
 const error = ref<string | null>(null);
 const streamStatus = ref<StreamStatus>("connecting");
+// The breadcrumb's project name (the epic only carries `project_id`); fills in
+// after load and falls back to "…" if the fetch fails.
+const projectName = ref<string | null>(null);
 
 let stream: ReturnType<typeof useDagStream> | null = null;
 onBeforeUnmount(() => stream?.close());
@@ -82,6 +87,10 @@ async function load() {
     ]);
     hydrateDag(state, epicObj, dag);
     stream = useDagStream(props.id, token, state, streamStatus);
+    // Non-blocking + non-fatal: the breadcrumb falls back to "…" without it.
+    void getProject(token, epicObj.project_id)
+      .then((p) => (projectName.value = p.name))
+      .catch((err) => bounceIfAuth(err));
   } catch (err) {
     if (bounceIfAuth(err)) {
       return;
@@ -100,12 +109,10 @@ onMounted(load);
       <RouterLink :to="{ name: 'projects' }">Projects</RouterLink>
       <template v-if="epic">
         <span class="sep">/</span>
-        <RouterLink :to="{ name: 'epic-planning', params: { id: props.id } }">Planning</RouterLink>
-        <span class="sep">/</span>
-        <RouterLink :to="{ name: 'epic-dag', params: { id: props.id } }">DAG</RouterLink>
+        <RouterLink :to="{ name: 'project-detail', params: { id: epic.project_id } }">
+          {{ projectName ?? "…" }}
+        </RouterLink>
       </template>
-      <span class="sep">/</span>
-      <span class="current">Board</span>
     </nav>
 
     <div v-if="loading" class="lanes-skeleton" aria-label="Loading board">
@@ -128,14 +135,10 @@ onMounted(load);
             </span>
           </div>
         </div>
-        <div class="head-side">
-          <span class="conn" :data-status="streamStatus">{{ streamStatus === "open" ? "live" : streamStatus }}</span>
-          <RouterLink class="btn btn-ghost" :to="{ name: 'epic-dag', params: { id: props.id } }">
-            <AppIcon name="diagram" :size="13" />
-            Edit DAG
-          </RouterLink>
-        </div>
+        <span class="conn" :data-status="streamStatus">{{ streamStatus === "open" ? "live" : streamStatus }}</span>
       </header>
+
+      <EpicTabs :id="props.id" tab="board" />
 
       <p v-if="error" class="banner banner-error" role="alert">{{ error }}</p>
 
@@ -211,13 +214,6 @@ onMounted(load);
   border-radius: var(--radius-pills);
   background: var(--color-signal-teal);
   animation: pulse-dot 1.2s ease-in-out infinite;
-}
-
-.head-side {
-  display: flex;
-  align-items: center;
-  gap: var(--spacing-16);
-  flex-shrink: 0;
 }
 
 .lanes {

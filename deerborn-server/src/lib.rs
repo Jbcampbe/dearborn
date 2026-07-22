@@ -234,7 +234,10 @@ pub fn app(state: AppState) -> Router {
             "/projects/:id/epics",
             get(epics::list_epics).post(epics::create_epic),
         )
-        .route("/epics/:id", get(epics::get_epic))
+        .route(
+            "/epics/:id",
+            get(epics::get_epic).patch(epics::update_epic),
+        )
         .route(
             "/epics/:id/messages",
             axum::routing::post(epics::post_message),

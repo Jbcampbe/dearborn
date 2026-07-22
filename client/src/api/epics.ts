@@ -86,6 +86,29 @@ export function getEpic(token: string, id: string): Promise<Epic> {
   return apiFetch<Epic>(`/epics/${encodeURIComponent(id)}`, token);
 }
 
+/**
+ * `PATCH /epics/{id}` body — manual edits from the Details tab. Absent keys
+ * are left untouched; a `null` context clears it. `title` must be non-empty
+ * when present.
+ */
+export interface UpdateEpicBody {
+  title?: string;
+  product_context?: string | null;
+  technical_context?: string | null;
+}
+
+/**
+ * `PATCH /epics/{id}` → the updated epic (200). The server also publishes an
+ * `epic_updated` frame on `epic:<id>`, so every subscribed view re-renders
+ * live with the manual edit.
+ */
+export function updateEpic(token: string, id: string, body: UpdateEpicBody): Promise<Epic> {
+  return apiFetch<Epic>(`/epics/${encodeURIComponent(id)}`, token, {
+    method: "PATCH",
+    body: JSON.stringify(body),
+  });
+}
+
 /** `GET /epics/{id}/transcript` → the epic's messages in `seq` order. */
 export async function getTranscript(token: string, id: string): Promise<TranscriptMessage[]> {
   const data = await apiFetch<Collection<TranscriptMessage>>(
