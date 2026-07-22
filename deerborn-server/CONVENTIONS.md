@@ -91,6 +91,7 @@ iff `status='Todo'` and every blocker (a task with an edge into it) is `Done`.
 | read the DAG (nodes + readiness + edges) | `GET /epics/{id}/dag` | `200` (`{ epic_id, nodes: [DagNode], edges: [{blocker_id, blocked_id}] }`) |
 | get one task | `GET /tasks/{id}` | `200` |
 | create a task under the epic | `POST /epics/{id}/tasks` | `201` (task; body `{ title, description?, acceptance?, blocks?: [ids] }`) |
+| create a standalone task under a project | `POST /projects/{id}/tasks` | `201` (task with `epic_id: null`; body `{ title, description?, acceptance? }` — no `blocks`: standalone tasks carry no dependencies) |
 | partially update a task | `PATCH /tasks/{id}` | `200` (double-option for `description`/`acceptance`: absent=untouched, `null`=clear, value=set; `status` validated) |
 | delete a task (and its edges) | `DELETE /tasks/{id}` | `204` |
 | link a dependency | `POST /epics/{id}/dependencies` | `201` (`{ blocker_id, blocked_id }`); `409` on a cycle, `400` on self/cross-epic |
@@ -107,7 +108,12 @@ uses (T-301).
 #### Project board & epic lanes (T-401)
 
 The project board is the kanban view at the project level — the project's epics
-(each in its lane) plus its standalone (parentless, `epic_id IS NULL`) tasks.
+(each in its lane) plus its standalone (parentless, `epic_id IS NULL`) tasks. Standalone tasks are small, self-contained units of
+tracked work: they have no dependencies (linking one is a `400`), no DAG, and
+no lane-move control — they are created (`POST /projects/{id}/tasks`), edited,
+and deleted through the plain task endpoints (`PATCH` / `DELETE /tasks/{id}`).
+Mutating a standalone task publishes `board_updated` on `project:<id>` (not
+`dag_updated` — there is no epic to publish it on).
 
 | Action | Method + path | Success status |
 | ------ | ------------- | -------------- |
@@ -287,7 +293,7 @@ malformed frames get an `error` frame back (the connection stays open).
 | `error`        | Protocol error; `payload.message` explains it. `topic` is `""`. |
 | `epic_updated` | An epic's record changed (planning `update_epic`, the breakdown `Planning → Ready` transition, or a lane transition via `POST /epics/{id}/lane`). `payload` = the updated epic. |
 | `dag_updated`  | A task or dependency changed under the epic (T-301). `payload` = `{ nodes: [DagNode], edges: [{ blocker_id, blocked_id }] }` (same shape as `GET /epics/{id}/dag`; nodes carry `ready` + `blocked_by`). |
-| `board_updated` | The project board changed (epic lane transition via `POST /epics/{id}/lane`, or breakdown's `Planning → Ready`). `payload` = `{ epics: [Epic], tasks: [Task] }` (same shape as `GET /projects/{id}/board`; `tasks` are standalone). Published on `project:<id>`. |
+| `board_updated` | The project board changed (epic lane transition via `POST /epics/{id}/lane`, breakdown's `Planning → Ready`, or a standalone task create/patch/delete). `payload` = `{ epics: [Epic], tasks: [Task] }` (same shape as `GET /projects/{id}/board`; `tasks` are standalone). Published on `project:<id>`. |
 | *(any other)*  | A published event, delivered only to connections subscribed to its `topic`. |
 
 ### Planning `RunEvent` stream (T-202)

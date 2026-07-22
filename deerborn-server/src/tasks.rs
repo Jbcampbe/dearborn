@@ -103,6 +103,49 @@ pub async fn create_task(
         .ok_or_else(|| AppError::Internal(format!("task {id} vanished after insert")))
 }
 
+/// Insert a **standalone** (parentless, `epic_id = NULL`) task directly under
+/// a project, landing it in `status='Todo'`. Standalone tasks are small,
+/// self-contained units of work that don't warrant an epic's planning /
+/// breakdown / DAG ceremony; they surface on the project board (T-401) via
+/// [`list_standalone_tasks`]. `position` is left `NULL` — the board orders
+/// standalone tasks by `created_at DESC`, so an ordinal is meaningless here.
+/// `title` is required (validated); `description` / `acceptance` are optional.
+/// Returns the stored task.
+pub async fn create_standalone_task(
+    conn: &Connection,
+    project_id: &str,
+    title: &str,
+    description: Option<&str>,
+    acceptance: Option<&str>,
+) -> AppResult<Task> {
+    let title = title.trim();
+    if title.is_empty() {
+        return Err(AppError::BadRequest("`title` must not be empty".to_string()));
+    }
+
+    let id = ulid::Ulid::new().to_string();
+    let now = now_ms();
+
+    conn.execute(
+        "INSERT INTO task \
+             (id, epic_id, project_id, title, description, acceptance, status, position, created_at, updated_at) \
+         VALUES (?1, NULL, ?2, ?3, ?4, ?5, 'Todo', NULL, ?6, ?6)",
+        params![
+            id.clone(),
+            project_id,
+            title,
+            description,
+            acceptance,
+            now
+        ],
+    )
+    .await?;
+
+    fetch_task(conn, &id)
+        .await?
+        .ok_or_else(|| AppError::Internal(format!("task {id} vanished after insert")))
+}
+
 /// Link a dependency edge `(blocker_id, blocked_id)` ("blocker blocks blocked").
 ///
 /// Validates that both tasks exist and share the **same epic**, rejects a
@@ -127,6 +170,16 @@ pub async fn link_dependency(
     let blocked_epic = task_epic(conn, blocked_id)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("task {blocked_id} not found")))?;
+
+    // Standalone tasks carry no dependencies: they are meant to be small,
+    // self-contained units of work. (This also closes the cross-project hole
+    // where two standalone tasks would pass the same-epic check as NULL ==
+    // NULL despite living under different projects.)
+    if blocker_epic.is_none() || blocked_epic.is_none() {
+        return Err(AppError::BadRequest(
+            "standalone tasks cannot have dependencies".to_string(),
+        ));
+    }
     if blocker_epic != blocked_epic {
         return Err(AppError::BadRequest(
             "both tasks must belong to the same epic to be linked".to_string(),
@@ -242,7 +295,10 @@ pub async fn task_belongs_to_epic(
     task_id: &str,
     epic_id: &str,
 ) -> AppResult<bool> {
-    Ok(task_epic(conn, task_id).await? == Some(epic_id.to_string()))
+    Ok(matches!(
+        task_epic(conn, task_id).await?,
+        Some(Some(e)) if e == epic_id
+    ))
 }
 
 /// The permitted task lifecycle statuses (§2.2). Readiness is *computed* from
@@ -414,7 +470,7 @@ use axum::http::StatusCode;
 use axum::Json;
 use serde::Deserialize;
 
-use crate::epics::fetch_epic;
+use crate::epics::{fetch_epic, project_exists};
 use crate::AppState;
 
 /// `GET /epics/{id}/dag` — the epic's task DAG with per-task readiness. `404` if
@@ -489,9 +545,50 @@ pub async fn create_epic_task(
     Ok((StatusCode::CREATED, Json(task)))
 }
 
+/// `POST /projects/{id}/tasks` — create a **standalone** (parentless) task
+/// directly under the project, for work too small to warrant an epic. Body:
+/// `{ title, description?, acceptance? }` (no `blocks` — standalone tasks
+/// carry no dependencies). `201` with the created task; `404` if the project
+/// does not exist. Publishes `board_updated` on `project:<id>`.
+#[derive(Debug, Deserialize)]
+pub struct CreateStandaloneTaskBody {
+    title: Option<String>,
+    #[serde(default)]
+    description: Option<String>,
+    #[serde(default)]
+    acceptance: Option<String>,
+}
+
+pub async fn create_project_task(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Json(req): Json<CreateStandaloneTaskBody>,
+) -> AppResult<(StatusCode, Json<Task>)> {
+    let conn = state.db.conn();
+    if !project_exists(conn, &id).await? {
+        return Err(AppError::NotFound(format!("project {id} not found")));
+    }
+    let title = req.title.as_deref().map(str::trim).filter(|s| !s.is_empty()).ok_or_else(|| {
+        AppError::BadRequest("`title` is required and must not be empty".to_string())
+    })?;
+
+    let task = create_standalone_task(
+        conn,
+        &id,
+        title,
+        req.description.as_deref(),
+        req.acceptance.as_deref(),
+    )
+    .await?;
+
+    crate::board::publish_board(&state, &id).await;
+    Ok((StatusCode::CREATED, Json(task)))
+}
+
 /// `PATCH /tasks/{id}` — partial update (double-option for nullable fields).
 /// `200` with the updated task; `404` if it does not exist. Publishes
-/// `dag_updated` on the task's epic.
+/// `dag_updated` on the task's epic (or `board_updated` on its project when
+/// the task is standalone).
 #[derive(Debug, Deserialize)]
 pub struct UpdateTaskBody {
     #[serde(default)]
@@ -521,22 +618,30 @@ pub async fn patch_task(
     .await?;
     if let Some(epic_id) = task.epic_id.as_ref() {
         crate::mcp::publish_dag(&state, epic_id).await;
+    } else {
+        crate::board::publish_board(&state, &task.project_id).await;
     }
     Ok(Json(task))
 }
 
 /// `DELETE /tasks/{id}` — remove a task and its dependency edges. `204`;
-/// `404` if it does not exist. Publishes `dag_updated` on the task's epic.
+/// `404` if it does not exist. Publishes `dag_updated` on the task's epic
+/// (or `board_updated` on its project when the task is standalone — a NULL
+/// epic must not be misread as "missing").
 pub async fn remove_task(
     State(state): State<AppState>,
     Path(id): Path<String>,
 ) -> AppResult<StatusCode> {
     let conn = state.db.conn();
-    let epic_id = task_epic(conn, &id)
+    let task = fetch_task(conn, &id)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("task {id} not found")))?;
     delete_task(conn, &id).await?;
-    crate::mcp::publish_dag(&state, &epic_id).await;
+    if let Some(epic_id) = task.epic_id.as_ref() {
+        crate::mcp::publish_dag(&state, epic_id).await;
+    } else {
+        crate::board::publish_board(&state, &task.project_id).await;
+    }
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -640,14 +745,16 @@ pub async fn fetch_task(conn: &Connection, id: &str) -> AppResult<Option<Task>> 
     }
 }
 
-/// The `epic_id` of a task, or `None` if the task does not exist (or is
-/// standalone with a NULL epic — treated as "no epic" for linking purposes).
-async fn task_epic(conn: &Connection, task_id: &str) -> AppResult<Option<String>> {
+/// The `epic_id` of a task as a **double option**: outer `None` = the task
+/// does not exist; inner `None` = the task exists but is standalone (NULL
+/// epic). Keeping the two cases distinct lets callers reject standalone tasks
+/// with a clear `400` instead of a misleading `404`.
+async fn task_epic(conn: &Connection, task_id: &str) -> AppResult<Option<Option<String>>> {
     let mut rows = conn
         .query("SELECT epic_id FROM task WHERE id = ?1", params![task_id])
         .await?;
     match rows.next().await? {
-        Some(row) => Ok(row.get::<Option<String>>(0)?),
+        Some(row) => Ok(Some(row.get::<Option<String>>(0)?)),
         None => Ok(None),
     }
 }
@@ -1226,5 +1333,140 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
+
+    // ---- standalone (parentless) tasks ----
+
+    #[tokio::test]
+    async fn create_standalone_task_round_trips_with_null_epic() {
+        let (db, project_id, _e) = seed().await;
+        let conn = db.conn();
+
+        let t = create_standalone_task(conn, &project_id, "Small fix", Some("desc"), None)
+            .await
+            .unwrap();
+        assert_eq!(t.title, "Small fix");
+        assert_eq!(t.epic_id, None, "standalone => NULL epic");
+        assert_eq!(t.project_id, project_id);
+        assert_eq!(t.status, "Todo");
+        assert_eq!(t.position, None, "no ordinal for standalone tasks");
+
+        // Surfaces via list_standalone_tasks; excluded from any epic's list.
+        let standalone = list_standalone_tasks(conn, &project_id).await.unwrap();
+        assert_eq!(standalone.len(), 1);
+        assert_eq!(standalone[0].id, t.id);
+        assert!(list_tasks_for_epic(conn, &_e).await.unwrap().is_empty());
+
+        // Empty title -> 400.
+        let err = create_standalone_task(conn, &project_id, "  ", None, None)
+            .await
+            .unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)));
+    }
+
+    #[tokio::test]
+    async fn link_dependency_rejects_standalone_tasks() {
+        let (db, project_id, epic_id) = seed().await;
+        let conn = db.conn();
+        let a = create_task(conn, &epic_id, &project_id, "A", None, None).await.unwrap();
+        let s1 = create_standalone_task(conn, &project_id, "S1", None, None).await.unwrap();
+        let s2 = create_standalone_task(conn, &project_id, "S2", None, None).await.unwrap();
+
+        // standalone <-> epic-scoped: rejected 400 (not a misleading 404).
+        let err = link_dependency(conn, &s1.id, &a.id).await.unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)), "standalone blocker rejected");
+        let err = link_dependency(conn, &a.id, &s1.id).await.unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)), "standalone blocked rejected");
+
+        // standalone <-> standalone: also rejected (and never links across
+        // projects via the NULL == NULL hole).
+        let err = link_dependency(conn, &s1.id, &s2.id).await.unwrap_err();
+        assert!(matches!(err, AppError::BadRequest(_)), "standalone pair rejected");
+    }
+
+    #[tokio::test]
+    async fn create_project_task_endpoint_creates_and_publishes_board() {
+        let (state, app, project_id, _e) = seed_app().await;
+
+        let mut sub = state.hub.subscribe(&format!("project:{project_id}"));
+
+        let response = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                &format!("/projects/{project_id}/tasks"),
+                Some(json!({"title":"Small fix","description":"d","acceptance":"a"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let task = body_json(response).await;
+        assert_eq!(task["title"], "Small fix");
+        assert_eq!(task["epic_id"], Value::Null);
+        assert_eq!(task["status"], "Todo");
+
+        // A board_updated frame fired, carrying the new standalone task.
+        let frame = sub.recv().await.unwrap();
+        let v: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(v["type"], "board_updated");
+        assert_eq!(v["payload"]["tasks"].as_array().unwrap().len(), 1);
+        assert_eq!(v["payload"]["tasks"][0]["id"], task["id"]);
+
+        // Missing title -> 400; unknown project -> 404.
+        let bad = app
+            .clone()
+            .oneshot(req("POST", &format!("/projects/{project_id}/tasks"), Some(json!({"title":"  "}))))
+            .await
+            .unwrap();
+        assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
+        let missing = app
+            .oneshot(req("POST", "/projects/nope/tasks", Some(json!({"title":"X"}))))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn patch_and_delete_standalone_task_publish_board() {
+        let (state, app, project_id, _e) = seed_app().await;
+        let conn = state.db.conn();
+        let t = create_standalone_task(conn, &project_id, "S", None, None)
+            .await
+            .unwrap();
+
+        let mut sub = state.hub.subscribe(&format!("project:{project_id}"));
+
+        // Patch a standalone task -> 200 + board_updated (not dag_updated).
+        let response = app
+            .clone()
+            .oneshot(req(
+                "PATCH",
+                &format!("/tasks/{}", t.id),
+                Some(json!({"title":"S2","status":"Done"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let task = body_json(response).await;
+        assert_eq!(task["title"], "S2");
+        assert_eq!(task["status"], "Done");
+        let frame = sub.recv().await.unwrap();
+        let v: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(v["type"], "board_updated");
+        assert_eq!(v["payload"]["tasks"][0]["title"], "S2");
+
+        // Delete a standalone task -> 204 (regression: a NULL epic must not
+        // be misread as "task not found") + board_updated.
+        let response = app
+            .clone()
+            .oneshot(req("DELETE", &format!("/tasks/{}", t.id), None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+        assert!(fetch_task(conn, &t.id).await.unwrap().is_none());
+        let frame = sub.recv().await.unwrap();
+        let v: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(v["type"], "board_updated");
+        assert!(v["payload"]["tasks"].as_array().unwrap().is_empty());
     }
 }

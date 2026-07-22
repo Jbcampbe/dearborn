@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted, ref } from "vue";
+import { onBeforeUnmount, onMounted, ref } from "vue";
 import { RouterLink } from "vue-router";
 import { useAuthStore } from "../stores/auth";
 import { ApiError } from "../api/client";
@@ -12,10 +12,11 @@ import StatusIcon from "./StatusIcon.vue";
 import AppIcon from "./AppIcon.vue";
 
 // Project detail shell (T-104). Shows the project's identity + clone lifecycle,
-// the project's epics, and a "New epic" entry point (T-204) that creates an
-// epic and drops the user into the planning chat. "Re-clone" triggers a
-// background `git fetch`; because the clone settles asynchronously, the user
-// reloads to watch pending → ready/error.
+// the project's epics, and a single "+ New" menu with the two creation entry
+// points: **Epic** (T-204, creates an epic and drops the user into the
+// planning chat) and **Task** (a standalone to-do, created through the board's
+// TaskModal). "Re-clone" triggers a background `git fetch`; because the clone
+// settles asynchronously, the user reloads to watch pending → ready/error.
 const props = defineProps<{ id: string }>();
 
 const auth = useAuthStore();
@@ -25,6 +26,55 @@ const loading = ref(true);
 const error = ref<string | null>(null);
 const refreshing = ref(false);
 const epicModalOpen = ref(false);
+
+/** The board's exposed create-task opener (its TaskModal serves create + edit). */
+const kanban = ref<{ openCreateTask: () => void } | null>(null);
+
+/** The "+ New" dropdown (Epic | Task). Closes on outside click and Escape. */
+const newMenuOpen = ref(false);
+const newMenuEl = ref<HTMLElement | null>(null);
+
+function closeNewMenu() {
+  newMenuOpen.value = false;
+}
+
+function onNewMenuDocMouseDown(event: MouseEvent) {
+  if (!newMenuEl.value?.contains(event.target as Node)) {
+    closeNewMenu();
+  }
+}
+
+function onNewMenuKeydown(event: KeyboardEvent) {
+  if (event.key === "Escape") {
+    closeNewMenu();
+  }
+}
+
+function toggleNewMenu() {
+  newMenuOpen.value = !newMenuOpen.value;
+  if (newMenuOpen.value) {
+    document.addEventListener("mousedown", onNewMenuDocMouseDown);
+    document.addEventListener("keydown", onNewMenuKeydown);
+  } else {
+    document.removeEventListener("mousedown", onNewMenuDocMouseDown);
+    document.removeEventListener("keydown", onNewMenuKeydown);
+  }
+}
+
+onBeforeUnmount(() => {
+  document.removeEventListener("mousedown", onNewMenuDocMouseDown);
+  document.removeEventListener("keydown", onNewMenuKeydown);
+});
+
+function chooseNewEpic() {
+  closeNewMenu();
+  epicModalOpen.value = true;
+}
+
+function chooseNewTask() {
+  closeNewMenu();
+  kanban.value?.openCreateTask();
+}
 
 async function load() {
   const token = auth.token;
@@ -103,10 +153,28 @@ onMounted(load);
             <AppIcon name="refresh" :size="13" />
             {{ refreshing ? "Re-cloning…" : "Re-clone" }}
           </button>
-          <button class="btn btn-primary" @click="epicModalOpen = true">
-            <AppIcon name="plus" :size="13" />
-            New epic
-          </button>
+          <div ref="newMenuEl" class="new-menu">
+            <button
+              class="btn btn-primary"
+              aria-haspopup="menu"
+              :aria-expanded="newMenuOpen"
+              @click="toggleNewMenu"
+            >
+              <AppIcon name="plus" :size="13" />
+              New
+              <AppIcon name="chevron-down" :size="12" />
+            </button>
+            <div v-if="newMenuOpen" class="new-menu-pop" role="menu">
+              <button class="new-menu-item" role="menuitem" @click="chooseNewEpic">
+                <span class="new-menu-title">Epic</span>
+                <span class="new-menu-desc">Plan and break down a larger body of work</span>
+              </button>
+              <button class="new-menu-item" role="menuitem" @click="chooseNewTask">
+                <span class="new-menu-title">Task</span>
+                <span class="new-menu-desc">Small standalone to-do, straight to the board</span>
+              </button>
+            </div>
+          </div>
         </div>
       </header>
 
@@ -162,7 +230,7 @@ onMounted(load);
         </ul>
       </section>
 
-      <ProjectKanbanView :id="project.id" />
+      <ProjectKanbanView :id="project.id" ref="kanban" />
 
       <CreateEpicModal
         :open="epicModalOpen"
@@ -209,6 +277,53 @@ onMounted(load);
   align-items: center;
   gap: var(--spacing-8);
   flex-shrink: 0;
+}
+
+.new-menu {
+  position: relative;
+}
+
+.new-menu-pop {
+  position: absolute;
+  top: calc(100% + 6px);
+  right: 0;
+  z-index: 40;
+  min-width: 240px;
+  display: flex;
+  flex-direction: column;
+  padding: 4px;
+  background: var(--surface-obsidian);
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-cards);
+  box-shadow: var(--shadow-xl);
+}
+
+.new-menu-item {
+  display: flex;
+  flex-direction: column;
+  align-items: flex-start;
+  gap: 2px;
+  padding: 8px 10px;
+  border: none;
+  border-radius: var(--radius-cards);
+  background: transparent;
+  text-align: left;
+  cursor: pointer;
+}
+
+.new-menu-item:hover {
+  background: var(--surface-carbon);
+}
+
+.new-menu-title {
+  font-size: var(--text-caption);
+  font-weight: var(--weight-medium);
+  color: var(--text-primary);
+}
+
+.new-menu-desc {
+  font-size: var(--text-label);
+  color: var(--text-faint);
 }
 
 .meta {

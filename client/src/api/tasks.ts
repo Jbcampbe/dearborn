@@ -84,6 +84,29 @@ export function createTask(token: string, epicId: string, input: CreateTaskInput
   });
 }
 
+/** Body for `POST /projects/{id}/tasks` (no `blocks` — standalone tasks carry no dependencies). */
+export interface CreateStandaloneTaskInput {
+  title: string;
+  description?: string;
+  acceptance?: string;
+}
+
+/**
+ * `POST /projects/{id}/tasks` → the created standalone task (201, `epic_id`
+ * is `null`). A `board_updated` frame on `project:<id>` carries it to the
+ * project kanban — no manual refetch needed.
+ */
+export function createProjectTask(
+  token: string,
+  projectId: string,
+  input: CreateStandaloneTaskInput,
+): Promise<Task> {
+  return apiFetch<Task>(`/projects/${encodeURIComponent(projectId)}/tasks`, token, {
+    method: "POST",
+    body: JSON.stringify(input),
+  });
+}
+
 /**
  * Body for `PATCH /tasks/{id}`. `description`/`acceptance` use the double-option
  * convention: absent = untouched, `null` = clear, a string = set. `title`/`status`

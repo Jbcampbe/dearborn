@@ -10,13 +10,15 @@ import type { Task } from "../api/tasks";
 import { hydrateBoard, initialBoardState, type BoardState } from "../board/stream";
 import { useBoardStream, type StreamStatus } from "../board/useBoardStream";
 import StatusIcon from "./StatusIcon.vue";
+import TaskModal from "./TaskModal.vue";
 
 // Project-detail kanban (T-401). Loads the project board (epics + standalone
 // tasks), subscribes to `project:<id>` for live `board_updated` frames, and
 // renders a lane-based kanban. Each epic card has a lane-move control limited
 // to the permitted transitions; the WS frame drives re-render after a move.
-// Standalone tasks map to lanes by status but have no lane-move control in
-// T-401.
+// Standalone tasks map to lanes by status; they have no lane-move control,
+// but are created (via the page header's `+ New` menu, through the exposed
+// `openCreateTask`) and edited (click a card) through the TaskModal.
 const props = defineProps<{ id: string }>();
 
 const auth = useAuthStore();
@@ -24,6 +26,25 @@ const state = reactive<BoardState>(initialBoardState());
 const loading = ref(true);
 const error = ref<string | null>(null);
 const streamStatus = ref<StreamStatus>("connecting");
+
+/** Task-modal state: open flag + the task being edited (null = create mode). */
+const taskModalOpen = ref(false);
+const editingTask = ref<Task | null>(null);
+
+function openCreateTask() {
+  editingTask.value = null;
+  taskModalOpen.value = true;
+}
+
+function openEditTask(task: Task) {
+  editingTask.value = task;
+  taskModalOpen.value = true;
+}
+
+// The project header's `+ New → Task` menu item opens the create dialog from
+// outside this component (the modal lives here so card click-to-edit and
+// create share one instance).
+defineExpose({ openCreateTask });
 
 let stream: ReturnType<typeof useBoardStream> | null = null;
 onBeforeUnmount(() => stream?.close());
@@ -212,7 +233,15 @@ onMounted(load);
             </div>
           </div>
 
-          <div v-for="task in tasksByLane[lane.key]" :key="task.id" class="card task-card">
+          <div
+            v-for="task in tasksByLane[lane.key]"
+            :key="task.id"
+            class="card card-interactive task-card"
+            role="button"
+            tabindex="0"
+            @click="openEditTask(task)"
+            @keydown.enter="openEditTask(task)"
+          >
             <span class="card-title">{{ task.title }}</span>
             <div class="card-foot">
               <span class="badge">
@@ -228,6 +257,13 @@ onMounted(load);
         </div>
       </div>
     </div>
+
+    <TaskModal
+      :open="taskModalOpen"
+      :project-id="props.id"
+      :task="editingTask"
+      @close="taskModalOpen = false"
+    />
   </section>
 </template>
 

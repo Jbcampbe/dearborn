@@ -231,6 +231,10 @@ pub fn app(state: AppState) -> Router {
         )
         .route("/projects/:id/board", get(board::get_board))
         .route(
+            "/projects/:id/tasks",
+            axum::routing::post(tasks::create_project_task),
+        )
+        .route(
             "/projects/:id/epics",
             get(epics::list_epics).post(epics::create_epic),
         )
