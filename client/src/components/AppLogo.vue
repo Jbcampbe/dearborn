@@ -1,5 +1,5 @@
 <script setup lang="ts">
-// Deerborn wordmark lockup. The glyph is a geometric "antler" mark — a stem
+// Dearborn wordmark lockup. The glyph is a geometric "antler" mark — a stem
 // forking into two branches tipped with nodes, deliberately echoing a git
 // graph. Rendered in void ink on the acid-lime tile (the brand's primary
 // lockup); `bare` renders the glyph alone in currentColor.

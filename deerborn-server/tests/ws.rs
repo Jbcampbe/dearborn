@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use deerborn_server::{app, AppState, Config, Db, Hub};
+use dearborn_server::{app, AppState, Config, Db, Hub};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio_tungstenite::connect_async;

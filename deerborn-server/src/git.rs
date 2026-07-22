@@ -269,12 +269,12 @@ mod tests {
         // A syntactically valid but non-resolvable https URL -> git fails fast
         // (GIT_TERMINAL_PROMPT=0 prevents any auth prompt hang).
         let dir = std::env::temp_dir().join(format!(
-            "deerborn-git-badurl-{}-{}",
+            "dearborn-git-badurl-{}-{}",
             std::process::id(),
             now_nanos()
         ));
         let dest = dir.join("repo");
-        let bad = "https://deerborn.invalid/nope/nope.git";
+        let bad = "https://dearborn.invalid/nope/nope.git";
         let err = clone_repo(bad, Some(PAT), &dest)
             .await
             .expect_err("clone of a bad URL must fail");

@@ -8,8 +8,8 @@
 //!
 //! Browsers cannot set an `Authorization` header on the WS handshake, so the
 //! token is accepted from **either**:
-//!   * the `token` query parameter — `GET /ws?token=<DEERBORN_TOKEN>` (browsers), or
-//!   * an `Authorization: Bearer <DEERBORN_TOKEN>` header (native clients / tools).
+//!   * the `token` query parameter — `GET /ws?token=<DEARBORN_TOKEN>` (browsers), or
+//!   * an `Authorization: Bearer <DEARBORN_TOKEN>` header (native clients / tools).
 //!
 //! Validation happens **before** the upgrade: a missing/invalid token is rejected
 //! with the standard `401` error envelope and the socket is never opened. `/ws` is
@@ -90,7 +90,11 @@ async fn handle_socket(socket: WebSocket, hub: Arc<Hub>) {
     let (outbox_tx, mut outbox_rx) = mpsc::channel::<Envelope>(OUTBOX_CAPACITY);
     let writer: JoinHandle<()> = tokio::spawn(async move {
         while let Some(frame) = outbox_rx.recv().await {
-            if ws_sink.send(Message::Text(frame.to_string())).await.is_err() {
+            if ws_sink
+                .send(Message::Text(frame.to_string()))
+                .await
+                .is_err()
+            {
                 break; // client went away
             }
         }
@@ -128,7 +132,11 @@ async fn handle_control(
         Ok(control) => control,
         Err(err) => {
             let _ = outbox_tx
-                .send(encode("", "error", json!({ "message": format!("invalid frame: {err}") })))
+                .send(encode(
+                    "",
+                    "error",
+                    json!({ "message": format!("invalid frame: {err}") }),
+                ))
                 .await;
             return;
         }
@@ -138,7 +146,11 @@ async fn handle_control(
         "subscribe" => {
             let Some(topic) = control.topic else {
                 let _ = outbox_tx
-                    .send(encode("", "error", json!({ "message": "subscribe requires a topic" })))
+                    .send(encode(
+                        "",
+                        "error",
+                        json!({ "message": "subscribe requires a topic" }),
+                    ))
                     .await;
                 return;
             };
@@ -147,18 +159,28 @@ async fn handle_control(
         "unsubscribe" => {
             let Some(topic) = control.topic else {
                 let _ = outbox_tx
-                    .send(encode("", "error", json!({ "message": "unsubscribe requires a topic" })))
+                    .send(encode(
+                        "",
+                        "error",
+                        json!({ "message": "unsubscribe requires a topic" }),
+                    ))
                     .await;
                 return;
             };
             if let Some(handle) = forwarders.remove(&topic) {
                 handle.abort();
             }
-            let _ = outbox_tx.send(encode(&topic, "unsubscribed", json!({}))).await;
+            let _ = outbox_tx
+                .send(encode(&topic, "unsubscribed", json!({})))
+                .await;
         }
         other => {
             let _ = outbox_tx
-                .send(encode("", "error", json!({ "message": format!("unknown type: {other}") })))
+                .send(encode(
+                    "",
+                    "error",
+                    json!({ "message": format!("unknown type: {other}") }),
+                ))
                 .await;
         }
     }
@@ -192,7 +214,9 @@ async fn subscribe(
     }
     // Ack after the forwarder is registered, so a client that waits for the ack
     // before triggering a publish is guaranteed to receive that event.
-    let _ = outbox_tx.send(encode(&topic, "subscribed", json!({}))).await;
+    let _ = outbox_tx
+        .send(encode(&topic, "subscribed", json!({})))
+        .await;
 }
 
 /// A client control frame. `payload` is accepted but unused for control types.

@@ -1,9 +1,9 @@
-# Deerborn — v1 Architecture Decisions
+# Dearborn — v1 Architecture Decisions
 
 Derived from a design interview over [VISION.md](./VISION.md). This captures the
 **resolved** decisions and the deliberate **v1 → v2** line. The `references/`
 directory (ralph-v2 + prompt contracts) is the proven blueprint for the
-orchestrator; Deerborn reimplements it in Rust with a libSQL job queue.
+orchestrator; Dearborn reimplements it in Rust with a libSQL job queue.
 
 ---
 
@@ -24,7 +24,7 @@ Clients are a shared Vue/Tauri codebase, web-first.
   **[agent-harness](https://github.com/getlatentic/agent-harness)** — one
   `Harness` trait, normalized `RunEvent` stream (text, reasoning, tool calls,
   tokens, lifecycle).
-- Deerborn does **not** implement its own agent loop.
+- Dearborn does **not** implement its own agent loop.
 
 ## 2. Concurrency & isolation
 - **Concurrency unit = the epic.** Serial *within* an epic (topological DAG
@@ -44,13 +44,13 @@ Clients are a shared Vue/Tauri codebase, web-first.
 
 ## 4. Per-task pipeline
 ```
-implement → [test gate: Deerborn runs tests, fix-loop ≤N] → commit
+implement → [test gate: Dearborn runs tests, fix-loop ≤N] → commit
           → review+verdict (single agent) → fix-loop ≤N (re-test, re-commit) → close
 ```
 - Merged **review+judge into one agent** (ralph-v2 was over-split). Mitigation:
   **strict output contract** — `VERDICT: PASS|NEEDS_CHANGES|BLOCKED` on the first
   line, one reparse retry.
-- **Deerborn owns all determinism** (ralph-v2 discipline): the test gate, git,
+- **Dearborn owns all determinism** (ralph-v2 discipline): the test gate, git,
   commits, status transitions, close, PR. Agents are pure functions.
 
 ## 5. Project build/test config
@@ -92,22 +92,22 @@ implement → [test gate: Deerborn runs tests, fix-loop ≤N] → commit
   `Blocked` and `Cancelled`.
 
 ## 9. Knowledge base (agentmemory) — mostly deferred
-- **v1: agentmemory is an environment assumption, not Deerborn code.** The user
+- **v1: agentmemory is an environment assumption, not Dearborn code.** The user
   manually runs agentmemory and pre-configures each coding agent (plugins / MCP /
-  lifecycle hooks) so memory capture happens automatically when Deerborn shells
+  lifecycle hooks) so memory capture happens automatically when Dearborn shells
   out to them.
-- Deerborn ships **zero agentmemory-aware code** in v1 — no supervision, no
+- Dearborn ships **zero agentmemory-aware code** in v1 — no supervision, no
   namespacing, no `API → Memory` reads. Only the agents touch memory.
 - agentmemory is a self-contained Node server (SQLite + vectors; REST :3111,
   MCP with 53 tools, viewer :3113) with hook-based auto-capture + MCP save/recall.
-- **v2:** Deerborn supervises the process, handles per-project namespacing, and —
+- **v2:** Dearborn supervises the process, handles per-project namespacing, and —
   enabled by the libSQL choice below — can absorb agentmemory's store into its own
   DB without swapping engines.
 
 ## 10. Planning agents (interactive)
 - **Same machine, two prompt configs:** product-planning (business scope) and
   technical-planning (code-focused) share one chat/transcript mechanism.
-- **Deerborn owns the durable transcript** per epic (source of truth, resumable,
+- **Dearborn owns the durable transcript** per epic (source of truth, resumable,
   portable across backends); may ride native session-resume purely as a cost
   optimization. Each user message → an agent run → `RunEvent`s streamed to the
   client over WS.
@@ -116,10 +116,10 @@ implement → [test gate: Deerborn runs tests, fix-loop ≤N] → commit
 - Output artifact = the **Epic record**, maintained live by the agent via an
   `update_epic` tool.
 
-## 11. Agent ↔ Deerborn boundary (MCP)
-- Deerborn exposes a **local MCP server**; shelled-out agents connect back to it.
+## 11. Agent ↔ Dearborn boundary (MCP)
+- Dearborn exposes a **local MCP server**; shelled-out agents connect back to it.
 - **Phase-scoped tool surface**, holding the ralph determinism line:
-  | Phase | Agent may call | Deerborn keeps |
+  | Phase | Agent may call | Dearborn keeps |
   |---|---|---|
   | Planning (interactive) | `update_epic`, `search_memory`, `read_codebase_context` | lane transitions |
   | Breakdown (one-shot, human-gated) | `create_task`, `link_dependency` | — |
@@ -143,12 +143,12 @@ implement → [test gate: Deerborn runs tests, fix-loop ≤N] → commit
 - **`GitHost` trait** (`clone / push / open_pr / check_auth`).
 - **v1: GitHub only.** Gitea = v2 (slots into the trait).
 - **Per-project PAT, encrypted at rest**, used for git-over-HTTPS + the host API.
-- **One PR per epic**, branch `deerborn/<project key>-<id>`.
+- **One PR per epic**, branch `dearborn/<project key>-<id>`.
 
 ## 15. Transport & clients
 - **REST for commands/queries; WebSocket for live subscriptions** (kanban/status
   changes, relayed agent `RunEvent`s, planning-chat streaming).
-- **One Vue/TS codebase, three shells.** Web = the SPA **served by the Deerborn
+- **One Vue/TS codebase, three shells.** Web = the SPA **served by the Dearborn
   binary**; desktop/mobile = **Tauri shells** of the same app pointed at the
   server. **Web-first in v1.**
 - **Mobile push (APNs/FCM) = v2.** v1 uses in-app WS notifications while connected.
@@ -167,7 +167,7 @@ session id, artifacts) · `Comment` · planning `Transcript`. No `user_id` in v1
 
 ## Deferred to v2 (explicit)
 Parallel-within-epic worktrees · containerized build envs · inferred project
-config · Deerborn-managed agentmemory (supervision, namespacing, DB
+config · Dearborn-managed agentmemory (supervision, namespacing, DB
 consolidation) · Gitea + other hosts · multi-user/teams/RBAC · offline-first
 synced clients · mobile push notifications · issue-tracker integrations
 (Linear/GitHub Issues) · multi-repo projects.

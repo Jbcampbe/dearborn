@@ -1,6 +1,6 @@
 // Project board + epic lane REST surface (T-401) consumed by the project
 // kanban. Mirrors `tasks.ts`/`epics.ts`: typed DTOs matching the server's
-// shapes (see `deerborn-server/src/board.rs` + `lanes.rs`) wrapped around the
+// shapes (see `dearborn-server/src/board.rs` + `lanes.rs`) wrapped around the
 // generic `apiFetch`.
 //
 // The live board does NOT come through here on mutations — a lane change

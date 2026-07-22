@@ -13,7 +13,7 @@ export type DragKind = "epic" | "task";
 
 /**
  * Permitted epic `current → target` lane transitions. Must match the server
- * table in `deerborn-server/src/lanes.rs`: `Planning → Ready` is owned by
+ * table in `dearborn-server/src/lanes.rs`: `Planning → Ready` is owned by
  * breakdown and `InProgress → Completed` by the worker, so neither is manual.
  * (Extracted from `ProjectKanbanView.vue` so the drag-and-drop rules and the
  * lane-move select share one source of truth.)

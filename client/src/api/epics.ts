@@ -1,6 +1,6 @@
 // Epics + planning-transcript REST surface (T-201/T-204) consumed by the
 // planning UI. Mirrors `projects.ts`: typed DTOs matching the server's shapes
-// (see `deerborn-server/src/epics.rs`) wrapped around the generic `apiFetch`.
+// (see `dearborn-server/src/epics.rs`) wrapped around the generic `apiFetch`.
 //
 // The live planning stream does NOT come through here — a `postMessage` triggers
 // an agent run whose reply arrives over the WebSocket (`epic:<id>`), not in the

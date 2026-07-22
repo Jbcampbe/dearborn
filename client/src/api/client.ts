@@ -1,4 +1,4 @@
-// Thin fetch wrapper for the Deerborn REST API.
+// Thin fetch wrapper for the Dearborn REST API.
 //
 // Attaches `Authorization: Bearer <token>` to every call and understands the
 // server's envelopes (CONVENTIONS.md): collections come back as `{ items: [] }`

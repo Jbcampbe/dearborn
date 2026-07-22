@@ -63,7 +63,7 @@ pub struct PlanningConfig {
     pub phase: &'static str,
     /// Appended to the agent via `--append-system-prompt`; stable across turns.
     pub system_prompt: &'static str,
-    /// Whether this phase exposes Deerborn's planning MCP tools (`update_epic`,
+    /// Whether this phase exposes Dearborn's planning MCP tools (`update_epic`,
     /// `read_codebase_context`) to the agent. When `true`, [`spawn_run`] mints a
     /// capability token, wires `--mcp-config`/`--allowedTools`, and points `cwd`
     /// at the project's read-only clone (T-203).
@@ -81,7 +81,7 @@ pub const PRODUCT_PLANNING: PlanningConfig = PlanningConfig {
 };
 
 const PRODUCT_PLANNING_PROMPT: &str = "\
-You are Deerborn's product-planning partner. You help a single engineer turn a \
+You are Dearborn's product-planning partner. You help a single engineer turn a \
 rough idea for an epic into a crisp product definition through conversation.
 
 Focus on the PRODUCT: the user problem, who it is for, the desired outcome, \
@@ -117,7 +117,7 @@ pub const TECHNICAL_PLANNING: PlanningConfig = PlanningConfig {
 };
 
 const TECHNICAL_PLANNING_PROMPT: &str = "\
-You are Deerborn's technical-planning partner. The product-planning phase has \
+You are Dearborn's technical-planning partner. The product-planning phase has \
 already agreed WHAT to build (its outcome is provided to you as the product \
 context). Your job is to work out HOW: the technical approach, architecture, the \
 concrete files and modules to touch, data model / API changes, sequencing, and \
@@ -193,14 +193,14 @@ pub struct PlanningRunRequest {
     pub continuity: Option<String>,
     /// MCP wiring for a tools-enabled phase (T-203). `None` for a plain
     /// conversational run; `Some` adds `--mcp-config`/`--allowedTools`/
-    /// `--permission-mode bypassPermissions` so the agent can reach Deerborn's
+    /// `--permission-mode bypassPermissions` so the agent can reach Dearborn's
     /// local MCP server.
     pub mcp: Option<McpRun>,
 }
 
 /// The MCP knobs [`spawn_run`] hands the agent for a tools-enabled planning turn.
 pub struct McpRun {
-    /// Path to the temp `--mcp-config` JSON file naming Deerborn's http server.
+    /// Path to the temp `--mcp-config` JSON file naming Dearborn's http server.
     pub config_path: PathBuf,
     /// Value for `--allowedTools` — the phase-scoped allow-list.
     pub allowed_tools: String,
@@ -246,7 +246,7 @@ impl PlanningAgent for ClaudePlanningAgent {
             extra_args.push("--append-system-prompt".to_string());
             extra_args.push(continuity.clone());
         }
-        // Tools-enabled phase (T-203): wire Deerborn's local MCP server exactly as
+        // Tools-enabled phase (T-203): wire Dearborn's local MCP server exactly as
         // the T-200 spike proved. Read-only is enforced by the allow-list (only the
         // two planning tools) + the read-only clone as `cwd`, NOT by `RunMode`.
         if let Some(mcp) = &req.mcp {
@@ -754,7 +754,11 @@ mod tests {
     /// Advance an epic product → technical; return the response for assertions.
     async fn advance_phase(app: &axum::Router, epic_id: &str) -> axum::response::Response {
         app.clone()
-            .oneshot(req("POST", &format!("/epics/{epic_id}/advance-phase"), None))
+            .oneshot(req(
+                "POST",
+                &format!("/epics/{epic_id}/advance-phase"),
+                None,
+            ))
             .await
             .unwrap()
     }
@@ -799,7 +803,10 @@ mod tests {
 
     #[tokio::test]
     async fn message_triggers_run_streams_in_order_and_persists() {
-        let agent = Arc::new(ScriptedPlanningAgent::new("sess-1", &["Hello", ", ", "world"]));
+        let agent = Arc::new(ScriptedPlanningAgent::new(
+            "sess-1",
+            &["Hello", ", ", "world"],
+        ));
         let (state, app) = app_with(agent).await;
         let project_id = seed_project(&app).await;
         let epic_id = create_epic(&app, &project_id).await;
@@ -807,7 +814,10 @@ mod tests {
         // Subscribe to the epic topic BEFORE posting so no frame is missed.
         let sub = state.hub.subscribe(&format!("epic:{epic_id}"));
 
-        assert_eq!(post_message(&app, &epic_id, "hi there").await, StatusCode::CREATED);
+        assert_eq!(
+            post_message(&app, &epic_id, "hi there").await,
+            StatusCode::CREATED
+        );
 
         // The relayed events arrive in order: started, session, text*, exited.
         let frames = collect_until_exited(sub).await;
@@ -843,7 +853,10 @@ mod tests {
         let epic_id = create_epic(&app, &project_id).await;
 
         // Turn 1: run captures + persists the session id.
-        assert_eq!(post_message(&app, &epic_id, "first").await, StatusCode::CREATED);
+        assert_eq!(
+            post_message(&app, &epic_id, "first").await,
+            StatusCode::CREATED
+        );
         wait_for_transcript(&state, &epic_id, 2).await; // user + agent
 
         // The planning session now carries the harness resume id.
@@ -864,7 +877,10 @@ mod tests {
         );
 
         // Turn 2: the run must receive that id as `resume`.
-        assert_eq!(post_message(&app, &epic_id, "second").await, StatusCode::CREATED);
+        assert_eq!(
+            post_message(&app, &epic_id, "second").await,
+            StatusCode::CREATED
+        );
         wait_for_transcript(&state, &epic_id, 4).await; // + user + agent
 
         let runs = recorded.lock().unwrap();
@@ -880,7 +896,8 @@ mod tests {
     #[tokio::test]
     async fn concurrent_trigger_is_ignored_and_transcript_is_uncorrupted() {
         let gate = Arc::new(Gate::default());
-        let agent = Arc::new(ScriptedPlanningAgent::new("sess-c", &["reply"]).with_gate(gate.clone()));
+        let agent =
+            Arc::new(ScriptedPlanningAgent::new("sess-c", &["reply"]).with_gate(gate.clone()));
         let recorded = agent.recorded();
         let (state, app) = app_with(agent).await;
         let project_id = seed_project(&app).await;
@@ -889,11 +906,17 @@ mod tests {
         // Trigger 1: the gated run pins the epic in-flight. The handler returns
         // as soon as the run is spawned, so once this POST responds the in-flight
         // slot is held.
-        assert_eq!(post_message(&app, &epic_id, "one").await, StatusCode::CREATED);
+        assert_eq!(
+            post_message(&app, &epic_id, "one").await,
+            StatusCode::CREATED
+        );
 
         // Trigger 2 while run 1 is still in flight: the user message is stored,
         // but no overlapping run starts.
-        assert_eq!(post_message(&app, &epic_id, "two").await, StatusCode::CREATED);
+        assert_eq!(
+            post_message(&app, &epic_id, "two").await,
+            StatusCode::CREATED
+        );
 
         // Let run 1 finish, then wait for its agent reply to land.
         gate.release();
@@ -914,9 +937,7 @@ mod tests {
     #[test]
     fn ws_type_maps_every_common_event() {
         assert_eq!(
-            ws_type(&RunEvent::Started {
-                run_id: "r".into()
-            }),
+            ws_type(&RunEvent::Started { run_id: "r".into() }),
             "started"
         );
         assert_eq!(
@@ -948,7 +969,10 @@ mod tests {
         append_message(state.db.conn(), &epic_id, "product", "user", "seed")
             .await
             .unwrap();
-        assert_eq!(post_message(&app, &epic_id, "again").await, StatusCode::CREATED);
+        assert_eq!(
+            post_message(&app, &epic_id, "again").await,
+            StatusCode::CREATED
+        );
 
         // Give any run time to complete; the silent agent writes nothing, so only
         // the two user messages remain.
@@ -974,7 +998,10 @@ mod tests {
         let epic_id = create_epic(&app, &project_id).await;
 
         // Product turn.
-        assert_eq!(post_message(&app, &epic_id, "product idea").await, StatusCode::CREATED);
+        assert_eq!(
+            post_message(&app, &epic_id, "product idea").await,
+            StatusCode::CREATED
+        );
         wait_for_transcript(&state, &epic_id, 2).await; // user + agent
 
         // Record a product context, so the technical continuity has real content.
@@ -1009,7 +1036,11 @@ mod tests {
         // One continuous transcript: monotonic seq 1..4, phase recorded per msg.
         assert_eq!(items.len(), 4);
         let seqs: Vec<i64> = items.iter().map(|m| m["seq"].as_i64().unwrap()).collect();
-        assert_eq!(seqs, vec![1, 2, 3, 4], "seq stays globally monotonic across phases");
+        assert_eq!(
+            seqs,
+            vec![1, 2, 3, 4],
+            "seq stays globally monotonic across phases"
+        );
         let phases: Vec<&str> = items.iter().map(|m| m["phase"].as_str().unwrap()).collect();
         assert_eq!(phases, vec!["product", "product", "technical", "technical"]);
         let roles: Vec<&str> = items.iter().map(|m| m["role"].as_str().unwrap()).collect();
@@ -1019,7 +1050,10 @@ mod tests {
         let runs = recorded.lock().unwrap();
         assert_eq!(runs.len(), 2, "one product run + one technical run");
         let tech = &runs[1];
-        let continuity = tech.continuity.as_deref().expect("technical run carries continuity");
+        let continuity = tech
+            .continuity
+            .as_deref()
+            .expect("technical run carries continuity");
         assert!(
             continuity.contains("Users need one-click export."),
             "continuity must seed the product context, got: {continuity}"
@@ -1042,12 +1076,21 @@ mod tests {
         assert_eq!(post_message(&app, &epic_id, "p").await, StatusCode::CREATED);
         wait_for_transcript(&state, &epic_id, 2).await;
 
-        assert_eq!(advance_phase(&app, &epic_id).await.status(), StatusCode::CREATED);
+        assert_eq!(
+            advance_phase(&app, &epic_id).await.status(),
+            StatusCode::CREATED
+        );
 
         // Technical turn 1, then turn 2.
-        assert_eq!(post_message_phase(&app, &epic_id, "technical", "t1").await, StatusCode::CREATED);
+        assert_eq!(
+            post_message_phase(&app, &epic_id, "technical", "t1").await,
+            StatusCode::CREATED
+        );
         wait_for_transcript(&state, &epic_id, 4).await;
-        assert_eq!(post_message_phase(&app, &epic_id, "technical", "t2").await, StatusCode::CREATED);
+        assert_eq!(
+            post_message_phase(&app, &epic_id, "technical", "t2").await,
+            StatusCode::CREATED
+        );
         wait_for_transcript(&state, &epic_id, 6).await;
 
         let resumes: Vec<Option<String>> = {
@@ -1079,7 +1122,12 @@ mod tests {
                     )
                     .await
                     .unwrap();
-                rows.next().await.unwrap().unwrap().get::<Option<String>>(0).unwrap()
+                rows.next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .get::<Option<String>>(0)
+                    .unwrap()
             }
         };
         assert_eq!(harness_id("product").await.as_deref(), Some("sess-1"));
@@ -1120,7 +1168,10 @@ mod tests {
         let (state, app) = app_with(Arc::new(SilentPlanningAgent)).await;
         let project_id = seed_project(&app).await;
         let epic_id = create_epic(&app, &project_id).await;
-        assert_eq!(advance_phase(&app, &epic_id).await.status(), StatusCode::CREATED);
+        assert_eq!(
+            advance_phase(&app, &epic_id).await.status(),
+            StatusCode::CREATED
+        );
 
         // A technical-phase run mints a capability scoped to (epic, technical).
         let guard = state.caps.mint(
@@ -1174,7 +1225,7 @@ mod tests {
 
     /// Ignore-marked live smoke test: drives the REAL `claude` CLI end to end.
     /// Excluded from the hermetic gate (needs auth + network); run with
-    /// `cargo test -p deerborn-server -- --ignored`.
+    /// `cargo test -p dearborn-server -- --ignored`.
     #[tokio::test]
     #[ignore]
     async fn live_claude_planning_run() {
@@ -1183,12 +1234,19 @@ mod tests {
         let epic_id = create_epic(&app, &project_id).await;
         let sub = state.hub.subscribe(&format!("epic:{epic_id}"));
         assert_eq!(
-            post_message(&app, &epic_id, "In one sentence, what makes a good acceptance criterion?")
-                .await,
+            post_message(
+                &app,
+                &epic_id,
+                "In one sentence, what makes a good acceptance criterion?"
+            )
+            .await,
             StatusCode::CREATED
         );
         let frames = collect_until_exited(sub).await;
-        assert!(frames.iter().any(|f| f["type"] == "text"), "got streamed text");
+        assert!(
+            frames.iter().any(|f| f["type"] == "text"),
+            "got streamed text"
+        );
         let items = wait_for_transcript(&state, &epic_id, 2).await;
         assert!(items.iter().any(|m| m["role"] == "agent"));
     }

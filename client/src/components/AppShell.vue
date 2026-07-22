@@ -41,7 +41,7 @@ function isActiveProject(id: string): boolean {
     <aside class="sidebar">
       <div class="brand">
         <AppLogo :size="20" />
-        <span class="brand-name">Deerborn</span>
+        <span class="brand-name">Dearborn</span>
       </div>
 
       <nav class="nav">

@@ -198,7 +198,7 @@ mod tests {
     #[tokio::test]
     async fn migrations_are_idempotent_across_reconnect() {
         let path = std::env::temp_dir().join(format!(
-            "deerborn-mig-test-{}-{}.db",
+            "dearborn-mig-test-{}-{}.db",
             std::process::id(),
             now_ms()
         ));

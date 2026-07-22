@@ -5,7 +5,7 @@
 //! agent that reads the epic's product + technical context and creates a graph of
 //! tasks (thin vertical slices / tracer bullets, per `references/prompts/to-tasks.md`)
 //! via the breakdown-phase MCP tools `create_task` / `link_dependency`
-//! ([`crate::mcp`]). When the run finishes, Deerborn moves the epic
+//! ([`crate::mcp`]). When the run finishes, Dearborn moves the epic
 //! **Planning → Ready** and records the run in `agent_run`.
 //!
 //! ## Relation to planning
@@ -23,7 +23,7 @@
 //!
 //! The agent only ever creates tasks and links dependencies (its allow-list is
 //! [`crate::mcp::BREAKDOWN_ALLOWED_TOOLS`], scoped to this one epic by the
-//! capability token). Deerborn — not the agent — owns the `Planning → Ready`
+//! capability token). Dearborn — not the agent — owns the `Planning → Ready`
 //! lane transition, exactly as ARCHITECTURE §11 requires.
 
 use std::path::PathBuf;
@@ -44,7 +44,7 @@ use crate::{AppError, AppResult, AppState, InflightGuard};
 /// The system prompt that encodes the `to-tasks` vertical-slice breakdown logic.
 /// The epic's product + technical context is appended separately (as the "PRD").
 const BREAKDOWN_PROMPT: &str = "\
-You are Deerborn's breakdown agent. You run ONCE (non-interactively) to convert an \
+You are Dearborn's breakdown agent. You run ONCE (non-interactively) to convert an \
 approved epic into an executable task DAG. The epic's product and technical context \
 are provided to you as the plan.
 
@@ -86,7 +86,7 @@ pub struct BreakdownRunRequest {
 
 /// The MCP knobs [`spawn_breakdown`] hands the agent for the run.
 pub struct BreakdownMcp {
-    /// Path to the temp `--mcp-config` JSON naming Deerborn's http server.
+    /// Path to the temp `--mcp-config` JSON naming Dearborn's http server.
     pub config_path: PathBuf,
     /// Value for `--allowedTools` — [`crate::mcp::BREAKDOWN_ALLOWED_TOOLS`].
     pub allowed_tools: String,
@@ -369,7 +369,7 @@ pub fn spawn_breakdown(state: AppState, epic_id: String, guard: InflightGuard) {
             )
             .await;
 
-        // Deerborn owns the lane transition: Planning → Ready.
+        // Dearborn owns the lane transition: Planning → Ready.
         let _ = conn
             .execute(
                 "UPDATE epic SET status = 'Ready', updated_at = ?1 WHERE id = ?2 AND status = 'Planning'",
@@ -504,7 +504,7 @@ pub(crate) mod testing {
         }
     }
 
-    /// A [`BreakdownAgent`] that creates a small fixed DAG by calling Deerborn's
+    /// A [`BreakdownAgent`] that creates a small fixed DAG by calling Dearborn's
     /// own MCP endpoint (proving the end-to-end seam), driven by a callback the
     /// test supplies. Kept minimal: it just emits a terminal stream; DAG creation
     /// is done by the test directly against the store/endpoint so the engine's
@@ -573,9 +573,7 @@ mod tests {
     }
 
     /// Boot state with an injected breakdown agent (silent planner).
-    async fn app_with_breakdown(
-        breakdown: Arc<dyn BreakdownAgent>,
-    ) -> (AppState, axum::Router) {
+    async fn app_with_breakdown(breakdown: Arc<dyn BreakdownAgent>) -> (AppState, axum::Router) {
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
         let state = AppState::with_agents(
@@ -619,7 +617,11 @@ mod tests {
     async fn advance(app: &axum::Router, epic_id: &str) {
         let r = app
             .clone()
-            .oneshot(req("POST", &format!("/epics/{epic_id}/advance-phase"), None))
+            .oneshot(req(
+                "POST",
+                &format!("/epics/{epic_id}/advance-phase"),
+                None,
+            ))
             .await
             .unwrap();
         assert_eq!(r.status(), StatusCode::CREATED);
@@ -646,7 +648,10 @@ mod tests {
 
     #[tokio::test]
     async fn breakdown_streams_moves_epic_to_ready_and_records_a_run() {
-        let agent = Arc::new(ScriptedBreakdownAgent::new("bd-sess", &["Breaking ", "down…"]));
+        let agent = Arc::new(ScriptedBreakdownAgent::new(
+            "bd-sess",
+            &["Breaking ", "down…"],
+        ));
         let recorded = agent.recorded();
         let (state, app) = app_with_breakdown(agent).await;
         let project_id = seed_project(&app).await;
@@ -692,7 +697,10 @@ mod tests {
             .unwrap();
         let row = rows.next().await.unwrap().expect("agent_run row");
         assert_eq!(row.get::<String>(0).unwrap(), "breakdown");
-        assert_eq!(row.get::<Option<String>>(1).unwrap().as_deref(), Some("bd-sess"));
+        assert_eq!(
+            row.get::<Option<String>>(1).unwrap().as_deref(),
+            Some("bd-sess")
+        );
 
         // The engine received the plan built from the epic's context.
         let runs = recorded.lock().unwrap();

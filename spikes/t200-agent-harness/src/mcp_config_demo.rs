@@ -1,14 +1,14 @@
-//! T-200 SPIKE — how Deerborn passes its LOCAL MCP server to the shelled-out
+//! T-200 SPIKE — how Dearborn passes its LOCAL MCP server to the shelled-out
 //! Claude Code, given that `agent-harness` v0.3.5 has NO first-class MCP field.
 //!
 //! Finding: the harness has no `mcp`/`McpServer` config anywhere. But
 //! `RunTuning.extra_args` is appended verbatim to the `claude` argv (see
 //! `build_claude_args` in the crate), and Claude Code supports `--mcp-config`
-//! plus tool-allow flags. So Deerborn wires MCP purely through `extra_args` —
+//! plus tool-allow flags. So Dearborn wires MCP purely through `extra_args` —
 //! no fork, no adapter change.
 //!
 //! This binary does NOT spawn claude (a real MCP endpoint would need to be
-//! serving). It builds the exact RunRequest Deerborn's planning agent (T-203)
+//! serving). It builds the exact RunRequest Dearborn's planning agent (T-203)
 //! would send and prints the resulting knobs, proving the wiring compiles
 //! against the real API.
 //!
@@ -17,12 +17,12 @@
 use harness::{RunMode, RunRequest, RunTuning};
 
 fn main() {
-    // Deerborn would write this JSON to a temp file (or pass inline) describing
+    // Dearborn would write this JSON to a temp file (or pass inline) describing
     // its local MCP server. Claude Code reads it via `--mcp-config`. Tools then
-    // surface to the agent as `mcp__deerborn__update_epic`, etc.
+    // surface to the agent as `mcp__dearborn__update_epic`, etc.
     let mcp_config_json = r#"{
   "mcpServers": {
-    "deerborn": {
+    "dearborn": {
       "type": "http",
       "url": "http://127.0.0.1:PORT/mcp",
       "headers": { "Authorization": "Bearer <planning-session-token>" }
@@ -30,13 +30,12 @@ fn main() {
   }
 }"#;
     // (An stdio server — "command"/"args" instead of "type":"http" — works the
-    // same way; Deerborn picks whichever transport its MCP server exposes.)
+    // same way; Dearborn picks whichever transport its MCP server exposes.)
 
     // Phase-scoped allow-list per MILESTONE §2.4 / ARCHITECTURE §11: the
     // planning agent may ONLY call update_epic + read_codebase_context. Claude
     // Code namespaces MCP tools as `mcp__<server>__<tool>`.
-    let allowed_tools =
-        "mcp__deerborn__update_epic,mcp__deerborn__read_codebase_context";
+    let allowed_tools = "mcp__dearborn__update_epic,mcp__dearborn__read_codebase_context";
 
     let extra_args = vec![
         "--mcp-config".to_owned(),
@@ -55,11 +54,14 @@ fn main() {
         prompt: "Draft the product context for this epic, then call update_epic.".to_owned(),
         cwd: Some(std::path::PathBuf::from("/path/to/project/canonical-clone")),
         mode: RunMode::Ask,
-        tuning: RunTuning { extra_args, ..RunTuning::default() },
+        tuning: RunTuning {
+            extra_args,
+            ..RunTuning::default()
+        },
         resume: None,
     };
 
-    println!("Deerborn planning RunRequest (MCP wired via extra_args):\n");
+    println!("Dearborn planning RunRequest (MCP wired via extra_args):\n");
     println!("run_id : {}", request.run_id);
     println!("cwd    : {:?}", request.cwd);
     println!("mode   : {:?}", request.mode);
@@ -73,8 +75,10 @@ fn main() {
          --include-partial-messages --mcp-config <json> \
          --allowedTools {allowed_tools} --permission-mode bypassPermissions"
     );
-    println!("\nTool calls then surface as RunEvent::ToolStart {{ name: \"mcp__deerborn__update_epic\", .. }}");
+    println!("\nTool calls then surface as RunEvent::ToolStart {{ name: \"mcp__dearborn__update_epic\", .. }}");
     println!("(NOTE: for Claude, ToolStart.input is always None — args stream as input_json_delta");
-    println!(" and the adapter does not reconstruct them. Deerborn reads the real args server-side");
+    println!(
+        " and the adapter does not reconstruct them. Dearborn reads the real args server-side"
+    );
     println!(" inside its own MCP handler, so this is not a blocker.)");
 }

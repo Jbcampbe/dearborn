@@ -1,7 +1,7 @@
-//! Deerborn's in-process **local MCP server** for the planning agent (T-203).
+//! Dearborn's in-process **local MCP server** for the planning agent (T-203).
 //!
 //! During an interactive planning run, the shelled-out Claude Code agent connects
-//! *back* to Deerborn over MCP to maintain the epic record and inspect the
+//! *back* to Dearborn over MCP to maintain the epic record and inspect the
 //! project's code. Per MILESTONE_1 §2.4 / ARCHITECTURE §11 the planning tool
 //! surface is exactly two tools:
 //!
@@ -13,9 +13,9 @@
 //!
 //! ## Transport: in-process HTTP (streamable-http), not stdio
 //!
-//! Deerborn is already a live axum server and `update_epic` must mutate the
+//! Dearborn is already a live axum server and `update_epic` must mutate the
 //! **shared libSQL DB** and publish a WS event on the **in-memory [`Hub`]** — a
-//! stdio subprocess could reach neither. So Deerborn hosts the MCP server itself
+//! stdio subprocess could reach neither. So Dearborn hosts the MCP server itself
 //! as a route ([`mcp_endpoint`], `POST /mcp/:cap`) speaking minimal JSON-RPC 2.0
 //! over HTTP (the MCP "streamable HTTP" transport). Only two tools are exposed,
 //! so a hand-rolled JSON-RPC endpoint keeps deps lean — no `rmcp`. Requests get a
@@ -52,18 +52,18 @@ use crate::epics::update_epic_context;
 use crate::tasks;
 use crate::{AppError, AppState};
 
-/// The MCP server name the agent addresses tools under (`mcp__deerborn__<tool>`).
-pub const MCP_SERVER_NAME: &str = "deerborn";
+/// The MCP server name the agent addresses tools under (`mcp__dearborn__<tool>`).
+pub const MCP_SERVER_NAME: &str = "dearborn";
 
 /// The phase-scoped `--allowedTools` allow-list value for a planning run
 /// (MILESTONE_1 §2.4). These are the *only* tools the agent may call.
 pub const PLANNING_ALLOWED_TOOLS: &str =
-    "mcp__deerborn__update_epic,mcp__deerborn__read_codebase_context";
+    "mcp__dearborn__update_epic,mcp__dearborn__read_codebase_context";
 
 /// The phase-scoped `--allowedTools` allow-list value for a breakdown run
 /// (MILESTONE_1 §2.4). These are the *only* tools the breakdown agent may call.
 pub const BREAKDOWN_ALLOWED_TOOLS: &str =
-    "mcp__deerborn__create_task,mcp__deerborn__link_dependency";
+    "mcp__dearborn__create_task,mcp__dearborn__link_dependency";
 
 /// Default lifetime of a minted capability token. A planning run is far shorter;
 /// the [`CapabilityGuard`] revokes the token the instant the run ends regardless,
@@ -71,7 +71,7 @@ pub const BREAKDOWN_ALLOWED_TOOLS: &str =
 const CAPABILITY_TTL: Duration = Duration::from_secs(6 * 60 * 60);
 
 /// Cap on bytes returned by a single `read_codebase_context` file read, so a
-/// huge file can't blow up the agent's context (or Deerborn's memory).
+/// huge file can't blow up the agent's context (or Dearborn's memory).
 const MAX_READ_BYTES: usize = 200_000;
 
 // ---- capability tokens ---------------------------------------------------
@@ -198,9 +198,9 @@ impl Drop for CapabilityGuard {
 
 // ---- MCP config the planning run hands to the agent ----------------------
 
-/// Build the `--mcp-config` JSON naming Deerborn's local http MCP server, scoped
+/// Build the `--mcp-config` JSON naming Dearborn's local http MCP server, scoped
 /// by `token`. Claude Code accepts this inline or as a file path
-/// ([`write_mcp_config`] writes it to a temp file). `base_url` is Deerborn's own
+/// ([`write_mcp_config`] writes it to a temp file). `base_url` is Dearborn's own
 /// loopback origin (e.g. `http://127.0.0.1:8787`).
 pub fn mcp_config_json(base_url: &str, token: &str) -> String {
     let url = format!("{}/mcp/{}", base_url.trim_end_matches('/'), token);
@@ -209,7 +209,7 @@ pub fn mcp_config_json(base_url: &str, token: &str) -> String {
             MCP_SERVER_NAME: {
                 "type": "http",
                 "url": url,
-                // The token is the URL path segment (Deerborn's auth); the header
+                // The token is the URL path segment (Dearborn's auth); the header
                 // is belt-and-suspenders and matches the streamable-http idiom.
                 "headers": { "Authorization": format!("Bearer {token}") }
             }
@@ -222,14 +222,14 @@ pub fn mcp_config_json(base_url: &str, token: &str) -> String {
 /// system temp dir (never into the read-only clone), keyed by `token`; the caller
 /// removes it when the run ends.
 pub fn write_mcp_config(base_url: &str, token: &str) -> std::io::Result<PathBuf> {
-    let path = std::env::temp_dir().join(format!("deerborn-mcp-{token}.json"));
+    let path = std::env::temp_dir().join(format!("dearborn-mcp-{token}.json"));
     std::fs::write(&path, mcp_config_json(base_url, token))?;
     Ok(path)
 }
 
 // ---- the JSON-RPC endpoint -----------------------------------------------
 
-/// `POST /mcp/:cap` — Deerborn's local MCP server for one planning run.
+/// `POST /mcp/:cap` — Dearborn's local MCP server for one planning run.
 ///
 /// Minimal JSON-RPC 2.0 over HTTP (streamable-http): drives `initialize`,
 /// `tools/list`, `tools/call`, and `ping`; `notifications/*` get `202 Accepted`.
@@ -280,7 +280,7 @@ fn initialize_result(params: &Value) -> Value {
         "capabilities": { "tools": { "listChanged": false } },
         "serverInfo": {
             "name": MCP_SERVER_NAME,
-            "title": "Deerborn planning",
+            "title": "Dearborn planning",
             "version": env!("CARGO_PKG_VERSION"),
         }
     })
@@ -503,7 +503,12 @@ async fn tool_create_task(
             if let Some(blocked_id) = entry.as_str() {
                 tasks::link_dependency(state.db.conn(), &task.id, blocked_id)
                     .await
-                    .map_err(|e| format!("task created ({}), but linking to {blocked_id} failed: {e}", task.id))?;
+                    .map_err(|e| {
+                        format!(
+                            "task created ({}), but linking to {blocked_id} failed: {e}",
+                            task.id
+                        )
+                    })?;
                 linked += 1;
             }
         }
@@ -834,9 +839,12 @@ mod tests {
     async fn initialize_then_tools_list_returns_the_two_scoped_tools() {
         let (state, app) = boot().await;
         let (_p, epic_id) = seed_epic(&state, None).await;
-        let guard = state
-            .caps
-            .mint(epic_id, "proj".into(), "product".into(), PathBuf::from("/tmp"));
+        let guard = state.caps.mint(
+            epic_id,
+            "proj".into(),
+            "product".into(),
+            PathBuf::from("/tmp"),
+        );
 
         // initialize handshake.
         let (status, init) = rpc(
@@ -848,7 +856,7 @@ mod tests {
         .await;
         assert_eq!(status, StatusCode::OK);
         assert_eq!(init["result"]["protocolVersion"], "2025-06-18");
-        assert_eq!(init["result"]["serverInfo"]["name"], "deerborn");
+        assert_eq!(init["result"]["serverInfo"]["name"], "dearborn");
 
         // notifications/initialized → 202, empty body.
         let (status, body) = rpc(
@@ -878,9 +886,12 @@ mod tests {
     async fn update_epic_writes_scoped_column_and_publishes_ws_event() {
         let (state, app) = boot().await;
         let (_p, epic_id) = seed_epic(&state, None).await;
-        let guard = state
-            .caps
-            .mint(epic_id.clone(), "proj".into(), "product".into(), PathBuf::from("/tmp"));
+        let guard = state.caps.mint(
+            epic_id.clone(),
+            "proj".into(),
+            "product".into(),
+            PathBuf::from("/tmp"),
+        );
 
         // Subscribe BEFORE the call so we catch the epic_updated frame.
         let mut sub = state.hub.subscribe(&format!("epic:{epic_id}"));
@@ -919,9 +930,12 @@ mod tests {
     async fn technical_scope_writes_technical_column() {
         let (state, app) = boot().await;
         let (_p, epic_id) = seed_epic(&state, None).await;
-        let guard = state
-            .caps
-            .mint(epic_id.clone(), "proj".into(), "technical".into(), PathBuf::from("/tmp"));
+        let guard = state.caps.mint(
+            epic_id.clone(),
+            "proj".into(),
+            "technical".into(),
+            PathBuf::from("/tmp"),
+        );
 
         rpc(
             &app,
@@ -963,9 +977,12 @@ mod tests {
         // A token for epic A. The agent can't name epic B or a status field — the
         // scope fixes the target — but we also pass hostile args to prove they're
         // ignored.
-        let guard = state
-            .caps
-            .mint(epic_a.clone(), "proj".into(), "product".into(), PathBuf::from("/tmp"));
+        let guard = state.caps.mint(
+            epic_a.clone(),
+            "proj".into(),
+            "product".into(),
+            PathBuf::from("/tmp"),
+        );
         rpc(
             &app,
             guard.token(),
@@ -1004,9 +1021,12 @@ mod tests {
         let (state, app) = boot().await;
         let (_p, epic_id) = seed_epic(&state, None).await;
         let token = {
-            let guard = state
-                .caps
-                .mint(epic_id, "proj".into(), "product".into(), PathBuf::from("/tmp"));
+            let guard = state.caps.mint(
+                epic_id,
+                "proj".into(),
+                "product".into(),
+                PathBuf::from("/tmp"),
+            );
             guard.token().to_string()
             // guard dropped here → token revoked
         };
@@ -1023,9 +1043,9 @@ mod tests {
 
     /// Build a temp "clone" with a known file; return (dir, canonical dir).
     fn temp_clone() -> PathBuf {
-        let dir = std::env::temp_dir().join(format!("deerborn-mcp-clone-{}", ulid::Ulid::new()));
+        let dir = std::env::temp_dir().join(format!("dearborn-mcp-clone-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(dir.join("src")).unwrap();
-        std::fs::write(dir.join("src/lib.rs"), "pub fn deerborn() -> u32 { 42 }\n").unwrap();
+        std::fs::write(dir.join("src/lib.rs"), "pub fn dearborn() -> u32 { 42 }\n").unwrap();
         std::fs::write(dir.join("README.md"), "# Demo\n").unwrap();
         dir
     }
@@ -1045,7 +1065,7 @@ mod tests {
         let text = tool_read_codebase_context(&scope, &json!({"path":"src/lib.rs"}))
             .await
             .unwrap();
-        assert!(text.contains("deerborn() -> u32 { 42 }"));
+        assert!(text.contains("dearborn() -> u32 { 42 }"));
 
         // List the root (default path).
         let listing = tool_read_codebase_context(&scope, &json!({}))
@@ -1064,7 +1084,7 @@ mod tests {
         let secret = clone
             .parent()
             .unwrap()
-            .join(format!("deerborn-secret-{}.txt", ulid::Ulid::new()));
+            .join(format!("dearborn-secret-{}.txt", ulid::Ulid::new()));
         std::fs::write(&secret, "TOP SECRET").unwrap();
         let scope = CapabilityScope {
             epic_id: "e".into(),
@@ -1111,7 +1131,7 @@ mod tests {
         let secret = clone
             .parent()
             .unwrap()
-            .join(format!("deerborn-symlink-secret-{}.txt", ulid::Ulid::new()));
+            .join(format!("dearborn-symlink-secret-{}.txt", ulid::Ulid::new()));
         std::fs::write(&secret, "SECRET VIA SYMLINK").unwrap();
         #[cfg(unix)]
         std::os::unix::fs::symlink(&secret, clone.join("escape")).unwrap();
@@ -1144,7 +1164,9 @@ mod tests {
         let (state, app) = boot().await;
         let clone = temp_clone();
         let (_p, epic_id) = seed_epic(&state, Some(&clone.to_string_lossy())).await;
-        let guard = state.caps.mint(epic_id, "proj".into(), "product".into(), clone.clone());
+        let guard = state
+            .caps
+            .mint(epic_id, "proj".into(), "product".into(), clone.clone());
 
         let (status, body) = rpc(
             &app,
@@ -1156,7 +1178,7 @@ mod tests {
         assert_eq!(status, StatusCode::OK);
         assert_eq!(body["result"]["isError"], false);
         let text = body["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("deerborn() -> u32 { 42 }"));
+        assert!(text.contains("dearborn() -> u32 { 42 }"));
 
         std::fs::remove_dir_all(&clone).ok();
     }
@@ -1165,9 +1187,12 @@ mod tests {
     async fn unknown_tool_name_is_a_method_error() {
         let (state, app) = boot().await;
         let (_p, epic_id) = seed_epic(&state, None).await;
-        let guard = state
-            .caps
-            .mint(epic_id, "proj".into(), "product".into(), PathBuf::from("/tmp"));
+        let guard = state.caps.mint(
+            epic_id,
+            "proj".into(),
+            "product".into(),
+            PathBuf::from("/tmp"),
+        );
         let (status, body) = rpc(
             &app,
             guard.token(),
@@ -1182,13 +1207,13 @@ mod tests {
     fn mcp_config_json_names_the_http_server_and_token() {
         let cfg = mcp_config_json("http://127.0.0.1:8787", "TOK123");
         let value: Value = serde_json::from_str(&cfg).unwrap();
-        assert_eq!(value["mcpServers"]["deerborn"]["type"], "http");
+        assert_eq!(value["mcpServers"]["dearborn"]["type"], "http");
         assert_eq!(
-            value["mcpServers"]["deerborn"]["url"],
+            value["mcpServers"]["dearborn"]["url"],
             "http://127.0.0.1:8787/mcp/TOK123"
         );
         assert_eq!(
-            value["mcpServers"]["deerborn"]["headers"]["Authorization"],
+            value["mcpServers"]["dearborn"]["headers"]["Authorization"],
             "Bearer TOK123"
         );
     }
@@ -1236,11 +1261,11 @@ mod tests {
             &app,
             guard.token(),
             json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
-                   "params":{"name":"create_task","arguments":{
-                       "title":"Slice one",
-                       "description":"end-to-end behavior",
-                       "acceptance":"it works"
-                   }}}),
+            "params":{"name":"create_task","arguments":{
+                "title":"Slice one",
+                "description":"end-to-end behavior",
+                "acceptance":"it works"
+            }}}),
         )
         .await;
         assert_eq!(status, StatusCode::OK);
@@ -1285,11 +1310,11 @@ mod tests {
             &app,
             guard.token(),
             json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
-                   "params":{"name":"create_task","arguments":{
-                       "title":"hostile",
-                       "epic_id": other_epic,
-                       "project_id": "some-other-project"
-                   }}}),
+            "params":{"name":"create_task","arguments":{
+                "title":"hostile",
+                "epic_id": other_epic,
+                "project_id": "some-other-project"
+            }}}),
         )
         .await;
 
@@ -1301,10 +1326,12 @@ mod tests {
         assert_eq!(tasks[0].epic_id.as_deref(), Some(epic_id.as_str()));
         assert_eq!(tasks[0].project_id, project_id);
         // The other epic got nothing.
-        assert!(crate::tasks::list_tasks_for_epic(state.db.conn(), &other_epic)
-            .await
-            .unwrap()
-            .is_empty());
+        assert!(
+            crate::tasks::list_tasks_for_epic(state.db.conn(), &other_epic)
+                .await
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[tokio::test]
@@ -1315,25 +1342,19 @@ mod tests {
 
         // Create the blocked task first (so its id is known), then a blocker that
         // blocks it via the `blocks` arg.
-        let blocked = crate::tasks::create_task(
-            state.db.conn(),
-            &epic_id,
-            &project_id,
-            "B",
-            None,
-            None,
-        )
-        .await
-        .unwrap();
+        let blocked =
+            crate::tasks::create_task(state.db.conn(), &epic_id, &project_id, "B", None, None)
+                .await
+                .unwrap();
 
         let (_status, body) = rpc(
             &app,
             guard.token(),
             json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
-                   "params":{"name":"create_task","arguments":{
-                       "title":"A",
-                       "blocks": [blocked.id]
-                   }}}),
+            "params":{"name":"create_task","arguments":{
+                "title":"A",
+                "blocks": [blocked.id]
+            }}}),
         )
         .await;
         assert_eq!(body["result"]["isError"], false);
@@ -1406,9 +1427,16 @@ mod tests {
         let a = crate::tasks::create_task(state.db.conn(), &epic_id, &project_id, "A", None, None)
             .await
             .unwrap();
-        let x = crate::tasks::create_task(state.db.conn(), &other_epic, &other_project, "X", None, None)
-            .await
-            .unwrap();
+        let x = crate::tasks::create_task(
+            state.db.conn(),
+            &other_epic,
+            &other_project,
+            "X",
+            None,
+            None,
+        )
+        .await
+        .unwrap();
 
         let (_status, body) = rpc(
             &app,

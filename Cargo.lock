@@ -535,7 +535,7 @@ dependencies = [
 ]
 
 [[package]]
-name = "deerborn-server"
+name = "dearborn-server"
 version = "0.1.0"
 dependencies = [
  "aes-gcm",

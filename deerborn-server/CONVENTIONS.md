@@ -1,13 +1,13 @@
-# Deerborn HTTP/REST conventions
+# Dearborn HTTP/REST conventions
 
 The contract every handler (T-101+) must follow. Established in T-004.
 
 ## Transport & auth
 
-- **Base:** all endpoints are served by the Deerborn binary over HTTP. TLS is
-  terminated by the operator's reverse proxy (not by Deerborn).
+- **Base:** all endpoints are served by the Dearborn binary over HTTP. TLS is
+  terminated by the operator's reverse proxy (not by Dearborn).
 - **Auth:** every route **except `GET /health`** requires
-  `Authorization: Bearer <DEERBORN_TOKEN>`. A missing/invalid token yields `401`
+  `Authorization: Bearer <DEARBORN_TOKEN>`. A missing/invalid token yields `401`
   with the standard error envelope (see below). `/health` is public.
 - **Content type:** requests and responses are `application/json` (UTF-8).
 
@@ -77,7 +77,7 @@ stream live over WS on `epic:<id>` (same mapping as planning); it does **not**
 write to `transcript_message` — its durable output is the `task` rows +
 `task_dependency` edges the agent creates via its MCP tools, plus one
 `agent_run` row (`stage='breakdown'`) and the `epic.status='Ready'` transition
-Deerborn owns. Breakdown shares the planning in-flight slot, so a planning run
+Dearborn owns. Breakdown shares the planning in-flight slot, so a planning run
 and a breakdown run never overlap on one epic.
 
 #### Task DAG & readiness API (T-302)
@@ -243,8 +243,8 @@ Server-side code publishes through the shared `Hub` on `AppState`.
 A browser cannot set an `Authorization` header on a WebSocket handshake, so `/ws`
 accepts the bearer token from **either**:
 
-- the query string — `GET /ws?token=<DEERBORN_TOKEN>` (browsers), **or**
-- an `Authorization: Bearer <DEERBORN_TOKEN>` header (native clients / tests).
+- the query string — `GET /ws?token=<DEARBORN_TOKEN>` (browsers), **or**
+- an `Authorization: Bearer <DEARBORN_TOKEN>` header (native clients / tests).
 
 The token is validated **before** the upgrade. An absent/invalid token is
 rejected with a `401` and the standard error envelope — the socket is never
@@ -344,8 +344,8 @@ drops the **oldest** frames (bounded per-connection queue).
 ## Local MCP server (`POST /mcp/:cap`, T-203)
 
 During an interactive planning run the shelled-out Claude Code agent connects
-**back** to Deerborn over MCP to maintain the epic record and read the project's
-code. Deerborn hosts the MCP server **in-process** (a stdio subprocess couldn't
+**back** to Dearborn over MCP to maintain the epic record and read the project's
+code. Dearborn hosts the MCP server **in-process** (a stdio subprocess couldn't
 reach the in-memory `Hub` or the shared libSQL writer), speaking the minimal
 **streamable-http** transport: JSON-RPC 2.0 over HTTP at `POST /mcp/:cap`.
 
@@ -369,10 +369,10 @@ backstop). An unknown/expired token is rejected with `401` before any method run
 The agent **never supplies the target epic or phase** — they come from the token's
 scope. So a token minted for epic A + `product` can only write A's
 `product_context` and read A's clone; it cannot address another epic or change
-`status`/lane/`branch_name`/leases. The MCP config URL Deerborn generates:
+`status`/lane/`branch_name`/leases. The MCP config URL Dearborn generates:
 
 ```json
-{ "mcpServers": { "deerborn": {
+{ "mcpServers": { "dearborn": {
   "type": "http",
   "url": "http://127.0.0.1:<port>/mcp/<cap-token>",
   "headers": { "Authorization": "Bearer <cap-token>" }
@@ -389,7 +389,7 @@ scope. So a token minted for epic A + `product` can only write A's
 Tool-level failures (bad path, missing arg) come back as a JSON-RPC *result* with
 `isError: true` (so the model sees them); an unknown tool name is a JSON-RPC
 `-32601` error. The tools are exposed to the agent via
-`--allowedTools mcp__deerborn__update_epic,mcp__deerborn__read_codebase_context`;
+`--allowedTools mcp__dearborn__update_epic,mcp__dearborn__read_codebase_context`;
 the run's `cwd` is the read-only clone and `--permission-mode bypassPermissions`
 is set for headless auto-approval (read-only is guaranteed by the tool allow-list
 + the clone, per the T-200 spike, **not** by the run mode).
@@ -406,9 +406,9 @@ tools (the planning tools are hidden for this scope):
 | `link_dependency` | Add a `blocker_id → blocked_id` edge (blocker must finish first). Both endpoints must belong to the scope's epic. A self-edge or cross-epic link is rejected; a cycle is rejected (`isError` with a clear message). Publishes `dag_updated`. |
 
 The tool surface is `--allowedTools
-mcp__deerborn__create_task,mcp__deerborn__link_dependency`; the run's `cwd` is
+mcp__dearborn__create_task,mcp__dearborn__link_dependency`; the run's `cwd` is
 the read-only clone (the breakdown agent may inspect the code to ground its
-slices). The agent never changes the epic's status — Deerborn owns the
+slices). The agent never changes the epic's status — Dearborn owns the
 `Planning → Ready` transition when the run completes. Cycle rejection uses a
 forward DFS over the existing edges (adding `blocker → blocked` is rejected iff
 `blocked` can already reach `blocker`); T-302 reuses the same guard for the REST
@@ -419,7 +419,7 @@ DAG API.
 Per-project GitHub PATs (T-102) are encrypted with **AES-256-GCM** before insert
 into `project.pat_encrypted` and never leave the server in plaintext:
 
-- **Key:** `SHA-256(DEERBORN_MASTER_KEY)` gives the 256-bit AES key. Any
+- **Key:** `SHA-256(DEARBORN_MASTER_KEY)` gives the 256-bit AES key. Any
   non-empty master-key material is accepted; derivation is validated at boot
   (empty material fails fast).
 - **Nonce/layout:** a fresh random 96-bit nonce per encryption; the stored BLOB
@@ -434,5 +434,5 @@ into `project.pat_encrypted` and never leave the server in plaintext:
 
 Every request is traced via `tower_http::trace::TraceLayer` on top of the
 `tracing` subscriber initialised at boot (`init_tracing`). Verbosity honours
-`RUST_LOG` (default `info,deerborn_server=debug`). `5xx` errors are logged at
+`RUST_LOG` (default `info,dearborn_server=debug`). `5xx` errors are logged at
 `error` level with their real cause; secrets are never logged.

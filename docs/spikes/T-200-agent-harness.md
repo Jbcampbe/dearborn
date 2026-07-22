@@ -9,12 +9,12 @@
 > enforce read-only — file mutations still ran, so the planning read-only
 > guarantee must come from tool-scoping + a read-only checkout, not the mode;
 > (2) for Claude, `ToolStart.input` is always `None` (args aren't reconstructed
-> from the stream), so Deerborn reads MCP tool args server-side, not from the
+> from the stream), so Dearborn reads MCP tool args server-side, not from the
 > event; (3) the crate has NO first-class MCP field — wiring is a raw-args
-> passthrough Deerborn owns.
+> passthrough Dearborn owns.
 
 The PoC crate lives at `spikes/t200-agent-harness/` (a detached one-crate
-workspace; the root `deerborn-server` build is untouched and still green).
+workspace; the root `dearborn-server` build is untouched and still green).
 
 ---
 
@@ -92,7 +92,7 @@ pub enum ToolKind { Read, Write, Edit, Search, Execute, Other } // #[non_exhaust
 
 The wire JSON is camelCase (`kind`, `runId`, `sessionId`, `toolCallId`,
 `toolKind`, …) and derives `Serialize` only — designed to be relayed straight
-over Deerborn's WebSocket to the client, matching T-202's plan.
+over Dearborn's WebSocket to the client, matching T-202's plan.
 
 ### Claude adapter argv (`src/claude/mod.rs::build_claude_args`)
 
@@ -118,17 +118,17 @@ verbatim capture.
 
 ```
 =================== turn-1 ===================
-PROMPT: My name is Deerborn. Please acknowledge in one short sentence and remember it.
+PROMPT: My name is Dearborn. Please acknowledge in one short sentence and remember it.
 [Started] run_id=t200-turn-1
 [Session] session_id=Some("371d5c96-0ca0-4a84-8e12-9f4bcf74dd3f") model=Some("claude-opus-4-8")
-Understood, Deerborn — I'll remember your name.
+Understood, Dearborn — I'll remember your name.
 [ToolStart] name=Write id=toolu_01GhV8… kind=Write input=None
 [ToolEnd]   id=toolu_01GhV8… ok=true output=Some("File created successfully at: …/memory/user-name.md …")
 [ToolStart] name=Read  id=toolu_01Y9fx… kind=Read  input=None
-[ToolEnd]   id=toolu_01Y9fx… ok=true output=Some("1\t- [Deerborn v1 Architecture]…")
+[ToolEnd]   id=toolu_01Y9fx… ok=true output=Some("1\t- [Dearborn v1 Architecture]…")
 [ToolStart] name=Edit  id=toolu_01Bdqn… kind=Edit  input=None
 [ToolEnd]   id=toolu_01Bdqn… ok=true output=Some("The file …/memory/MEMORY.md has been updated successfully…")
-Got it, Deerborn — noted and saved to memory.
+Got it, Dearborn — noted and saved to memory.
 [Usage] in=Some(8) out=Some(602) total=Some(610)
 [Exited] exit_code=Some(0) cancelled=false
 
@@ -137,7 +137,7 @@ PROMPT: What is my name? Reply with only the name, nothing else.
 RESUME: 371d5c96-0ca0-4a84-8e12-9f4bcf74dd3f
 [Started] run_id=t200-turn-2
 [Session] session_id=Some("371d5c96-0ca0-4a84-8e12-9f4bcf74dd3f") model=Some("claude-opus-4-8")
-Deerborn
+Dearborn
 [Usage] in=Some(2) out=Some(7) total=Some(9)
 [Exited] exit_code=Some(0) cancelled=false
 
@@ -161,18 +161,18 @@ itself; there was no transcript replay in the prompt.
   `claude --resume <id>` → the CLI replays the conversation from its own
   transcript store. Proven above.
 - The resumed run **keeps the same `session_id`** (stable across turns), so
-  Deerborn can store one id per planning session.
+  Dearborn can store one id per planning session.
 
 **Recommendation for T-201/T-202:**
 - Drive multi-turn with **native resume as the primary path.** Persist
   `session_id` on the epic's planning session the first time `RunEvent::Session`
   arrives; pass it as `resume` on every subsequent user message.
-- **But keep Deerborn's own `transcript_message` table as the source of truth**
+- **But keep Dearborn's own `transcript_message` table as the source of truth**
   (already the plan — MILESTONE §2.2, ARCHITECTURE §10). Native resume is a
   *cost/context optimization*, not the durable record. Reasons to keep replay as
   a fallback:
   - Claude's session store is local to the machine + CLI version; it can be
-    GC'd, and a resume against a stale/missing id will fail. Deerborn must be
+    GC'd, and a resume against a stale/missing id will fail. Dearborn must be
     able to reconstruct context by replaying the stored transcript as a single
     prompt.
   - T-201 explicitly requires "resumable after a server restart" — the durable
@@ -205,9 +205,9 @@ Tool invocations surface as a **`ToolStart` … `ToolEnd` pair matched by
   moot for autonomous planning.
 
 **Impact on T-202/T-203:** the planning agent's `update_epic` / `read_codebase_context`
-calls will appear as `ToolStart{name:"mcp__deerborn__update_epic"}` → `ToolEnd`.
-Because `input` is `None`, **Deerborn must not rely on the event stream for the
-tool arguments.** It doesn't need to: the args are delivered to Deerborn's own
+calls will appear as `ToolStart{name:"mcp__dearborn__update_epic"}` → `ToolEnd`.
+Because `input` is `None`, **Dearborn must not rely on the event stream for the
+tool arguments.** It doesn't need to: the args are delivered to Dearborn's own
 MCP server (it *is* the tool), so it has them first-hand and applies the epic
 mutation there. The event stream is for the live transcript/UI only. This is
 fine and actually cleaner (single source of the args).
@@ -222,21 +222,21 @@ hits are tool-kind *classification* of already-running MCP calls).
 
 **But it is fully feasible via `RunTuning.extra_args`,** which the Claude adapter
 appends verbatim to the argv. Claude Code natively supports `--mcp-config` and
-tool-allow flags, so Deerborn wires its local MCP server like this (see
+tool-allow flags, so Dearborn wires its local MCP server like this (see
 `src/mcp_config_demo.rs`, which builds the real `RunRequest`):
 
 ```rust
 tuning.extra_args = vec![
-    "--mcp-config".into(),  <json-or-path>,        // Deerborn's local MCP server
+    "--mcp-config".into(),  <json-or-path>,        // Dearborn's local MCP server
     "--allowedTools".into(),
-        "mcp__deerborn__update_epic,mcp__deerborn__read_codebase_context".into(),
+        "mcp__dearborn__update_epic,mcp__dearborn__read_codebase_context".into(),
     "--permission-mode".into(), "bypassPermissions".into(), // headless auto-approve
 ];
 ```
 
-The MCP config (inline JSON or a temp file Deerborn writes into `cwd`) names an
-http- or stdio-transport server pointing back at Deerborn, scoped per planning
-session. Tools then appear to the agent as `mcp__deerborn__<tool>`.
+The MCP config (inline JSON or a temp file Dearborn writes into `cwd`) names an
+http- or stdio-transport server pointing back at Dearborn, scoped per planning
+session. Tools then appear to the agent as `mcp__dearborn__<tool>`.
 
 **Recommendation for T-203:**
 - Wire MCP through `extra_args` exactly as above. No fork, no adapter change.
@@ -271,12 +271,12 @@ if desired) with edit/bash tools omitted — **not** by `RunMode::Ask`.
 
 - **Version:** 0.3.5 (deps `cli-stream` / `bob-rs` at 0.3.6 — versions not fully
   locked in step). Pre-1.0; API can churn.
-- **License:** MIT OR Apache-2.0 (permissive, fine for Deerborn).
+- **License:** MIT OR Apache-2.0 (permissive, fine for Dearborn).
 - **Quality signals (good):** well-documented, `#[non_exhaustive]` on the public
-  enums (so new event kinds won't break Deerborn if it carries `_` arms),
+  enums (so new event kinds won't break Dearborn if it carries `_` arms),
   thorough unit tests in-crate, clean object-safe trait, `run_channel`
-  convenience matches Deerborn's consume-from-a-channel need.
-- **Rough edges:** (a) no MCP abstraction — Deerborn owns the raw args;
+  convenience matches Dearborn's consume-from-a-channel need.
+- **Rough edges:** (a) no MCP abstraction — Dearborn owns the raw args;
   (b) `ToolStart.input` always `None` for Claude; (c) `effort` silently ignored
   by the Claude adapter; (d) README under-documents resume/tool/MCP (this spike's
   reason for existing). None are blockers.
@@ -300,7 +300,7 @@ and MCP wiring are both achievable through the documented-here mechanisms. Phase
   `RunEvent::Session`.
 - **T-202:** relay `RunEvent`s straight to the client (already camelCase JSON).
   Don't expect tool *arguments* in the stream (`ToolStart.input` is `None`).
-- **T-203:** pass Deerborn's local MCP server via `RunTuning.extra_args`
+- **T-203:** pass Dearborn's local MCP server via `RunTuning.extra_args`
   (`--mcp-config` + `--allowedTools` + `--permission-mode`). Enforce the
   read-only / phase-scoped guarantee with `--allowedTools` + a read-only
   checkout, **not** `RunMode::Ask`. Smoke-test the headless MCP auto-approval

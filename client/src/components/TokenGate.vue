@@ -21,7 +21,7 @@ function submit() {
     <div class="gate-card fade-in">
       <div class="gate-brand">
         <AppLogo :size="28" />
-        <h1>Deerborn</h1>
+        <h1>Dearborn</h1>
       </div>
       <p class="lead">Enter your access token to continue.</p>
 
@@ -37,7 +37,7 @@ function submit() {
           class="input"
           type="password"
           autocomplete="off"
-          placeholder="DEERBORN_TOKEN"
+          placeholder="DEARBORN_TOKEN"
           autofocus
         />
         <button

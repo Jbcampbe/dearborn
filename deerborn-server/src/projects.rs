@@ -921,7 +921,7 @@ mod tests {
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
         let root = std::env::temp_dir().join(format!(
-            "deerborn-clone-test-{}-{}",
+            "dearborn-clone-test-{}-{}",
             std::process::id(),
             now_ms()
         ));
@@ -965,7 +965,7 @@ mod tests {
                 "/projects",
                 Some(json!({
                     "name": "Bad",
-                    "repo_url": "https://deerborn.invalid/nope/nope.git",
+                    "repo_url": "https://dearborn.invalid/nope/nope.git",
                     "pat": "ghp_secretTokenXYZ"
                 })),
             ))
@@ -999,7 +999,7 @@ mod tests {
                 "/projects",
                 Some(json!({
                     "name": "Bad",
-                    "repo_url": "https://deerborn.invalid/nope/nope.git"
+                    "repo_url": "https://dearborn.invalid/nope/nope.git"
                 })),
             ))
             .await

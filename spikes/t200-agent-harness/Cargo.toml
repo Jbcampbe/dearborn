@@ -1,8 +1,8 @@
 # T-200 spike: standalone PoC crate for the agent-harness interactive multi-turn evaluation.
 #
 # This is intentionally its OWN workspace (empty `[workspace]` table below) so it
-# is detached from the root Deerborn workspace and cannot disturb the
-# `deerborn-server` build. Build/run it from inside this directory:
+# is detached from the root Dearborn workspace and cannot disturb the
+# `dearborn-server` build. Build/run it from inside this directory:
 #     cargo run --bin multi_turn         # native session-resume PoC
 #     cargo run --bin mcp_config_demo    # prints the --mcp-config wiring (no run)
 [package]
@@ -11,7 +11,7 @@ version = "0.1.0"
 edition = "2021"
 publish = false
 
-# Detach from the parent workspace — keeps `deerborn-server` untouched/buildable.
+# Detach from the parent workspace — keeps `dearborn-server` untouched/buildable.
 [workspace]
 
 [dependencies]

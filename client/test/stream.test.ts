@@ -64,12 +64,12 @@ describe("planning stream reducer", () => {
     applyFrame(state, frame("started", { runId: "r1" }));
     applyFrame(
       state,
-      frame("tool_start", { runId: "r1", toolCallId: "t1", name: "mcp__deerborn__update_epic" }),
+      frame("tool_start", { runId: "r1", toolCallId: "t1", name: "mcp__dearborn__update_epic" }),
     );
     // While running, the chip is pending.
     expect(state.streaming?.toolCalls[0]).toMatchObject({
       toolCallId: "t1",
-      name: "mcp__deerborn__update_epic",
+      name: "mcp__dearborn__update_epic",
       status: "running",
     });
 
@@ -82,7 +82,7 @@ describe("planning stream reducer", () => {
     // Server persistence order: tool turn(s) first, then the agent text turn.
     expect(state.turns).toHaveLength(2);
     expect(state.turns[0]).toMatchObject({ role: "tool" });
-    expect(state.turns[0].tool).toMatchObject({ name: "mcp__deerborn__update_epic", status: "ok" });
+    expect(state.turns[0].tool).toMatchObject({ name: "mcp__dearborn__update_epic", status: "ok" });
     expect(state.turns[1]).toMatchObject({ role: "agent", text: "updated the epic" });
   });
 

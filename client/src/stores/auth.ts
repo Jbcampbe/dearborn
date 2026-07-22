@@ -1,7 +1,7 @@
 import { computed, ref } from "vue";
 import { defineStore } from "pinia";
 
-const STORAGE_KEY = "deerborn.token";
+const STORAGE_KEY = "dearborn.token";
 
 /**
  * Auth state for the single-user bearer token.

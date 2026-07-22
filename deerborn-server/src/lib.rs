@@ -1,4 +1,4 @@
-//! Deerborn server library.
+//! Dearborn server library.
 //!
 //! Keeps app-construction (router, handlers, shared state) separate from the
 //! binary entrypoint so later tasks can add modules and integration tests
@@ -34,12 +34,12 @@ use tower_http::{
     trace::TraceLayer,
 };
 
+pub use breakdown::BreakdownAgent;
 pub use config::{Config, ConfigError};
 pub use crypto::MasterKey;
 pub use db::{Db, DbError};
 pub use error::{AppError, AppResult};
 pub use hub::Hub;
-pub use breakdown::BreakdownAgent;
 pub use mcp::CapabilityStore;
 pub use planning::PlanningAgent;
 
@@ -48,7 +48,7 @@ pub use planning::PlanningAgent;
 pub fn init_tracing() {
     use tracing_subscriber::{fmt, EnvFilter};
     let filter = EnvFilter::try_from_default_env()
-        .unwrap_or_else(|_| EnvFilter::new("info,deerborn_server=debug"));
+        .unwrap_or_else(|_| EnvFilter::new("info,dearborn_server=debug"));
     // `try_init` returns Err if a subscriber is already set — ignore it.
     let _ = fmt().with_env_filter(filter).try_init();
 }
@@ -63,7 +63,7 @@ pub struct AppState {
     /// Topic pub/sub broadcaster for live WebSocket subscriptions. Server-side
     /// code publishes events via `state.hub.publish(topic, type, payload)`.
     pub hub: Arc<Hub>,
-    /// AES-256 key (derived from `DEERBORN_MASTER_KEY`) used to encrypt/decrypt
+    /// AES-256 key (derived from `DEARBORN_MASTER_KEY`) used to encrypt/decrypt
     /// per-project PATs. Never serialised or logged.
     pub crypto: Arc<MasterKey>,
     /// The planning agent that drives interactive epic-planning runs (T-202).
@@ -82,7 +82,7 @@ pub struct AppState {
     /// to one `(epic, phase, clone_path)`; the shelled-out agent authenticates its
     /// `POST /mcp/:cap` calls with it. See [`crate::mcp`].
     pub caps: Arc<CapabilityStore>,
-    /// Deerborn's own loopback origin (e.g. `http://127.0.0.1:8787`), used to
+    /// Dearborn's own loopback origin (e.g. `http://127.0.0.1:8787`), used to
     /// build the MCP config URL handed to the agent. Set once after the listener
     /// binds (`main`, or the live test); `None` in unit tests that never spawn a
     /// real agent, which disables MCP wiring for the run.
@@ -109,11 +109,7 @@ impl AppState {
     /// that lets tests drive planning runs hermetically with a scripted fake.
     /// The breakdown agent defaults to the production
     /// [`breakdown::ClaudeBreakdownAgent`] (override it via [`with_agents`]).
-    pub fn with_planner(
-        config: Config,
-        db: Db,
-        planner: Arc<dyn PlanningAgent>,
-    ) -> AppState {
+    pub fn with_planner(config: Config, db: Db, planner: Arc<dyn PlanningAgent>) -> AppState {
         AppState::with_agents(
             config,
             db,
@@ -148,7 +144,7 @@ impl AppState {
         }
     }
 
-    /// Record Deerborn's loopback origin (`http://host:port`) once the listener
+    /// Record Dearborn's loopback origin (`http://host:port`) once the listener
     /// is bound, so planning runs can build the agent's MCP config URL. Idempotent
     /// last-write-wins.
     pub fn set_advertised_base(&self, base: impl Into<String>) {
@@ -157,7 +153,10 @@ impl AppState {
 
     /// The advertised loopback origin, if set (see [`set_advertised_base`](Self::set_advertised_base)).
     pub fn advertised_base(&self) -> Option<String> {
-        self.advertised_base.lock().expect("base mutex poisoned").clone()
+        self.advertised_base
+            .lock()
+            .expect("base mutex poisoned")
+            .clone()
     }
 
     /// Claim the in-flight slot for `epic_id` for a planning run.
@@ -208,7 +207,7 @@ pub fn app(state: AppState) -> Router {
     let public = Router::new()
         .route("/health", get(health))
         .route("/ws", get(ws::ws_handler))
-        // Deerborn's local MCP server for planning runs (T-203). Authed by the
+        // Dearborn's local MCP server for planning runs (T-203). Authed by the
         // per-run capability token in the `:cap` path segment, NOT the browser
         // bearer token — so it lives outside the bearer layer, like `/ws`.
         .route("/mcp/:cap", axum::routing::post(mcp::mcp_endpoint));
@@ -238,10 +237,7 @@ pub fn app(state: AppState) -> Router {
             "/projects/:id/epics",
             get(epics::list_epics).post(epics::create_epic),
         )
-        .route(
-            "/epics/:id",
-            get(epics::get_epic).patch(epics::update_epic),
-        )
+        .route("/epics/:id", get(epics::get_epic).patch(epics::update_epic))
         .route(
             "/epics/:id/messages",
             axum::routing::post(epics::post_message),
@@ -257,18 +253,14 @@ pub fn app(state: AppState) -> Router {
             axum::routing::post(breakdown::trigger_breakdown),
         )
         .route("/epics/:id/dag", get(tasks::get_dag))
-        .route(
-            "/epics/:id/lane",
-            axum::routing::post(lanes::set_epic_lane),
-        )
+        .route("/epics/:id/lane", axum::routing::post(lanes::set_epic_lane))
         .route(
             "/epics/:id/tasks",
             axum::routing::post(tasks::create_epic_task),
         )
         .route(
             "/epics/:id/dependencies",
-            axum::routing::post(tasks::post_dependency)
-                .delete(tasks::remove_dependency),
+            axum::routing::post(tasks::post_dependency).delete(tasks::remove_dependency),
         )
         .route(
             "/tasks/:id",
@@ -342,7 +334,7 @@ mod tests {
     /// Build an app whose SPA static dir is a freshly-created temp dir holding a
     /// sentinel `index.html`, so the static/SPA-fallback path is exercised.
     async fn test_app_with_spa(marker: &str) -> (Router, std::path::PathBuf) {
-        let dir = std::env::temp_dir().join(format!("deerborn-spa-test-{}", ulid::Ulid::new()));
+        let dir = std::env::temp_dir().join(format!("dearborn-spa-test-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&dir).unwrap();
         std::fs::write(dir.join("index.html"), marker).unwrap();
         let db = Db::connect(":memory:").await.unwrap();
@@ -368,8 +360,14 @@ mod tests {
 
     #[tokio::test]
     async fn health_is_public_and_returns_200_ok() {
-        let response = test_app().await
-            .oneshot(Request::builder().uri("/health").body(Body::empty()).unwrap())
+        let response = test_app()
+            .await
+            .oneshot(
+                Request::builder()
+                    .uri("/health")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -379,8 +377,14 @@ mod tests {
 
     #[tokio::test]
     async fn protected_route_without_token_is_401() {
-        let response = test_app().await
-            .oneshot(Request::builder().uri("/whoami").body(Body::empty()).unwrap())
+        let response = test_app()
+            .await
+            .oneshot(
+                Request::builder()
+                    .uri("/whoami")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -389,7 +393,8 @@ mod tests {
 
     #[tokio::test]
     async fn protected_route_with_wrong_token_is_401() {
-        let response = test_app().await
+        let response = test_app()
+            .await
             .oneshot(
                 Request::builder()
                     .uri("/whoami")
@@ -405,7 +410,8 @@ mod tests {
 
     #[tokio::test]
     async fn protected_route_with_correct_token_is_200() {
-        let response = test_app().await
+        let response = test_app()
+            .await
             .oneshot(
                 Request::builder()
                     .uri("/whoami")
@@ -417,7 +423,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(body_json(response).await, json!({ "status": "authenticated" }));
+        assert_eq!(
+            body_json(response).await,
+            json!({ "status": "authenticated" })
+        );
     }
 
     #[test]
@@ -427,7 +436,7 @@ mod tests {
 
     #[tokio::test]
     async fn spa_served_at_root_when_built() {
-        let marker = "<!doctype html><title>deerborn-spa-marker</title>";
+        let marker = "<!doctype html><title>dearborn-spa-marker</title>";
         let (app, dir) = test_app_with_spa(marker).await;
         let response = app
             .oneshot(Request::builder().uri("/").body(Body::empty()).unwrap())
@@ -441,12 +450,17 @@ mod tests {
 
     #[tokio::test]
     async fn unknown_client_route_falls_back_to_index_html() {
-        let marker = "<!doctype html><title>deerborn-spa-marker</title>";
+        let marker = "<!doctype html><title>dearborn-spa-marker</title>";
         let (app, dir) = test_app_with_spa(marker).await;
         // A client-side-routing path (not an API route, not a real file) must
         // return index.html so the Vue router can take over.
         let response = app
-            .oneshot(Request::builder().uri("/foo/bar").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/foo/bar")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 
@@ -461,7 +475,12 @@ mod tests {
         // `/projects` is a real API route: it must still enforce auth (401),
         // never be shadowed by the static/SPA fallback.
         let response = app
-            .oneshot(Request::builder().uri("/projects").body(Body::empty()).unwrap())
+            .oneshot(
+                Request::builder()
+                    .uri("/projects")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
             .await
             .unwrap();
 

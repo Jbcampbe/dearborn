@@ -23,7 +23,7 @@ CREATE TABLE epic (
   technical_context TEXT,                  -- maintained live by technical-planning agent
   status            TEXT NOT NULL DEFAULT 'Planning',
                     -- Planning|Ready|InProgress|Completed|Blocked|Cancelled
-  branch_name       TEXT,                  -- deerborn/<project key>-<id> (Half 2)
+  branch_name       TEXT,                  -- dearborn/<project key>-<id> (Half 2)
   -- queue/lease columns: written by Half 1's enqueue, read by Half 2's claim
   lease_owner       TEXT,
   lease_expires_at  INTEGER,               -- unix ms

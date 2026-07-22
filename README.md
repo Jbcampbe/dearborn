@@ -1,4 +1,4 @@
-# Deerborn
+# Dearborn
 
 Self-hosted Rust server that turns an approved epic into a PR autonomously. See
 [VISION.md](./VISION.md) for product intent, [ARCHITECTURE.md](./ARCHITECTURE.md)
@@ -6,14 +6,14 @@ for resolved v1 decisions, and [MILESTONE_1.md](./MILESTONE_1.md) for the curren
 task plan.
 
 The HTTP/REST API contract (routes, JSON success/error envelopes, status codes)
-is documented in [`deerborn-server/CONVENTIONS.md`](./deerborn-server/CONVENTIONS.md).
+is documented in [`dearborn-server/CONVENTIONS.md`](./dearborn-server/CONVENTIONS.md).
 
 ## Layout
 
 ```
 .
 ├── Cargo.toml            # Cargo workspace root
-├── deerborn-server/      # Rust server crate (tokio + axum)
+├── dearborn-server/      # Rust server crate (tokio + axum)
 │   └── src/
 │       ├── main.rs       # binary entrypoint (binds + serves)
 │       └── lib.rs        # router + handlers (extended by later tasks)
@@ -43,24 +43,24 @@ cd client && npm install
 ### Server only
 
 ```bash
-cargo run -p deerborn-server
-# → deerborn-server listening on http://127.0.0.1:8787
+cargo run -p dearborn-server
+# → dearborn-server listening on http://127.0.0.1:8787
 curl http://127.0.0.1:8787/health
 # → {"status":"ok"}
 ```
 
 The server reads its configuration from the environment (see the
-[Configuration](#configuration) table below). `DEERBORN_TOKEN` and
-`DEERBORN_MASTER_KEY` are **required** — the server refuses to start without
+[Configuration](#configuration) table below). `DEARBORN_TOKEN` and
+`DEARBORN_MASTER_KEY` are **required** — the server refuses to start without
 them:
 
 ```bash
-DEERBORN_TOKEN=my-secret-token DEERBORN_MASTER_KEY=... cargo run -p deerborn-server
-# → deerborn-server listening on http://127.0.0.1:8787
+DEARBORN_TOKEN=my-secret-token DEARBORN_MASTER_KEY=... cargo run -p dearborn-server
+# → dearborn-server listening on http://127.0.0.1:8787
 ```
 
 Every route except `GET /health` requires an `Authorization: Bearer <token>`
-header matching `DEERBORN_TOKEN`; requests without it get `401`:
+header matching `DEARBORN_TOKEN`; requests without it get `401`:
 
 ```bash
 curl http://127.0.0.1:8787/health                                   # → 200 (public)
@@ -87,7 +87,7 @@ web server. `just build` (or `cd client && npm run build`) emits the assets to
 that isn't an API route and isn't a real asset file returns `index.html`, so
 client-side routing works on deep links / refreshes.
 
-- The assets dir is `DEERBORN_STATIC_DIR` (default `./client/dist`, relative to
+- The assets dir is `DEARBORN_STATIC_DIR` (default `./client/dist`, relative to
   the working directory — the workspace root under `cargo run`).
 - API routes always win: `/health`, `/ws`, `/projects*` etc. are matched before
   the static fallback, so serving the SPA never shadows or unauth-exposes them.
@@ -116,26 +116,26 @@ just build     # cargo build --release  +  vite production build (client/dist)
 ## Configuration
 
 Config is read from the process environment. As an **optional** fallback, point
-`DEERBORN_CONFIG` at a `KEY=VALUE` file (`#` comments and blank lines ignored);
+`DEARBORN_CONFIG` at a `KEY=VALUE` file (`#` comments and blank lines ignored);
 environment variables always take precedence over the file.
 
 | Variable              | Required | Default          | Purpose                                                                 |
 | --------------------- | :------: | ---------------- | ----------------------------------------------------------------------- |
-| `DEERBORN_TOKEN`      |   yes    | —                | Single-user bearer token; every route except `GET /health` requires it. |
-| `DEERBORN_MASTER_KEY` |   yes    | —                | Secret material for encrypting PATs at rest (see [Secret handling](#secret-handling)).|
-| `DEERBORN_BIND`       |    no    | `127.0.0.1:8787` | Server bind address.                                                     |
-| `DEERBORN_DB`         |    no    | `./deerborn.db`  | Path to the local libSQL database file (T-003).                         |
-| `DEERBORN_CLONE_ROOT` |    no    | `./clones`       | Root directory under which per-project clones live (T-103).             |
-| `DEERBORN_STATIC_DIR` |    no    | `./client/dist`  | Directory of built Vite SPA assets served at `/` (T-006).               |
-| `DEERBORN_CONFIG`     |    no    | —                | Optional path to a `KEY=VALUE` config file used as a fallback source.    |
+| `DEARBORN_TOKEN`      |   yes    | —                | Single-user bearer token; every route except `GET /health` requires it. |
+| `DEARBORN_MASTER_KEY` |   yes    | —                | Secret material for encrypting PATs at rest (see [Secret handling](#secret-handling)).|
+| `DEARBORN_BIND`       |    no    | `127.0.0.1:8787` | Server bind address.                                                     |
+| `DEARBORN_DB`         |    no    | `./dearborn.db`  | Path to the local libSQL database file (T-003).                         |
+| `DEARBORN_CLONE_ROOT` |    no    | `./clones`       | Root directory under which per-project clones live (T-103).             |
+| `DEARBORN_STATIC_DIR` |    no    | `./client/dist`  | Directory of built Vite SPA assets served at `/` (T-006).               |
+| `DEARBORN_CONFIG`     |    no    | —                | Optional path to a `KEY=VALUE` config file used as a fallback source.    |
 
 The server **fails fast at boot** with a clear error (non-zero exit) if
-`DEERBORN_TOKEN` or `DEERBORN_MASTER_KEY` is missing or empty.
+`DEARBORN_TOKEN` or `DEARBORN_MASTER_KEY` is missing or empty.
 
 ## Canonical read-only clone (T-103)
 
-On project create, Deerborn clones the repo's default branch (git-over-HTTPS,
-using the decrypted PAT when present) into `<DEERBORN_CLONE_ROOT>/<project id>` —
+On project create, Dearborn clones the repo's default branch (git-over-HTTPS,
+using the decrypted PAT when present) into `<DEARBORN_CLONE_ROOT>/<project id>` —
 the canonical **read-only** checkout later planning/execution reads from. The
 clone runs **asynchronously**: `POST /projects` returns immediately with
 `clone_status='pending'`; a background task then sets `clone_status` to `ready`
@@ -155,7 +155,7 @@ capture git's stderr with any token redacted.
 
 Per-project GitHub PATs are **encrypted at rest** with **AES-256-GCM** (T-102):
 
-- **Key derivation.** The 256-bit AES key is `SHA-256(DEERBORN_MASTER_KEY)` — the
+- **Key derivation.** The 256-bit AES key is `SHA-256(DEARBORN_MASTER_KEY)` — the
   master-key material may be any non-empty string (any length/format); SHA-256
   deterministically maps it to the 32 bytes AES-256 needs. Derivation is
   validated at boot, so a key that cannot form a valid 256-bit key (i.e. empty
@@ -164,7 +164,7 @@ Per-project GitHub PATs are **encrypted at rest** with **AES-256-GCM** (T-102):
   encryption; the value stored in the `project.pat_encrypted` BLOB is
   `nonce || ciphertext` (the 12-byte nonce prepended to the AES-GCM ciphertext,
   which already carries its 128-bit auth tag).
-- **Rotation.** Changing `DEERBORN_MASTER_KEY` changes the derived key, so PATs
+- **Rotation.** Changing `DEARBORN_MASTER_KEY` changes the derived key, so PATs
   encrypted under the old value stop decrypting (a wrong/rotated key yields a
   GCM authentication error, never plaintext) and must be re-entered.
 - **Never returned, never logged.** A PAT is accepted only on `POST`/`PATCH

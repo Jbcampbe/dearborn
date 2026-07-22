@@ -7,7 +7,7 @@
 //! transcript shows exactly how text / session / tool / lifecycle events
 //! surface.
 //!
-//! Turn 1:  "My name is Deerborn..."  -> capture `session_id` from RunEvent::Session
+//! Turn 1:  "My name is Dearborn..."  -> capture `session_id` from RunEvent::Session
 //! Turn 2:  (resume that session) "What is my name?" -> proves context carried
 //!
 //! Run:  cargo run --bin multi_turn
@@ -35,7 +35,7 @@ fn run_turn(
     let (_handle, rx) = Claude::new().run_channel(RunRequest {
         run_id: format!("t200-{label}"),
         prompt: prompt.to_owned(),
-        // Run in this crate's dir; a real Deerborn planning run would point cwd
+        // Run in this crate's dir; a real Dearborn planning run would point cwd
         // at the project's read-only canonical clone.
         cwd: std::env::current_dir().ok(),
         mode: RunMode::Ask, // planning is read-only discussion, no edits
@@ -51,7 +51,11 @@ fn run_turn(
     for event in rx {
         match &event {
             RunEvent::Started { run_id } => println!("[Started] run_id={run_id}"),
-            RunEvent::Session { session_id: sid, model, .. } => {
+            RunEvent::Session {
+                session_id: sid,
+                model,
+                ..
+            } => {
                 println!("[Session] session_id={sid:?} model={model:?}");
                 if let Some(s) = sid {
                     session_id = Some(s.clone());
@@ -64,22 +68,44 @@ fn run_turn(
                 let _ = std::io::stdout().flush();
             }
             RunEvent::Thinking { delta, .. } => println!("[Thinking] {delta}"),
-            RunEvent::ToolStart { name, tool_call_id, input, tool_kind, .. } => println!(
+            RunEvent::ToolStart {
+                name,
+                tool_call_id,
+                input,
+                tool_kind,
+                ..
+            } => println!(
                 "[ToolStart] name={name} id={tool_call_id} kind={tool_kind:?} input={input:?}"
             ),
-            RunEvent::ToolEnd { tool_call_id, ok, output, .. } => {
+            RunEvent::ToolEnd {
+                tool_call_id,
+                ok,
+                output,
+                ..
+            } => {
                 println!("[ToolEnd] id={tool_call_id} ok={ok} output={output:?}")
             }
-            RunEvent::SuggestedEdits { edits, .. } => println!("[SuggestedEdits] {} edit(s)", edits.len()),
+            RunEvent::SuggestedEdits { edits, .. } => {
+                println!("[SuggestedEdits] {} edit(s)", edits.len())
+            }
             RunEvent::Activity { message, .. } => println!("[Activity] {message}"),
-            RunEvent::Usage { input_tokens, output_tokens, total_tokens, .. } => println!(
+            RunEvent::Usage {
+                input_tokens,
+                output_tokens,
+                total_tokens,
+                ..
+            } => println!(
                 "\n[Usage] in={input_tokens:?} out={output_tokens:?} total={total_tokens:?}"
             ),
             RunEvent::AskQuestion { questions, .. } => {
                 println!("[AskQuestion] {} question(s)", questions.len())
             }
             RunEvent::Error { message, .. } => println!("\n[Error] {message}"),
-            RunEvent::Exited { exit_code: code, cancelled, .. } => {
+            RunEvent::Exited {
+                exit_code: code,
+                cancelled,
+                ..
+            } => {
                 exit_code = *code;
                 println!("\n[Exited] exit_code={code:?} cancelled={cancelled}");
             }
@@ -104,7 +130,7 @@ fn main() -> Result<(), harness::HarnessError> {
     // --- Turn 1: establish a fact the model must recall in turn 2. ----------
     let (_t1_text, session_id, _c1) = run_turn(
         "turn-1",
-        "My name is Deerborn. Please acknowledge in one short sentence and remember it.",
+        "My name is Dearborn. Please acknowledge in one short sentence and remember it.",
         None,
     )?;
 
@@ -126,7 +152,7 @@ fn main() -> Result<(), harness::HarnessError> {
     )?;
 
     println!("\n=================== VERDICT ===================");
-    if t2_text.to_lowercase().contains("deerborn") {
+    if t2_text.to_lowercase().contains("dearborn") {
         println!("PASS: turn 2 recalled the name from turn 1 via native session-resume.");
     } else {
         println!(

@@ -1,6 +1,6 @@
 [workspace]
 resolver = "2"
-members = ["deerborn-server"]
+members = ["dearborn-server"]
 
 [workspace.package]
 version = "0.1.0"

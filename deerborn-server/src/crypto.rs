@@ -7,13 +7,13 @@
 //!
 //! ## Key derivation
 //!
-//! The 256-bit AES key is derived from the `DEERBORN_MASTER_KEY` env material by
-//! **SHA-256**: `key = SHA-256(DEERBORN_MASTER_KEY_bytes)`. This accepts master
+//! The 256-bit AES key is derived from the `DEARBORN_MASTER_KEY` env material by
+//! **SHA-256**: `key = SHA-256(DEARBORN_MASTER_KEY_bytes)`. This accepts master
 //! key material of any length/format and deterministically produces exactly the
 //! 32 bytes AES-256 requires. The only invalid input is empty material, which is
 //! already rejected by config loading and is re-checked here so key derivation
 //! fails fast at boot rather than at first encryption. Rotating
-//! `DEERBORN_MASTER_KEY` changes the derived key, so PATs encrypted under the old
+//! `DEARBORN_MASTER_KEY` changes the derived key, so PATs encrypted under the old
 //! value stop decrypting (they must be re-entered) — an intentional, safe
 //! failure (a wrong/rotated key yields a GCM auth-tag error, never plaintext).
 //!
@@ -40,7 +40,7 @@ const NONCE_LEN: usize = 12;
 /// Errors from key derivation or PAT encrypt/decrypt.
 #[derive(Debug, Error)]
 pub enum CryptoError {
-    /// `DEERBORN_MASTER_KEY` was empty — cannot derive a key.
+    /// `DEARBORN_MASTER_KEY` was empty — cannot derive a key.
     #[error("master key material must not be empty")]
     EmptyKeyMaterial,
     /// AES-GCM encryption failed (should not happen for valid inputs).
@@ -54,7 +54,7 @@ pub enum CryptoError {
     Decrypt,
 }
 
-/// A 256-bit AES key derived from `DEERBORN_MASTER_KEY`.
+/// A 256-bit AES key derived from `DEARBORN_MASTER_KEY`.
 ///
 /// Deliberately does **not** derive `Debug`/`Serialize`: the key bytes must never
 /// be logged or serialised. The manual [`fmt::Debug`] impl redacts them.
@@ -68,7 +68,7 @@ impl fmt::Debug for MasterKey {
 }
 
 impl MasterKey {
-    /// Derive the AES-256 key from raw `DEERBORN_MASTER_KEY` material via SHA-256.
+    /// Derive the AES-256 key from raw `DEARBORN_MASTER_KEY` material via SHA-256.
     ///
     /// Fails only on empty material, so this doubles as the boot-time validation
     /// that the configured key can form a valid 256-bit key (see [`crate::main`]).
@@ -204,7 +204,10 @@ mod tests {
         ));
         // A truncated blob (shorter than the nonce) is rejected as malformed.
         let key = MasterKey::derive("k").unwrap();
-        assert!(matches!(key.decrypt(&[0u8; 4]), Err(CryptoError::Malformed)));
+        assert!(matches!(
+            key.decrypt(&[0u8; 4]),
+            Err(CryptoError::Malformed)
+        ));
         // A tampered ciphertext (valid length, wrong bytes) fails the auth check.
         let mut blob = key.encrypt_pat("hello").unwrap();
         let last = blob.len() - 1;

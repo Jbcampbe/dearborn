@@ -1,4 +1,4 @@
-/* Deerborn design tokens — derived from DESIGN.md (Linear "midnight precision
+/* Dearborn design tokens — derived from DESIGN.md (Linear "midnight precision
    instrument" system). Dark-only. Every component should consume these custom
    properties rather than hard-coding values. */
 :root {

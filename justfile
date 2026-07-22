@@ -1,4 +1,4 @@
-# Deerborn task runner. Install `just`: `cargo install just` or `brew install just`.
+# Dearborn task runner. Install `just`: `cargo install just` or `brew install just`.
 
 # List available recipes.
 default:
@@ -6,7 +6,7 @@ default:
 
 # Run the Rust backend alone.
 #
-# Required env vars (`DEERBORN_TOKEN`, `DEERBORN_MASTER_KEY`) are sourced from a
+# Required env vars (`DEARBORN_TOKEN`, `DEARBORN_MASTER_KEY`) are sourced from a
 # gitignored `.env` in the repo root if one exists; otherwise sensible dev
 # defaults are used so `just backend` works out of the box. Any var already
 # exported in your shell wins over both. See `.env.example`.
@@ -19,11 +19,11 @@ backend:
         . ./.env
         set +a
     fi
-    : "${DEERBORN_TOKEN:=dev-token}"
-    : "${DEERBORN_MASTER_KEY:=dev-master-key}"
-    : "${DEERBORN_BIND:=127.0.0.1:8787}"
-    export DEERBORN_TOKEN DEERBORN_MASTER_KEY DEERBORN_BIND
-    # cargo run -p deerborn-server
+    : "${DEARBORN_TOKEN:=dev-token}"
+    : "${DEARBORN_MASTER_KEY:=dev-master-key}"
+    : "${DEARBORN_BIND:=127.0.0.1:8787}"
+    export DEARBORN_TOKEN DEARBORN_MASTER_KEY DEARBORN_BIND
+    # cargo run -p dearborn-server
     cargo watch -x run
 
 # Run the Vite frontend dev server alone.
@@ -36,13 +36,13 @@ frontend:
 dev:
     #!/usr/bin/env bash
     set -euo pipefail
-    echo "starting deerborn-server + vite..."
+    echo "starting dearborn-server + vite..."
     just backend &
     backend_pid=$!
     trap 'kill "$backend_pid" 2>/dev/null || true' EXIT INT TERM
     just frontend
 
-# Whole-repo test gate (Rust + client). Becomes Deerborn's own test_cmd later.
+# Whole-repo test gate (Rust + client). Becomes Dearborn's own test_cmd later.
 test:
     cargo test
     cd client && npm test

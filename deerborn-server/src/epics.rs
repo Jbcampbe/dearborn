@@ -1259,7 +1259,7 @@ mod tests {
     #[tokio::test]
     async fn transcript_survives_a_server_restart() {
         let path = std::env::temp_dir().join(format!(
-            "deerborn-t201-restart-{}-{}.db",
+            "dearborn-t201-restart-{}-{}.db",
             std::process::id(),
             now_ms()
         ));

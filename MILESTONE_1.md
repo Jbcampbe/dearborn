@@ -1,6 +1,6 @@
 # Milestone 1 — Half 1: Planning & Task Creation
 
-> **Goal of this milestone:** stand up the entire *human-facing* half of Deerborn —
+> **Goal of this milestone:** stand up the entire *human-facing* half of Dearborn —
 > projects, interactive epic planning, agent-driven task-DAG breakdown, the
 > Ready-lane DAG editor, and the kanban — such that hitting **In Progress** lands
 > claimable jobs in the queue. Execution of those jobs (the ralph loop) is
@@ -24,7 +24,7 @@ of truth for the **shared contract** frozen in §2 below.
 - Each task is a **vertical slice** with explicit **acceptance criteria (AC)**.
   A task is done when every AC is demonstrably true and the test suite is green.
 - Every task must leave the tree **green and committed** before the next starts
-  (ralph discipline — Deerborn will eventually run this way on itself).
+  (ralph discipline — Dearborn will eventually run this way on itself).
 - Check the box (`- [x]`) when a task is merged. If you deviate from a decision
   recorded here (stack choice, schema, contract), **update this document in the
   same change** — it is the single source of truth for Half 1.
@@ -43,14 +43,14 @@ choice only by updating this section and justifying it.
   shelling out to Claude Code (default). **No custom agent loop.**
 - **Git:** shell out to the `git` CLI (matches the reference; simplest for clone/fetch).
 - **Client:** Vue 3 + TypeScript + Vite, Pinia for state. **Web-first**, SPA
-  **served by the Deerborn binary**; Tauri shells are later.
+  **served by the Dearborn binary**; Tauri shells are later.
 - **Auth:** single-user static **bearer token** from config; every route except
   `/health` requires it.
 - **Secrets:** PATs encrypted at rest with **AES-256-GCM**, key from
-  `DEERBORN_MASTER_KEY` (env). Never returned by any API.
+  `DEARBORN_MASTER_KEY` (env). Never returned by any API.
 - **Testing:** each task ships tests. Server = `cargo test`; a `just test`
-  target runs the whole gate (this becomes Deerborn's own `test_cmd`).
-- **Layout (suggested, T-001 finalizes):** Cargo workspace with a `deerborn-server`
+  target runs the whole gate (this becomes Dearborn's own `test_cmd`).
+- **Layout (suggested, T-001 finalizes):** Cargo workspace with a `dearborn-server`
   crate and a `client/` Vite app; a `justfile` with `dev`/`test`/`build`.
 
 ---
@@ -109,7 +109,7 @@ CREATE TABLE epic (
   technical_context TEXT,                  -- maintained live by technical-planning agent
   status            TEXT NOT NULL DEFAULT 'Planning',
                     -- Planning|Ready|InProgress|Completed|Blocked|Cancelled
-  branch_name       TEXT,                  -- deerborn/<project key>-<id> (Half 2)
+  branch_name       TEXT,                  -- dearborn/<project key>-<id> (Half 2)
   -- queue/lease columns: written by Half 1's enqueue, read by Half 2's claim
   lease_owner       TEXT,
   lease_expires_at  INTEGER,               -- unix ms
@@ -195,11 +195,11 @@ CREATE TABLE comment (
   ready task, **and no sibling task in the epic is `InProgress`**. Half 1's
   enqueue (T-403) sets `epic.status='InProgress'` and leaves `lease_owner` NULL.
 
-### 2.4 Agent ↔ Deerborn tool surface for Half 1 (phase-scoped)
+### 2.4 Agent ↔ Dearborn tool surface for Half 1 (phase-scoped)
 
 Only the **planning** and **breakdown** phases exist in Half 1:
 
-| Phase | Agent may call (via local MCP) | Deerborn keeps |
+| Phase | Agent may call (via local MCP) | Dearborn keeps |
 |---|---|---|
 | Planning (interactive) | `update_epic`, `read_codebase_context`, (`search_memory` = env assumption) | lane transitions |
 | Breakdown (one-shot, human-gated) | `create_task`, `link_dependency` | — |
@@ -209,13 +209,13 @@ Only the **planning** and **breakdown** phases exist in Half 1:
 ## 3. Phase 0 — Foundations
 
 - [x] **T-001 — Workspace scaffolding & run story.** *deps: none*
-  Cargo workspace (`deerborn-server` + `client/`), `justfile` (`dev`/`test`/`build`),
+  Cargo workspace (`dearborn-server` + `client/`), `justfile` (`dev`/`test`/`build`),
   README run instructions. **AC:** `cargo run` boots a server answering `200` on
   `GET /health`; `just dev` runs server + Vite together; `just test` is wired
   (may be near-empty). Ratifies §1 stack choices.
 
 - [x] **T-002 — Config & single-user token auth.** *deps: T-001*
-  Load config from env/file: bind addr, `DEERBORN_TOKEN`, `DEERBORN_MASTER_KEY`,
+  Load config from env/file: bind addr, `DEARBORN_TOKEN`, `DEARBORN_MASTER_KEY`,
   db path, clone root. **AC:** a middleware rejects any request lacking
   `Authorization: Bearer <token>` except `/health`; env vars documented in README;
   missing `MASTER_KEY` fails fast at boot.
@@ -252,7 +252,7 @@ Only the **planning** and **breakdown** phases exist in Half 1:
   are structured; `test_cmd` NULL is allowed and preserved.
 
 - [x] **T-102 — PAT encryption at rest.** *deps: T-101, T-002*
-  Encrypt the PAT with AES-256-GCM (key from `DEERBORN_MASTER_KEY`) before insert;
+  Encrypt the PAT with AES-256-GCM (key from `DEARBORN_MASTER_KEY`) before insert;
   provide an internal decrypt path. **AC:** PAT never appears in any API response
   or log; stored bytes are ciphertext; a round-trip test encrypts→decrypts.
 
@@ -323,14 +323,14 @@ Only the **planning** and **breakdown** phases exist in Half 1:
   so T-205 adds a `technical` config against the same engine.
 
 - [x] **T-203 — Local MCP server: `update_epic` + `read_codebase_context`.** *deps: T-202, T-103*
-  Expose Deerborn's local MCP server to the shelled-out agent, scoped to the
+  Expose Dearborn's local MCP server to the shelled-out agent, scoped to the
   planning tool surface (§2.4). `update_epic` maintains `epic.product_context` /
   `technical_context`; `read_codebase_context` reads the project's canonical clone
   **read-only**. **AC:** during a chat the agent calls `update_epic` and the Epic
   record changes live on the client; the agent can quote real code from the clone;
   the agent cannot mutate lane/status.
   **Done:** `src/mcp.rs`. Transport is an **in-process http (streamable-http) MCP
-  endpoint** the Deerborn binary hosts — `POST /mcp/:cap`, minimal hand-rolled
+  endpoint** the Dearborn binary hosts — `POST /mcp/:cap`, minimal hand-rolled
   JSON-RPC 2.0 (no `rmcp` dep; only two tools). A stdio subprocess was rejected: it
   couldn't reach the in-memory `Hub` or the shared libSQL writer that `update_epic`
   needs. The route sits **outside** the browser bearer layer (like `/ws`) and is
@@ -346,7 +346,7 @@ Only the **planning** and **breakdown** phases exist in Half 1:
   absolute, and symlink escapes. Wired into the run in `src/planning.rs`:
   `PlanningConfig.tools_enabled` (true for product planning) makes `spawn_run` mint a
   capability, write a temp `--mcp-config` JSON, set `cwd` to the read-only clone, and
-  add `--allowedTools mcp__deerborn__update_epic,mcp__deerborn__read_codebase_context`
+  add `--allowedTools mcp__dearborn__update_epic,mcp__dearborn__read_codebase_context`
   + `--permission-mode bypassPermissions` (per T-200 spike; read-only comes from
   tool-scoping + the clone, not `RunMode`). Hermetic gate covers all AC (13 tests);
   the live end-to-end smoke test is `tests/mcp_live.rs` (`#[ignore]`d). See
@@ -476,9 +476,9 @@ Only the **planning** and **breakdown** phases exist in Half 1:
   surfaced). Show epics and standalone tasks; update live over WS; allow the
   permitted lane transitions. **AC:** epics appear in the right lanes and move
   between them; two browsers see the same board update in real time.
-  **Done:** `deerborn-server/src/board.rs` (`Board { epics, tasks }`,
+  **Done:** `dearborn-server/src/board.rs` (`Board { epics, tasks }`,
   `load_board`, `publish_board` best-effort on `project:<id>`, `GET
-  /projects/:id/board` handler). `deerborn-server/src/lanes.rs` (`POST
+  /projects/:id/board` handler). `dearborn-server/src/lanes.rs` (`POST
   /epics/:id/lane` with the permitted-transition table; `409` on disallowed,
   `400` on unknown lane, `404` on unknown epic; publishes `epic_updated` on
   `epic:<id>` + `board_updated` on `project:<id>`). `epics.rs` gained
@@ -528,7 +528,7 @@ Only the **planning** and **breakdown** phases exist in Half 1:
   agent, no git). **AC:** hitting In Progress drives the board through the DAG to
   `Completed` via the stub, end-to-end; the rows written are exactly what Half 2's
   claim predicate will read. **This is the Milestone-1 finish line.**
-  **Done:** `deerborn-server/src/worker.rs` — the stub worker (`run_stub_worker` +
+  **Done:** `dearborn-server/src/worker.rs` — the stub worker (`run_stub_worker` +
   `spawn_stub_worker`). It re-fetches the epic each iteration (clean Cancel-during-
   walk no-op), computes the DAG via `tasks::compute_dag`, claims one ready task at
   a time (`Todo → InProgress → Done` with a `dag_updated` publish per transition),
@@ -537,12 +537,12 @@ Only the **planning** and **breakdown** phases exist in Half 1:
   is ready but not all are `Done` (all blocked, none InProgress), it logs a warning
   and stops (no infinite-loop; a valid acyclic DAG never hits this). The worker
   owns `InProgress → Completed` — manual lane moves to `Completed` stay `409`.
-  `deerborn-server/src/lanes.rs` — the `Ready → InProgress` arm now explicitly
+  `dearborn-server/src/lanes.rs` — the `Ready → InProgress` arm now explicitly
   writes `lease_owner=NULL, lease_expires_at=NULL` (the §2.3 enqueue shape) and
   `spawn_stub_worker`s (fire-and-forget). The HTTP response is unchanged (`200`
-  with the updated epic). `deerborn-server/src/config.rs` — added
+  with the updated epic). `dearborn-server/src/config.rs` — added
   `stub_worker_delay_ms: u64` (default `600` in production, `0` in tests; optional
-  env override `DEERBORN_STUB_WORKER_DELAY_MS`). `lib.rs` — `pub mod worker`. No
+  env override `DEARBORN_STUB_WORKER_DELAY_MS`). `lib.rs` — `pub mod worker`. No
   new routes, no new migration, no schema change. 6 hermetic tests in `worker.rs`
   (linear DAG, branching DAG, empty epic, non-InProgress no-op, no-sibling-
   InProgress invariant, end-to-end AC via the lane endpoint with §2.3 contract
@@ -581,5 +581,5 @@ breakdown **granularity** before Half 2 exists.
 Real agent execution (implement/test-gate/commit/review/judge/fix/close) ·
 epic leases/heartbeat/reaper/crash-recovery · one-PR-per-epic + `GitHost` ·
 `Blocked` failure handling + branch push · per-run timeouts/budget caps ·
-Deerborn-managed agentmemory · Gitea/other hosts · Tauri desktop/mobile shells ·
+Dearborn-managed agentmemory · Gitea/other hosts · Tauri desktop/mobile shells ·
 mobile push · multi-user/RBAC · worktrees · containerized build envs.

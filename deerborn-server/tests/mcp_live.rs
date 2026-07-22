@@ -1,13 +1,13 @@
 //! LIVE end-to-end smoke test for T-203 (the local MCP server), driving the REAL
 //! `claude` CLI. Excluded from the hermetic `cargo test` gate — it needs `claude`
 //! installed + authenticated and spawns a real agent that connects back to
-//! Deerborn's `/mcp/:cap` endpoint over loopback.
+//! Dearborn's `/mcp/:cap` endpoint over loopback.
 //!
 //! ## How to run
 //!
 //! ```sh
 //! # from the repo root; `claude` must be on PATH and logged in
-//! cargo test -p deerborn-server --test mcp_live -- --ignored --nocapture
+//! cargo test -p dearborn-server --test mcp_live -- --ignored --nocapture
 //! ```
 //!
 //! No env is required beyond a working `claude` (the same prerequisite as the
@@ -26,18 +26,18 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use deerborn_server::{app, AppState, Config, Db};
+use dearborn_server::{app, AppState, Config, Db};
 
 const TOKEN: &str = "s3cret-token";
 /// A unique string that only exists inside the fixture clone, so finding it in
 /// the epic record proves the agent truly read the file (not hallucinated it).
-const MARKER: &str = "DEERBORN_MAGIC_PINEAPPLE_42";
+const MARKER: &str = "DEARBORN_MAGIC_PINEAPPLE_42";
 
 #[tokio::test]
 #[ignore = "drives the live `claude` CLI; run with --ignored"]
 async fn live_planning_agent_reads_clone_and_updates_epic_via_mcp() {
     // ---- fixture clone on disk (read-only content the agent will quote) ----
-    let clone_dir = std::env::temp_dir().join(format!("deerborn-t203-live-{}", ulid::Ulid::new()));
+    let clone_dir = std::env::temp_dir().join(format!("dearborn-t203-live-{}", ulid::Ulid::new()));
     std::fs::create_dir_all(clone_dir.join("src")).unwrap();
     std::fs::write(
         clone_dir.join("src/marker.rs"),
@@ -168,7 +168,7 @@ async fn live_planning_agent_reads_clone_and_updates_epic_via_mcp() {
 ///
 /// Run with:
 /// ```sh
-/// cargo test -p deerborn-server --test mcp_live \
+/// cargo test -p dearborn-server --test mcp_live \
 ///   live_technical_planning_reads_clone_and_fills_technical_context \
 ///   -- --ignored --nocapture
 /// ```
@@ -179,7 +179,7 @@ async fn live_technical_planning_reads_clone_and_fills_technical_context() {
     use axum::http::{header::AUTHORIZATION, header::CONTENT_TYPE, Request, StatusCode};
     use tower::ServiceExt;
 
-    let clone_dir = std::env::temp_dir().join(format!("deerborn-t205-live-{}", ulid::Ulid::new()));
+    let clone_dir = std::env::temp_dir().join(format!("dearborn-t205-live-{}", ulid::Ulid::new()));
     std::fs::create_dir_all(clone_dir.join("src")).unwrap();
     std::fs::write(
         clone_dir.join("src/marker.rs"),

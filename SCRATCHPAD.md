@@ -1,13 +1,15 @@
-# Deerborn Scratchpad
+# Dearborn Scratchpad
 
 Ideas
-- Create Deerborn task from Slack or the cli?
+- Create Dearborn task from Slack or the cli?
 - Agent that watches observability system
 - Scheduled jobs
 - secrets and .env file for agent to run locally
 - Give planning agents the ability to improve their own skills?
 
 Missing Features
+- Better auth model
+- Multi-user support
 - Project settings
     - Configure which coding agents + api keys, login, etc.
     - Agent harness/models

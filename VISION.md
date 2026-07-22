@@ -1,20 +1,20 @@
-# Deerborn: Easy Setup Software Factory
+# Dearborn: Easy Setup Software Factory
 
 ## Goal
 
-The idea behind Deerborn is to make it easy to get up and running with a software factory. A user could install a single binary on a VPS, personal server, etc., connect an llm subscription or api key, connect a git repository (Github, Gitea, etc.) and then open the desktop or mobile app to begin building software with Deerborn
+The idea behind Dearborn is to make it easy to get up and running with a software factory. A user could install a single binary on a VPS, personal server, etc., connect an llm subscription or api key, connect a git repository (Github, Gitea, etc.) and then open the desktop or mobile app to begin building software with Dearborn
 
 ## Core System Components
 
-These will be some of the key components of Deerborn
+These will be some of the key components of Dearborn
 
-1. A central knowledge base powered by [agentmemory](https://github.com/rohitg00/agentmemory). This allows Deerborn to compound in value the more you use it by learning the "Why" behind every part of the project.
+1. A central knowledge base powered by [agentmemory](https://github.com/rohitg00/agentmemory). This allows Dearborn to compound in value the more you use it by learning the "Why" behind every part of the project.
 2. A lightweight task management system (similar to Github Issues or Linear). There will be epics to represent large features and then regular tasks. Tasks can either be part of an epic or stand on their own. Tasks that are part of an epic have a dependency graph to clearly show what work needs to come first. Tasks will also track not only the work but also the agent session that implemented them. 
 3. An agent orchestrator to take tasks that are ready to be implemented and trigger coding agents like claude code, pi, codex, etc. to implement them. 
 
 ## Workflow
 
-The main workflow for Deerborn will look something like this
+The main workflow for Dearborn will look something like this
 
 1. User chats with the product planning agent to plan out the scope of an epic from a product perspective. agent uses its knowledge of the codebase both from direct inspection as well as the agentmemory kb to guide the planning. Not from a technical perspective but from a business/product perspective. The output of this planning session is an Epic (status is `Planning`)
 2. User chats with the technical planning agent that refines the epic and adds necessary technical context.
@@ -24,11 +24,11 @@ The main workflow for Deerborn will look something like this
 
 ## High-level Client Overview
 
-In addition to the Deerborn server there will also be clients apps for web, desktop and mobile (using Tauri with Vue/Typescript for shared codebase)
+In addition to the Dearborn server there will also be clients apps for web, desktop and mobile (using Tauri with Vue/Typescript for shared codebase)
 
 ### Projects Page
 
-A project in Deerborn is the highest-level entity. Represents a single software project/product. For the MVP version a project will
+A project in Dearborn is the highest-level entity. Represents a single software project/product. For the MVP version a project will
 - Be connected to a single git repository (1-1 mapping)
 - Have a single shared knowledge base (knowledge bases are not shared across projects)
 - To create a new project all you need is a git repository and a name

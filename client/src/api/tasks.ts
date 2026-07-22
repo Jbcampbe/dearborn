@@ -1,6 +1,6 @@
 // Task DAG REST surface (T-302/T-303) consumed by the Ready-lane DAG editor.
 // Mirrors `projects.ts`/`epics.ts`: typed DTOs matching the server's shapes
-// (see `deerborn-server/src/tasks.rs`) wrapped around the generic `apiFetch`.
+// (see `dearborn-server/src/tasks.rs`) wrapped around the generic `apiFetch`.
 //
 // The live DAG does NOT come through here on mutations — every mutating call
 // triggers a `dag_updated` frame over the WebSocket (`epic:<id>`), which the
