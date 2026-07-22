@@ -542,6 +542,8 @@ pub async fn create_epic_task(
     }
 
     crate::mcp::publish_dag(&state, &id).await;
+    // A new task changes the epic's total on the project board's progress badge.
+    crate::board::publish_board(&state, &epic.project_id).await;
     Ok((StatusCode::CREATED, Json(task)))
 }
 
@@ -588,7 +590,9 @@ pub async fn create_project_task(
 /// `PATCH /tasks/{id}` — partial update (double-option for nullable fields).
 /// `200` with the updated task; `404` if it does not exist. Publishes
 /// `dag_updated` on the task's epic (or `board_updated` on its project when
-/// the task is standalone).
+/// the task is standalone). Epic-scoped tasks also publish `board_updated` — a
+/// status change moves the epic's done/total progress badge on the project
+/// kanban.
 #[derive(Debug, Deserialize)]
 pub struct UpdateTaskBody {
     #[serde(default)]
@@ -618,16 +622,18 @@ pub async fn patch_task(
     .await?;
     if let Some(epic_id) = task.epic_id.as_ref() {
         crate::mcp::publish_dag(&state, epic_id).await;
-    } else {
-        crate::board::publish_board(&state, &task.project_id).await;
     }
+    // Always refresh the project board: standalone tasks live on it directly,
+    // and an epic-scoped status change moves the epic's progress badge.
+    crate::board::publish_board(&state, &task.project_id).await;
     Ok(Json(task))
 }
 
 /// `DELETE /tasks/{id}` — remove a task and its dependency edges. `204`;
 /// `404` if it does not exist. Publishes `dag_updated` on the task's epic
 /// (or `board_updated` on its project when the task is standalone — a NULL
-/// epic must not be misread as "missing").
+/// epic must not be misread as "missing"). Epic-scoped deletes also publish
+/// `board_updated` (the epic's progress total changes).
 pub async fn remove_task(
     State(state): State<AppState>,
     Path(id): Path<String>,
@@ -639,9 +645,8 @@ pub async fn remove_task(
     delete_task(conn, &id).await?;
     if let Some(epic_id) = task.epic_id.as_ref() {
         crate::mcp::publish_dag(&state, epic_id).await;
-    } else {
-        crate::board::publish_board(&state, &task.project_id).await;
     }
+    crate::board::publish_board(&state, &task.project_id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 
@@ -1198,6 +1203,42 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn patch_epic_scoped_task_also_publishes_board_updated() {
+        let (state, app, project_id, epic_id) = seed_app().await;
+        let conn = state.db.conn();
+        let a = create_task(conn, &epic_id, &project_id, "A", None, None)
+            .await
+            .unwrap();
+
+        let mut epic_sub = state.hub.subscribe(&format!("epic:{epic_id}"));
+        let mut proj_sub = state.hub.subscribe(&format!("project:{project_id}"));
+
+        let response = app
+            .oneshot(req(
+                "PATCH",
+                &format!("/tasks/{}", a.id),
+                Some(json!({"status":"Done"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // dag_updated on the epic topic (existing behaviour).
+        let frame = epic_sub.recv().await.unwrap();
+        let v: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(v["type"], "dag_updated");
+
+        // ... and board_updated on the project topic, so the epic card's
+        // done/total progress badge refreshes live (done=1, total=1).
+        let frame = proj_sub.recv().await.unwrap();
+        let v: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(v["type"], "board_updated");
+        assert_eq!(v["payload"]["epic_progress"][0]["epic_id"], epic_id);
+        assert_eq!(v["payload"]["epic_progress"][0]["done"], 1);
+        assert_eq!(v["payload"]["epic_progress"][0]["total"], 1);
     }
 
     #[tokio::test]

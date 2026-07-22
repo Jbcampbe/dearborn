@@ -14,12 +14,14 @@ import { TASK_LANES } from "../board/epicLanes";
 import AppModal from "./AppModal.vue";
 import ConfirmModal from "./ConfirmModal.vue";
 
-// Standalone-task dialog (create + full edit). Create mode (`task === null`):
-// title required, description/acceptance optional — the task lands in `Todo`
-// on the project board. Edit mode (`task` set): title, description,
-// acceptance, and status are editable, plus a destructive delete behind a
-// ConfirmModal. Every mutation fires a `board_updated` WS frame on
-// `project:<id>`, which the kanban's stream folds in — no refetch here.
+// Task dialog (create standalone + full edit for standalone and epic tasks).
+// Create mode (`task === null`): title required, description/acceptance
+// optional — the task lands in `Todo` on the project board. Edit mode (`task`
+// set): title, description, acceptance, and status are editable, plus a
+// destructive delete behind a ConfirmModal. Every mutation fires a WS frame
+// (`board_updated` on `project:<id>` for standalone tasks, `dag_updated` on
+// `epic:<id>` for epic tasks), which the kanban's stream folds in — no refetch
+// here.
 const props = defineProps<{ open: boolean; projectId: string; task: Task | null }>();
 const emit = defineEmits<{ close: [] }>();
 
@@ -35,6 +37,24 @@ const confirmingDelete = ref(false);
 const inputEl = ref<HTMLInputElement | null>(null);
 
 const isEdit = computed(() => props.task !== null);
+
+/** Epic-scoped tasks edit against the epic's board, not the project board. */
+const isEpicTask = computed(() => props.task?.epic_id != null);
+
+// The hint reflects where the task lives: standalone tasks land on the project
+// board; epic tasks are edited from the epic's task kanban.
+const hint = computed(() =>
+  isEpicTask.value
+    ? "A task in this epic — edits publish live to the epic's board and DAG."
+    : "A standalone task lands on the project board — no epic, no planning session. For small, self-contained work.",
+);
+
+// The worker owns transitions out of InProgress for epic tasks (drag-and-drop
+// on the epic board enforces the same rule), so the status select is hidden
+// for a running epic task.
+const statusEditable = computed(
+  () => isEdit.value && !(isEpicTask.value && props.task?.status === "InProgress"),
+);
 
 watch(
   () => props.open,
@@ -133,10 +153,7 @@ async function confirmDelete() {
     @close="emit('close')"
   >
     <form class="form" @submit.prevent="submit">
-      <p class="task-hint">
-        A standalone task lands on the project board — no epic, no planning session. For
-        small, self-contained work.
-      </p>
+      <p class="task-hint">{{ hint }}</p>
       <p v-if="error" class="banner banner-error" role="alert">{{ error }}</p>
       <div>
         <label class="label" for="task-title">Title</label>
@@ -173,7 +190,7 @@ async function confirmDelete() {
           :disabled="busy"
         />
       </div>
-      <div v-if="isEdit">
+      <div v-if="statusEditable">
         <label class="label" for="task-status">Status</label>
         <select id="task-status" v-model="status" class="select" :disabled="busy">
           <option v-for="lane in TASK_LANES" :key="lane.key" :value="lane.key">

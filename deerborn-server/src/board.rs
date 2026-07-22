@@ -24,25 +24,66 @@ use crate::{AppError, AppResult, AppState};
 
 /// The project board: its epics (in lane order) and its standalone
 /// (parentless) tasks. Epics go in the lane of their `status`; standalone tasks
-/// are mapped to lanes client-side.
+/// are mapped to lanes client-side. `epic_progress` carries per-epic task
+/// counts so the kanban can render a `done / total` badge on each epic card.
 #[derive(Debug, Serialize)]
 pub struct Board {
     pub epics: Vec<Epic>,
     pub tasks: Vec<Task>,
+    pub epic_progress: Vec<EpicProgress>,
+}
+
+/// Task progress for one epic: `done` counts strictly `status='Done'` tasks;
+/// `total` counts all of the epic's tasks **except** `Cancelled` ones.
+#[derive(Debug, Serialize)]
+pub struct EpicProgress {
+    pub epic_id: String,
+    pub done: i64,
+    pub total: i64,
+}
+
+/// Load the per-epic task counts for a project (one row per epic that has any
+/// tasks; epics with no tasks are absent — the client treats them as 0/0).
+async fn load_epic_progress(conn: &Connection, project_id: &str) -> AppResult<Vec<EpicProgress>> {
+    let mut rows = conn
+        .query(
+            "SELECT epic_id, \
+                    SUM(CASE WHEN status = 'Done' THEN 1 ELSE 0 END) AS done, \
+                    SUM(CASE WHEN status != 'Cancelled' THEN 1 ELSE 0 END) AS total \
+             FROM task \
+             WHERE project_id = ?1 AND epic_id IS NOT NULL \
+             GROUP BY epic_id",
+            libsql::params![project_id],
+        )
+        .await?;
+    let mut items = Vec::new();
+    while let Some(row) = rows.next().await? {
+        items.push(EpicProgress {
+            epic_id: row.get(0)?,
+            done: row.get(1)?,
+            total: row.get(2)?,
+        });
+    }
+    Ok(items)
 }
 
 /// Load the board for `project_id`: its epics (newest first, same ordering as
-/// `list_epics`) and its standalone tasks (`epic_id IS NULL`, newest first).
-/// Does **not** check project existence — callers guard with [`project_exists`]
-/// for a clean `404`.
+/// `list_epics`), its standalone tasks (`epic_id IS NULL`, newest first), and
+/// the per-epic task progress counts. Does **not** check project existence —
+/// callers guard with [`project_exists`] for a clean `404`.
 pub(crate) async fn load_board(conn: &Connection, project_id: &str) -> AppResult<Board> {
     let epics = list_epics_by_project(conn, project_id).await?;
     let tasks = list_standalone_tasks(conn, project_id).await?;
-    Ok(Board { epics, tasks })
+    let epic_progress = load_epic_progress(conn, project_id).await?;
+    Ok(Board {
+        epics,
+        tasks,
+        epic_progress,
+    })
 }
 
 /// Best-effort publish of the board on `project:<id>` as a `board_updated`
-/// frame (payload `{ epics, tasks }`). A read error is logged and the publish
+/// frame (payload `{ epics, tasks, epic_progress }`). A read error is logged and the publish
 /// is skipped — mirrors `mcp::publish_dag`.
 pub async fn publish_board(state: &AppState, project_id: &str) {
     let board = match load_board(state.db.conn(), project_id).await {
@@ -59,7 +100,7 @@ pub async fn publish_board(state: &AppState, project_id: &str) {
     state.hub.publish(
         &format!("project:{project_id}"),
         "board_updated",
-        json!({ "epics": board.epics, "tasks": board.tasks }),
+        json!({ "epics": board.epics, "tasks": board.tasks, "epic_progress": board.epic_progress }),
     );
 }
 
@@ -242,6 +283,46 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn get_board_reports_epic_progress() {
+        let (state, app) = test_app().await;
+        let project_id = seed_project(&state).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let other_epic = seed_epic(&state, &project_id, "Ready").await;
+
+        // 2 Done + 1 Todo + 1 InProgress + 1 Cancelled on `epic_id`:
+        // done = 2, total = 4 (Cancelled excluded from the total).
+        seed_task(&state, Some(&epic_id), &project_id, "t1", "Done").await;
+        seed_task(&state, Some(&epic_id), &project_id, "t2", "Done").await;
+        seed_task(&state, Some(&epic_id), &project_id, "t3", "Todo").await;
+        seed_task(&state, Some(&epic_id), &project_id, "t4", "InProgress").await;
+        seed_task(&state, Some(&epic_id), &project_id, "t5", "Cancelled").await;
+        // The other epic has no tasks -> no progress row (client shows 0/0).
+        // A standalone task must not leak into any epic's counts.
+        seed_task(&state, None, &project_id, "standalone", "Done").await;
+
+        let response = app
+            .clone()
+            .oneshot(req("GET", &format!("/projects/{project_id}/board"), None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let board = body_json(response).await;
+
+        let progress = board["epic_progress"].as_array().unwrap();
+        assert_eq!(progress.len(), 1, "only the epic with tasks gets a row");
+        assert_eq!(progress[0]["epic_id"], epic_id);
+        assert_eq!(progress[0]["done"], 2, "done counts strictly Done");
+        assert_eq!(progress[0]["total"], 4, "total excludes Cancelled");
+
+        // `other_epic` is absent from epic_progress.
+        let ids: Vec<&str> = progress
+            .iter()
+            .map(|p| p["epic_id"].as_str().unwrap())
+            .collect();
+        assert!(!ids.contains(&other_epic.as_str()));
+    }
+
+    #[tokio::test]
     async fn get_board_unknown_project_is_404() {
         let (_state, app) = test_app().await;
         let response = app
@@ -269,5 +350,6 @@ mod tests {
         assert_eq!(v["type"], "board_updated");
         assert_eq!(v["payload"]["epics"].as_array().unwrap().len(), 1);
         assert_eq!(v["payload"]["tasks"].as_array().unwrap().len(), 1);
+        assert!(v["payload"]["epic_progress"].is_array());
     }
 }

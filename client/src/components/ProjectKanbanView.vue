@@ -4,11 +4,17 @@ import { RouterLink } from "vue-router";
 
 import { useAuthStore } from "../stores/auth";
 import { ApiError } from "../api/client";
-import { getBoard, setEpicLane, type EpicLane } from "../api/board";
+import { getBoard, setEpicLane, type EpicLane, type EpicProgress } from "../api/board";
 import type { Epic } from "../api/epics";
-import type { Task } from "../api/tasks";
+import { patchTask, type Task, type TaskStatus } from "../api/tasks";
 import { hydrateBoard, initialBoardState, type BoardState } from "../board/stream";
 import { useBoardStream, type StreamStatus } from "../board/useBoardStream";
+import {
+  canDropOnProjectLane,
+  permittedEpicTargets,
+  taskStatusForLane,
+  type DragKind,
+} from "../board/dnd";
 import StatusIcon from "./StatusIcon.vue";
 import TaskModal from "./TaskModal.vue";
 
@@ -59,15 +65,8 @@ const LANES: { key: EpicLane; label: string }[] = [
   { key: "Blocked", label: "Blocked" },
 ];
 
-/** Permitted `current → target` transitions (must match the server table). */
-const PERMITTED_TRANSITIONS: Record<string, EpicLane[]> = {
-  Planning: ["Cancelled"],
-  Ready: ["InProgress", "Cancelled"],
-  InProgress: ["Cancelled", "Blocked"],
-  Blocked: ["Ready", "Cancelled"],
-  Completed: [],
-  Cancelled: [],
-};
+/** Permitted `current → target` transitions live in `board/dnd.ts` (shared
+ * with drag-and-drop); the lane-move select below offers the same set. */
 
 /** Map a standalone task's status to a lane key. */
 function taskLane(task: Task): EpicLane {
@@ -116,7 +115,107 @@ const tasksByLane = computed<Record<string, Task[]>>(() => {
 });
 
 function permittedTargets(currentStatus: string): EpicLane[] {
-  return PERMITTED_TRANSITIONS[currentStatus] ?? [];
+  return permittedEpicTargets(currentStatus);
+}
+
+/** Task progress per epic id, for the epic cards' done/total badge. */
+const progressByEpic = computed<Record<string, EpicProgress>>(() => {
+  const map: Record<string, EpicProgress> = {};
+  for (const p of state.epicProgress) {
+    map[p.epic_id] = p;
+  }
+  return map;
+});
+
+function progressOf(epicId: string): EpicProgress | null {
+  const p = progressByEpic.value[epicId];
+  return p && p.total > 0 ? p : null;
+}
+
+function snippet(text: string | null, max = 100): string | null {
+  if (!text) return null;
+  return text.length > max ? `${text.slice(0, max)}…` : text;
+}
+
+/* --- Drag and drop --------------------------------------------------------
+ * Native HTML5 DnD; drop rules live in `board/dnd.ts`. The dragged card is
+ * kept in component state (dragover handlers can't read dataTransfer data),
+ * and `dropLane` tracks the highlighted valid drop target. Mutations reuse
+ * the same REST calls as the select/click paths — the `board_updated` frame
+ * drives the re-render, so there is no optimistic state to roll back.
+ */
+interface DragPayload {
+  kind: DragKind;
+  id: string;
+  status: string;
+}
+const dragPayload = ref<DragPayload | null>(null);
+const dropLane = ref<EpicLane | null>(null);
+
+function onDragStart(kind: DragKind, card: Epic | Task, event: DragEvent) {
+  dragPayload.value = { kind, id: card.id, status: card.status };
+  event.dataTransfer?.setData("text/plain", card.id);
+  if (event.dataTransfer) {
+    event.dataTransfer.effectAllowed = "move";
+  }
+}
+
+function onDragEnd() {
+  dragPayload.value = null;
+  dropLane.value = null;
+}
+
+/** Whether the current drag may drop on `lane` (drives highlight + cursor). */
+function laneAccepts(lane: EpicLane): boolean {
+  const drag = dragPayload.value;
+  return drag !== null && canDropOnProjectLane(drag.kind, drag.status, lane);
+}
+
+function onLaneDragOver(lane: EpicLane, event: DragEvent) {
+  if (!laneAccepts(lane)) {
+    return; // no preventDefault -> the lane rejects the drop (not-allowed cursor)
+  }
+  event.preventDefault();
+  if (event.dataTransfer) {
+    event.dataTransfer.dropEffect = "move";
+  }
+  dropLane.value = lane;
+}
+
+function onLaneDragLeave(event: DragEvent) {
+  // Only clear the highlight when the pointer truly leaves the lane (entering
+  // a child card fires dragleave on the lane too).
+  const related = event.relatedTarget as Node | null;
+  if (!related || !(event.currentTarget as HTMLElement).contains(related)) {
+    dropLane.value = null;
+  }
+}
+
+async function onLaneDrop(lane: EpicLane, event: DragEvent) {
+  event.preventDefault();
+  const drag = dragPayload.value;
+  onDragEnd();
+  const token = auth.token;
+  if (drag === null || token === null || !canDropOnProjectLane(drag.kind, drag.status, lane)) {
+    return;
+  }
+  error.value = null;
+  try {
+    if (drag.kind === "epic") {
+      await setEpicLane(token, drag.id, lane);
+    } else {
+      const status = taskStatusForLane(lane);
+      if (status !== null && status !== drag.status) {
+        await patchTask(token, drag.id, { status: status as TaskStatus });
+      }
+    }
+    // The board_updated WS frame drives the re-render.
+  } catch (err) {
+    if (bounceIfAuth(err)) {
+      return;
+    }
+    error.value = err instanceof Error ? err.message : "failed to move the card";
+  }
 }
 
 function laneLabel(key: string): string {
@@ -186,7 +285,16 @@ onMounted(load);
     <p v-else-if="error" class="banner banner-error" role="alert">{{ error }}</p>
 
     <div v-else class="lanes fade-in">
-      <div v-for="lane in LANES" :key="lane.key" class="lane" :data-lane="lane.key">
+      <div
+        v-for="lane in LANES"
+        :key="lane.key"
+        class="lane"
+        :class="{ 'drop-target': dropLane === lane.key }"
+        :data-lane="lane.key"
+        @dragover="onLaneDragOver(lane.key, $event)"
+        @dragleave="onLaneDragLeave"
+        @drop="onLaneDrop(lane.key, $event)"
+      >
         <header class="lane-head">
           <StatusIcon :status="lane.key" :size="13" />
           <h3>{{ lane.label }}</h3>
@@ -200,6 +308,10 @@ onMounted(load);
             v-for="epic in epicsByLane[lane.key]"
             :key="epic.id"
             class="card card-interactive epic-card"
+            :class="{ dragging: dragPayload?.id === epic.id }"
+            draggable="true"
+            @dragstart="onDragStart('epic', epic, $event)"
+            @dragend="onDragEnd"
           >
             <RouterLink
               class="card-title"
@@ -207,6 +319,18 @@ onMounted(load);
             >
               {{ epic.title }}
             </RouterLink>
+            <p v-if="snippet(epic.description)" class="card-desc">{{ snippet(epic.description) }}</p>
+            <div v-if="progressOf(epic.id)" class="card-progress">
+              <span class="progress-track">
+                <span
+                  class="progress-fill"
+                  :style="{ width: `${(progressOf(epic.id)!.done / progressOf(epic.id)!.total) * 100}%` }"
+                />
+              </span>
+              <span class="progress-label">
+                {{ progressOf(epic.id)!.done }} / {{ progressOf(epic.id)!.total }} tasks
+              </span>
+            </div>
             <div class="card-foot">
               <span class="badge">
                 <StatusIcon :status="epic.status" :size="11" />
@@ -237,8 +361,12 @@ onMounted(load);
             v-for="task in tasksByLane[lane.key]"
             :key="task.id"
             class="card card-interactive task-card"
+            :class="{ dragging: dragPayload?.id === task.id }"
             role="button"
             tabindex="0"
+            draggable="true"
+            @dragstart="onDragStart('task', task, $event)"
+            @dragend="onDragEnd"
             @click="openEditTask(task)"
             @keydown.enter="openEditTask(task)"
           >
@@ -383,6 +511,58 @@ onMounted(load);
 .lane-move:focus,
 .card-open:focus {
   opacity: 1;
+}
+
+/* --- Drag and drop ---------------------------------------------------------*/
+
+.card[draggable="true"] {
+  cursor: grab;
+}
+
+.card.dragging {
+  opacity: 0.45;
+  cursor: grabbing;
+}
+
+.lane.drop-target {
+  border-color: var(--color-signal-teal);
+  background: rgba(255, 255, 255, 0.03);
+}
+
+/* --- Epic card extras ------------------------------------------------------*/
+
+.card-desc {
+  font-size: var(--text-label);
+  color: var(--text-faint);
+  line-height: 1.45;
+}
+
+.card-progress {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-8);
+}
+
+.progress-track {
+  flex: 1;
+  height: 3px;
+  border-radius: var(--radius-pills);
+  background: rgba(255, 255, 255, 0.08);
+  overflow: hidden;
+}
+
+.progress-fill {
+  display: block;
+  height: 100%;
+  border-radius: var(--radius-pills);
+  background: var(--color-pulse-green);
+  transition: width var(--duration-fast) var(--ease-out);
+}
+
+.progress-label {
+  font-size: 11px;
+  color: var(--text-faint);
+  white-space: nowrap;
 }
 
 .empty-lane {

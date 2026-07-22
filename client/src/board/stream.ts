@@ -13,7 +13,7 @@
 
 import type { Epic } from "../api/epics";
 import type { Task } from "../api/tasks";
-import type { Board } from "../api/board";
+import type { Board, EpicProgress } from "../api/board";
 
 /** A WS frame as delivered on `project:<id>` (same envelope as the planning/DAG streams). */
 export interface BoardFrame {
@@ -30,11 +30,13 @@ export interface BoardState {
   epics: Epic[];
   /** The project's standalone (parentless) tasks, live-replaced by `board_updated`. */
   tasks: Task[];
+  /** Per-epic task progress (done/total), live-replaced by `board_updated`. */
+  epicProgress: EpicProgress[];
 }
 
 /** A fresh, empty view model. */
 export function initialBoardState(): BoardState {
-  return { projectId: null, epics: [], tasks: [] };
+  return { projectId: null, epics: [], tasks: [], epicProgress: [] };
 }
 
 /**
@@ -46,6 +48,7 @@ export function initialBoardState(): BoardState {
 export function hydrateBoard(state: BoardState, board: Board): BoardState {
   state.epics = board.epics;
   state.tasks = board.tasks;
+  state.epicProgress = board.epic_progress ?? [];
   state.projectId = board.epics[0]?.project_id ?? state.projectId;
   return state;
 }
@@ -63,6 +66,7 @@ export function applyBoardFrame(state: BoardState, frame: BoardFrame): BoardStat
     if (board && Array.isArray(board.epics) && Array.isArray(board.tasks)) {
       state.epics = board.epics;
       state.tasks = board.tasks;
+      state.epicProgress = Array.isArray(board.epic_progress) ? board.epic_progress : [];
     }
   }
   return state;

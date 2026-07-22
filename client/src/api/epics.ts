@@ -15,12 +15,14 @@ export type EpicStatus = "Planning" | string;
 /**
  * An epic as returned by the API (`epics.rs` `Epic`). `product_context` /
  * `technical_context` are `null` until the planning agent fills them in via its
- * `update_epic` tool (surfaced live as `epic_updated` WS frames).
+ * `update_epic` tool (surfaced live as `epic_updated` WS frames). `description`
+ * is an optional user-facing short blurb shown on kanban cards.
  */
 export interface Epic {
   id: string;
   project_id: string;
   title: string;
+  description: string | null;
   product_context: string | null;
   technical_context: string | null;
   status: EpicStatus;
@@ -64,11 +66,21 @@ export interface TranscriptMessage {
   created_at: number;
 }
 
+/** Body for `POST /projects/{id}/epics`. `description` is optional. */
+export interface CreateEpicInput {
+  title: string;
+  description?: string;
+}
+
 /** `POST /projects/{id}/epics` → the created epic (201, `status='Planning'`). */
-export function createEpic(token: string, projectId: string, title: string): Promise<Epic> {
+export function createEpic(
+  token: string,
+  projectId: string,
+  input: CreateEpicInput,
+): Promise<Epic> {
   return apiFetch<Epic>(`/projects/${encodeURIComponent(projectId)}/epics`, token, {
     method: "POST",
-    body: JSON.stringify({ title }),
+    body: JSON.stringify(input),
   });
 }
 
@@ -93,6 +105,7 @@ export function getEpic(token: string, id: string): Promise<Epic> {
  */
 export interface UpdateEpicBody {
   title?: string;
+  description?: string | null;
   product_context?: string | null;
   technical_context?: string | null;
 }

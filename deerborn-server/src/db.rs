@@ -33,6 +33,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0002_planning_session",
         sql: include_str!("../migrations/0002_planning_session.sql"),
     },
+    Migration {
+        id: 3,
+        name: "0003_epic_description",
+        sql: include_str!("../migrations/0003_epic_description.sql"),
+    },
 ];
 
 /// Errors surfaced while opening the database or running migrations.

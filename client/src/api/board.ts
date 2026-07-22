@@ -13,10 +13,18 @@ import { apiFetch } from "./client";
 import type { Epic } from "./epics";
 import type { Task } from "./tasks";
 
-/** The project board: its epics (in lane order) and standalone tasks. */
+/** Task progress for one epic: `done` = strictly `Done`; `total` excludes `Cancelled`. */
+export interface EpicProgress {
+  epic_id: string;
+  done: number;
+  total: number;
+}
+
+/** The project board: its epics (in lane order), standalone tasks, and per-epic progress. */
 export interface Board {
   epics: Epic[];
   tasks: Task[];
+  epic_progress: EpicProgress[];
 }
 
 /** The epic lane set (§2.2 stored values — no spaces). */

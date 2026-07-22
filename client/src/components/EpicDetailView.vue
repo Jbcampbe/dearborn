@@ -51,8 +51,8 @@ const projectName = ref<string | null>(null);
 
 // The local edit buffer and the last-known server values it diffs against.
 // Only meaningful in edit mode; view mode renders straight from `state.epic`.
-const draft = reactive<EpicDraft>({ title: "", product_context: "", technical_context: "" });
-const baseline = reactive<EpicDraft>({ title: "", product_context: "", technical_context: "" });
+const draft = reactive<EpicDraft>({ title: "", description: "", product_context: "", technical_context: "" });
+const baseline = reactive<EpicDraft>({ title: "", description: "", product_context: "", technical_context: "" });
 
 const epic = computed(() => state.epic);
 const projectId = computed<string | null>(() => state.epic?.project_id ?? null);
@@ -234,6 +234,11 @@ onMounted(load);
             <dd>{{ epic.title }}</dd>
           </div>
           <div class="prop">
+            <dt>Description</dt>
+            <dd v-if="epic.description">{{ epic.description }}</dd>
+            <dd v-else class="prop-empty">No description — add one via Edit.</dd>
+          </div>
+          <div class="prop">
             <dt>Status</dt>
             <dd>{{ epic.status }}</dd>
           </div>
@@ -283,6 +288,20 @@ onMounted(load);
             :disabled="saving"
           />
           <p v-if="titleEmpty" class="field-error" role="alert">Title must not be empty.</p>
+        </div>
+
+        <div class="field">
+          <label class="label" for="epic-description">
+            Description <span class="label-optional">(optional)</span>
+          </label>
+          <input
+            id="epic-description"
+            v-model="draft.description"
+            class="input"
+            type="text"
+            placeholder="A short blurb — shown on the epic's kanban card"
+            :disabled="saving"
+          />
         </div>
 
         <div class="field">
@@ -406,6 +425,12 @@ onMounted(load);
 .prop dd {
   font-size: var(--text-caption);
   color: var(--text-body);
+}
+
+.prop-empty,
+.label-optional {
+  color: var(--text-faint);
+  font-weight: var(--weight-regular);
 }
 
 .context h3 {

@@ -41,7 +41,7 @@ use crate::{AppError, AppResult, AppState};
 /// Columns projected into an [`Epic`] DTO. The Half-2 lease columns
 /// (`lease_owner`, `lease_expires_at`, `branch_name`) are omitted — they are not
 /// part of the planning-facing shape.
-const EPIC_COLUMNS: &str = "id, project_id, title, product_context, technical_context, \
+const EPIC_COLUMNS: &str = "id, project_id, title, description, product_context, technical_context, \
      status, created_at, updated_at";
 
 /// Columns projected into a [`TranscriptMessage`] DTO, in schema (§2.2) order.
@@ -53,14 +53,16 @@ const INITIAL_PHASE: &str = "product";
 
 /// An epic as returned by the API. Lands in `status='Planning'` on create.
 ///
-/// `product_context` / `technical_context` are `Option<String>` so a `NULL`
-/// column round-trips as JSON `null` (maintained live by the planning agent in
-/// T-203).
+/// `product_context` / `technical_context` / `description` are `Option<String>`
+/// so a `NULL` column round-trips as JSON `null` (the contexts are maintained
+/// live by the planning agent in T-203; the description is a user-facing short
+/// blurb shown on kanban cards).
 #[derive(Debug, Serialize)]
 pub struct Epic {
     pub id: String,
     pub project_id: String,
     pub title: String,
+    pub description: Option<String>,
     pub product_context: Option<String>,
     pub technical_context: Option<String>,
     pub status: String,
@@ -107,6 +109,10 @@ const SESSION_COLUMNS: &str = "epic_id, phase, status, created_at, updated_at";
 #[derive(Debug, Deserialize)]
 pub struct CreateEpic {
     title: Option<String>,
+    /// Optional short description (kanban card blurb). An empty/whitespace
+    /// string is stored as `NULL`.
+    #[serde(default)]
+    description: Option<String>,
 }
 
 /// `POST /epics/{id}/messages` body — append a `user` message to the transcript.
@@ -126,6 +132,8 @@ pub struct AppendMessage {
 pub struct UpdateEpic {
     #[serde(default)]
     title: Option<String>,
+    #[serde(default, deserialize_with = "double_option")]
+    description: Option<Option<String>>,
     #[serde(default, deserialize_with = "double_option")]
     product_context: Option<Option<String>>,
     #[serde(default, deserialize_with = "double_option")]
@@ -166,11 +174,17 @@ pub async fn create_epic(
     let now = now_ms();
 
     // `status` takes its schema default of 'Planning' by omission; the context
-    // columns and Half-2 lease columns stay NULL.
+    // columns and Half-2 lease columns stay NULL. An empty/whitespace
+    // description is stored as NULL (unset).
+    let description = req
+        .description
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
     conn.execute(
-        "INSERT INTO epic (id, project_id, title, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5)",
-        params![id.clone(), project_id, title, now, now],
+        "INSERT INTO epic (id, project_id, title, description, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+        params![id.clone(), project_id, title, description, now, now],
     )
     .await?;
 
@@ -240,6 +254,7 @@ pub async fn update_epic(
         values.push(Value::Text(require_field(Some(title), "title")?));
     }
     for (column, field) in [
+        ("description = ?", req.description),
         ("product_context = ?", req.product_context),
         ("technical_context = ?", req.technical_context),
     ] {
@@ -660,11 +675,12 @@ fn row_to_epic(row: &Row) -> Result<Epic, libsql::Error> {
         id: row.get(0)?,
         project_id: row.get(1)?,
         title: row.get(2)?,
-        product_context: row.get(3)?,
-        technical_context: row.get(4)?,
-        status: row.get(5)?,
-        created_at: row.get(6)?,
-        updated_at: row.get(7)?,
+        description: row.get(3)?,
+        product_context: row.get(4)?,
+        technical_context: row.get(5)?,
+        status: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
     })
 }
 
@@ -992,6 +1008,79 @@ mod tests {
             .unwrap();
         assert_eq!(cleared.status(), StatusCode::OK);
         assert_eq!(body_json(cleared).await["product_context"], Json::Null);
+    }
+
+    #[tokio::test]
+    async fn create_epic_with_description_round_trips_and_blank_is_null() {
+        let app = test_app().await;
+        let project_id = seed_project(&app).await;
+
+        // A provided description is stored and returned.
+        let created = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                &format!("/projects/{project_id}/epics"),
+                Some(json!({ "title": "Ship it", "description": "  Short blurb.  " })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let epic = body_json(created).await;
+        assert_eq!(epic["description"], "Short blurb.", "description is trimmed");
+
+        // Omitted or blank descriptions store NULL.
+        let blank = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                &format!("/projects/{project_id}/epics"),
+                Some(json!({ "title": "Blank", "description": "   " })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(blank.status(), StatusCode::CREATED);
+        assert_eq!(body_json(blank).await["description"], Json::Null);
+
+        let omitted = create_epic_via_api(&app, &project_id, "Omitted").await;
+        assert_eq!(omitted["description"], Json::Null);
+    }
+
+    #[tokio::test]
+    async fn patch_epic_sets_and_clears_description() {
+        let app = test_app().await;
+        let project_id = seed_project(&app).await;
+        let id = create_epic_via_api(&app, &project_id, "Keep me").await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // Set the description; absent fields stay untouched.
+        let patched = app
+            .clone()
+            .oneshot(req(
+                "PATCH",
+                &format!("/epics/{id}"),
+                Some(json!({ "description": "Now with a blurb" })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(patched.status(), StatusCode::OK);
+        let epic = body_json(patched).await;
+        assert_eq!(epic["description"], "Now with a blurb");
+        assert_eq!(epic["title"], "Keep me", "absent title untouched");
+
+        // An explicit null clears it back to NULL.
+        let cleared = app
+            .oneshot(req(
+                "PATCH",
+                &format!("/epics/{id}"),
+                Some(json!({ "description": null })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(cleared.status(), StatusCode::OK);
+        assert_eq!(body_json(cleared).await["description"], Json::Null);
     }
 
     #[tokio::test]

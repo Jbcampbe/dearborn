@@ -21,6 +21,7 @@ function epic(overrides: Partial<Epic> = {}): Epic {
     id: "E1",
     project_id: "P1",
     title: "Ship it",
+    description: null,
     product_context: null,
     technical_context: null,
     status: "Planning",
@@ -31,7 +32,13 @@ function epic(overrides: Partial<Epic> = {}): Epic {
 }
 
 function draft(overrides: Partial<EpicDraft> = {}): EpicDraft {
-  return { title: "Ship it", product_context: "", technical_context: "", ...overrides };
+  return {
+    title: "Ship it",
+    description: "",
+    product_context: "",
+    technical_context: "",
+    ...overrides,
+  };
 }
 
 describe("draftFromEpic", () => {
@@ -69,6 +76,18 @@ describe("diffEpicEdits", () => {
       draft({ product_context: "" }),
     );
     expect(body).toEqual({ product_context: null });
+  });
+
+  it("diffs the description like a context (set, change, clear-to-null)", () => {
+    expect(diffEpicEdits(draft(), draft({ description: "A blurb" }))).toEqual({
+      description: "A blurb",
+    });
+    expect(
+      diffEpicEdits(draft({ description: "A blurb" }), draft({ description: "" })),
+    ).toEqual({ description: null });
+    expect(diffEpicEdits(draft({ description: "Same" }), draft({ description: "Same" }))).toEqual(
+      {},
+    );
   });
 });
 

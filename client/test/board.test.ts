@@ -6,7 +6,7 @@ import { describe, expect, it } from "vitest";
 
 import type { Epic } from "../src/api/epics";
 import type { Task } from "../src/api/tasks";
-import type { Board } from "../src/api/board";
+import type { Board, EpicProgress } from "../src/api/board";
 import {
   applyBoardFrame,
   hydrateBoard,
@@ -25,6 +25,7 @@ function makeEpic(overrides: Partial<Epic> = {}): Epic {
     id: "E1",
     project_id: "P1",
     title: "Ship it",
+    description: null,
     product_context: null,
     technical_context: null,
     status: "Planning",
@@ -52,8 +53,8 @@ function makeTask(overrides: Partial<Task> = {}): Task {
   };
 }
 
-function board(epics: Epic[], tasks: Task[]): Board {
-  return { epics, tasks };
+function board(epics: Epic[], tasks: Task[], epic_progress: EpicProgress[] = []): Board {
+  return { epics, tasks, epic_progress };
 }
 
 describe("Board stream reducer", () => {
@@ -76,6 +77,29 @@ describe("Board stream reducer", () => {
     expect(state.projectId).toBeNull();
     expect(state.epics).toEqual([]);
     expect(state.tasks).toEqual([]);
+  });
+
+  it("hydrate and board_updated carry the epic progress counts", () => {
+    const state = initialBoardState();
+    const progress: EpicProgress[] = [{ epic_id: "E1", done: 2, total: 4 }];
+    hydrateBoard(state, board([makeEpic({ id: "E1" })], [], progress));
+    expect(state.epicProgress).toEqual(progress);
+
+    const updated: EpicProgress[] = [{ epic_id: "E1", done: 3, total: 4 }];
+    applyBoardFrame(
+      state,
+      frame("board_updated", board([makeEpic({ id: "E1" })], [], updated)),
+    );
+    expect(state.epicProgress).toEqual(updated);
+  });
+
+  it("a board_updated frame without epic_progress clears the counts", () => {
+    const state = initialBoardState();
+    hydrateBoard(state, board([makeEpic({ id: "E1" })], [], [{ epic_id: "E1", done: 1, total: 2 }]));
+
+    applyBoardFrame(state, frame("board_updated", { epics: [], tasks: [] }));
+
+    expect(state.epicProgress).toEqual([]);
   });
 
   it("board_updated replaces both epics and tasks", () => {

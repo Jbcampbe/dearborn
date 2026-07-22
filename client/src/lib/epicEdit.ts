@@ -13,17 +13,19 @@ import type { Epic, UpdateEpicBody } from "../api/epics";
  */
 export interface EpicDraft {
   title: string;
+  description: string;
   product_context: string;
   technical_context: string;
 }
 
 /** The editable field keys, for iteration that stays type-safe. */
-const FIELDS = ["title", "product_context", "technical_context"] as const;
+const FIELDS = ["title", "description", "product_context", "technical_context"] as const;
 
 /** Snapshot an epic's editable fields into draft strings. */
 export function draftFromEpic(epic: Epic): EpicDraft {
   return {
     title: epic.title,
+    description: epic.description ?? "",
     product_context: epic.product_context ?? "",
     technical_context: epic.technical_context ?? "",
   };
@@ -50,6 +52,9 @@ export function diffEpicEdits(baseline: EpicDraft, draft: EpicDraft): UpdateEpic
   const body: UpdateEpicBody = {};
   if (draft.title.trim() !== baseline.title) {
     body.title = draft.title.trim();
+  }
+  if (draft.description !== baseline.description) {
+    body.description = draft.description.length > 0 ? draft.description : null;
   }
   if (draft.product_context !== baseline.product_context) {
     body.product_context = draft.product_context.length > 0 ? draft.product_context : null;

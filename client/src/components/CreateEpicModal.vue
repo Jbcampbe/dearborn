@@ -14,6 +14,7 @@ const emit = defineEmits<{ close: [] }>();
 const auth = useAuthStore();
 const router = useRouter();
 const title = ref("");
+const description = ref("");
 const busy = ref(false);
 const error = ref<string | null>(null);
 const inputEl = ref<HTMLInputElement | null>(null);
@@ -23,6 +24,7 @@ watch(
   async (open) => {
     if (open) {
       title.value = "";
+      description.value = "";
       error.value = null;
       await nextTick();
       inputEl.value?.focus();
@@ -39,7 +41,11 @@ async function submit() {
   busy.value = true;
   error.value = null;
   try {
-    const epic = await createEpic(token, props.projectId, trimmed);
+    const blurb = description.value.trim();
+    const epic = await createEpic(token, props.projectId, {
+      title: trimmed,
+      ...(blurb ? { description: blurb } : {}),
+    });
     emit("close");
     await router.push({ name: "epic-planning", params: { id: epic.id } });
   } catch (err) {
@@ -75,6 +81,20 @@ async function submit() {
           @keydown.enter.prevent="submit"
         />
       </div>
+      <div>
+        <label class="label" for="epic-description">
+          Description <span class="optional">(optional)</span>
+        </label>
+        <input
+          id="epic-description"
+          v-model="description"
+          class="input"
+          type="text"
+          placeholder="A short blurb — shown on the kanban card"
+          :disabled="busy"
+          @keydown.enter.prevent="submit"
+        />
+      </div>
     </form>
     <template #footer>
       <button class="btn" :disabled="busy" @click="emit('close')">Cancel</button>
@@ -105,5 +125,10 @@ async function submit() {
 .epic-hint strong {
   color: var(--text-body);
   font-weight: var(--weight-medium);
+}
+
+.optional {
+  color: var(--text-muted);
+  font-weight: var(--weight-regular);
 }
 </style>
