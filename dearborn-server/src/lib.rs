@@ -21,6 +21,7 @@ pub mod mcp;
 pub mod planning;
 pub mod projects;
 pub mod spec;
+pub mod task_agent;
 pub mod tasks;
 pub mod worker;
 pub mod workspace;
@@ -46,6 +47,7 @@ pub use error::{AppError, AppResult};
 pub use hub::Hub;
 pub use mcp::CapabilityStore;
 pub use planning::PlanningAgent;
+pub use task_agent::TaskAgent;
 
 /// Initialise the global `tracing` subscriber. Idempotent; safe to skip in tests.
 /// Honours `RUST_LOG`, defaulting to `info`.
@@ -78,6 +80,15 @@ pub struct AppState {
     /// a fake. Shares the planning in-flight slot so the two never overlap on
     /// one epic.
     pub breakdown: Arc<dyn BreakdownAgent>,
+    /// The task-stage agent that drives `implement`/`fix`/`review`/
+    /// `verify_complete`/`summarize` (T-512). Production is
+    /// [`task_agent::ClaudeTaskAgent`]; tests inject a scripted fake. Unlike
+    /// `planner`/`breakdown`, a task-stage run is one-shot with no `resume`
+    /// (D19) and has no in-flight slot of its own here — concurrency for
+    /// task stages is the worker pool's job (T-510+: at most one stage per
+    /// claimed task at a time, by construction of the DAG walk), not a
+    /// per-epic guard like planning's.
+    pub task_agent: Arc<dyn TaskAgent>,
     /// Epics with a planning run currently in flight. A second trigger for an
     /// epic already in this set is ignored (its user message is still stored),
     /// so runs never interleave on `seq`/resume. See [`AppState::try_acquire_run`].
@@ -155,12 +166,33 @@ impl AppState {
     /// [`BreakdownAgent`] — the seam tests use to drive breakdown runs
     /// hermetically (T-301). Production wiring ([`AppState::new`] /
     /// [`with_planner`](Self::with_planner)) defaults the breakdown agent to
-    /// [`breakdown::ClaudeBreakdownAgent`].
+    /// [`breakdown::ClaudeBreakdownAgent`]; the task agent defaults to
+    /// [`task_agent::ClaudeTaskAgent`] (override it via
+    /// [`with_all_agents`](Self::with_all_agents)).
     pub fn with_agents(
         config: Config,
         db: Db,
         planner: Arc<dyn PlanningAgent>,
         breakdown: Arc<dyn BreakdownAgent>,
+    ) -> AppState {
+        AppState::with_all_agents(
+            config,
+            db,
+            planner,
+            breakdown,
+            Arc::new(task_agent::ClaudeTaskAgent::new()),
+        )
+    }
+
+    /// Like [`with_agents`](Self::with_agents) but also injecting the
+    /// [`TaskAgent`] — the seam tests use to drive task-stage runs
+    /// hermetically (T-512) without spawning `claude`.
+    pub fn with_all_agents(
+        config: Config,
+        db: Db,
+        planner: Arc<dyn PlanningAgent>,
+        breakdown: Arc<dyn BreakdownAgent>,
+        task_agent: Arc<dyn TaskAgent>,
     ) -> AppState {
         let crypto = MasterKey::derive(&config.master_key)
             .expect("master key material validated non-empty at config load");
@@ -171,6 +203,7 @@ impl AppState {
             crypto: Arc::new(crypto),
             planner,
             breakdown,
+            task_agent,
             inflight: Arc::new(Mutex::new(HashSet::new())),
             caps: Arc::new(CapabilityStore::new()),
             advertised_base: Arc::new(Mutex::new(None)),
@@ -328,6 +361,8 @@ pub fn app(state: AppState) -> Router {
                 .patch(tasks::patch_task)
                 .delete(tasks::remove_task),
         )
+        .route("/tasks/:id/runs", get(evidence::list_task_runs))
+        .route("/runs/:id", get(evidence::get_run))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_bearer,

@@ -258,7 +258,7 @@ with `agent_error` and gets thickened in later phases.
   `Blocked(setup_failed)` with the captured output in an `agent_run` row;
   workspace deleted after a successful PR, retained on `Blocked`/`Cancelled`.
 
-- [ ] **T-512 — `TaskAgent` seam + evidence.** *deps: T-500, T-502*
+- [x] **T-512 — `TaskAgent` seam + evidence.** *deps: T-500, T-502*
   `trait TaskAgent { fn run(&self, req: TaskRunRequest) -> Result<(RunHandle, Receiver<RunEvent>)> }`
   with `Stage`; `ClaudeTaskAgent` maps stage → prompt + `RunMode` + tool flags;
   `ScriptedTaskAgent` fake. Every stage opens an `agent_run` row (`running`) and

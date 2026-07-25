@@ -181,6 +181,34 @@ Progress / Done / Failed / Cancelled) for a single epic. It reuses `GET
 /epics/{id}/dag` + the `dag_updated`/`epic_updated` frames on `epic:<id>` —
 no new server route.
 
+#### Task stage evidence: `agent_run` history + logs (T-512)
+
+Every pipeline stage — agent-driven (`implement`/`fix`/`review`/
+`verify_complete`/`summarize`) and plain (`setup`/`preflight`/`test_gate`/
+`commit`/`push`) alike — writes one `agent_run` row per attempt (Milestone 2
+§2.1/§2.2): opened `running` when the stage starts, closed `ok|error|
+timeout|cancelled` when it ends, with a capped (~256 KB head+tail, D13) log.
+
+| Action | Method + path | Success status |
+| ------ | ------------- | -------------- |
+| a task's stage history | `GET /tasks/{id}/runs` | `200` (`{ items: [AgentRunSummary] }`, **oldest first** by `created_at`); `404` if the task does not exist |
+| one stage's full log | `GET /runs/{id}` | `200` (`AgentRunSummary` fields + `log: string`); `404` if unknown |
+
+An `AgentRunSummary` is `{ id, task_id, epic_id, stage, attempt, status,
+verdict, session_id, started_at, ended_at, exit_code, created_at }`.
+**The list endpoint deliberately omits `log`** — a busy task can accumulate
+several capped-256KB logs, and a stage-timeline view only needs to know what
+happened (stage/attempt/status/verdict/timing), not download every stage's
+full transcript just to render a list; `GET /runs/{id}` fetches one stage's
+full log on demand. `verdict` is only ever non-null for a `review` stage
+(T-530); `session_id` is `null` for every non-agent stage.
+
+An agent stage additionally streams its `RunEvent`s live — see the new
+`task:<id>` WS topic below — and flushes its accumulated log to the row
+roughly every 2 seconds while it runs (D14), so a client that opens a task
+mid-run can hydrate the log-so-far from `GET /runs/{id}` and then follow the
+rest live over WS with no gap.
+
 ## Identifiers & timestamps
 
 - **IDs** are opaque strings (ULID/UUID) generated server-side.
@@ -273,6 +301,12 @@ existence at the transport layer):
   /epics/{id}/dag`, so nodes carry computed `ready`/`blocked_by`), and
   `epic_updated` (payload = the updated epic) on the `Planning → Ready`
   breakdown transition.
+- `task:<id>` — a task-stage agent run's `RunEvent` firehose (T-512), the same
+  mapping as the planning stream below (reusing `planning::ws_type`). Kept on
+  its own topic, separate from the coarse `epic:<id>` frames, precisely so a
+  project kanban subscribed only to `epic:<id>`/`project:<id>` never receives
+  the token-by-token stream of every task in the epic — only a client that has
+  opened that specific task's detail view subscribes here.
 
 ### Client → server (control frames)
 
@@ -326,6 +360,19 @@ below and the `payload` is the **serialized `RunEvent` verbatim** (camelCase,
 the run completes; the durable transcript is the source of truth. At most one run
 is in flight per epic; a trigger arriving during a run is **ignored** (its user
 message is still stored, but no overlapping run starts).
+
+### Task-stage `RunEvent` stream (T-512)
+
+A task-stage agent run (`implement`/`fix`/`review`/`verify_complete`/
+`summarize`) relays its `RunEvent`s live the same way, on `task:<id>` instead
+of `epic:<id>` — same frame shape, same `type` mapping table above (reusing
+`planning::ws_type`). Unlike planning, a task stage is **one-shot** (D19: a
+fresh agent context every stage, never resumed) and does not write to
+`transcript_message` — its durable record is the `agent_run` row (see the
+new `GET /tasks/{id}/runs` / `GET /runs/{id}` endpoints above), which also
+receives the accumulated log every ~2 seconds while the stage streams (D14),
+so a client that opens a task mid-run can hydrate from REST and then follow
+the rest live with no gap.
 
 ### Publishing from server code
 

@@ -31,9 +31,23 @@
 //! `$1`/`$2` argument conventions stripped — Dearborn pre-bakes all context
 //! (spec, epic context, sibling manifest, base SHA, test output, review
 //! findings) into the prompt per D8, rather than pointing the agent at files
-//! to read. [`PromptStage`] is a deliberately minimal discriminator for
-//! [`prompt_for`] only; the real `Stage` enum wired through the `TaskAgent`
-//! trait and `agent_run` evidence rows is T-512's job, not this module's.
+//! to read.
+//!
+//! ## `Stage` lives in `task_agent`, not here
+//!
+//! `prompt_for` takes [`crate::task_agent::Stage`] — the real, full §2.2
+//! vocabulary (T-512), which superseded this module's original placeholder
+//! `PromptStage` (five variants, one job: pick a prompt). `Stage` lives next
+//! to the `TaskAgent` trait it drives instead of here, because this module's
+//! whole reason to exist is staying a **pure, dependency-light leaf**: no
+//! I/O, no DB, no async, no `AppState`. `Stage` itself is just data (and one
+//! reference to `harness::RunMode`, itself a plain enum with no I/O
+//! semantics), so depending on its *type* costs this module nothing — but
+//! defining the stage → `RunMode` → tool-flags policy here would have meant
+//! importing the `harness` crate's run machinery into what is otherwise a
+//! string-formatting module, which is exactly the kind of scope creep this
+//! module's doc has always warned against. See `task_agent`'s module doc for
+//! the full rationale.
 
 /// Rendered-spec fields for [`render_spec`] — the only task fields an
 /// implement/review agent ever sees (MILESTONE_1 §2.1): `title`,
@@ -302,25 +316,7 @@ pub fn parse_verdict(output: &str) -> Option<Verdict> {
 
 // ---- prompts (D6/D7/D9 content, `include_str!`-compiled) ------------------
 
-/// A minimal discriminator for [`prompt_for`] only. T-512 owns the real
-/// `Stage` enum (mirroring `PlanningAgent`/`BreakdownAgent`'s config-per-role
-/// pattern) that flows through `TaskAgent`, `RunMode`, and `agent_run` rows —
-/// this one exists solely so this module can hand back the right prompt text
-/// without reaching ahead into that seam.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PromptStage {
-    /// `Stage::Implement` (§2.2): make the code changes for a task.
-    Implement,
-    /// `Stage::Fix` (§2.2): address one round of test or review feedback.
-    Fix,
-    /// `Stage::Review` (§2.2): findings + the D9 `VERDICT:` line.
-    Review,
-    /// `Stage::VerifyComplete` (§2.2): confirm a no-diff task is genuinely
-    /// done; also emits a D9 `VERDICT:` line (T-532).
-    VerifyComplete,
-    /// `Stage::Summarize` (§2.2): the PR body's "Summary of changes" section.
-    Summarize,
-}
+use crate::task_agent::Stage;
 
 const IMPLEMENT_PROMPT: &str = include_str!("../prompts/implement.md");
 const FIX_PROMPT: &str = include_str!("../prompts/fix.md");
@@ -328,18 +324,21 @@ const REVIEW_PROMPT: &str = include_str!("../prompts/review.md");
 const VERIFY_COMPLETE_PROMPT: &str = include_str!("../prompts/verify_complete.md");
 const SUMMARIZE_PROMPT: &str = include_str!("../prompts/summarize.md");
 
-/// The static prompt text for a stage — `include_str!`-compiled into the
-/// binary at build time (D6), so fetching it is pure (no filesystem read at
-/// call time). The worker (T-512+) is responsible for appending the D8
-/// context block ([`build_context`]) after this text before handing the
-/// whole thing to the harness.
-pub fn prompt_for(stage: PromptStage) -> &'static str {
+/// The static prompt text for an agent stage — `include_str!`-compiled into
+/// the binary at build time (D6), so fetching it is pure (no filesystem read
+/// at call time). `None` for a non-agent stage (`Setup`/`Preflight`/
+/// `TestGate`/`Commit`/`Push`), which has no prompt at all. The caller
+/// ([`crate::task_agent::assemble_prompt`]) appends the D8 context block
+/// ([`build_context`]) after this text before handing the whole thing to the
+/// harness.
+pub fn prompt_for(stage: Stage) -> Option<&'static str> {
     match stage {
-        PromptStage::Implement => IMPLEMENT_PROMPT,
-        PromptStage::Fix => FIX_PROMPT,
-        PromptStage::Review => REVIEW_PROMPT,
-        PromptStage::VerifyComplete => VERIFY_COMPLETE_PROMPT,
-        PromptStage::Summarize => SUMMARIZE_PROMPT,
+        Stage::Implement => Some(IMPLEMENT_PROMPT),
+        Stage::Fix => Some(FIX_PROMPT),
+        Stage::Review => Some(REVIEW_PROMPT),
+        Stage::VerifyComplete => Some(VERIFY_COMPLETE_PROMPT),
+        Stage::Summarize => Some(SUMMARIZE_PROMPT),
+        Stage::Setup | Stage::Preflight | Stage::TestGate | Stage::Commit | Stage::Push => None,
     }
 }
 
@@ -611,45 +610,55 @@ VERDICT: PASS";
 
     // ---- prompts -----------------------------------------------------
 
+    /// Every agent stage, for tests that iterate over all five.
+    const AGENT_STAGES: [Stage; 5] = [
+        Stage::Implement,
+        Stage::Fix,
+        Stage::Review,
+        Stage::VerifyComplete,
+        Stage::Summarize,
+    ];
+
     #[test]
-    fn every_prompt_is_non_empty() {
+    fn every_agent_stage_prompt_is_non_empty() {
+        for stage in AGENT_STAGES {
+            assert!(!prompt_for(stage).unwrap().trim().is_empty());
+        }
+    }
+
+    #[test]
+    fn non_agent_stages_have_no_prompt() {
         for stage in [
-            PromptStage::Implement,
-            PromptStage::Fix,
-            PromptStage::Review,
-            PromptStage::VerifyComplete,
-            PromptStage::Summarize,
+            Stage::Setup,
+            Stage::Preflight,
+            Stage::TestGate,
+            Stage::Commit,
+            Stage::Push,
         ] {
-            assert!(!prompt_for(stage).trim().is_empty());
+            assert_eq!(prompt_for(stage), None, "{stage:?} must have no prompt");
         }
     }
 
     #[test]
     fn review_and_verify_complete_prompts_state_the_verdict_contract() {
-        assert!(prompt_for(PromptStage::Review).contains("VERDICT:"));
-        assert!(prompt_for(PromptStage::VerifyComplete).contains("VERDICT:"));
+        assert!(prompt_for(Stage::Review).unwrap().contains("VERDICT:"));
+        assert!(prompt_for(Stage::VerifyComplete).unwrap().contains("VERDICT:"));
     }
 
     #[test]
     fn implement_fix_and_summarize_prompts_do_not_ask_for_a_verdict() {
         // These stages never emit VERDICT lines (only review/verify_complete
         // do, per D9/T-532) — a cheap guard against a copy-paste mistake.
-        assert!(!prompt_for(PromptStage::Implement).contains("VERDICT:"));
-        assert!(!prompt_for(PromptStage::Fix).contains("VERDICT:"));
-        assert!(!prompt_for(PromptStage::Summarize).contains("VERDICT:"));
+        assert!(!prompt_for(Stage::Implement).unwrap().contains("VERDICT:"));
+        assert!(!prompt_for(Stage::Fix).unwrap().contains("VERDICT:"));
+        assert!(!prompt_for(Stage::Summarize).unwrap().contains("VERDICT:"));
     }
 
     #[test]
     fn every_stage_prompt_mentions_add_comment_as_the_autonomous_tool_surface() {
         // D7: the only MCP tool an autonomous task agent gets is `add_comment`.
-        for stage in [
-            PromptStage::Implement,
-            PromptStage::Fix,
-            PromptStage::Review,
-            PromptStage::VerifyComplete,
-            PromptStage::Summarize,
-        ] {
-            assert!(prompt_for(stage).contains("add_comment"));
+        for stage in AGENT_STAGES {
+            assert!(prompt_for(stage).unwrap().contains("add_comment"));
         }
     }
 }
