@@ -214,7 +214,7 @@ immediately instead of waiting out a TTL.
   failure); `Config::for_test` yields test-fast values (concurrency 1, poll
   10 ms, timeouts short); README's configuration table updated.
 
-- [ ] **T-502 — Spec rendering & prompt assembly (pure).** *deps: none*
+- [x] **T-502 — Spec rendering & prompt assembly (pure).** *deps: none*
   `spec.rs`: the §2.1 renderer plus the D8 context builder, and the D9 verdict
   parser. Prompts live in `dearborn-server/prompts/*.md`, pulled in with
   `include_str!`. **AC:** renderer output matches §2.1 byte-for-byte including

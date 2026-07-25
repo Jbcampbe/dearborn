@@ -18,6 +18,7 @@ pub mod lanes;
 pub mod mcp;
 pub mod planning;
 pub mod projects;
+pub mod spec;
 pub mod tasks;
 pub mod worker;
 pub mod ws;
