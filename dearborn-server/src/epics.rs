@@ -38,11 +38,14 @@ use serde_json::json;
 use crate::planning::config_for_phase;
 use crate::{AppError, AppResult, AppState};
 
-/// Columns projected into an [`Epic`] DTO. The Half-2 lease columns
-/// (`lease_owner`, `lease_expires_at`, `branch_name`) are omitted — they are not
-/// part of the planning-facing shape.
+/// Columns projected into an [`Epic`] DTO. The lease columns (`lease_owner`,
+/// `lease_expires_at`, `branch_name`) are internal executor state and are
+/// deliberately omitted here — they are read by the worker via direct SQL
+/// (T-510+), never through this DTO. `pr_url`/`pr_number`/`blocked_reason`
+/// (M2 §2.1) *are* part of the API-facing shape: they tell the user where the
+/// epic's PR landed and, if it stalled, why.
 const EPIC_COLUMNS: &str = "id, project_id, title, description, product_context, technical_context, \
-     status, created_at, updated_at";
+     status, pr_url, pr_number, blocked_reason, created_at, updated_at";
 
 /// Columns projected into a [`TranscriptMessage`] DTO, in schema (§2.2) order.
 const MESSAGE_COLUMNS: &str = "id, epic_id, phase, role, content, seq, created_at";
@@ -56,7 +59,10 @@ const INITIAL_PHASE: &str = "product";
 /// `product_context` / `technical_context` / `description` are `Option<String>`
 /// so a `NULL` column round-trips as JSON `null` (the contexts are maintained
 /// live by the planning agent in T-203; the description is a user-facing short
-/// blurb shown on kanban cards).
+/// blurb shown on kanban cards). `pr_url` / `pr_number` / `blocked_reason`
+/// (M2 §2.1) are populated by the executor: the PR identity once one opens, and
+/// the structured reason (§2.3) if the epic lands in `Blocked`. The lease
+/// columns are deliberately **not** on this struct — see [`EPIC_COLUMNS`].
 #[derive(Debug, Serialize)]
 pub struct Epic {
     pub id: String,
@@ -66,6 +72,9 @@ pub struct Epic {
     pub product_context: Option<String>,
     pub technical_context: Option<String>,
     pub status: String,
+    pub pr_url: Option<String>,
+    pub pr_number: Option<i64>,
+    pub blocked_reason: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -679,8 +688,11 @@ fn row_to_epic(row: &Row) -> Result<Epic, libsql::Error> {
         product_context: row.get(4)?,
         technical_context: row.get(5)?,
         status: row.get(6)?,
-        created_at: row.get(7)?,
-        updated_at: row.get(8)?,
+        pr_url: row.get(7)?,
+        pr_number: row.get(8)?,
+        blocked_reason: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
     })
 }
 
@@ -840,6 +852,64 @@ mod tests {
             .unwrap();
         assert_eq!(created.status(), StatusCode::CREATED);
         body_json(created).await
+    }
+
+    /// T-500 AC: the Half-2 executor columns (`pr_url`, `pr_number`,
+    /// `blocked_reason`) round-trip through `fetch_epic` and its JSON, while the
+    /// lease columns (internal executor state, written directly by the worker)
+    /// never appear on the DTO or in the API response.
+    #[tokio::test]
+    async fn epic_pr_and_blocked_reason_round_trip_but_lease_columns_stay_internal() {
+        let db = Db::connect(":memory:").await.unwrap();
+        db.run_migrations().await.unwrap();
+        let state = AppState::new(Config::for_test(TOKEN), db);
+        let app = app(state.clone());
+        let project_id = seed_project(&app).await;
+        let id = create_epic_via_api(&app, &project_id, "Ship it").await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let conn = state.db.conn();
+        // Write the new columns directly via SQL, the way the executor will
+        // (T-514 persists pr_url/pr_number; T-540 persists blocked_reason). Also
+        // set the lease columns, mirroring a claimed epic, to prove they never
+        // leak through the DTO.
+        conn.execute(
+            "UPDATE epic SET pr_url = ?1, pr_number = ?2, blocked_reason = ?3, \
+                 lease_owner = ?4, lease_expires_at = ?5 WHERE id = ?6",
+            params![
+                "https://github.com/acme/demo/pull/42",
+                42i64,
+                "test_gate_exhausted",
+                "worker-1",
+                9_999_999_999i64,
+                id.clone()
+            ],
+        )
+        .await
+        .unwrap();
+
+        let epic = fetch_epic(conn, &id).await.unwrap().expect("epic exists");
+        assert_eq!(epic.pr_url.as_deref(), Some("https://github.com/acme/demo/pull/42"));
+        assert_eq!(epic.pr_number, Some(42));
+        assert_eq!(epic.blocked_reason.as_deref(), Some("test_gate_exhausted"));
+
+        // Same story through the HTTP response the client actually sees.
+        let response = app
+            .oneshot(req("GET", &format!("/epics/{id}"), None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["pr_url"], "https://github.com/acme/demo/pull/42");
+        assert_eq!(body["pr_number"], 42);
+        assert_eq!(body["blocked_reason"], "test_gate_exhausted");
+        assert!(body.get("lease_owner").is_none(), "lease_owner must not be exposed");
+        assert!(
+            body.get("lease_expires_at").is_none(),
+            "lease_expires_at must not be exposed"
+        );
     }
 
     #[tokio::test]

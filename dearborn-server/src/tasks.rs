@@ -24,15 +24,25 @@ use std::collections::{HashMap, HashSet};
 
 use crate::{AppError, AppResult};
 
-/// Columns projected into a [`Task`] DTO, in schema (§2.2) order.
+/// Columns projected into a [`Task`] DTO, in schema (§2.2) order. The Half-2
+/// executor columns added by `0004_executor.sql` (`lease_owner`,
+/// `lease_expires_at`, `base_sha`) are deliberately **not** projected here —
+/// they are internal claim/review-diff state, read by the worker via direct
+/// SQL (T-510+), never through this DTO. `branch_name` / `pr_url` / `pr_number`
+/// *are* projected: they are user-facing identity for a standalone task's run.
 const TASK_COLUMNS: &str = "id, epic_id, project_id, title, description, acceptance, status, \
-     failure_reason, agent_session_id, position, created_at, updated_at";
+     failure_reason, agent_session_id, position, branch_name, pr_url, pr_number, created_at, updated_at";
 
 /// A task as returned by the store / API (`task`, §2.2).
 ///
 /// `epic_id` is `Option` because the schema permits standalone (parentless)
-/// tasks (`NULL => standalone`); breakdown always sets it. The Half-2 columns
-/// (`failure_reason`, `agent_session_id`) round-trip as `null` in Half 1.
+/// tasks (`NULL => standalone`); breakdown always sets it. `failure_reason`
+/// (§2.3) is populated by the executor when a task lands in `Failed`.
+/// `branch_name` / `pr_url` / `pr_number` (M2 §2.1) are populated once a
+/// standalone task provisions its workspace and opens its own PR; they stay
+/// `null` for epic-scoped tasks (the epic carries the PR identity instead).
+/// The lease columns are deliberately **not** on this struct — see
+/// [`TASK_COLUMNS`].
 #[derive(Debug, Clone, Serialize)]
 pub struct Task {
     pub id: String,
@@ -46,6 +56,9 @@ pub struct Task {
     pub failure_reason: Option<String>,
     pub agent_session_id: Option<String>,
     pub position: Option<i64>,
+    pub branch_name: Option<String>,
+    pub pr_url: Option<String>,
+    pub pr_number: Option<i64>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -795,8 +808,11 @@ fn row_to_task(row: &Row) -> Result<Task, libsql::Error> {
         failure_reason: row.get(7)?,
         agent_session_id: row.get(8)?,
         position: row.get(9)?,
-        created_at: row.get(10)?,
-        updated_at: row.get(11)?,
+        branch_name: row.get(10)?,
+        pr_url: row.get(11)?,
+        pr_number: row.get(12)?,
+        created_at: row.get(13)?,
+        updated_at: row.get(14)?,
     })
 }
 
@@ -1377,6 +1393,65 @@ mod tests {
     }
 
     // ---- standalone (parentless) tasks ----
+
+    /// T-500 AC: the Half-2 executor columns (`branch_name`, `pr_url`,
+    /// `pr_number`) round-trip through `fetch_task` and its JSON alongside the
+    /// pre-existing `failure_reason`, while the lease columns and `base_sha`
+    /// (internal executor state, written directly by the worker) never appear
+    /// on the DTO or in the API response.
+    #[tokio::test]
+    async fn task_executor_columns_round_trip_but_lease_and_base_sha_stay_internal() {
+        let (state, app, project_id, _epic_id) = seed_app().await;
+        let conn = state.db.conn();
+        let t = create_standalone_task(conn, &project_id, "Small fix", None, None)
+            .await
+            .unwrap();
+
+        // Write the new columns directly via SQL, the way the executor will
+        // (T-551 persists branch_name/pr_url/pr_number; task.rs's own
+        // failure_reason already existed pre-M2).
+        conn.execute(
+            "UPDATE task SET branch_name = ?1, pr_url = ?2, pr_number = ?3, \
+                 failure_reason = ?4, lease_owner = ?5, lease_expires_at = ?6, \
+                 base_sha = ?7 WHERE id = ?8",
+            params![
+                "dearborn/task-small-fix-abc123",
+                "https://github.com/acme/demo/pull/7",
+                7i64,
+                "test_gate_exhausted",
+                "worker-1",
+                9_999_999_999i64,
+                "deadbeef",
+                t.id.clone()
+            ],
+        )
+        .await
+        .unwrap();
+
+        let fetched = fetch_task(conn, &t.id).await.unwrap().expect("task exists");
+        assert_eq!(fetched.branch_name.as_deref(), Some("dearborn/task-small-fix-abc123"));
+        assert_eq!(fetched.pr_url.as_deref(), Some("https://github.com/acme/demo/pull/7"));
+        assert_eq!(fetched.pr_number, Some(7));
+        assert_eq!(fetched.failure_reason.as_deref(), Some("test_gate_exhausted"));
+
+        // Same story through the HTTP response the client actually sees.
+        let response = app
+            .oneshot(req("GET", &format!("/tasks/{}", t.id), None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["branch_name"], "dearborn/task-small-fix-abc123");
+        assert_eq!(body["pr_url"], "https://github.com/acme/demo/pull/7");
+        assert_eq!(body["pr_number"], 7);
+        assert_eq!(body["failure_reason"], "test_gate_exhausted");
+        assert!(body.get("lease_owner").is_none(), "lease_owner must not be exposed");
+        assert!(
+            body.get("lease_expires_at").is_none(),
+            "lease_expires_at must not be exposed"
+        );
+        assert!(body.get("base_sha").is_none(), "base_sha must not be exposed");
+    }
 
     #[tokio::test]
     async fn create_standalone_task_round_trips_with_null_epic() {

@@ -38,6 +38,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0003_epic_description",
         sql: include_str!("../migrations/0003_epic_description.sql"),
     },
+    Migration {
+        id: 4,
+        name: "0004_executor",
+        sql: include_str!("../migrations/0004_executor.sql"),
+    },
 ];
 
 /// Errors surfaced while opening the database or running migrations.
@@ -216,6 +221,131 @@ mod tests {
             // A fresh connection to the same file sees the applied migration.
             let db = Db::connect(path).await.unwrap();
             assert_eq!(db.run_migrations().await.unwrap(), 0, "re-boot is a no-op");
+        }
+
+        for suffix in ["", "-shm", "-wal"] {
+            let _ = std::fs::remove_file(format!("{path}{suffix}"));
+        }
+    }
+
+    /// A fresh boot's `0004_executor` migration lands every new column on
+    /// `epic`/`task`/`agent_run` (M2 §2.1) plus the three claim-path indexes.
+    /// Checked via `PRAGMA table_info` rather than a `SELECT` so a column that
+    /// merely fails to bind still shows up as missing.
+    #[tokio::test]
+    async fn migration_0004_adds_executor_columns_and_indexes() {
+        let db = Db::connect(":memory:").await.unwrap();
+        db.run_migrations().await.unwrap();
+
+        for (table, column) in [
+            ("epic", "pr_url"),
+            ("epic", "pr_number"),
+            ("epic", "blocked_reason"),
+            ("task", "lease_owner"),
+            ("task", "lease_expires_at"),
+            ("task", "branch_name"),
+            ("task", "pr_url"),
+            ("task", "pr_number"),
+            ("task", "base_sha"),
+            ("agent_run", "attempt"),
+            ("agent_run", "status"),
+            ("agent_run", "verdict"),
+            ("agent_run", "started_at"),
+            ("agent_run", "ended_at"),
+            ("agent_run", "exit_code"),
+        ] {
+            let mut rows = db
+                .conn()
+                .query(&format!("PRAGMA table_info({table})"), ())
+                .await
+                .unwrap();
+            let mut found = false;
+            while let Some(row) = rows.next().await.unwrap() {
+                if row.get::<String>(1).unwrap() == column {
+                    found = true;
+                    break;
+                }
+            }
+            assert!(found, "missing column {table}.{column}");
+        }
+
+        for index in ["idx_epic_claim", "idx_task_claim", "idx_agent_run_task"] {
+            let mut rows = db
+                .conn()
+                .query(
+                    "SELECT name FROM sqlite_master WHERE type='index' AND name=?1",
+                    libsql::params![index],
+                )
+                .await
+                .unwrap();
+            assert!(rows.next().await.unwrap().is_some(), "missing index: {index}");
+        }
+    }
+
+    /// `0004_executor` also applies cleanly to a database that already has
+    /// migrations 1-3 (i.e. a real pre-M2 `dearborn.db`): simulate that state
+    /// by applying only the first three migrations by hand, then run the full
+    /// migration set and confirm exactly one (id 4) newly applies and the new
+    /// columns show up — the AC's "existing dearborn.db" case.
+    #[tokio::test]
+    async fn migration_0004_applies_cleanly_on_an_existing_pre_m2_database() {
+        let path = std::env::temp_dir().join(format!(
+            "dearborn-t500-existing-{}-{}.db",
+            std::process::id(),
+            now_ms()
+        ));
+        let path = path.to_str().unwrap();
+
+        {
+            let db = Db::connect(path).await.unwrap();
+            db.conn()
+                .execute(
+                    "CREATE TABLE IF NOT EXISTS _migrations (\
+                         id         INTEGER PRIMARY KEY, \
+                         name       TEXT NOT NULL, \
+                         applied_at INTEGER NOT NULL\
+                     )",
+                    (),
+                )
+                .await
+                .unwrap();
+            for migration in MIGRATIONS.iter().filter(|m| m.id < 4) {
+                db.conn().execute_batch(migration.sql).await.unwrap();
+                db.conn()
+                    .execute(
+                        "INSERT INTO _migrations (id, name, applied_at) VALUES (?1, ?2, ?3)",
+                        (migration.id, migration.name, now_ms()),
+                    )
+                    .await
+                    .unwrap();
+            }
+        }
+
+        // Re-open (as a restarted server would) and run the full migration set:
+        // only 0004_executor should be newly applied.
+        {
+            let db = Db::connect(path).await.unwrap();
+            assert_eq!(
+                db.run_migrations().await.unwrap(),
+                1,
+                "only 0004_executor is newly applied on top of 1-3"
+            );
+
+            let mut rows = db
+                .conn()
+                .query("PRAGMA table_info(epic)", ())
+                .await
+                .unwrap();
+            let mut has_pr_url = false;
+            while let Some(row) = rows.next().await.unwrap() {
+                if row.get::<String>(1).unwrap() == "pr_url" {
+                    has_pr_url = true;
+                }
+            }
+            assert!(has_pr_url, "epic.pr_url present after migrating an existing db");
+
+            // Re-running again is a no-op.
+            assert_eq!(db.run_migrations().await.unwrap(), 0);
         }
 
         for suffix in ["", "-shm", "-wal"] {

@@ -200,7 +200,7 @@ immediately instead of waiting out a TTL.
 
 ## 3. Phase 0 — Contract & foundations
 
-- [ ] **T-500 — Executor schema migration.** *deps: none*
+- [x] **T-500 — Executor schema migration.** *deps: none*
   Apply §2.1 as `migrations/0004_executor.sql`. **AC:** migration applies
   idempotently at boot on a fresh **and** an existing `dearborn.db`; every new
   column round-trips through the relevant row structs; existing M1 tests stay
