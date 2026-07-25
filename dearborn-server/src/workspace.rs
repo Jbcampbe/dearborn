@@ -63,6 +63,16 @@
 //! unprotected against drift (a dependency lockfile changed since the first
 //! provision, say) that a fresh `setup_cmd` run would catch.
 //!
+//! ## `test_cmd` is carried through, not run here
+//!
+//! [`ProvisionedWorkspace::test_cmd`] is populated from the same project row
+//! this module already loads to find `setup_cmd` — but this module never
+//! *runs* it. T-521's preflight gate (`worker.rs`, immediately after
+//! provisioning returns) is what actually invokes `test_cmd` against the
+//! now-`setup_cmd`'d, untouched tree; carrying the value through here just
+//! saves that caller a second project query for a field this module already
+//! has in hand.
+//!
 //! ## The per-project refresh lock (§11 risk 3)
 //!
 //! Every epic provision refreshes the *same* project's canonical checkout
@@ -162,6 +172,15 @@ fn last_n_lower(s: &str, n: usize) -> String {
 pub struct ProvisionedWorkspace {
     pub workspace_path: PathBuf,
     pub branch_name: String,
+    /// The project's `test_cmd`, carried through from the same project row
+    /// this function already loaded to run `setup_cmd` — so T-521's
+    /// preflight gate (the caller, in `worker.rs`, immediately after
+    /// provisioning) doesn't need a second project query just to find out
+    /// whether a gate command is even configured. Untrimmed, possibly
+    /// blank/`None` — the same "skip means no row" filtering
+    /// [`cmd::run_stage_command`] already applies is left to the caller,
+    /// exactly as `setup_cmd` is filtered via [`non_empty`] rather than here.
+    pub test_cmd: Option<String>,
 }
 
 /// Why [`provision_epic_workspace`] failed — the two §2.3 reasons this
@@ -279,6 +298,7 @@ pub async fn provision_epic_workspace(
     Ok(ProvisionedWorkspace {
         workspace_path,
         branch_name,
+        test_cmd: project.test_cmd,
     })
 }
 
@@ -368,6 +388,10 @@ pub async fn delete_workspace(workspace_path: &Path) -> std::io::Result<()> {
 struct ProjectForProvision {
     repo_url: String,
     setup_cmd: Option<String>,
+    /// Carried through to [`ProvisionedWorkspace::test_cmd`] — see that
+    /// field's doc for why the preflight gate (T-521) reuses this load
+    /// instead of querying the project a second time.
+    test_cmd: Option<String>,
     clone_path: Option<String>,
     clone_status: String,
 }
@@ -378,7 +402,7 @@ async fn load_project(
 ) -> Result<Option<ProjectForProvision>, libsql::Error> {
     let mut rows = conn
         .query(
-            "SELECT repo_url, setup_cmd, clone_path, clone_status FROM project WHERE id = ?1",
+            "SELECT repo_url, setup_cmd, test_cmd, clone_path, clone_status FROM project WHERE id = ?1",
             params![project_id],
         )
         .await?;
@@ -386,8 +410,9 @@ async fn load_project(
         Some(row) => Ok(Some(ProjectForProvision {
             repo_url: row.get(0)?,
             setup_cmd: row.get(1)?,
-            clone_path: row.get(2)?,
-            clone_status: row.get(3)?,
+            test_cmd: row.get(2)?,
+            clone_path: row.get(3)?,
+            clone_status: row.get(4)?,
         })),
         None => Ok(None),
     }

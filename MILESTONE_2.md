@@ -313,7 +313,7 @@ with `agent_error` and gets thickened in later phases.
   killed (process group) and recorded `status='timeout'`; `test_cmd IS NULL` ⇒
   the caller skips the gate entirely (§5) and records nothing.
 
-- [ ] **T-521 — Preflight gate.** *deps: T-511, T-520*
+- [x] **T-521 — Preflight gate.** *deps: T-511, T-520*
   Run `test_cmd` once after `setup_cmd` on the untouched tree. **AC:** red
   preflight ⇒ epic `Blocked(preflight_red)` with the output stored and **no
   agent ever spawned**; green preflight proceeds; absent `test_cmd` skips

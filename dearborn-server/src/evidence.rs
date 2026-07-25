@@ -356,14 +356,21 @@ fn row_to_summary(row: &Row) -> Result<AgentRunSummary, libsql::Error> {
 }
 
 /// All `agent_run` rows for `task_id`, **oldest first** (`created_at` then
-/// `id` for stable ordering among rows sharing a millisecond timestamp).
+/// `rowid` for stable ordering among rows sharing a millisecond timestamp).
+/// `rowid`, not `id`, is the tiebreak: `id` is a ULID, and two ULIDs minted
+/// within the same millisecond differ only in their random tail — nothing
+/// about that tail is guaranteed to sort in generation order, so `id ASC`
+/// can (and, observed as a real flake, does) reorder same-millisecond rows.
+/// SQLite's implicit `rowid` (this table has no `WITHOUT ROWID` clause and no
+/// `INTEGER PRIMARY KEY` alias for it) always increases with insertion order,
+/// which is exactly the tiebreak this function's contract promises.
 pub async fn list_runs_for_task(
     conn: &Connection,
     task_id: &str,
 ) -> AppResult<Vec<AgentRunSummary>> {
     let sql = format!(
         "SELECT {RUN_SUMMARY_COLUMNS} FROM agent_run WHERE task_id = ?1 \
-         ORDER BY created_at ASC, id ASC"
+         ORDER BY created_at ASC, rowid ASC"
     );
     let mut rows = conn.query(&sql, params![task_id]).await?;
     let mut items = Vec::new();

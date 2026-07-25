@@ -98,15 +98,79 @@
 //! the very first poll/notify rather than after however much of the TTL
 //! happened to elapse.
 //!
+//! ## The preflight gate (T-521, D5, §2.2/§5)
+//!
+//! Immediately after [`workspace::provision_epic_workspace`] returns (so
+//! `setup_cmd` has already run) and strictly before the DAG walk below ever
+//! looks at a task, [`run_preflight`] runs the project's `test_cmd` **once**
+//! against the untouched tree — no task's `Stage::Implement` has run yet, so
+//! this is the one moment in the whole claim where "the tree is green" is a
+//! claim about the *repository*, not about anything Dearborn did to it.
+//!
+//! ### Why it exists
+//!
+//! Every later test gate (T-522's per-task `test_gate`, T-530's review) only
+//! means something if a red result can be blamed on the task that just ran.
+//! If the repo's tests were already red before Dearborn touched anything,
+//! that inference is broken — a red `test_gate` after `Stage::Implement`
+//! could be the agent's fault or a pre-existing break, and the executor has
+//! no way to tell them apart after the fact. ralph's own preflight
+//! (`references/ralph-v2.sh`, the `# --- preflight ---` section: it runs
+//! `$TEST_CMD` once, before its main loop, and `die`s the whole run if that
+//! fails) exists for the identical reason; D5 keeps it.
+//!
+//! ### Absent `test_cmd`, and why a timeout still counts as red
+//!
+//! No `test_cmd` configured ⇒ [`cmd::run_stage_command`]'s own
+//! [`StageOutcome::Skipped`] contract applies unchanged: no `agent_run` row,
+//! no gate, the walk proceeds — T-521 does not invent a stricter rule than
+//! T-520 already promises. A `test_cmd` that *times out* is treated the same
+//! as one that exits non-zero: both become `blocked_reason = 'preflight_red'`
+//! (never `'timeout'`, despite §2.3 listing both as valid reasons — see
+//! [`run_preflight`]'s doc for the reasoning, in short: `timeout` reads as
+//! "Dearborn's own tooling got stuck," which is the right story for T-543's
+//! agent-stage timeouts but the wrong one here, where the actionable fact for
+//! a human triaging the board is simply "this repo's tests did not come back
+//! green in time" — indistinguishable in consequence from an ordinary
+//! failure). The finer distinction is not lost: the `preflight` `agent_run`
+//! row's own `status` column still says `"timeout"`; only the coarse,
+//! board-facing `blocked_reason` collapses the two.
+//!
+//! ### Once per claim, including a re-claim (design decision)
+//!
+//! [`run_preflight`] is called exactly once per invocation of
+//! [`run_epic_pipeline_inner`] — i.e. once per successful claim, never once
+//! per task — and there is deliberately no special-casing for "this is a
+//! re-claim of an already-provisioned workspace, skip it." A re-attached
+//! workspace was just reset (`git reset --hard HEAD` + `git clean -fd`,
+//! inside `provision_epic_workspace`) to the tip of whatever this epic has
+//! actually committed so far — that tree is just as "untouched by the
+//! upcoming task" as a first claim's fresh clone, so the gate is exactly as
+//! meaningful, and re-running `test_cmd` is cheap next to a full agent stage
+//! (mirroring the same "cheap to redo, unsafe to skip" argument
+//! `workspace.rs` already makes for re-running `setup_cmd` on re-attach).
+//!
+//! ### No agent is ever spawned on a red preflight
+//!
+//! A red/absent-green preflight `return`s out of
+//! [`run_epic_pipeline_inner`] before the DAG walk loop below is even
+//! entered — no task is looked up, no `Stage::Implement` request is ever
+//! built, and [`crate::task_agent::TaskAgent::run`] is never called. The
+//! epic's tasks stay exactly `Todo` (or whatever they already were), the
+//! workspace is retained (routed through [`set_epic_blocked`], the same
+//! helper every other blocked path here uses — never a bespoke write), and
+//! the lease is released by [`try_claim_and_run`] exactly as it is on every
+//! other exit path.
+//!
 //! ## The real implement walk (T-513)
 //!
 //! [`run_epic_pipeline_inner`] is the real DAG walk that replaced Milestone
 //! 1's DB-only stub walk (that stub's pipeline functions are deleted
 //! outright, not kept around behind a flag; see MILESTONE_2 §10's definition
-//! of done). After [`workspace::provision_epic_workspace`] gates
-//! entry exactly as before (see the section above), the walk processes
-//! **ready** tasks (per [`compute_dag`]'s §2.3 readiness) one at a time, in
-//! full, before ever looking for the next one:
+//! of done). After [`workspace::provision_epic_workspace`] and the T-521
+//! preflight gate above both clear (see the sections above), the walk
+//! processes **ready** tasks (per [`compute_dag`]'s §2.3 readiness) one at a
+//! time, in full, before ever looking for the next one:
 //!
 //! 1. **`base_sha`** — the workspace's current `HEAD` (`git rev-parse HEAD`),
 //!    recorded on the task *before* anything else touches the tree. This has
@@ -199,6 +263,7 @@ use libsql::{params, Connection};
 use tokio::task::JoinHandle;
 
 use crate::board;
+use crate::cmd::{self, StageCommand, StageOutcome};
 use crate::epics::{fetch_epic, get_epic_project_id};
 use crate::evidence::{self, CloseStage, OpenStage, StageHandle};
 use crate::git;
@@ -596,6 +661,34 @@ async fn run_epic_pipeline_inner(state: AppState, epic_id: String, lease: LeaseH
             }
         }
     };
+
+    // T-521: the green-tree gate — see the module doc's "The preflight gate"
+    // section for the full rationale (why it exists, the timeout mapping,
+    // and why it runs on every claim including a re-claim). Gated on a fresh
+    // re-fetch of the epic, exactly like the provisioning block above, so a
+    // Cancel/Block landing while provisioning was in flight is honored
+    // before spending any more time running `test_cmd`.
+    {
+        if lease.is_lost() {
+            return;
+        }
+        let conn = state.db.conn();
+        let Ok(Some(epic)) = fetch_epic(conn, &epic_id).await else {
+            return;
+        };
+        if epic.status != "InProgress" {
+            return;
+        }
+        let pat = crate::projects::load_decrypted_pat(&state, &epic.project_id)
+            .await
+            .ok()
+            .flatten();
+        if let PreflightOutcome::Blocked =
+            run_preflight(&state, &epic_id, &workspace, pat.as_deref()).await
+        {
+            return;
+        }
+    }
 
     // ---- the real DAG walk (T-513) ----
     loop {
@@ -1005,6 +1098,101 @@ async fn block_epic_on_provision_failure(state: &AppState, epic_id: &str, failur
         "workspace provisioning failed; epic -> Blocked"
     );
     set_epic_blocked(state, epic_id, reason).await;
+}
+
+/// What [`run_preflight`] tells its caller to do next. See the module doc's
+/// "The preflight gate" section for the full rationale.
+enum PreflightOutcome {
+    /// Either no `test_cmd` was configured ([`StageOutcome::Skipped`] —
+    /// silent, no row, per T-520's contract) or `test_cmd` ran and exited
+    /// `0`. The walk proceeds exactly as if this gate did not exist.
+    Proceed,
+    /// `test_cmd` failed, timed out, or could not even be evaluated (a
+    /// database error recording the attempt). The epic is already `Blocked`
+    /// by the time this variant is returned — [`run_preflight`] performs that
+    /// write itself via [`set_epic_blocked`] — so the caller's only job is to
+    /// `return` immediately without ever looking at a task.
+    Blocked,
+}
+
+/// T-521: run the project's `test_cmd` exactly once, in `workspace`, as the
+/// `preflight` stage (§2.2) — the green-tree gate D5 keeps from
+/// `references/ralph-v2.sh`. See the module doc's "The preflight gate"
+/// section for why this exists, why an absent `test_cmd` is a silent no-op,
+/// and — the one genuinely subjective call this task makes — why a timeout
+/// is reported as `preflight_red` rather than `timeout`:
+///
+/// §2.3 offers both `preflight_red` and `timeout` as valid `blocked_reason`
+/// values, and a `test_cmd` that runs past `DEARBORN_CMD_TIMEOUT_SECS` could
+/// honestly be described either way. This function picks `preflight_red` for
+/// every non-`ok` outcome — error exit *and* timeout alike — because the
+/// question a human reads `blocked_reason` to answer is "why didn't my epic
+/// start?", and the answer is the same in both cases: *this repository's own
+/// test suite did not come back green on an untouched tree*. Reporting
+/// `timeout` instead would misleadingly suggest Dearborn's own tooling got
+/// stuck (the story `timeout` correctly tells for T-543's agent-stage
+/// timeouts, a different kind of failure entirely) rather than that the
+/// project itself has a problem to go fix. The `agent_run` row backing this
+/// call still records the precise `status` (`"ok"` | `"error"` | `"timeout"`)
+/// via [`cmd::run_stage_command`] — nothing about the finer-grained truth is
+/// lost, only the coarse board-facing label is collapsed to one value.
+async fn run_preflight(
+    state: &AppState,
+    epic_id: &str,
+    workspace: &ProvisionedWorkspace,
+    pat: Option<&str>,
+) -> PreflightOutcome {
+    let conn = state.db.conn();
+    // Boxed rather than awaited inline: `cmd::run_stage_command` transitively
+    // embeds `run_shell_timed`'s own state (including its 32 KB read-chunk
+    // buffer, live across an internal `tokio::select!` await) — inlining
+    // that directly into `run_preflight`'s generated state machine, which is
+    // itself inlined into the already-large `run_epic_pipeline_inner`, stacks
+    // up enough live state to overflow the default thread stack on the test
+    // harness's direct (non-`tokio::spawn`) call path. `Box::pin` moves that
+    // storage to the heap so this call site contributes only a pointer's
+    // worth of state to its caller, exactly like `try_claim_and_run`'s own
+    // `tokio::spawn` already isolates the *whole* pipeline body's size in
+    // production — this is the equivalent guard for the one nested call this
+    // task adds.
+    let outcome = Box::pin(cmd::run_stage_command(
+        conn,
+        StageCommand {
+            task_id: None,
+            epic_id: Some(epic_id),
+            stage: Stage::Preflight.as_str(),
+            attempt: 1,
+            cwd: &workspace.workspace_path,
+            timeout: Duration::from_secs(state.config.executor.cmd_timeout_secs),
+        },
+        workspace.test_cmd.as_deref(),
+        |raw: &str| git::redact(raw, pat),
+    ))
+    .await;
+
+    match outcome {
+        Ok(StageOutcome::Skipped) => PreflightOutcome::Proceed,
+        Ok(StageOutcome::Ran(ran)) if ran.status == "ok" => PreflightOutcome::Proceed,
+        Ok(StageOutcome::Ran(ran)) => {
+            tracing::warn!(
+                epic = %epic_id,
+                status = ran.status,
+                exit_code = ?ran.exit_code,
+                "preflight: test_cmd is not green on the untouched tree; epic -> Blocked(preflight_red)"
+            );
+            set_epic_blocked(state, epic_id, "preflight_red").await;
+            PreflightOutcome::Blocked
+        }
+        Err(err) => {
+            tracing::warn!(
+                epic = %epic_id,
+                error = %err,
+                "preflight: failed to record test_cmd evidence; epic -> Blocked(preflight_red)"
+            );
+            set_epic_blocked(state, epic_id, "preflight_red").await;
+            PreflightOutcome::Blocked
+        }
+    }
 }
 
 /// Route a T-513 implement-walk failure (a failed/erroring implement stage,
@@ -2353,6 +2541,34 @@ mod tests {
         id
     }
 
+    /// Like [`seed_project_with_workspace`] but with a `test_cmd`, so T-521's
+    /// preflight gate has something to run against a real (local, hermetic)
+    /// workspace.
+    async fn seed_project_with_test_cmd(
+        state: &AppState,
+        fixture: &GitFixture,
+        test_cmd: &str,
+    ) -> String {
+        let conn = state.db.conn();
+        let id = ulid::Ulid::new().to_string();
+        let now = now_ms();
+        let clone_path = std::path::Path::new(&state.config.clone_root).join(&id);
+        conn.execute(
+            "INSERT INTO project (id, name, repo_url, test_cmd, clone_path, clone_status, created_at, updated_at) \
+             VALUES (?1, 'P', ?2, ?3, ?4, 'ready', ?5, ?5)",
+            params![
+                id.clone(),
+                fixture.path_str(),
+                test_cmd,
+                clone_path.to_string_lossy().to_string(),
+                now
+            ],
+        )
+        .await
+        .unwrap();
+        id
+    }
+
     /// Drain `sub` (bounded) until an `epic_updated` frame carrying
     /// `status` matches, or panic after 5s. Draining rather than asserting a
     /// fixed frame position keeps this robust against the lane handler's own
@@ -2494,6 +2710,218 @@ mod tests {
         assert_eq!(row.get::<Option<i64>>(1).unwrap(), Some(5));
         let log: String = row.get(2).unwrap();
         assert!(log.contains("setup-boom"));
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    // ---- T-521: the preflight gate --------------------------------------------
+
+    /// The headline AC: a red `test_cmd` on the untouched tree blocks the
+    /// epic with `preflight_red`, the output lands in evidence, the
+    /// workspace is retained, and — the part that actually matters — the
+    /// implement stage is **never** invoked. A bare `ScriptedTaskAgent`'s
+    /// `recorded()` list staying empty is the proof: if the walk had ever
+    /// reached `Stage::Implement` for either seeded task, this would record
+    /// at least one entry.
+    #[tokio::test]
+    async fn red_preflight_blocks_epic_and_spawns_no_agent() {
+        let agent = Arc::new(ScriptedTaskAgent::new());
+        let recorded = agent.recorded();
+        let (state, _app) = test_app_with_task_agent(agent.clone()).await;
+        let fixture = GitFixture::new().await;
+        let project_id =
+            seed_project_with_test_cmd(&state, &fixture, "echo tree-is-red && exit 1").await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        seed_task(&state, &epic_id, &project_id, "A").await;
+        seed_task(&state, &epic_id, &project_id, "B").await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        assert_eq!(epic.status, "Blocked");
+        assert_eq!(epic.blocked_reason.as_deref(), Some("preflight_red"));
+
+        // The important assertion: no agent stage was ever spawned.
+        assert_eq!(
+            recorded.lock().unwrap().len(),
+            0,
+            "a red preflight must never reach Stage::Implement"
+        );
+
+        // No task ever left Todo — the walk never got that far.
+        let statuses = task_statuses(&state, &epic_id).await;
+        assert_eq!(statuses["A"], "Todo");
+        assert_eq!(statuses["B"], "Todo");
+
+        // Preflight evidence: the red output landed in agent_run.
+        let mut rows = state
+            .db
+            .conn()
+            .query(
+                "SELECT status, exit_code, log FROM agent_run WHERE epic_id = ?1 AND stage = 'preflight'",
+                params![epic_id.clone()],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("a preflight agent_run row");
+        assert_eq!(row.get::<String>(0).unwrap(), "error");
+        assert_eq!(row.get::<Option<i64>>(1).unwrap(), Some(1));
+        let log: String = row.get(2).unwrap();
+        assert!(log.contains("tree-is-red"));
+
+        // Workspace retained: the provisioned directory is still on disk.
+        let workspace_path = crate::workspace::epic_workspace_path(&state.config.clone_root, &epic_id);
+        assert!(
+            workspace_path.join(".git").exists(),
+            "workspace must be retained on preflight_red"
+        );
+
+        // Lease released, matching every other Blocked path.
+        let (lease_owner, lease_expires_at) = epic_lease(&state, &epic_id).await;
+        assert!(lease_owner.is_none());
+        assert!(lease_expires_at.is_none());
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// A green preflight is a no-op from the walk's point of view: the epic
+    /// still reaches `Completed` through the full pipeline (workspace →
+    /// preflight → implement → commit → push → PR), and the preflight
+    /// `agent_run` row records `status = "ok"`.
+    #[tokio::test]
+    async fn green_preflight_proceeds_to_completed() {
+        let (state, _app) = test_app().await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_test_cmd(&state, &fixture, "true").await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        seed_task(&state, &epic_id, &project_id, "A").await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        assert_eq!(
+            epic.status, "Completed",
+            "a green preflight must let the rest of the pipeline run to completion"
+        );
+
+        let mut rows = state
+            .db
+            .conn()
+            .query(
+                "SELECT status FROM agent_run WHERE epic_id = ?1 AND stage = 'preflight'",
+                params![epic_id.clone()],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("a preflight agent_run row");
+        assert_eq!(row.get::<String>(0).unwrap(), "ok");
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// No `test_cmd` configured ⇒ the gate is skipped silently: zero
+    /// `preflight` rows, and the walk proceeds exactly as if T-521 did not
+    /// exist (mirrors T-520's `StageOutcome::Skipped` contract, just proven
+    /// from the pipeline's side rather than `cmd.rs`'s own unit tests).
+    #[tokio::test]
+    async fn absent_test_cmd_skips_preflight_silently() {
+        let (state, _app) = test_app().await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await; // no test_cmd
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        seed_task(&state, &epic_id, &project_id, "A").await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        assert_eq!(epic.status, "Completed");
+
+        let mut rows = state
+            .db
+            .conn()
+            .query(
+                "SELECT COUNT(*) FROM agent_run WHERE epic_id = ?1 AND stage = 'preflight'",
+                params![epic_id.clone()],
+            )
+            .await
+            .unwrap();
+        let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(count, 0, "an absent test_cmd must record zero preflight rows");
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// The epic card's `blocked_reason` (T-500's DTO field) actually reaches
+    /// both `GET /epics/{id}` and the project board payload once a red
+    /// preflight has blocked the epic — the client rendering of it is
+    /// T-561's job, out of scope here, but the data has to be there for it.
+    #[tokio::test]
+    async fn blocked_epic_surfaces_reason_through_epic_api_and_board() {
+        let (state, app) = test_app().await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_test_cmd(&state, &fixture, "exit 1").await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        seed_task(&state, &epic_id, &project_id, "A").await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        let epic_response = app
+            .clone()
+            .oneshot(req("GET", &format!("/epics/{epic_id}"), None))
+            .await
+            .unwrap();
+        assert_eq!(epic_response.status(), StatusCode::OK);
+        let epic_body = body_json(epic_response).await;
+        assert_eq!(epic_body["blocked_reason"], "preflight_red");
+
+        let board_response = app
+            .oneshot(req("GET", &format!("/projects/{project_id}/board"), None))
+            .await
+            .unwrap();
+        assert_eq!(board_response.status(), StatusCode::OK);
+        let board_body = body_json(board_response).await;
+        let epic_on_board = board_body["epics"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|e| e["id"] == epic_id)
+            .expect("the blocked epic must be on the board");
+        assert_eq!(epic_on_board["blocked_reason"], "preflight_red");
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// `run_preflight` is called once per invocation of
+    /// `run_epic_pipeline_inner` (i.e. once per claim), never once per
+    /// task — a multi-task epic that completes still has exactly one
+    /// `preflight` row, even though its DAG walk processes two tasks.
+    #[tokio::test]
+    async fn preflight_runs_exactly_once_per_claim_not_once_per_task() {
+        let (state, _app) = test_app().await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_test_cmd(&state, &fixture, "true").await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let a = seed_task(&state, &epic_id, &project_id, "A").await;
+        let b = seed_task(&state, &epic_id, &project_id, "B").await;
+        link(&state, &a, &b).await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        let statuses = task_statuses(&state, &epic_id).await;
+        assert_eq!(statuses["A"], "Done");
+        assert_eq!(statuses["B"], "Done");
+
+        let mut rows = state
+            .db
+            .conn()
+            .query(
+                "SELECT COUNT(*) FROM agent_run WHERE epic_id = ?1 AND stage = 'preflight'",
+                params![epic_id.clone()],
+            )
+            .await
+            .unwrap();
+        let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(count, 1, "preflight must run once per claim, not once per task");
 
         cleanup_clone_root(&state, &project_id, &[&epic_id]);
     }
