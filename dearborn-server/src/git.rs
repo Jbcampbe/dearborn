@@ -17,6 +17,15 @@
 //! reset to the clean (token-free) URL, and `git fetch` re-injects credentials
 //! transiently via `-c remote.origin.url=<auth>` (process-scoped, not written to
 //! `.git/config`).
+//!
+//! ## Epic-workspace helpers (T-511)
+//!
+//! [`clone_local`], [`set_remote_url`], [`checkout_new_branch`],
+//! [`current_branch`], and [`reset_hard_and_clean`] back
+//! [`crate::workspace`]'s clone-off-canonical provisioning (D3): a `git clone`
+//! of a local path needs no PAT at all (it's disk-to-disk), so these never
+//! take one — the token only ever re-enters the picture at [`refresh_repo`]
+//! (the canonical checkout's fetch) and, later, at push time (T-514).
 
 use std::fmt;
 use std::path::Path;
@@ -172,10 +181,78 @@ pub async fn refresh_repo(repo_url: &str, pat: Option<&str>, dest: &Path) -> Res
     Ok(())
 }
 
-/// Run `git` with `args`, optionally in `cwd`. On non-zero exit the (redacted)
-/// stderr becomes the [`GitError`] message. `GIT_TERMINAL_PROMPT=0` guarantees
-/// git never blocks on an interactive credential prompt.
+/// Clone `src` (a local filesystem path, not a network URL) into `dest` — the
+/// T-511 epic-workspace clone (`git clone <canonical> <workspace>`, D3). No
+/// PAT is ever involved: cloning off a path on the same disk needs no
+/// authentication regardless of what the *canonical* checkout's own remote
+/// requires. Any stale `dest` is cleared first, mirroring [`clone_repo`].
+pub async fn clone_local(src: &Path, dest: &Path) -> Result<(), GitError> {
+    if dest.exists() {
+        tokio::fs::remove_dir_all(dest)
+            .await
+            .map_err(|e| GitError::new(format!("failed to clear workspace directory: {e}")))?;
+    }
+    if let Some(parent) = dest.parent() {
+        tokio::fs::create_dir_all(parent)
+            .await
+            .map_err(|e| GitError::new(format!("failed to create workspace root: {e}")))?;
+    }
+    let src_str = src.to_string_lossy();
+    let dest_str = dest.to_string_lossy();
+    run_git(&["clone", src_str.as_ref(), dest_str.as_ref()], None, None).await
+}
+
+/// Repoint `repo_dir`'s `origin` remote at `url` (plain, no credentials
+/// embedded). Used after [`clone_local`] to swap the workspace's origin from
+/// the canonical checkout's local path to the real (token-free) remote URL,
+/// so a later push (T-514) has somewhere real to push to — the PAT itself is
+/// injected transiently at push time, exactly like [`refresh_repo`]'s fetch.
+pub async fn set_remote_url(repo_dir: &Path, url: &str) -> Result<(), GitError> {
+    run_git(&["remote", "set-url", "origin", url], Some(repo_dir), None).await
+}
+
+/// Create and switch to a new local branch `branch` in `repo_dir` (the epic
+/// workspace's branch, §2.8). Fails if the branch already exists — callers
+/// only take this path on a fresh clone, never on re-attach.
+pub async fn checkout_new_branch(repo_dir: &Path, branch: &str) -> Result<(), GitError> {
+    run_git(&["checkout", "-b", branch], Some(repo_dir), None).await
+}
+
+/// The current branch name (`git rev-parse --abbrev-ref HEAD`), trimmed.
+/// Used by the T-511 re-attach check: a workspace is only re-attached (rather
+/// than re-cloned) when it is already checked out on the expected branch.
+pub async fn current_branch(repo_dir: &Path) -> Result<String, GitError> {
+    run_git_capture(&["rev-parse", "--abbrev-ref", "HEAD"], Some(repo_dir), None).await
+}
+
+/// Discard any working-tree changes and untracked files in `repo_dir`: `git
+/// reset --hard HEAD` then `git clean -fd`. This is the T-511 re-attach path
+/// — cheaper than a fresh clone and exactly what's needed to drop a previous
+/// (failed or interrupted) attempt's dirty tree before resuming work on the
+/// same branch.
+pub async fn reset_hard_and_clean(repo_dir: &Path) -> Result<(), GitError> {
+    run_git(&["reset", "--hard", "HEAD"], Some(repo_dir), None).await?;
+    run_git(&["clean", "-fd"], Some(repo_dir), None).await
+}
+
+/// Run `git` with `args`, optionally in `cwd`, discarding stdout. On
+/// non-zero exit the (redacted) stderr becomes the [`GitError`] message.
+/// `GIT_TERMINAL_PROMPT=0` guarantees git never blocks on an interactive
+/// credential prompt. Thin wrapper over [`run_git_capture`] for the (common)
+/// callers that don't need stdout.
 async fn run_git(args: &[&str], cwd: Option<&Path>, pat: Option<&str>) -> Result<(), GitError> {
+    run_git_capture(args, cwd, pat).await.map(|_| ())
+}
+
+/// Run `git` with `args`, optionally in `cwd`, returning trimmed stdout on
+/// success. On non-zero exit the (redacted) stderr becomes the [`GitError`]
+/// message. `GIT_TERMINAL_PROMPT=0` guarantees git never blocks on an
+/// interactive credential prompt.
+async fn run_git_capture(
+    args: &[&str],
+    cwd: Option<&Path>,
+    pat: Option<&str>,
+) -> Result<String, GitError> {
     let mut cmd = Command::new("git");
     cmd.args(args).env("GIT_TERMINAL_PROMPT", "0");
     if let Some(dir) = cwd {
@@ -188,7 +265,7 @@ async fn run_git(args: &[&str], cwd: Option<&Path>, pat: Option<&str>) -> Result
         .map_err(|e| GitError::new(format!("failed to run git: {e}")))?;
 
     if output.status.success() {
-        return Ok(());
+        return Ok(String::from_utf8_lossy(&output.stdout).trim().to_string());
     }
 
     let stderr = String::from_utf8_lossy(&output.stderr);

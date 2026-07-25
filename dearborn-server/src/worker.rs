@@ -117,6 +117,7 @@ use crate::board;
 use crate::epics::{fetch_epic, get_epic_project_id};
 use crate::mcp;
 use crate::tasks::compute_dag;
+use crate::workspace::{self, ProvisionFailure};
 use crate::AppState;
 
 /// Test-only pipeline hook (T-510): an async closure the claimed-epic body
@@ -454,6 +455,19 @@ pub async fn run_stub_worker(state: AppState, epic_id: String) {
 /// can gate/observe the body without sleeps (see
 /// [`crate::AppState::test_pipeline_hook`]); superseded whenever T-513 lands.
 ///
+/// ## Workspace provisioning gates the walk (T-511)
+///
+/// Immediately after the test hook, and only if the epic is (still)
+/// `InProgress`, this provisions the epic's workspace
+/// ([`workspace::provision_epic_workspace`]) exactly once per claim, before
+/// the DAG walk below ever runs. A provisioning failure never reaches the
+/// walk at all: it routes straight to [`block_epic_on_provision_failure`]
+/// (epic → `Blocked`, reason per §2.3, workspace retained, lease released by
+/// the caller as usual) and returns. This is deliberately still the M1 stub
+/// DAG walk underneath — provisioning is the only part of the *real*
+/// pipeline that exists yet; T-513 replaces the walk itself with one that
+/// actually uses the provisioned workspace.
+///
 /// ## The "no sibling InProgress" invariant (§2.3)
 ///
 /// The claim predicate requires that no sibling task in the epic is
@@ -476,6 +490,31 @@ async fn run_stub_worker_inner(state: AppState, epic_id: String, lease: LeaseHan
     #[cfg(test)]
     if let Some(hook) = state.test_pipeline_hook.clone() {
         hook().await;
+    }
+
+    // T-511: provision the workspace once per claim, before the (still-stub)
+    // DAG walk. Only when the epic is actually InProgress — a claim racing a
+    // Cancel/Block, or (defensively) any other status, must leave the epic
+    // untouched here exactly as the walk's own status guard below would.
+    if !lease.is_lost() {
+        let conn = state.db.conn();
+        if let Ok(Some(epic)) = fetch_epic(conn, &epic_id).await {
+            if epic.status == "InProgress" {
+                if let Err(failure) =
+                    workspace::provision_epic_workspace(&state, &epic_id, &epic.project_id).await
+                {
+                    // Re-check the lease right before writing: a slow
+                    // provisioning failure racing a fenced-out lease must not
+                    // stomp on the new owner's epic (mirrors the same
+                    // belt-and-suspenders fencing the Completed transition
+                    // below uses).
+                    if !lease.is_lost() {
+                        block_epic_on_provision_failure(&state, &epic_id, failure).await;
+                    }
+                    return;
+                }
+            }
+        }
     }
 
     loop {
@@ -610,6 +649,47 @@ async fn run_stub_worker_inner(state: AppState, epic_id: String, lease: LeaseHan
     }
 }
 
+/// Route a [`ProvisionFailure`] (T-511) to the epic `Blocked` transition:
+/// `status='Blocked'`, `blocked_reason` per §2.3 (`workspace_error` |
+/// `setup_failed`), publish `epic_updated` + `board_updated` (mirroring the
+/// `Completed` transition above). The workspace is **retained** — this
+/// function never deletes anything; deletion only ever happens after a PR
+/// opens (T-514). Fenced by `status = 'InProgress'` so a transition that
+/// already happened out from under us (a Cancel racing this same moment) is
+/// a no-op rather than an overwrite.
+async fn block_epic_on_provision_failure(state: &AppState, epic_id: &str, failure: ProvisionFailure) {
+    let (reason, log_message) = match failure {
+        ProvisionFailure::Workspace(message) => ("workspace_error", message),
+        ProvisionFailure::Setup { message, exit_code } => {
+            ("setup_failed", format!("exit_code={exit_code:?}: {message}"))
+        }
+    };
+    tracing::warn!(
+        epic = %epic_id,
+        reason,
+        error = %log_message,
+        "workspace provisioning failed; epic -> Blocked"
+    );
+
+    let conn = state.db.conn();
+    let now = now_ms();
+    let _ = conn
+        .execute(
+            "UPDATE epic SET status = 'Blocked', blocked_reason = ?1, updated_at = ?2 \
+             WHERE id = ?3 AND status = 'InProgress'",
+            params![reason, now, epic_id],
+        )
+        .await;
+
+    if let Ok(Some(updated)) = fetch_epic(conn, epic_id).await {
+        let payload = serde_json::to_value(&updated).unwrap_or(serde_json::Value::Null);
+        state
+            .hub
+            .publish(&format!("epic:{epic_id}"), "epic_updated", payload);
+        board::publish_board(state, &updated.project_id).await;
+    }
+}
+
 /// Resolve the project id for an epic (best-effort, for the board publish).
 /// Re-fetches the epic to read `.project_id` directly. Kept for completeness;
 /// the pipeline body uses `fetch_epic` + `.project_id` instead.
@@ -717,6 +797,98 @@ mod tests {
         id
     }
 
+    // ---- T-511: a real (local, hermetic) git fixture for pipeline-body tests ----
+    //
+    // Since T-511, the claimed-epic body provisions a workspace (a real
+    // `git clone`/`git fetch`) before the DAG walk. Any test that drives the
+    // body to completion (`run_stub_worker`, or the pool via `spawn_pool`)
+    // needs a project whose `clone_path`/`repo_url` point at something git can
+    // actually clone from — the plain `seed_project` above (no `clone_path`,
+    // a fake `repo_url`) is intentionally kept for the claim/heartbeat/lease
+    // tests that never reach provisioning (they call `claim_epic`/
+    // `renew_lease_once` directly, or seed a non-`InProgress` epic).
+
+    /// A local git fixture: `git init`'s a source repo with one commit in a
+    /// fresh temp dir, entirely offline. Cleans itself up on drop.
+    struct GitFixture {
+        dir: std::path::PathBuf,
+    }
+
+    impl GitFixture {
+        async fn new() -> GitFixture {
+            let dir = std::env::temp_dir().join(format!(
+                "dearborn-worker-fixture-{}-{}",
+                std::process::id(),
+                ulid::Ulid::new()
+            ));
+            std::fs::create_dir_all(&dir).unwrap();
+            for args in [
+                &["init", "-b", "main"][..],
+                &["config", "user.email", "test@example.com"],
+                &["config", "user.name", "Test"],
+            ] {
+                git_ok(&dir, args).await;
+            }
+            std::fs::write(dir.join("README.md"), "hello\n").unwrap();
+            git_ok(&dir, &["add", "."]).await;
+            git_ok(&dir, &["commit", "-m", "init"]).await;
+            GitFixture { dir }
+        }
+
+        fn path_str(&self) -> String {
+            self.dir.to_string_lossy().to_string()
+        }
+    }
+
+    impl Drop for GitFixture {
+        fn drop(&mut self) {
+            let _ = std::fs::remove_dir_all(&self.dir);
+        }
+    }
+
+    async fn git_ok(dir: &std::path::Path, args: &[&str]) {
+        let status = tokio::process::Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed in {dir:?}");
+    }
+
+    /// Like [`seed_project`] but with a real `clone_path`/`repo_url` pointing
+    /// at `fixture`, so a claimed epic under this project can actually
+    /// provision a workspace (T-511) instead of failing `workspace_error`.
+    async fn seed_project_with_workspace(state: &AppState, fixture: &GitFixture) -> String {
+        let conn = state.db.conn();
+        let id = ulid::Ulid::new().to_string();
+        let now = now_ms();
+        let clone_path = std::path::Path::new(&state.config.clone_root).join(&id);
+        conn.execute(
+            "INSERT INTO project (id, name, repo_url, clone_path, clone_status, created_at, updated_at) \
+             VALUES (?1, 'P', ?2, ?3, 'ready', ?4, ?4)",
+            params![
+                id.clone(),
+                fixture.path_str(),
+                clone_path.to_string_lossy().to_string(),
+                now
+            ],
+        )
+        .await
+        .unwrap();
+        id
+    }
+
+    /// Remove the on-disk clone directories a `seed_project_with_workspace`
+    /// test created, so repeated local runs don't accumulate temp dirs.
+    fn cleanup_clone_root(state: &AppState, project_id: &str, epic_ids: &[&str]) {
+        let root = std::path::Path::new(&state.config.clone_root);
+        let _ = std::fs::remove_dir_all(root.join(project_id));
+        for epic_id in epic_ids {
+            let _ = std::fs::remove_dir_all(root.join("epics").join(epic_id));
+        }
+    }
+
     /// Create a task under `epic_id` with `status='Todo'` via direct SQL (mirrors
     /// `tasks::create_task` but keeps the test self-contained).
     async fn seed_task(state: &AppState, epic_id: &str, project_id: &str, title: &str) -> String {
@@ -812,7 +984,8 @@ mod tests {
     #[tokio::test]
     async fn linear_dag_walks_to_completion() {
         let (state, _app) = test_app().await;
-        let project_id = seed_project(&state).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
         let epic_id = seed_epic(&state, &project_id, "InProgress").await;
 
         let a = seed_task(&state, &epic_id, &project_id, "A").await;
@@ -829,13 +1002,15 @@ mod tests {
         assert_eq!(statuses["B"], "Done");
         assert_eq!(statuses["C"], "Done");
         assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
     }
 
     /// Branching DAG (A blocks B and C; B and C both block D): all Done.
     #[tokio::test]
     async fn branching_dag_walks_to_completion() {
         let (state, _app) = test_app().await;
-        let project_id = seed_project(&state).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
         let epic_id = seed_epic(&state, &project_id, "InProgress").await;
 
         let a = seed_task(&state, &epic_id, &project_id, "A").await;
@@ -856,18 +1031,21 @@ mod tests {
         assert_eq!(statuses["C"], "Done");
         assert_eq!(statuses["D"], "Done");
         assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
     }
 
     /// Empty epic (no tasks): worker sets the epic Completed.
     #[tokio::test]
     async fn empty_epic_completes() {
         let (state, _app) = test_app().await;
-        let project_id = seed_project(&state).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
         let epic_id = seed_epic(&state, &project_id, "InProgress").await;
 
         run_stub_worker(state.clone(), epic_id.clone()).await;
 
         assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
     }
 
     /// Non-InProgress epic is a no-op: no task or epic status changes.
@@ -892,7 +1070,8 @@ mod tests {
     #[tokio::test]
     async fn no_sibling_in_progress_after_run() {
         let (state, _app) = test_app().await;
-        let project_id = seed_project(&state).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
         let epic_id = seed_epic(&state, &project_id, "InProgress").await;
         let a = seed_task(&state, &epic_id, &project_id, "A").await;
         let b = seed_task(&state, &epic_id, &project_id, "B").await;
@@ -907,6 +1086,7 @@ mod tests {
         assert_eq!(statuses["B"], "Done");
         assert!(statuses.values().all(|s| s != "InProgress"));
         assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
     }
 
     // ---- T-510: claim semantics ----
@@ -1223,7 +1403,8 @@ mod tests {
             Arc::new(SilentBreakdownAgent),
         );
 
-        let project_id = seed_project(&state).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
         let epic_a = seed_epic(&state, &project_id, "InProgress").await;
         let epic_b = seed_epic(&state, &project_id, "InProgress").await;
         let epic_c = seed_epic(&state, &project_id, "InProgress").await;
@@ -1282,6 +1463,8 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
+
+        cleanup_clone_root(&state, &project_id, &[&epic_a, &epic_b, &epic_c]);
     }
 
     // ---- end-to-end AC test via the lane endpoint + pool ----
@@ -1294,7 +1477,8 @@ mod tests {
     #[tokio::test]
     async fn enqueue_via_lane_drives_dag_to_completed() {
         let (state, app) = test_app().await;
-        let project_id = seed_project(&state).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
         let epic_id = seed_epic(&state, &project_id, "Ready").await;
         let a = seed_task(&state, &epic_id, &project_id, "A").await;
         let b = seed_task(&state, &epic_id, &project_id, "B").await;
@@ -1338,5 +1522,198 @@ mod tests {
         let statuses = task_statuses(&state, &epic_id).await;
         assert_eq!(statuses["A"], "Done");
         assert_eq!(statuses["B"], "Done");
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    // ---- T-511: provisioning-failure wiring (workspace_error / setup_failed) ----
+
+    /// A project whose repo is unreachable (mirrors `git.rs`'s own bad-url
+    /// fixture): the canonical refresh inside provisioning fails fast
+    /// (`GIT_TERMINAL_PROMPT=0`), forcing `ProvisionFailure::Workspace`.
+    async fn seed_project_bad_repo(state: &AppState) -> String {
+        let conn = state.db.conn();
+        let id = ulid::Ulid::new().to_string();
+        let now = now_ms();
+        let clone_path = std::path::Path::new(&state.config.clone_root).join(&id);
+        conn.execute(
+            "INSERT INTO project (id, name, repo_url, clone_path, clone_status, created_at, updated_at) \
+             VALUES (?1, 'P', 'https://dearborn.invalid/nope/nope.git', ?2, 'ready', ?3, ?3)",
+            params![id.clone(), clone_path.to_string_lossy().to_string(), now],
+        )
+        .await
+        .unwrap();
+        id
+    }
+
+    /// Like [`seed_project_with_workspace`] but with a `setup_cmd`, so a
+    /// provisioned workspace's setup step can be made to fail on demand.
+    async fn seed_project_with_setup_cmd(
+        state: &AppState,
+        fixture: &GitFixture,
+        setup_cmd: &str,
+    ) -> String {
+        let conn = state.db.conn();
+        let id = ulid::Ulid::new().to_string();
+        let now = now_ms();
+        let clone_path = std::path::Path::new(&state.config.clone_root).join(&id);
+        conn.execute(
+            "INSERT INTO project (id, name, repo_url, setup_cmd, clone_path, clone_status, created_at, updated_at) \
+             VALUES (?1, 'P', ?2, ?3, ?4, 'ready', ?5, ?5)",
+            params![
+                id.clone(),
+                fixture.path_str(),
+                setup_cmd,
+                clone_path.to_string_lossy().to_string(),
+                now
+            ],
+        )
+        .await
+        .unwrap();
+        id
+    }
+
+    /// Drain `sub` (bounded) until an `epic_updated` frame carrying
+    /// `status` matches, or panic after 5s. Draining rather than asserting a
+    /// fixed frame position keeps this robust against the lane handler's own
+    /// `Ready → InProgress` `epic_updated`/`board_updated` publishes landing
+    /// on the same subscriber ahead of the provisioning-failure ones.
+    async fn recv_epic_updated_with_status(
+        sub: &mut tokio::sync::broadcast::Receiver<crate::hub::Envelope>,
+        status: &str,
+    ) -> Value {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let frame = tokio::time::timeout(remaining, sub.recv())
+                .await
+                .unwrap_or_else(|_| panic!("never saw epic_updated(status={status})"))
+                .unwrap();
+            let v: Value = serde_json::from_str(&frame).unwrap();
+            if v["type"] == "epic_updated" && v["payload"]["status"] == status {
+                return v;
+            }
+        }
+    }
+
+    /// A workspace-provisioning failure (unreachable repo) drives the epic to
+    /// `Blocked(workspace_error)`: the lease is released, the seeded task
+    /// never leaves `Todo` (the stub DAG walk never runs), and both the
+    /// `epic_updated` and `board_updated` frames land.
+    #[tokio::test]
+    async fn workspace_error_blocks_epic_releases_lease_and_publishes() {
+        let (state, app) = test_app().await;
+        let project_id = seed_project_bad_repo(&state).await;
+        let epic_id = seed_epic(&state, &project_id, "Ready").await;
+        seed_task(&state, &epic_id, &project_id, "A").await;
+
+        let mut epic_sub = state.hub.subscribe(&format!("epic:{epic_id}"));
+        let mut proj_sub = state.hub.subscribe(&format!("project:{project_id}"));
+
+        let _handles = spawn_pool(state.clone());
+        let response = app
+            .oneshot(req(
+                "POST",
+                &format!("/epics/{epic_id}/lane"),
+                Some(json!({ "status": "InProgress" })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let blocked_frame = recv_epic_updated_with_status(&mut epic_sub, "Blocked").await;
+        assert_eq!(blocked_frame["payload"]["blocked_reason"], "workspace_error");
+
+        // board_updated must have landed too (either for the InProgress
+        // enqueue, the Blocked transition, or both) — drain for one.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let frame = tokio::time::timeout(Duration::from_secs(5), proj_sub.recv())
+                .await
+                .expect("never saw a board_updated frame")
+                .unwrap();
+            let v: Value = serde_json::from_str(&frame).unwrap();
+            if v["type"] == "board_updated" {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("never saw board_updated");
+            }
+        }
+
+        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        assert_eq!(epic.status, "Blocked");
+        assert_eq!(epic.blocked_reason.as_deref(), Some("workspace_error"));
+
+        let (lease_owner, lease_expires_at) = epic_lease(&state, &epic_id).await;
+        assert!(lease_owner.is_none(), "lease must be released on Blocked");
+        assert!(lease_expires_at.is_none());
+
+        // The DAG walk never ran: the seeded task is still Todo.
+        let statuses = task_statuses(&state, &epic_id).await;
+        assert_eq!(statuses["A"], "Todo");
+    }
+
+    /// A failing `setup_cmd` drives the epic to `Blocked(setup_failed)` with
+    /// the workspace retained on disk (never deleted) and the captured
+    /// output landed in an `agent_run` row.
+    #[tokio::test]
+    async fn setup_cmd_failure_blocks_epic_and_retains_workspace() {
+        let (state, app) = test_app().await;
+        let fixture = GitFixture::new().await;
+        let project_id =
+            seed_project_with_setup_cmd(&state, &fixture, "echo setup-boom && exit 5").await;
+        let epic_id = seed_epic(&state, &project_id, "Ready").await;
+        seed_task(&state, &epic_id, &project_id, "A").await;
+
+        let _handles = spawn_pool(state.clone());
+        let response = app
+            .oneshot(req(
+                "POST",
+                &format!("/epics/{epic_id}/lane"),
+                Some(json!({ "status": "InProgress" })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if epic_status(&state, &epic_id).await == "Blocked" {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("epic never reached Blocked");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        assert_eq!(epic.blocked_reason.as_deref(), Some("setup_failed"));
+
+        // Workspace retained: the provisioned directory (and its .git) is
+        // still on disk, not deleted on this failure path.
+        let workspace_path = crate::workspace::epic_workspace_path(&state.config.clone_root, &epic_id);
+        assert!(
+            workspace_path.join(".git").exists(),
+            "workspace must be retained on setup_failed"
+        );
+
+        // Evidence: the captured setup_cmd output landed in agent_run.
+        let mut rows = state
+            .db
+            .conn()
+            .query(
+                "SELECT status, exit_code, log FROM agent_run WHERE epic_id = ?1 AND stage = 'setup'",
+                params![epic_id.clone()],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("a setup agent_run row");
+        assert_eq!(row.get::<String>(0).unwrap(), "error");
+        assert_eq!(row.get::<Option<i64>>(1).unwrap(), Some(5));
+        let log: String = row.get(2).unwrap();
+        assert!(log.contains("setup-boom"));
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
     }
 }

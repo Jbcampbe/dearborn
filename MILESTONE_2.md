@@ -245,7 +245,7 @@ with `agent_error` and gets thickened in later phases.
   lease reports lost and aborts; boot clears all leases; with concurrency 2 and
   3 enqueued epics, exactly 2 run concurrently.
 
-- [ ] **T-511 — Epic workspace provisioning & re-attach.** *deps: T-510*
+- [x] **T-511 — Epic workspace provisioning & re-attach.** *deps: T-510*
   `workspace.rs`: per-project refresh lock → `refresh_repo(canonical)` →
   `git clone <canonical> <ws>` → `git remote set-url origin <token-free url>` →
   `git checkout -b <branch>` → `setup_cmd`. Re-claim of an existing workspace

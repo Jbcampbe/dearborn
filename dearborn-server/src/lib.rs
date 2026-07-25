@@ -7,11 +7,13 @@
 pub mod auth;
 pub mod board;
 pub mod breakdown;
+pub mod cmd;
 pub mod config;
 pub mod crypto;
 pub mod db;
 pub mod epics;
 pub mod error;
+pub mod evidence;
 pub mod git;
 pub mod hub;
 pub mod lanes;
@@ -21,9 +23,10 @@ pub mod projects;
 pub mod spec;
 pub mod tasks;
 pub mod worker;
+pub mod workspace;
 pub mod ws;
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::sync::{Arc, Mutex};
 
 use std::path::Path;
@@ -94,6 +97,20 @@ pub struct AppState {
     /// loops wake immediately instead of waiting out their poll interval. See
     /// [`worker::spawn_pool`] for the notify-or-poll idle loop this drives.
     pub notify: Arc<tokio::sync::Notify>,
+    /// Per-project async lock guarding the canonical checkout's refresh step
+    /// (T-511, MILESTONE_2 §11 risk 3). Every epic provision in a project
+    /// calls `git::refresh_repo` against that project's single shared
+    /// canonical checkout; without serializing, two workers provisioning
+    /// epics in the same project concurrently could interleave one's `git
+    /// reset --hard` with another's in-flight `git fetch`, corrupting the
+    /// checkout both epics clone from. Keyed by project id so provisions in
+    /// *different* projects never block each other. See
+    /// [`AppState::project_refresh_lock`]; consumed by
+    /// [`crate::workspace::provision_epic_workspace`]. The outer
+    /// `std::sync::Mutex` guards only the map itself (never held across an
+    /// `.await`); the per-project `tokio::sync::Mutex` it hands out is the
+    /// actual (long-held, across-await) exclusion.
+    pub refresh_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Test-only seam (T-510) letting a test observe/gate the claimed-epic
     /// pipeline body without sleeps: if set, [`worker::run_stub_worker`] awaits
     /// it once, immediately after claiming an epic and before doing any work.
@@ -158,6 +175,7 @@ impl AppState {
             caps: Arc::new(CapabilityStore::new()),
             advertised_base: Arc::new(Mutex::new(None)),
             notify: Arc::new(tokio::sync::Notify::new()),
+            refresh_locks: Arc::new(Mutex::new(HashMap::new())),
             #[cfg(test)]
             test_pipeline_hook: None,
         }
@@ -175,6 +193,18 @@ impl AppState {
         self.advertised_base
             .lock()
             .expect("base mutex poisoned")
+            .clone()
+    }
+
+    /// Hand out `project_id`'s canonical-checkout refresh lock (T-511),
+    /// creating it on first use. The same project id always yields the same
+    /// underlying `tokio::sync::Mutex` (checked via `Arc::ptr_eq` in tests),
+    /// so every caller provisioning against that project actually excludes
+    /// every other. See [`AppState::refresh_locks`] for why this exists.
+    pub fn project_refresh_lock(&self, project_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = self.refresh_locks.lock().expect("refresh_locks mutex poisoned");
+        map.entry(project_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
     }
 
