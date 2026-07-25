@@ -293,7 +293,7 @@ with `agent_error` and gets thickened in later phases.
   leaves the epic `Blocked(pr_failed)` with the workspace retained; a 4xx from
   GitHub surfaces a readable, token-redacted error; no PAT in any log line.
 
-- [ ] **T-515 — Live end-to-end proof.** *deps: T-514*
+- [x] **T-515 — Live end-to-end proof.** *deps: T-514*
   `tests/worker_live.rs`, `#[ignore]`d per the T-203 convention: a temp fixture
   repo + bare origin, one epic, one real `claude` run in `RunMode::Edit`.
   **AC:** documented run command in the module header; the real agent modifies

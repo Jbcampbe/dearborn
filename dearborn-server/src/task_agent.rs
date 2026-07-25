@@ -77,6 +77,34 @@
 //! cumulative-diff review (T-522/T-530) — exactly as `references/ralph-v2.sh`
 //! accepts the same property. `--disallowedTools` narrows the *accidental*
 //! surface; it is not a sandbox.
+//!
+//! ## T-515's empirical finding: headless write-mode "just works" as built
+//!
+//! MILESTONE_2 §11 risk 1 flagged `RunMode::Edit` + `--permission-mode` +
+//! tool flags as unproven — M1 never ran an agent read-write. `tests/
+//! worker_live.rs` (T-515) is the live proof: a real `claude` subprocess,
+//! `RunMode::Edit`, driven through the exact [`ClaudeTaskAgent::run`] below
+//! with **no changes**, wrote a file, and the write landed without any
+//! approval prompt blocking the run. The reason this worked with zero
+//! plumbing changes here: `agent-harness`'s Claude adapter
+//! (`build_claude_args`) already injects a *default* `--permission-mode
+//! acceptEdits` for `RunMode::Edit` whenever the caller hasn't set
+//! `--permission-mode` itself via `extra_args` — and [`build_extra_args`]
+//! never does for `Implement`/`Fix` (only the `Review`/`VerifyComplete`/
+//! `Summarize` trio gets `extra_args` at all, and that's `--disallowedTools`,
+//! a different flag). `acceptEdits` auto-approves `Edit`/`Write`/`MultiEdit`
+//! while leaving `Bash` gated; a task whose spec is satisfiable with the
+//! editor tools alone (the common case — the T-515 fixture asked for exactly
+//! one new file) never even hits the gated surface. The empirical run: one
+//! `claude -p` turn, no `--model`/`--max-turns` override, no `--resume`,
+//! cold-CLI-start-to-exit in well under 30s, one commit landing on the
+//! branch with the §2.8 subject, pushed and read back from the bare-origin
+//! fixture. **Caveat, not yet retired**: a task whose only path to
+//! satisfying its acceptance criteria requires `Bash` (e.g. running a
+//! generator script) will hit `acceptEdits`' gate and has not been
+//! empirically exercised — if that turns out to block real epics, the fix is
+//! a caller-supplied `--permission-mode` override via `extra_args` (the
+//! adapter already supports last-wins), not a change to this reasoning.
 
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
