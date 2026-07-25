@@ -47,7 +47,72 @@ pub struct Config {
     /// Milliseconds the stub worker (T-403) sleeps between task transitions so a
     /// browser can watch the walk. `0` in tests (hermetic + fast); `600` in
     /// production. Optional env override: `DEARBORN_STUB_WORKER_DELAY_MS`.
+    /// Removed along with the stub worker in T-513.
     pub stub_worker_delay_ms: u64,
+    /// Executor worker-pool tuning (Milestone 2 §2.7). See [`ExecutorConfig`].
+    pub executor: ExecutorConfig,
+}
+
+/// Tuning knobs for the executor worker pool (Milestone 2 §2.7). Every field
+/// has a same-named environment variable and resolves through the same
+/// env-then-file path as the rest of [`Config`] (see [`resolve`]). An invalid
+/// or missing value **never fails boot**: it falls back to the default noted
+/// below and emits a `tracing::warn!` naming the offending variable — a bad
+/// executor knob should degrade the run, not crash the server.
+#[derive(Debug, Clone)]
+pub struct ExecutorConfig {
+    /// Number of long-lived worker loops started in `main` (D2), each
+    /// claiming and driving one epic/task at a time
+    /// (`DEARBORN_WORKER_CONCURRENCY`). Default `2`. **Rejects `0`**: a
+    /// 0-worker pool would silently accept enqueued work and never run it —
+    /// a hang with no error, which is worse than falling back to a default.
+    pub worker_concurrency: usize,
+    /// How long a claimed lease is valid before it implicitly expires and
+    /// becomes re-claimable by another worker (`DEARBORN_LEASE_TTL_SECS`,
+    /// D4 — there is no reaper task, expiry is implicit). Default `300`
+    /// (5 minutes): long enough to tolerate a missed heartbeat tick or two
+    /// without letting a genuinely dead worker squat on work indefinitely.
+    /// **Rejects `0`**: a 0s lease would expire the instant it is granted.
+    pub lease_ttl_secs: u64,
+    /// Interval between heartbeat renewals of a held lease
+    /// (`DEARBORN_HEARTBEAT_SECS`). Default `30`, comfortably under
+    /// `lease_ttl_secs` so ordinary scheduling jitter never lets a live
+    /// worker's lease lapse. **Rejects `0`**: a 0s heartbeat is a busy-loop
+    /// against the database.
+    pub heartbeat_secs: u64,
+    /// Wall-clock ceiling on a single agent stage — implement, review, or fix
+    /// (`DEARBORN_AGENT_STAGE_TIMEOUT_SECS`). Default `1800` (30 minutes):
+    /// generous enough for a real Claude Code run on a nontrivial task while
+    /// still bounding a stuck or looping agent. **Rejects `0`**: an instant
+    /// timeout would fail every stage before it could produce anything —
+    /// that is a misconfiguration, not a valid "run forever" or "skip" knob.
+    pub agent_stage_timeout_secs: u64,
+    /// Wall-clock ceiling on a single `setup_cmd`/`test_cmd` invocation
+    /// (`DEARBORN_CMD_TIMEOUT_SECS`, T-520). Default `900` (15 minutes):
+    /// enough headroom for a cold dependency install or a slow test suite.
+    /// **Rejects `0`** for the same reason as `agent_stage_timeout_secs`.
+    pub cmd_timeout_secs: u64,
+    /// Maximum attempts the test-driven fix loop takes to turn a red
+    /// `test_cmd` green before failing the task
+    /// (`DEARBORN_MAX_TEST_FIX_ATTEMPTS`, ralph parity, T-522). Default `3`.
+    /// `0` is **accepted** — "fail on first red, no fix loop" is an
+    /// aggressive but legitimate configuration, not a broken one.
+    pub max_test_fix_attempts: u32,
+    /// Maximum rounds of reviewer `NEEDS_CHANGES` → fix the review-convergence
+    /// loop takes before giving up (`DEARBORN_MAX_FIX_ROUNDS`, ralph parity,
+    /// T-530+). Default `3`. `0` is **accepted** for the same reason as
+    /// `max_test_fix_attempts`.
+    pub max_fix_rounds: u32,
+    /// Extra attempts the verdict parser gets when a review response is
+    /// missing a parseable `VERDICT:` line before the round counts as a
+    /// contract failure (`DEARBORN_VERDICT_RETRIES`, D9, ralph parity).
+    /// Default `1`. `0` is **accepted** — "no re-run, first miss fails" is a
+    /// valid strict-contract configuration.
+    pub verdict_retries: u32,
+    /// Fallback poll interval for workers waiting on `tokio::sync::Notify`
+    /// (`DEARBORN_POLL_INTERVAL_MS`) — the backstop in case a notify is
+    /// missed. Default `1500`ms. **Rejects `0`**: a 0ms poll is a busy-loop.
+    pub poll_interval_ms: u64,
 }
 
 /// Errors that prevent the server from booting with a valid configuration.
@@ -92,6 +157,7 @@ impl Config {
             .filter(|v| !v.is_empty())
             .and_then(|v| v.parse::<u64>().ok())
             .unwrap_or(600);
+        let executor = executor_from(&resolve_executor_vars(&file));
 
         Ok(Config {
             bind,
@@ -102,7 +168,95 @@ impl Config {
             static_dir,
             auto_clone: true,
             stub_worker_delay_ms,
+            executor,
         })
+    }
+}
+
+/// Environment variable names for every [`ExecutorConfig`] field, in
+/// declaration order.
+const EXECUTOR_VAR_NAMES: &[&str] = &[
+    "DEARBORN_WORKER_CONCURRENCY",
+    "DEARBORN_LEASE_TTL_SECS",
+    "DEARBORN_HEARTBEAT_SECS",
+    "DEARBORN_AGENT_STAGE_TIMEOUT_SECS",
+    "DEARBORN_CMD_TIMEOUT_SECS",
+    "DEARBORN_MAX_TEST_FIX_ATTEMPTS",
+    "DEARBORN_MAX_FIX_ROUNDS",
+    "DEARBORN_VERDICT_RETRIES",
+    "DEARBORN_POLL_INTERVAL_MS",
+];
+
+/// Resolve every executor variable through the same env-then-file path as the
+/// rest of `Config` (via [`resolve`]), collecting the results into a plain
+/// map. Kept separate from [`executor_from`] so the actual parse-or-default
+/// logic is a pure function of a `HashMap`, testable without touching
+/// process-global env (see `mod tests`).
+fn resolve_executor_vars(file: &HashMap<String, String>) -> HashMap<String, String> {
+    let mut map = HashMap::new();
+    for key in EXECUTOR_VAR_NAMES {
+        if let Some(v) = resolve(file, key) {
+            map.insert((*key).to_string(), v);
+        }
+    }
+    map
+}
+
+/// Parse an [`ExecutorConfig`] out of an already-resolved key/value map (see
+/// [`resolve_executor_vars`]). Pure, so it is unit-tested directly with
+/// hand-built maps instead of through `from_env`, which would require
+/// mutating process-global env under a threaded test runner.
+fn executor_from(map: &HashMap<String, String>) -> ExecutorConfig {
+    ExecutorConfig {
+        worker_concurrency: parse_or_warn(map, "DEARBORN_WORKER_CONCURRENCY", 2usize, true),
+        lease_ttl_secs: parse_or_warn(map, "DEARBORN_LEASE_TTL_SECS", 300u64, true),
+        heartbeat_secs: parse_or_warn(map, "DEARBORN_HEARTBEAT_SECS", 30u64, true),
+        agent_stage_timeout_secs: parse_or_warn(
+            map,
+            "DEARBORN_AGENT_STAGE_TIMEOUT_SECS",
+            1800u64,
+            true,
+        ),
+        cmd_timeout_secs: parse_or_warn(map, "DEARBORN_CMD_TIMEOUT_SECS", 900u64, true),
+        max_test_fix_attempts: parse_or_warn(map, "DEARBORN_MAX_TEST_FIX_ATTEMPTS", 3u32, false),
+        max_fix_rounds: parse_or_warn(map, "DEARBORN_MAX_FIX_ROUNDS", 3u32, false),
+        verdict_retries: parse_or_warn(map, "DEARBORN_VERDICT_RETRIES", 1u32, false),
+        poll_interval_ms: parse_or_warn(map, "DEARBORN_POLL_INTERVAL_MS", 1500u64, true),
+    }
+}
+
+/// Parse a single executor tuning value out of a resolved map, falling back
+/// to `default` (with a `tracing::warn!` naming the variable and the bad
+/// value) if the key is absent, empty, unparseable, or — when `reject_zero`
+/// is set — zero. Factors the "parse or warn-and-default" behavior so it is
+/// written once instead of once per field.
+fn parse_or_warn<T>(map: &HashMap<String, String>, key: &str, default: T, reject_zero: bool) -> T
+where
+    T: std::str::FromStr + PartialEq + From<u8> + std::fmt::Display + Copy,
+{
+    let Some(raw) = map.get(key).filter(|v| !v.is_empty()) else {
+        return default;
+    };
+    match raw.parse::<T>() {
+        Ok(v) if reject_zero && v == T::from(0u8) => {
+            tracing::warn!(
+                var = key,
+                value = %raw,
+                default = %default,
+                "config: value must be nonzero; using default"
+            );
+            default
+        }
+        Ok(v) => v,
+        Err(_) => {
+            tracing::warn!(
+                var = key,
+                value = %raw,
+                default = %default,
+                "config: value is not a valid number; using default"
+            );
+            default
+        }
     }
 }
 
@@ -183,6 +337,20 @@ impl Config {
             auto_clone: false,
             // Tests want the stub worker to be instant (no visible delay).
             stub_worker_delay_ms: 0,
+            executor: ExecutorConfig {
+                // 1 worker + a 10ms poll keep tests deterministic and fast.
+                worker_concurrency: 1,
+                lease_ttl_secs: 30,
+                heartbeat_secs: 5,
+                agent_stage_timeout_secs: 10,
+                cmd_timeout_secs: 10,
+                // Ralph-parity counts stay at production defaults so tests
+                // exercise the real loop bounds (T-522, T-530+).
+                max_test_fix_attempts: 3,
+                max_fix_rounds: 3,
+                verdict_retries: 1,
+                poll_interval_ms: 10,
+            },
         }
     }
 }
@@ -209,5 +377,127 @@ mod tests {
     fn parse_keeps_equals_in_value() {
         let map = parse_config_file("DEARBORN_MASTER_KEY=aa==bb\n");
         assert_eq!(map.get("DEARBORN_MASTER_KEY"), Some(&"aa==bb".to_string()));
+    }
+
+    fn map_of(pairs: &[(&str, &str)]) -> HashMap<String, String> {
+        pairs
+            .iter()
+            .map(|(k, v)| (k.to_string(), v.to_string()))
+            .collect()
+    }
+
+    #[test]
+    fn executor_from_parses_every_documented_value() {
+        let map = map_of(&[
+            ("DEARBORN_WORKER_CONCURRENCY", "5"),
+            ("DEARBORN_LEASE_TTL_SECS", "600"),
+            ("DEARBORN_HEARTBEAT_SECS", "60"),
+            ("DEARBORN_AGENT_STAGE_TIMEOUT_SECS", "3600"),
+            ("DEARBORN_CMD_TIMEOUT_SECS", "1200"),
+            ("DEARBORN_MAX_TEST_FIX_ATTEMPTS", "5"),
+            ("DEARBORN_MAX_FIX_ROUNDS", "4"),
+            ("DEARBORN_VERDICT_RETRIES", "2"),
+            ("DEARBORN_POLL_INTERVAL_MS", "2000"),
+        ]);
+        let cfg = executor_from(&map);
+        assert_eq!(cfg.worker_concurrency, 5);
+        assert_eq!(cfg.lease_ttl_secs, 600);
+        assert_eq!(cfg.heartbeat_secs, 60);
+        assert_eq!(cfg.agent_stage_timeout_secs, 3600);
+        assert_eq!(cfg.cmd_timeout_secs, 1200);
+        assert_eq!(cfg.max_test_fix_attempts, 5);
+        assert_eq!(cfg.max_fix_rounds, 4);
+        assert_eq!(cfg.verdict_retries, 2);
+        assert_eq!(cfg.poll_interval_ms, 2000);
+    }
+
+    #[test]
+    fn executor_from_defaults_when_all_absent() {
+        let cfg = executor_from(&HashMap::new());
+        assert_eq!(cfg.worker_concurrency, 2);
+        assert_eq!(cfg.lease_ttl_secs, 300);
+        assert_eq!(cfg.heartbeat_secs, 30);
+        assert_eq!(cfg.agent_stage_timeout_secs, 1800);
+        assert_eq!(cfg.cmd_timeout_secs, 900);
+        assert_eq!(cfg.max_test_fix_attempts, 3);
+        assert_eq!(cfg.max_fix_rounds, 3);
+        assert_eq!(cfg.verdict_retries, 1);
+        assert_eq!(cfg.poll_interval_ms, 1500);
+    }
+
+    #[test]
+    fn executor_from_defaults_on_unparseable_values() {
+        let map = map_of(&[
+            ("DEARBORN_WORKER_CONCURRENCY", "abc"),
+            ("DEARBORN_LEASE_TTL_SECS", "abc"),
+            ("DEARBORN_HEARTBEAT_SECS", "abc"),
+            ("DEARBORN_AGENT_STAGE_TIMEOUT_SECS", "abc"),
+            ("DEARBORN_CMD_TIMEOUT_SECS", "abc"),
+            ("DEARBORN_MAX_TEST_FIX_ATTEMPTS", "abc"),
+            ("DEARBORN_MAX_FIX_ROUNDS", "abc"),
+            ("DEARBORN_VERDICT_RETRIES", "abc"),
+            ("DEARBORN_POLL_INTERVAL_MS", "abc"),
+        ]);
+        let cfg = executor_from(&map);
+        let defaults = executor_from(&HashMap::new());
+        assert_eq!(cfg.worker_concurrency, defaults.worker_concurrency);
+        assert_eq!(cfg.lease_ttl_secs, defaults.lease_ttl_secs);
+        assert_eq!(cfg.heartbeat_secs, defaults.heartbeat_secs);
+        assert_eq!(
+            cfg.agent_stage_timeout_secs,
+            defaults.agent_stage_timeout_secs
+        );
+        assert_eq!(cfg.cmd_timeout_secs, defaults.cmd_timeout_secs);
+        assert_eq!(cfg.max_test_fix_attempts, defaults.max_test_fix_attempts);
+        assert_eq!(cfg.max_fix_rounds, defaults.max_fix_rounds);
+        assert_eq!(cfg.verdict_retries, defaults.verdict_retries);
+        assert_eq!(cfg.poll_interval_ms, defaults.poll_interval_ms);
+    }
+
+    #[test]
+    fn executor_from_defaults_on_zero_where_zero_is_invalid() {
+        let map = map_of(&[
+            ("DEARBORN_WORKER_CONCURRENCY", "0"),
+            ("DEARBORN_LEASE_TTL_SECS", "0"),
+            ("DEARBORN_HEARTBEAT_SECS", "0"),
+            ("DEARBORN_AGENT_STAGE_TIMEOUT_SECS", "0"),
+            ("DEARBORN_CMD_TIMEOUT_SECS", "0"),
+            ("DEARBORN_POLL_INTERVAL_MS", "0"),
+        ]);
+        let cfg = executor_from(&map);
+        assert_eq!(cfg.worker_concurrency, 2);
+        assert_eq!(cfg.lease_ttl_secs, 300);
+        assert_eq!(cfg.heartbeat_secs, 30);
+        assert_eq!(cfg.agent_stage_timeout_secs, 1800);
+        assert_eq!(cfg.cmd_timeout_secs, 900);
+        assert_eq!(cfg.poll_interval_ms, 1500);
+    }
+
+    #[test]
+    fn executor_from_accepts_zero_for_ralph_parity_counts() {
+        let map = map_of(&[
+            ("DEARBORN_MAX_TEST_FIX_ATTEMPTS", "0"),
+            ("DEARBORN_MAX_FIX_ROUNDS", "0"),
+            ("DEARBORN_VERDICT_RETRIES", "0"),
+        ]);
+        let cfg = executor_from(&map);
+        assert_eq!(cfg.max_test_fix_attempts, 0);
+        assert_eq!(cfg.max_fix_rounds, 0);
+        assert_eq!(cfg.verdict_retries, 0);
+    }
+
+    #[test]
+    fn for_test_yields_fast_executor_values() {
+        let cfg = Config::for_test("t");
+        assert_eq!(cfg.executor.worker_concurrency, 1);
+        assert_eq!(cfg.executor.poll_interval_ms, 10);
+        assert_eq!(cfg.executor.lease_ttl_secs, 30);
+        assert_eq!(cfg.executor.heartbeat_secs, 5);
+        assert_eq!(cfg.executor.agent_stage_timeout_secs, 10);
+        assert_eq!(cfg.executor.cmd_timeout_secs, 10);
+        // Ralph-parity counts stay at real defaults even in test config.
+        assert_eq!(cfg.executor.max_test_fix_attempts, 3);
+        assert_eq!(cfg.executor.max_fix_rounds, 3);
+        assert_eq!(cfg.executor.verdict_retries, 1);
     }
 }

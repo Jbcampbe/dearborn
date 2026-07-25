@@ -26,7 +26,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use dearborn_server::{app, AppState, Config, Db};
+use dearborn_server::{app, AppState, Config, Db, ExecutorConfig};
 
 const TOKEN: &str = "s3cret-token";
 /// A unique string that only exists inside the fixture clone, so finding it in
@@ -57,6 +57,17 @@ async fn live_planning_agent_reads_clone_and_updates_epic_via_mcp() {
         static_dir: "./client/dist".to_string(),
         auto_clone: false,
         stub_worker_delay_ms: 0,
+        executor: ExecutorConfig {
+            worker_concurrency: 1,
+            lease_ttl_secs: 30,
+            heartbeat_secs: 5,
+            agent_stage_timeout_secs: 10,
+            cmd_timeout_secs: 10,
+            max_test_fix_attempts: 3,
+            max_fix_rounds: 3,
+            verdict_retries: 1,
+            poll_interval_ms: 10,
+        },
     };
     let state = AppState::new(config, db); // production ClaudePlanningAgent
 
@@ -198,6 +209,17 @@ async fn live_technical_planning_reads_clone_and_fills_technical_context() {
         static_dir: "./client/dist".to_string(),
         auto_clone: false,
         stub_worker_delay_ms: 0,
+        executor: ExecutorConfig {
+            worker_concurrency: 1,
+            lease_ttl_secs: 30,
+            heartbeat_secs: 5,
+            agent_stage_timeout_secs: 10,
+            cmd_timeout_secs: 10,
+            max_test_fix_attempts: 3,
+            max_fix_rounds: 3,
+            verdict_retries: 1,
+            poll_interval_ms: 10,
+        },
     };
     let state = AppState::new(config, db);
 

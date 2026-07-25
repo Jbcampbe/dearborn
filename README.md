@@ -129,9 +129,21 @@ environment variables always take precedence over the file.
 | `DEARBORN_CLONE_ROOT` |    no    | `./clones`       | Root directory under which per-project clones live (T-103).             |
 | `DEARBORN_STATIC_DIR` |    no    | `./client/dist`  | Directory of built Vite SPA assets served at `/` (T-006).               |
 | `DEARBORN_CONFIG`     |    no    | —                | Optional path to a `KEY=VALUE` config file used as a fallback source.    |
+| `DEARBORN_WORKER_CONCURRENCY` | no | `2`            | Number of executor worker loops.                                         |
+| `DEARBORN_LEASE_TTL_SECS` | no | `300`              | Executor lease lifetime.                                                 |
+| `DEARBORN_HEARTBEAT_SECS` | no | `30`               | Executor lease renewal interval.                                         |
+| `DEARBORN_AGENT_STAGE_TIMEOUT_SECS` | no | `1800`  | Wall-clock ceiling per agent stage.                                      |
+| `DEARBORN_CMD_TIMEOUT_SECS` | no | `900`            | Wall-clock ceiling per `setup_cmd` / `test_cmd` run.                     |
+| `DEARBORN_MAX_TEST_FIX_ATTEMPTS` | no | `3`         | Max attempts of the test-driven fix loop (ralph parity).                 |
+| `DEARBORN_MAX_FIX_ROUNDS` | no | `3`                | Max rounds of the review-convergence fix loop (ralph parity).            |
+| `DEARBORN_VERDICT_RETRIES` | no | `1`               | Extra re-runs when a review reply lacks a parseable verdict (ralph parity). |
+| `DEARBORN_POLL_INTERVAL_MS` | no | `1500`           | Fallback poll interval for workers, behind the notify.                   |
 
 The server **fails fast at boot** with a clear error (non-zero exit) if
-`DEARBORN_TOKEN` or `DEARBORN_MASTER_KEY` is missing or empty.
+`DEARBORN_TOKEN` or `DEARBORN_MASTER_KEY` is missing or empty. The executor
+variables above are best-effort: an invalid or unparseable value falls back to
+its default with a logged warning rather than failing boot (see
+`dearborn-server/src/config.rs`).
 
 ## Canonical read-only clone (T-103)
 

@@ -35,7 +35,7 @@ use tower_http::{
 };
 
 pub use breakdown::BreakdownAgent;
-pub use config::{Config, ConfigError};
+pub use config::{Config, ConfigError, ExecutorConfig};
 pub use crypto::MasterKey;
 pub use db::{Db, DbError};
 pub use error::{AppError, AppResult};

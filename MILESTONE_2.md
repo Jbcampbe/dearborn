@@ -207,7 +207,7 @@ immediately instead of waiting out a TTL.
   green; `Task`/`Epic` API responses expose `pr_url`, `failure_reason`,
   `blocked_reason` (never lease columns).
 
-- [ ] **T-501 — Executor config surface.** *deps: none*
+- [x] **T-501 — Executor config surface.** *deps: none*
   Add §2.7 to `config.rs` as an `ExecutorConfig` nested in `Config`. **AC:**
   every var parses from env and the `KEY=VALUE` file with the documented
   default; invalid values fall back to the default with a `warn` (never a boot
