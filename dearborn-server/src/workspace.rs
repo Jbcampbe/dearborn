@@ -77,11 +77,11 @@
 //! locks and never block each other.
 
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use libsql::{params, Connection};
 
-use crate::cmd;
-use crate::evidence::{self, SetupRunRecord};
+use crate::cmd::{self, StageCommand, StageOutcome};
 use crate::git;
 use crate::projects::load_decrypted_pat;
 use crate::AppState;
@@ -295,10 +295,24 @@ async fn workspace_reattachable(workspace_path: &Path, expected_branch: &str) ->
     )
 }
 
-/// Run the project's `setup_cmd` in the workspace, record the (redacted)
-/// evidence row unconditionally (success and failure alike, so a human can
-/// always see what setup did), and turn a non-zero exit into
-/// [`ProvisionFailure::Setup`].
+/// Run the project's `setup_cmd` in the workspace via [`cmd::run_stage_command`]
+/// (T-520) — one `agent_run` row per call, `stage = "setup"`, `attempt = 1`
+/// (`setup_cmd` never retries) — and turn a non-`ok` outcome into
+/// [`ProvisionFailure::Setup`]. `setup_cmd` is only ever called with a
+/// non-empty command (the caller already filtered via [`non_empty`]), so the
+/// [`StageOutcome::Skipped`] arm below is unreachable in practice — it is
+/// still matched explicitly (rather than assumed away) so a future caller
+/// that stops pre-filtering gets a loud panic instead of a silently wrong
+/// "setup succeeded".
+///
+/// Redaction happens in the `sanitize` hook handed to `run_stage_command`:
+/// `setup_cmd` output should never contain the project's PAT, but a command
+/// that echoes its own environment (or a misconfigured build script) could
+/// otherwise leak it into stored evidence, so it is redacted ([`git::redact`])
+/// before either the returned message or the persisted `agent_run.log` sees
+/// it — the same defensive redaction T-511 established, now happening for
+/// free wherever [`cmd::run_stage_command`] is used with this hook, instead
+/// of only at this one call site.
 async fn run_setup(
     state: &AppState,
     epic_id: &str,
@@ -306,52 +320,32 @@ async fn run_setup(
     setup_cmd: &str,
     pat: Option<&str>,
 ) -> Result<(), ProvisionFailure> {
-    let started_at = now_ms();
-    let run_result = cmd::run_shell(setup_cmd, workspace_path).await;
-    let ended_at = now_ms();
-
-    // Redact defensively: setup_cmd output should never contain the PAT, but
-    // a command that echoes its own environment (or a misconfigured build
-    // script) could otherwise leak it into stored evidence.
-    let (exit_code, redacted_output, status) = match &run_result {
-        Ok(out) => (
-            Some(out.exit_code),
-            git::redact(&out.output, pat),
-            if out.exit_code == 0 { "ok" } else { "error" },
-        ),
-        Err(io_err) => (
-            None,
-            git::redact(&format!("failed to run setup_cmd: {io_err}"), pat),
-            "error",
-        ),
-    };
-
-    let conn = state.db.conn();
-    if let Err(err) = evidence::record_setup_run(
-        conn,
-        SetupRunRecord {
-            epic_id,
-            status,
-            exit_code,
-            log: &redacted_output,
-            started_at,
-            ended_at,
+    let outcome = cmd::run_stage_command(
+        state.db.conn(),
+        StageCommand {
+            task_id: None,
+            epic_id: Some(epic_id),
+            stage: "setup",
+            attempt: 1,
+            cwd: workspace_path,
+            timeout: Duration::from_secs(state.config.executor.cmd_timeout_secs),
         },
+        Some(setup_cmd),
+        |raw: &str| git::redact(raw, pat),
     )
     .await
-    {
-        tracing::warn!(
-            epic = %epic_id,
-            error = %err,
-            "failed to write setup_cmd evidence row"
-        );
-    }
+    .map_err(|e| {
+        ProvisionFailure::Workspace(format!("failed to record setup_cmd evidence: {e}"))
+    })?;
 
-    match &run_result {
-        Ok(out) if out.exit_code == 0 => Ok(()),
-        _ => Err(ProvisionFailure::Setup {
-            message: redacted_output,
-            exit_code,
+    match outcome {
+        StageOutcome::Skipped => unreachable!(
+            "run_setup is only called with a non-empty setup_cmd (see non_empty's caller)"
+        ),
+        StageOutcome::Ran(ran) if ran.status == "ok" => Ok(()),
+        StageOutcome::Ran(ran) => Err(ProvisionFailure::Setup {
+            message: ran.output,
+            exit_code: ran.exit_code,
         }),
     }
 }

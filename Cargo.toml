@@ -30,3 +30,7 @@ base64 = "0.22"
 # GitHub API client for T-514's GitHost (push + PR). rustls (not native-tls /
 # OpenSSL) per D15 — see MILESTONE_2 §14 and dearborn-server/src/git_host.rs.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
+# Direct `libc::kill` for T-520's process-group kill (SIGTERM/SIGKILL on a
+# negative pid). Already present transitively (via tokio) at 0.2.186, so this
+# adds a direct dependency without introducing a new version into the tree.
+libc = "0.2"

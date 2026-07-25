@@ -306,7 +306,7 @@ with `agent_error` and gets thickened in later phases.
 
 ## 5. Phase 2 — Test gate & fix loop
 
-- [ ] **T-520 — Shell command runner.** *deps: T-501*
+- [x] **T-520 — Shell command runner.** *deps: T-501*
   `cmd.rs`: run `sh -c <cmd>` in the workspace with combined output capture,
   `DEARBORN_CMD_TIMEOUT_SECS`, and an `agent_run` row. **AC:** exit code +
   combined stdout/stderr captured and capped; a command exceeding the timeout is

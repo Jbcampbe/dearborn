@@ -1,7 +1,7 @@
 //! The per-stage `agent_run` evidence table: open/flush/close for every
 //! stage (agent and non-agent alike), the D13 log cap, and the two read
 //! endpoints (§2.5) a human uses to inspect a task's pipeline history
-//! (T-512, generalizing T-511's single `setup`-stage write).
+//! (T-512, generalizing T-511's original single `setup`-stage write).
 //!
 //! ## The lifecycle every stage follows
 //!
@@ -22,19 +22,20 @@
 //! ## Why capping lives here (D13)
 //!
 //! [`cap_log`] is the one place a transcript is ever truncated, so every
-//! caller (agent stages via [`close_stage`]/[`flush_stage_log`], the plain
-//! `setup_cmd` write below, a future shell-command stage) gets the same
-//! head+tail-with-elision-marker shape for free instead of reimplementing
-//! (and potentially getting UTF-8 boundary safety wrong) at each call site.
+//! caller (agent stages via [`close_stage`]/[`flush_stage_log`], a
+//! shell-command stage's terminal write) gets the same head+tail-with-
+//! elision-marker shape for free instead of reimplementing (and potentially
+//! getting UTF-8 boundary safety wrong) at each call site.
 //!
-//! ## T-511's `setup` stage, folded in
+//! ## `setup`/`preflight`/`test_gate`, folded into the same lifecycle
 //!
-//! [`record_setup_run`] is T-511's original after-the-fact write (the
-//! command has already finished by the time it's called, so there is no
-//! `running` row to open first) — now routed through [`cap_log`] like every
-//! other stage's log, but otherwise unchanged: `session_id` stays NULL (no
-//! agent involved) and `attempt` stays fixed at `1` (`setup_cmd` does not
-//! retry).
+//! T-511 originally gave the `setup` stage its own after-the-fact write
+//! (`record_setup_run`: the command had already finished by the time it was
+//! called, so there was no `running` row to open first). T-520 replaced that
+//! with [`crate::cmd::run_stage_command`], which drives the exact
+//! [`open_stage`]/[`guard_stage_close`] lifecycle above for every non-agent,
+//! shell-backed stage (`setup`, `preflight`, `test_gate`) — one code path
+//! writes all three instead of each stage growing its own bespoke insert.
 
 use std::future::Future;
 use std::panic::AssertUnwindSafe;
@@ -300,50 +301,6 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
-/// The `setup` stage's evidence row (see the module doc for scope).
-pub struct SetupRunRecord<'a> {
-    pub epic_id: &'a str,
-    /// `"ok"` | `"error"` (§2.1's `agent_run.status` vocabulary).
-    pub status: &'a str,
-    pub exit_code: Option<i32>,
-    /// Already redacted (see [`crate::git::redact`]) — never the raw command
-    /// output if a PAT could have leaked into it.
-    pub log: &'a str,
-    pub started_at: i64,
-    pub ended_at: i64,
-}
-
-/// Insert one `agent_run` row for the `setup` stage. `task_id` is `NULL`
-/// (setup runs once per epic workspace, not per task) and `verdict` is `NULL`
-/// (only the `review` stage ever sets one, T-530+).
-pub async fn record_setup_run(
-    conn: &Connection,
-    rec: SetupRunRecord<'_>,
-) -> Result<(), libsql::Error> {
-    let id = ulid::Ulid::new().to_string();
-    // D13 capping applies uniformly, even to a setup_cmd's output — see the
-    // module doc's "T-511's setup stage, folded in" section.
-    let log = cap_log(rec.log);
-    conn.execute(
-        "INSERT INTO agent_run \
-         (id, task_id, epic_id, stage, session_id, log, created_at, \
-          attempt, status, verdict, started_at, ended_at, exit_code) \
-         VALUES (?1, NULL, ?2, 'setup', NULL, ?3, ?4, 1, ?5, NULL, ?6, ?7, ?8)",
-        params![
-            id,
-            rec.epic_id,
-            log,
-            rec.started_at,
-            rec.status,
-            rec.started_at,
-            rec.ended_at,
-            rec.exit_code.map(|c| c as i64),
-        ],
-    )
-    .await?;
-    Ok(())
-}
-
 // ---- REST: task stage history + one stage's log (§2.5) ---------------------
 
 /// One `agent_run` row as returned by `GET /tasks/{id}/runs` — **without**
@@ -470,63 +427,12 @@ mod tests {
     use super::*;
     use crate::Db;
 
-    #[tokio::test]
-    async fn records_a_setup_stage_row_with_the_documented_shape() {
-        let db = Db::connect(":memory:").await.unwrap();
-        db.run_migrations().await.unwrap();
-        let conn = db.conn();
-
-        // agent_run.epic_id is a foreign key — seed a real project + epic row.
-        conn.execute(
-            "INSERT INTO project (id, name, repo_url, clone_status, created_at, updated_at) \
-             VALUES ('proj-1', 'P', 'https://example.com/p.git', 'ready', 0, 0)",
-            (),
-        )
-        .await
-        .unwrap();
-        conn.execute(
-            "INSERT INTO epic (id, project_id, title, status, created_at, updated_at) \
-             VALUES ('epic-1', 'proj-1', 'E', 'InProgress', 0, 0)",
-            (),
-        )
-        .await
-        .unwrap();
-
-        record_setup_run(
-            conn,
-            SetupRunRecord {
-                epic_id: "epic-1",
-                status: "error",
-                exit_code: Some(1),
-                log: "boom",
-                started_at: 1000,
-                ended_at: 1500,
-            },
-        )
-        .await
-        .unwrap();
-
-        let mut rows = conn
-            .query(
-                "SELECT task_id, epic_id, stage, session_id, log, attempt, status, \
-                 verdict, started_at, ended_at, exit_code FROM agent_run WHERE epic_id = ?1",
-                params!["epic-1"],
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().expect("row inserted");
-        assert_eq!(row.get::<Option<String>>(0).unwrap(), None, "task_id NULL");
-        assert_eq!(row.get::<String>(1).unwrap(), "epic-1");
-        assert_eq!(row.get::<String>(2).unwrap(), "setup");
-        assert_eq!(row.get::<Option<String>>(3).unwrap(), None, "session_id NULL");
-        assert_eq!(row.get::<String>(4).unwrap(), "boom");
-        assert_eq!(row.get::<i64>(5).unwrap(), 1);
-        assert_eq!(row.get::<String>(6).unwrap(), "error");
-        assert_eq!(row.get::<Option<String>>(7).unwrap(), None, "verdict NULL");
-        assert_eq!(row.get::<i64>(8).unwrap(), 1000);
-        assert_eq!(row.get::<i64>(9).unwrap(), 1500);
-        assert_eq!(row.get::<Option<i64>>(10).unwrap(), Some(1));
-    }
+    // The `setup` stage's row shape (task_id NULL, session_id NULL, attempt
+    // 1, redacted+capped log) is now exercised where it's written —
+    // `crate::cmd`'s `run_stage_command` tests, plus `crate::workspace`'s
+    // `setup_cmd`-through-provisioning tests — rather than here against a
+    // hand-called `record_setup_run`, which T-520 removed (see the module
+    // doc's "folded into the same lifecycle" section).
 
     // ---- D13: log capping ------------------------------------------------
 
