@@ -72,15 +72,29 @@ implement → [test gate: Dearborn runs tests, fix-loop ≤N] → commit
 
 ## 7. Failure & human-in-the-loop
 - Failure is **epic-scoped, not fatal.** Task → **`Failed`** with a structured
-  reason (`test_gate_exhausted | review_not_converged | blocked | agent_error`);
-  epic → **`Blocked`** (new status); worker continues on other epics. No PR.
+  reason; epic → **`Blocked`** (new status) carrying the same reason; worker
+  continues on other epics. No PR. The reason set (MILESTONE_2 §2.3) is the
+  original four — `test_gate_exhausted | review_not_converged | blocked |
+  agent_error` — plus the conditions ralph-v2 handled by `die`ing, which
+  Dearborn must name rather than abort on: `preflight_red | setup_failed |
+  workspace_error | timeout | cancelled | pr_failed`.
+- A failed task **halts its epic immediately** rather than continuing on
+  independent DAG branches: a half-built epic with a hole in it yields a
+  PR-shaped branch nobody can review, and later slices would be reviewed against
+  a dependency they were told exists.
 - **On `Blocked`, push the epic branch to the remote** so the user clones &
   triages locally (no VPS spelunking). Optional per-task push as an off-box
   durability flag.
 - Preserve evidence: **per-stage logs + the agent session id per task** (also
   satisfies VISION §2 "tasks track the agent session that implemented them").
-- **v1 recovery actions: Retry task + Cancel epic.** Edit-spec-then-retry is a
-  fast follow.
+- **v1 recovery actions: Retry task + Cancel epic.** Retry is one atomic
+  transition (`POST /tasks/{id}/retry`: task `Failed → Todo` + epic `Blocked →
+  InProgress` + lease clear + notify). Edit-spec-then-retry needs no new
+  surface — `PATCH /tasks/{id}` already edits the spec, so the client issues
+  the two calls back-to-back.
+- **Cancel is a kill, not a stage-boundary flag:** an in-process registry holds
+  the live `RunHandle`, so `InProgress → Cancelled` terminates the agent in
+  seconds instead of after a 30-minute stage.
 
 ## 8. Epic → task DAG breakdown
 - **One-shot breakdown agent** (the `to-tasks` vertical-slice / tracer-bullet

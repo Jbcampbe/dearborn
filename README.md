@@ -2,8 +2,9 @@
 
 Self-hosted Rust server that turns an approved epic into a PR autonomously. See
 [VISION.md](./VISION.md) for product intent, [ARCHITECTURE.md](./ARCHITECTURE.md)
-for resolved v1 decisions, and [MILESTONE_1.md](./MILESTONE_1.md) for the current
-task plan.
+for resolved v1 decisions, [MILESTONE_1.md](./MILESTONE_1.md) for the completed
+planning/task-creation half, and [MILESTONE_2.md](./MILESTONE_2.md) for the
+current task plan (the executor).
 
 The HTTP/REST API contract (routes, JSON success/error envelopes, status codes)
 is documented in [`dearborn-server/CONVENTIONS.md`](./dearborn-server/CONVENTIONS.md).
