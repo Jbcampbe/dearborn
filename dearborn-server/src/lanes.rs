@@ -2,14 +2,27 @@
 //!
 //! Epics move between lanes (`Planning | Ready | InProgress | Completed |
 //! Cancelled | Blocked`) via `POST /epics/:id/lane`. Not every transition is
-//! permitted: breakdown owns `Planning → Ready`, and the stub worker (T-403)
-//! will own `InProgress → Completed`. This module encodes the permitted
-//! transition table and rejects everything else as `409 conflict`, so the
-//! kanban's lane-move control can never put an epic in an illegal state.
+//! permitted: breakdown owns `Planning → Ready`, and the executor worker pool
+//! ([`crate::worker`], T-510) owns `InProgress → Completed`. This module
+//! encodes the permitted transition table and rejects everything else as
+//! `409 conflict`, so the kanban's lane-move control can never put an epic in
+//! an illegal state.
 //!
 //! On a successful transition the updated epic is published as `epic_updated`
 //! on `epic:<id>` (so a subscribed planning/DAG view re-renders) and the board
 //! is published as `board_updated` on `project:<id>` (so the kanban re-renders).
+//!
+//! ## Enqueue, don't spawn (D2, T-510)
+//!
+//! Before T-510 this handler spawned the stub worker directly on `Ready →
+//! InProgress`, one `tokio::spawn` per enqueue. That model doesn't survive a
+//! restart and doesn't bound concurrency. Since T-510 this handler only
+//! **enqueues**: it sets `status='InProgress'`, explicitly clears the lease
+//! columns (idle by construction on a fresh enqueue, but explicit is the
+//! contract — see the inline comment below), and calls
+//! `state.notify.notify_waiters()` to wake an idle worker loop immediately.
+//! The long-lived worker pool ([`worker::spawn_pool`], started once in `main`)
+//! is what claims and drives the epic; this handler never touches it again.
 
 use axum::extract::{Path, State};
 use axum::Json;
@@ -18,7 +31,6 @@ use serde::Deserialize;
 
 use crate::board;
 use crate::epics::{fetch_epic, Epic};
-use crate::worker;
 use crate::{AppError, AppResult, AppState};
 
 /// The epic lane set (§2.2 stored values — no spaces: `InProgress`/`Completed`).
@@ -51,8 +63,9 @@ fn validate_lane(lane: &str) -> AppResult<()> {
 /// - `Completed → (none)` — terminal
 /// - `Cancelled → (none)` — terminal
 ///
-/// `Planning → Ready` is owned by breakdown; `InProgress → Completed` will be
-/// owned by the stub worker (T-403). Both are rejected here.
+/// `Planning → Ready` is owned by breakdown; `InProgress → Completed` is
+/// owned by the executor worker pool ([`crate::worker`], T-510). Both are
+/// rejected here.
 fn transition_permitted(current: &str, target: &str) -> bool {
     match current {
         "Planning" => target == "Cancelled",
@@ -121,21 +134,21 @@ pub async fn set_epic_lane(
     // ... and the board on project:<id>.
     board::publish_board(&state, &updated.project_id).await;
 
-    // T-403: the Ready → InProgress enqueue. Explicitly write the queue/lease
-    // shape from §2.3 (lease columns are NULL from creation, but this makes the
-    // enqueue explicit — "Half 1's enqueue sets epic.status='InProgress' and
-    // leaves lease_owner NULL"), then fire-and-forget the stub worker. The
-    // worker claims ready tasks one at a time (no sibling InProgress, per §2.3)
-    // and drives the epic to Completed; its progress streams over WS via
-    // dag_updated / epic_updated / board_updated. The HTTP response is still
-    // the updated epic — the worker runs in the background.
+    // T-510: the Ready → InProgress enqueue. Explicitly write the queue/lease
+    // shape from §2.3 (lease columns are NULL from creation, but this makes
+    // the enqueue explicit — "the enqueue sets epic.status='InProgress' and
+    // leaves lease_owner NULL"), then wake an idle worker. This handler never
+    // spawns anything itself (D2) — a long-lived worker loop in the pool
+    // claims the epic (§2.4) and drives it to Completed; progress streams
+    // over WS via dag_updated / epic_updated / board_updated. The HTTP
+    // response is still the updated epic — the claim/run happens in the pool.
     if epic.status == "Ready" && target == "InProgress" {
         conn.execute(
             "UPDATE epic SET lease_owner = NULL, lease_expires_at = NULL WHERE id = ?1",
             params![id.clone()],
         )
         .await?;
-        worker::spawn_stub_worker(state.clone(), id.clone());
+        state.notify.notify_waiters();
     }
 
     Ok(Json(updated))
@@ -230,6 +243,24 @@ mod tests {
         id
     }
 
+    /// Seed a single `Todo` task under `epic_id` (mirrors `worker.rs`'s test
+    /// helper of the same shape, kept local so this module's tests stay
+    /// self-contained).
+    async fn seed_task(state: &AppState, epic_id: &str, project_id: &str) -> String {
+        let conn = state.db.conn();
+        let id = ulid::Ulid::new().to_string();
+        let now = now_ms();
+        conn.execute(
+            "INSERT INTO task \
+             (id, epic_id, project_id, title, status, position, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, 'A', 'Todo', 1, ?4, ?4)",
+            params![id.clone(), epic_id, project_id, now],
+        )
+        .await
+        .unwrap();
+        id
+    }
+
     #[tokio::test]
     async fn planning_to_cancelled_is_permitted_and_publishes() {
         let (state, app) = test_app().await;
@@ -282,6 +313,71 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(body_json(response).await["status"], "InProgress");
+    }
+
+    /// T-510: `Ready → InProgress` clears the lease, wakes a waiter on
+    /// `state.notify` (proving `notify_waiters()` is actually called — a
+    /// waiter registered *before* the request resolves promptly instead of
+    /// timing out), and — with no worker pool running in this test — spawns
+    /// nothing itself: a seeded task never leaves `Todo`.
+    #[tokio::test]
+    async fn ready_to_in_progress_clears_lease_notifies_and_spawns_nothing() {
+        let (state, app) = test_app().await;
+        let project_id = seed_project(&state).await;
+        let epic_id = seed_epic(&state, &project_id, "Ready").await;
+        let task_id = seed_task(&state, &epic_id, &project_id).await;
+
+        // Register the waiter BEFORE the request so we can prove the handler
+        // itself calls `notify_waiters()` (a notify with no registered waiter
+        // is not queued — this is the standard tokio::sync::Notify pattern).
+        let notified = state.notify.notified();
+
+        let response = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                &format!("/epics/{epic_id}/lane"),
+                Some(json!({ "status": "InProgress" })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        tokio::time::timeout(std::time::Duration::from_millis(500), notified)
+            .await
+            .expect("lane transition must call state.notify.notify_waiters()");
+
+        // Lease columns explicitly cleared (contract shape).
+        let conn = state.db.conn();
+        let mut rows = conn
+            .query(
+                "SELECT lease_owner, lease_expires_at FROM epic WHERE id = ?1",
+                libsql::params![epic_id.clone()],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let lease_owner: Option<String> = row.get(0).unwrap();
+        let lease_expires_at: Option<i64> = row.get(1).unwrap();
+        assert!(lease_owner.is_none());
+        assert!(lease_expires_at.is_none());
+
+        // No worker pool is running in this test, so nothing can move the
+        // task off Todo — proving the handler itself spawns nothing. A few
+        // `yield_now`s give any (incorrectly) spawned task a chance to run
+        // without relying on wall-clock timing.
+        for _ in 0..10 {
+            tokio::task::yield_now().await;
+        }
+        let mut rows = conn
+            .query(
+                "SELECT status FROM task WHERE id = ?1",
+                libsql::params![task_id],
+            )
+            .await
+            .unwrap();
+        let status: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(status, "Todo", "lane handler must not spawn a worker itself");
     }
 
     #[tokio::test]

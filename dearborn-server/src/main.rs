@@ -1,6 +1,6 @@
 //! Dearborn server binary entrypoint.
 
-use dearborn_server::{app, init_tracing, AppState, Config, Db, MasterKey};
+use dearborn_server::{app, init_tracing, worker, AppState, Config, Db, MasterKey};
 
 #[tokio::main]
 async fn main() {
@@ -42,6 +42,14 @@ async fn main() {
         }
     }
 
+    // Boot-time lease clear (D4, §13): single-server assumption means nothing
+    // else could legitimately hold a lease across a restart, so clear every
+    // lease now rather than making the pool wait out the TTL before resuming
+    // in-flight work. Must run before `spawn_pool` claims anything.
+    if let Err(err) = worker::clear_all_leases(&db).await {
+        tracing::warn!(error = %err, "boot: failed to clear stale leases");
+    }
+
     let addr = config.bind.clone();
     let state = AppState::new(config, db);
 
@@ -55,6 +63,11 @@ async fn main() {
     if let Ok(local) = listener.local_addr() {
         state.set_advertised_base(format!("http://127.0.0.1:{}", local.port()));
     }
+
+    // Start the worker pool (D2, T-510): N long-lived loops that claim and
+    // drive leased epics for the life of the process. Handles are dropped —
+    // the pool runs until the process exits.
+    let _worker_handles = worker::spawn_pool(state.clone());
 
     tracing::info!(%addr, "dearborn-server listening on http://{addr}");
 

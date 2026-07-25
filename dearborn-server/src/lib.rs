@@ -88,6 +88,21 @@ pub struct AppState {
     /// binds (`main`, or the live test); `None` in unit tests that never spawn a
     /// real agent, which disables MCP wiring for the run.
     pub advertised_base: Arc<Mutex<Option<String>>>,
+    /// The worker pool's wake signal (D2, T-510). Anything that enqueues work —
+    /// today, the `Ready → InProgress` lane transition — calls
+    /// `notify.notify_waiters()` after committing the enqueue so idle worker
+    /// loops wake immediately instead of waiting out their poll interval. See
+    /// [`worker::spawn_pool`] for the notify-or-poll idle loop this drives.
+    pub notify: Arc<tokio::sync::Notify>,
+    /// Test-only seam (T-510) letting a test observe/gate the claimed-epic
+    /// pipeline body without sleeps: if set, [`worker::run_stub_worker`] awaits
+    /// it once, immediately after claiming an epic and before doing any work.
+    /// A concurrency test uses this to hold N claims in flight simultaneously
+    /// and assert the pool never exceeds `worker_concurrency`. `None` (the
+    /// default) is a no-op — production code never sets it. Superseded
+    /// whenever T-513 replaces the stub pipeline with the real one.
+    #[cfg(test)]
+    pub test_pipeline_hook: Option<worker::PipelineHook>,
 }
 
 impl AppState {
@@ -142,6 +157,9 @@ impl AppState {
             inflight: Arc::new(Mutex::new(HashSet::new())),
             caps: Arc::new(CapabilityStore::new()),
             advertised_base: Arc::new(Mutex::new(None)),
+            notify: Arc::new(tokio::sync::Notify::new()),
+            #[cfg(test)]
+            test_pipeline_hook: None,
         }
     }
 
@@ -176,6 +194,17 @@ impl AppState {
             set: self.inflight.clone(),
             epic_id: epic_id.to_string(),
         })
+    }
+}
+
+#[cfg(test)]
+impl AppState {
+    /// Attach the T-510 test-only pipeline hook (see
+    /// [`AppState::test_pipeline_hook`]) for a concurrency test to gate the
+    /// claimed-epic body deterministically.
+    pub fn with_pipeline_hook(mut self, hook: worker::PipelineHook) -> AppState {
+        self.test_pipeline_hook = Some(hook);
+        self
     }
 }
 

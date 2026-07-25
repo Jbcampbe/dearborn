@@ -233,7 +233,7 @@ PR. **Deliberately missing:** test gate, review loop, fix loops, structured
 failure handling, standalone tasks. Anything that fails here Blocks the epic
 with `agent_error` and gets thickened in later phases.
 
-- [ ] **T-510 — Worker pool, lease, heartbeat.** *deps: T-500, T-501*
+- [x] **T-510 — Worker pool, lease, heartbeat.** *deps: T-500, T-501*
   Replace `spawn_stub_worker` with N loops started in `main`: notify-or-poll →
   claim (§2.4) → run → release. Heartbeat task per claimed item with fencing;
   `tokio::sync::Notify` on `AppState`; boot-time lease clear. The pipeline body
