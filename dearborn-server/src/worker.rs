@@ -254,6 +254,105 @@
 //! in-flight agent process" mechanism is T-542's job, out of scope here; this
 //! walk only guarantees that once a cancel/lease-loss is *observed*, nothing
 //! further gets written.
+//!
+//! ## The test gate & fix loop (T-522, §2.2/§5)
+//!
+//! [`run_test_gate_loop`] slots into "The real implement walk" above between
+//! its step 4 (`Stage::Implement` returns `ok`) and step 5 (`git add -A` +
+//! commit-if-dirty): a task's changes land in the working tree, and *then*
+//! Dearborn asks "does the project's own `test_cmd` pass against that tree?"
+//! before ever staging or committing anything. This is
+//! `references/ralph-v2.sh`'s `test_attempt` loop (its `# ---- test gate
+//! ----` section, lines ~243–259) reimplemented against Dearborn's
+//! stage/evidence machinery rather than bash + log files.
+//!
+//! ### Commit only at known-green
+//!
+//! A red `test_cmd` never reaches the commit step — [`process_one_task`]
+//! only runs `git add -A`/`git commit` after [`run_test_gate_loop`] returns
+//! [`GateOutcome::Proceed`]. This is deliberate, not incidental: an
+//! automated pipeline with no human watching each commit land has no cheap
+//! way to *un*-commit a red tree once T-530's review loop and T-531's
+//! re-review start diffing against `base_sha` — every later stage's "diff
+//! since this task started" reasoning only holds if every commit that
+//! exists is one the tests actually passed against. Never committing a red
+//! tree in the first place is far cheaper than teaching every later stage to
+//! tolerate one that might be red, and it matches ralph's own shape
+//! (`git add -A`/`git commit` sit *after* the whole `test_attempt` loop in
+//! the reference script, not inside it).
+//!
+//! ### Attempt numbering starts at 0, and why a fix and the gate that follows
+//! ### it share a number
+//!
+//! The **first** gate run — before any fix has ever been attempted — is
+//! `attempt = 0`. It isn't a retry of anything, so numbering it "1" would
+//! misname the one gate run in the whole loop that has no fix behind it.
+//! Every subsequent round bumps the counter *before* running `Stage::Fix`
+//! (so `Stage::Fix`'s own row opens at the new, post-increment value), and
+//! the gate re-run that immediately follows that fix reuses the *same*
+//! value — because it's testing the output of that specific fix round, not
+//! starting a new one. A red→red→green run's rows read, in order:
+//! `test_gate@0(error) → fix@1(ok) → test_gate@1(error) → fix@2(ok) →
+//! test_gate@2(ok)`. This is exactly ralph's own `test_attempt` counter
+//! (`references/ralph-v2.sh` initializes `test_attempt=0`, increments it
+//! *before* invoking the fix agent, and the following loop iteration's log
+//! file name — `test-${test_attempt}.log` — already reflects the bumped
+//! value) — Dearborn's `attempt` column is that same counter, just persisted
+//! per row instead of encoded in a filename.
+//!
+//! ### Exhaustion: the task fails, the epic blocks, nothing is committed
+//!
+//! Once `attempt` reaches `DEARBORN_MAX_TEST_FIX_ATTEMPTS` and the gate is
+//! still red, [`run_test_gate_loop`] gives up: [`fail_task_and_block_epic`]
+//! sets `task.status = 'Failed'`/`task.failure_reason = 'test_gate_exhausted'`
+//! *and* routes the epic to `Blocked` with the identical reason string (D10:
+//! a failed task halts its epic immediately). Nothing above this point ever
+//! called `git add`, so the dirty tree the last fix round produced simply
+//! stays in the workspace exactly as it was — retained on disk (this path
+//! never deletes anything, same as every other failure path in this module)
+//! but never staged, never committed, never pushed. A human inspecting the
+//! retained workspace sees precisely what the last fix attempt left behind,
+//! which is the whole point of not committing it: there's nothing to `git
+//! revert`, no history to clean up, just an ordinary dirty working tree.
+//!
+//! ### Why `fail_task_and_block_epic` exists alongside `block_epic_on_agent_error`
+//!
+//! Every T-513 failure path (`block_epic_on_agent_error`) blocks the epic but
+//! leaves the failing task's own `status` wherever the walk left it
+//! (`InProgress`) — MILESTONE_2 §4 calls that acceptable for the Phase 1
+//! tracer bullet and names T-540 as the task that centralizes a real
+//! `Failed`/`Blocked` router. T-522's AC is more specific than that
+//! tracer-bullet allowance, though: it names `Failed(test_gate_exhausted)` as
+//! a **task**-level outcome (not just something the epic's `blocked_reason`
+//! implies), because T-541's retry contract (`POST /tasks/{id}/retry`, `409`
+//! unless the task is `Failed`) needs `task.status = 'Failed'` to find this
+//! task at all once it's fixed by hand. [`fail_task_and_block_epic`] is
+//! written narrowly for the two failure shapes T-522 itself introduces
+//! (gate exhaustion, and a fix stage that errors — see the AC's point 6);
+//! it is deliberately not offered as a drop-in replacement for
+//! `block_epic_on_agent_error`'s other call sites, so as not to quietly
+//! pre-build T-540's centralization ahead of that task actually landing.
+//!
+//! ### Why the fix agent sees only the failing output (D19)
+//!
+//! [`task_agent::assemble_fix_prompt`] builds the `Fix` stage's prompt from
+//! `prompts/fix.md` plus *only* this round's test output — never
+//! [`task_agent::assemble_prompt`] + [`crate::spec::TaskContext`], which is
+//! what `Stage::Implement` gets (the rendered spec, the epic's background,
+//! the sibling manifest). See that function's doc for the full rationale
+//! and an open concern about it worth a human's attention.
+//!
+//! ### Lease/cancellation checks inside a long fix loop
+//!
+//! A test-driven fix loop can run several full agent turns back to back —
+//! easily the longest single-task stretch in the whole walk. [`run_test_gate_loop`]
+//! re-checks the lease and the epic's `InProgress` status at the top of
+//! every iteration (before spending time on a `test_cmd` run) *and* again
+//! immediately before every `Stage::Fix` invocation (before spending time on
+//! a whole agent turn) — the same belt-and-suspenders discipline the section
+//! above describes for the rest of the walk, just applied at finer grain
+//! because this loop's body is where a lost lease or a cancelled epic is
+//! most likely to be sitting unnoticed the longest.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -937,14 +1036,12 @@ async fn process_one_task(
     }
 
     // Re-check the epic's status *and* the lease immediately before the
-    // commit/Done writes below — a slow implement run racing an external
-    // cancel (a lane move away from InProgress) or a lease theft must not
-    // finalize this task after either happened. This is the "cancelling
-    // mid-walk stops cleanly" AC; the full kill-the-in-flight-agent path is
-    // T-542's job.
-    let still_in_progress =
-        matches!(fetch_epic(conn, epic_id).await, Ok(Some(e)) if e.status == "InProgress");
-    if lease.is_lost() || !still_in_progress {
+    // test-gate/commit/Done writes below — a slow implement run racing an
+    // external cancel (a lane move away from InProgress) or a lease theft
+    // must not finalize this task after either happened. This is the
+    // "cancelling mid-walk stops cleanly" AC; the full kill-the-in-flight-agent
+    // path is T-542's job.
+    if lease.is_lost() || !epic_still_in_progress(conn, epic_id).await {
         tracing::warn!(
             epic = %epic_id,
             task = %task_id,
@@ -953,7 +1050,21 @@ async fn process_one_task(
         return TaskStepOutcome::Stop;
     }
 
-    // 4. git add -A, then commit iff there is something to commit. An agent
+    // 4. T-522: the test gate + test-driven fix loop. See the module doc's
+    //    "The test gate & fix loop" section for the full rationale — in
+    //    short, a red test_cmd never reaches the commit step below, and the
+    //    fix agent this loop drives sees only the failing output, nothing
+    //    else (D19).
+    let pat = crate::projects::load_decrypted_pat(state, &epic.project_id)
+        .await
+        .ok()
+        .flatten();
+    match run_test_gate_loop(state, epic_id, &task_id, workspace, pat.as_deref(), lease).await {
+        GateOutcome::Proceed => {}
+        GateOutcome::Stop => return TaskStepOutcome::Stop,
+    }
+
+    // 5. git add -A, then commit iff there is something to commit. An agent
     //    that made no changes is committed as *nothing* — see the module doc
     //    for why (T-532 owns verifying that "no diff" really means done).
     if let Err(err) = git::add_all(&workspace.workspace_path).await {
@@ -1036,7 +1147,7 @@ async fn process_one_task(
         }
     }
 
-    // 5. Done.
+    // 6. Done.
     if lease.is_lost() {
         return TaskStepOutcome::Stop;
     }
@@ -1050,6 +1161,241 @@ async fn process_one_task(
     mcp::publish_dag(state, epic_id).await;
 
     TaskStepOutcome::Continue
+}
+
+/// Whether `epic_id` is still (or again) `InProgress` — the "between tasks" /
+/// "before a slow step's finalizing writes" re-check every stop-worthy pause
+/// in this walk performs. Factored out once [`process_one_task`]'s
+/// pre-existing T-513 check and [`run_test_gate_loop`]'s T-522 checks both
+/// needed the identical query.
+async fn epic_still_in_progress(conn: &Connection, epic_id: &str) -> bool {
+    matches!(fetch_epic(conn, epic_id).await, Ok(Some(e)) if e.status == "InProgress")
+}
+
+/// What [`run_test_gate_loop`] tells [`process_one_task`] to do next. See the
+/// module doc's "The test gate & fix loop" section for the full rationale.
+enum GateOutcome {
+    /// The gate is green, or there is no `test_cmd` configured at all
+    /// ([`StageOutcome::Skipped`] — T-520's contract) — proceed to the
+    /// ordinary commit step exactly as if this loop didn't exist.
+    Proceed,
+    /// The loop already routed the task to `Failed` and the epic to
+    /// `Blocked` (attempts exhausted, the fix agent itself failed, or a
+    /// lease/cancellation was observed mid-loop) — the caller's only job is
+    /// to stop, with no further writes, exactly like every other failure
+    /// exit in this module.
+    Stop,
+}
+
+/// T-522: run `test_cmd` as the `test_gate` stage; on red, run `Stage::Fix`
+/// with the failing output as its **sole** feedback (D19) and retry, up to
+/// `DEARBORN_MAX_TEST_FIX_ATTEMPTS`. See the module doc's "The test gate &
+/// fix loop" section for the full rationale (commit-only-at-green, the
+/// attempt-numbering scheme, why exhaustion fails the *task* and not just the
+/// epic, and the D19 concern) — this function is the literal translation of
+/// `references/ralph-v2.sh`'s `test_attempt` loop (its `# ---- test gate
+/// ----` section) into Dearborn's stage/evidence machinery.
+async fn run_test_gate_loop(
+    state: &AppState,
+    epic_id: &str,
+    task_id: &str,
+    workspace: &ProvisionedWorkspace,
+    pat: Option<&str>,
+    lease: &LeaseHandle,
+) -> GateOutcome {
+    let conn = state.db.conn();
+    let cmd_timeout = Duration::from_secs(state.config.executor.cmd_timeout_secs);
+    let max_attempts = state.config.executor.max_test_fix_attempts as i64;
+
+    // Attempt 0 is the first gate run — not a retry of anything (see the
+    // module doc for why it doesn't start at 1).
+    let mut attempt: i64 = 0;
+    loop {
+        // Belt-and-suspenders re-check, same discipline as every other pause
+        // in this walk — a fix round runs a whole agent turn, long enough
+        // for a lease to expire or the epic to be cancelled out from under
+        // it.
+        if lease.is_lost() || !epic_still_in_progress(conn, epic_id).await {
+            tracing::warn!(
+                epic = %epic_id,
+                task = %task_id,
+                "pipeline: epic cancelled or lease lost mid-test-gate; stopping without finalizing"
+            );
+            return GateOutcome::Stop;
+        }
+
+        // Boxed for the same reason `run_preflight`'s call is (see that
+        // function's doc): this transitively embeds `run_shell_timed`'s own
+        // sizeable stack state, and this call site is itself nested inside
+        // the already-large `process_one_task`/`run_epic_pipeline_inner`
+        // frames.
+        let gate_result = Box::pin(cmd::run_stage_command(
+            conn,
+            StageCommand {
+                task_id: Some(task_id),
+                epic_id: Some(epic_id),
+                stage: Stage::TestGate.as_str(),
+                attempt,
+                cwd: &workspace.workspace_path,
+                timeout: cmd_timeout,
+            },
+            workspace.test_cmd.as_deref(),
+            |raw: &str| git::redact(raw, pat),
+        ))
+        .await;
+
+        let ran = match gate_result {
+            // No test_cmd configured: T-520's "skip means no row" contract
+            // applies unchanged — no gate, no fix loop, proceed to commit
+            // exactly as T-513 already did before this task existed.
+            Ok(StageOutcome::Skipped) => return GateOutcome::Proceed,
+            // Green: the *only* path out of this loop that leads to a
+            // commit — see the module doc for why that's load-bearing.
+            Ok(StageOutcome::Ran(ran)) if ran.status == "ok" => return GateOutcome::Proceed,
+            Ok(StageOutcome::Ran(ran)) => ran,
+            Err(err) => {
+                if !lease.is_lost() {
+                    fail_task_and_block_epic(
+                        state,
+                        epic_id,
+                        task_id,
+                        "agent_error",
+                        &format!("failed to record test_gate evidence: {err}"),
+                    )
+                    .await;
+                }
+                return GateOutcome::Stop;
+            }
+        };
+
+        // Red. Out of attempts?
+        if attempt >= max_attempts {
+            tracing::warn!(
+                epic = %epic_id,
+                task = %task_id,
+                attempt,
+                "test gate still red after the configured fix attempts; task -> Failed(test_gate_exhausted)"
+            );
+            if !lease.is_lost() {
+                fail_task_and_block_epic(
+                    state,
+                    epic_id,
+                    task_id,
+                    "test_gate_exhausted",
+                    &format!("tests still failing after {max_attempts} fix attempt(s)"),
+                )
+                .await;
+            }
+            return GateOutcome::Stop;
+        }
+
+        attempt += 1;
+
+        if lease.is_lost() || !epic_still_in_progress(conn, epic_id).await {
+            tracing::warn!(
+                epic = %epic_id,
+                task = %task_id,
+                "pipeline: epic cancelled or lease lost before the fix round; stopping without finalizing"
+            );
+            return GateOutcome::Stop;
+        }
+
+        // D19: the fix agent's entire context is prompts/fix.md plus this
+        // one round's failing output — see `task_agent::assemble_fix_prompt`
+        // for the full rationale and an open concern about it.
+        let fix_prompt = task_agent::assemble_fix_prompt(&ran.output);
+        let run_id = ulid::Ulid::new().to_string();
+        let fix_outcome = task_agent::run_agent_stage(
+            state,
+            &*state.task_agent,
+            AgentStageParams {
+                task_id,
+                epic_id: Some(epic_id),
+                attempt,
+            },
+            TaskRunRequest {
+                run_id,
+                stage: Stage::Fix,
+                prompt: fix_prompt,
+                cwd: workspace.workspace_path.clone(),
+            },
+        )
+        .await;
+
+        match fix_outcome {
+            Ok(outcome) if outcome.is_ok() => {
+                // Loop back to the top: re-run the gate at this same
+                // `attempt` — that retest is what decides whether this fix
+                // round actually worked.
+            }
+            Ok(_) => {
+                if !lease.is_lost() {
+                    fail_task_and_block_epic(
+                        state,
+                        epic_id,
+                        task_id,
+                        "agent_error",
+                        "fix stage did not complete successfully",
+                    )
+                    .await;
+                }
+                return GateOutcome::Stop;
+            }
+            Err(err) => {
+                if !lease.is_lost() {
+                    fail_task_and_block_epic(
+                        state,
+                        epic_id,
+                        task_id,
+                        "agent_error",
+                        &format!("fix stage failed to start: {err}"),
+                    )
+                    .await;
+                }
+                return GateOutcome::Stop;
+            }
+        }
+    }
+}
+
+/// Route a T-522 failure (test-gate exhaustion, or a fix stage that errored
+/// or never started) to a terminal state: the **task** moves to
+/// `Failed(reason)` and the epic moves to `Blocked` via [`set_epic_blocked`]
+/// with the **same** reason string (T-522's AC). Unlike every T-513 failure
+/// path (`block_epic_on_agent_error`), which blocks the epic but leaves the
+/// task's own status wherever the walk left it (T-540's job to fix
+/// retroactively), T-522's AC names `Failed(test_gate_exhausted)` as a
+/// task-level outcome — T-541's retry contract (`409` unless the task is
+/// `Failed`) needs `task.status = 'Failed'` to find this task once a human
+/// has fixed it by hand. This function is written narrowly for the two
+/// failure shapes T-522 itself introduces; it is deliberately not offered as
+/// a drop-in replacement for `block_epic_on_agent_error`'s other call sites,
+/// so as not to quietly pre-build T-540's centralized failure router ahead
+/// of that task actually landing.
+async fn fail_task_and_block_epic(
+    state: &AppState,
+    epic_id: &str,
+    task_id: &str,
+    reason: &str,
+    message: &str,
+) {
+    tracing::warn!(
+        epic = %epic_id,
+        task = %task_id,
+        reason,
+        error = %message,
+        "task failed; task -> Failed, epic -> Blocked"
+    );
+    let conn = state.db.conn();
+    let now = now_ms();
+    let _ = conn
+        .execute(
+            "UPDATE task SET status = 'Failed', failure_reason = ?1, updated_at = ?2 WHERE id = ?3",
+            params![reason, now, task_id],
+        )
+        .await;
+    mcp::publish_dag(state, epic_id).await;
+    set_epic_blocked(state, epic_id, reason).await;
 }
 
 /// The shared "flip the epic to Blocked" write + publish, factored out so
@@ -3651,6 +3997,411 @@ mod tests {
             vec!["init".to_string(), format!("impl({}): A", spec::short_id(&a))],
             "only A's commit may have landed before the cancel stopped the walk"
         );
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    // ---- T-522: the test gate + test-driven fix loop --------------------------
+
+    /// A project whose `test_cmd` is flippable by the scripted `Fix` stage —
+    /// the canonical trick this task's own AC prescribes: a sentinel file
+    /// (`.fixed`) a scripted `Fix` run creates like any other scripted file
+    /// write. Deterministic red-then-green, no sleeps, no real test
+    /// framework.
+    ///
+    /// This is **not** simply `test -f .fixed` — this same `test_cmd` also
+    /// runs as T-521's *preflight* gate, on the untouched tree, before any
+    /// task's implement stage has run at all. A bare `test -f .fixed` would
+    /// be red on that untouched tree too (`.fixed` doesn't exist yet
+    /// anywhere), blocking the epic with `preflight_red` before the DAG walk
+    /// ever starts — exactly the failure these tests hit before this
+    /// three-way branch was added. So the command distinguishes three
+    /// states: **pristine** (neither file exists — green, preflight passes),
+    /// **implemented but not yet fixed** (`work.txt` exists, `.fixed`
+    /// doesn't — red, this is the state T-522's gate is supposed to catch),
+    /// and **fixed** (`.fixed` exists — green). Every test using this
+    /// constant scripts `Stage::Implement` to write `work.txt`, which is
+    /// what actually flips the tree from "pristine" into "implemented but
+    /// not yet fixed".
+    const FLIPPABLE_TEST_CMD: &str =
+        "if test -f .fixed; then exit 0; elif test -f work.txt; then exit 1; else exit 0; fi";
+
+    /// Like [`FLIPPABLE_TEST_CMD`] but the red branch also echoes a
+    /// distinctive marker — used by the D19 test to prove the exact test
+    /// output reached the fix agent's prompt.
+    const FLIPPABLE_TEST_CMD_WITH_MARKER: &str =
+        "if test -f .fixed; then exit 0; \
+         elif test -f work.txt; then echo THE_TESTS_ARE_BROKEN_MARKER; exit 1; \
+         else exit 0; fi";
+
+    /// A `ScriptedRun` that writes `.fixed` into the workspace — the `Fix`
+    /// stage's half of the flippable-`test_cmd` trick.
+    fn writes_fixed_marker() -> ScriptedRun {
+        writes_file(".fixed", "fixed\n")
+    }
+
+    /// All `(stage, attempt, status)` rows for `task_id`, oldest first,
+    /// restricted to the two T-522 stages — the exact shape T-522's AC asks
+    /// tests to assert against ("the exact sequence of (stage, attempt,
+    /// status) rows").
+    async fn gate_and_fix_rows(state: &AppState, task_id: &str) -> Vec<(String, i64, String)> {
+        evidence::list_runs_for_task(state.db.conn(), task_id)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.stage == "test_gate" || r.stage == "fix")
+            .map(|r| (r.stage, r.attempt, r.status))
+            .collect()
+    }
+
+    /// `test_gate`/`fix` rows tend to be pinned to specific `(stage,
+    /// attempt)` pairs by attempt count elsewhere, but exhaustion needs the
+    /// raw `base_sha` off the task row (deliberately not part of the public
+    /// `tasks::Task`/JSON surface — T-500's AC keeps it internal — so read
+    /// it directly).
+    async fn task_base_sha(state: &AppState, task_id: &str) -> Option<String> {
+        let mut rows = state
+            .db
+            .conn()
+            .query("SELECT base_sha FROM task WHERE id = ?1", params![task_id])
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    }
+
+    /// `git show <ref>:<path>` in `dir`, trimmed — reads a file's content out
+    /// of a specific commit rather than the working tree, so a test can
+    /// confirm exactly what landed in the one commit a red-then-green run
+    /// produces.
+    async fn git_show_file(dir: &std::path::Path, git_ref: &str, path: &str) -> String {
+        let output = tokio::process::Command::new("git")
+            .args(["show", &format!("{git_ref}:{path}")])
+            .current_dir(dir)
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success(), "git show {git_ref}:{path} failed: {output:?}");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// Directly set a task's `description`/`acceptance` (the plain
+    /// `seed_task` helper only takes a title) — used by the D19 test to give
+    /// the implement stage's prompt a distinctive marker to check the fix
+    /// prompt never inherits.
+    async fn set_task_spec(state: &AppState, task_id: &str, description: &str, acceptance: &str) {
+        state
+            .db
+            .conn()
+            .execute(
+                "UPDATE task SET description = ?1, acceptance = ?2 WHERE id = ?3",
+                params![description, acceptance, task_id],
+            )
+            .await
+            .unwrap();
+    }
+
+    /// The headline AC: a red gate that a scripted `Fix` round turns green
+    /// commits exactly once, and that one commit contains the fix. A red
+    /// gate never reaches the commit step at all (by construction — see
+    /// `run_test_gate_loop`), so "exactly one commit" here is already strong
+    /// evidence the commit happened *after* green, not on some earlier red
+    /// pass; reading the committed tree back and finding both the
+    /// implement-stage file and the fix-stage file confirms it further.
+    #[tokio::test]
+    async fn red_then_green_test_gate_commits_once_after_green() {
+        let agent = Arc::new(
+            ScriptedTaskAgent::new()
+                .script(Stage::Implement, writes_file("work.txt", "work\n"))
+                .script(Stage::Fix, writes_fixed_marker()),
+        );
+        let (state, _app) = test_app_with_task_agent(agent).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_test_cmd(&state, &fixture, FLIPPABLE_TEST_CMD).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let a = seed_task(&state, &epic_id, &project_id, "A").await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+
+        let branch = epic_branch_name_column(&state, &epic_id).await;
+        let subjects = git_log_subjects_for_ref(&fixture.dir, &branch).await;
+        assert_eq!(
+            subjects,
+            vec!["init".to_string(), format!("impl({}): A", spec::short_id(&a))],
+            "exactly one commit must land, after the gate went green"
+        );
+
+        // The single commit contains both the implement stage's file and
+        // the fix stage's file — the fix really did land in the commit that
+        // finally went green, not get discarded.
+        assert_eq!(git_show_file(&fixture.dir, &branch, "work.txt").await, "work");
+        assert_eq!(git_show_file(&fixture.dir, &branch, ".fixed").await, "fixed");
+
+        let rows = gate_and_fix_rows(&state, &a).await;
+        assert_eq!(
+            rows,
+            vec![
+                ("test_gate".to_string(), 0, "error".to_string()),
+                ("fix".to_string(), 1, "ok".to_string()),
+                ("test_gate".to_string(), 1, "ok".to_string()),
+            ]
+        );
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// Two red rounds before green: the exact `(stage, attempt, status)`
+    /// sequence T-522's AC asks for, proving both that attempts increase
+    /// monotonically and that a `fix@N` always pairs with the `test_gate@N`
+    /// retest that follows it (see the module doc's attempt-numbering
+    /// section).
+    #[tokio::test]
+    async fn each_fix_round_writes_its_own_increasing_attempt_rows() {
+        let agent = Arc::new(
+            ScriptedTaskAgent::new()
+                .script(Stage::Implement, writes_file("work.txt", "work\n"))
+                // First fix round doesn't actually satisfy the gate...
+                .script(Stage::Fix, writes_file(".attempt1", "nope\n"))
+                // ...the second one does.
+                .script(Stage::Fix, writes_fixed_marker()),
+        );
+        let (state, _app) = test_app_with_task_agent(agent).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_test_cmd(&state, &fixture, FLIPPABLE_TEST_CMD).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let a = seed_task(&state, &epic_id, &project_id, "A").await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+
+        let rows = gate_and_fix_rows(&state, &a).await;
+        assert_eq!(
+            rows,
+            vec![
+                ("test_gate".to_string(), 0, "error".to_string()),
+                ("fix".to_string(), 1, "ok".to_string()),
+                ("test_gate".to_string(), 1, "error".to_string()),
+                ("fix".to_string(), 2, "ok".to_string()),
+                ("test_gate".to_string(), 2, "ok".to_string()),
+            ],
+            "red -> red -> green must produce exactly this (stage, attempt, status) sequence"
+        );
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// A gate that never goes green exhausts `DEARBORN_MAX_TEST_FIX_ATTEMPTS`
+    /// (3 in `Config::for_test`): the task fails, the epic blocks with the
+    /// identical reason, the lease is released, the workspace (and its dirty
+    /// tree) is retained, and — the headline negative assertion — nothing is
+    /// ever committed: `HEAD` in the retained workspace is still exactly
+    /// `base_sha`.
+    #[tokio::test]
+    async fn exhausting_attempts_fails_the_task_blocks_the_epic_and_commits_nothing() {
+        let agent = Arc::new(
+            ScriptedTaskAgent::new().script(Stage::Implement, writes_file("broken.txt", "oops\n")),
+        );
+        let (state, _app) = test_app_with_task_agent(agent).await;
+        let fixture = GitFixture::new().await;
+        // Green on the untouched tree (so preflight passes and the walk
+        // actually reaches this task's implement stage), red forever once
+        // `broken.txt` exists — the scripted Fix stage (default: no files
+        // written) never creates anything that would satisfy it.
+        let project_id =
+            seed_project_with_test_cmd(&state, &fixture, "! test -f broken.txt").await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let a = seed_task(&state, &epic_id, &project_id, "A").await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        let task = fetch_task_row(&state, &a).await;
+        assert_eq!(task.0, "Failed", "the task itself must be Failed");
+        assert_eq!(task.1.as_deref(), Some("test_gate_exhausted"));
+
+        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        assert_eq!(epic.status, "Blocked");
+        assert_eq!(
+            epic.blocked_reason.as_deref(),
+            Some("test_gate_exhausted"),
+            "the epic must carry the identical reason string as the task"
+        );
+
+        let (lease_owner, lease_expires_at) = epic_lease(&state, &epic_id).await;
+        assert!(lease_owner.is_none(), "lease must be released on exhaustion");
+        assert!(lease_expires_at.is_none());
+
+        // Attempts: test_gate@0..3 all error (4 rows), fix@1..3 all ok (3
+        // rows) — attempt 3 (== max_test_fix_attempts) is where the loop
+        // gives up rather than trying a 4th fix.
+        let rows = gate_and_fix_rows(&state, &a).await;
+        assert_eq!(
+            rows,
+            vec![
+                ("test_gate".to_string(), 0, "error".to_string()),
+                ("fix".to_string(), 1, "ok".to_string()),
+                ("test_gate".to_string(), 1, "error".to_string()),
+                ("fix".to_string(), 2, "ok".to_string()),
+                ("test_gate".to_string(), 2, "error".to_string()),
+                ("fix".to_string(), 3, "ok".to_string()),
+                ("test_gate".to_string(), 3, "error".to_string()),
+            ]
+        );
+
+        // Workspace retained, dirty tree still there, nothing committed.
+        let workspace_path = workspace::epic_workspace_path(&state.config.clone_root, &epic_id);
+        assert!(
+            workspace_path.join(".git").exists(),
+            "workspace must be retained on test_gate_exhausted"
+        );
+        let base_sha = task_base_sha(&state, &a)
+            .await
+            .expect("base_sha must have been recorded before the implement stage ran");
+        let head = git_rev_parse(&workspace_path, "HEAD").await;
+        assert_eq!(
+            head, base_sha,
+            "HEAD must be unchanged from base_sha — nothing was ever committed"
+        );
+        let status = git::status_porcelain(&workspace_path).await.unwrap();
+        assert!(
+            !status.trim().is_empty(),
+            "the last fix round's dirty tree must still be sitting there, uncommitted"
+        );
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// Read `(status, failure_reason)` directly off the task row (bypassing
+    /// the public `tasks::Task`/JSON surface, same reasoning as
+    /// [`task_base_sha`]).
+    async fn fetch_task_row(state: &AppState, task_id: &str) -> (String, Option<String>) {
+        let mut rows = state
+            .db
+            .conn()
+            .query(
+                "SELECT status, failure_reason FROM task WHERE id = ?1",
+                params![task_id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        (row.get(0).unwrap(), row.get(1).unwrap())
+    }
+
+    /// D19's explicit AC: the fix agent's prompt contains the failing test
+    /// output and **nothing** from the implement stage's own context — no
+    /// spec block, no epic-context heading, no sibling manifest. Proven
+    /// against what the `ScriptedTaskAgent` actually recorded, with the
+    /// implement stage's recorded prompt checked too (containing the same
+    /// markers) so the negative assertion on the fix prompt is meaningful
+    /// rather than vacuously true.
+    #[tokio::test]
+    async fn fix_prompt_contains_only_the_test_output_not_the_implement_stage_context() {
+        let agent = Arc::new(
+            ScriptedTaskAgent::new()
+                .script(Stage::Implement, writes_file("work.txt", "work\n"))
+                .script(Stage::Fix, writes_fixed_marker()),
+        );
+        let recorded = agent.recorded();
+        let (state, _app) = test_app_with_task_agent(agent).await;
+        let fixture = GitFixture::new().await;
+        let project_id =
+            seed_project_with_test_cmd(&state, &fixture, FLIPPABLE_TEST_CMD_WITH_MARKER).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let a = seed_task(&state, &epic_id, &project_id, "D19 Task").await;
+        set_task_spec(
+            &state,
+            &a,
+            "SPEC_MARKER_ONLY_IN_IMPLEMENT_CONTEXT",
+            "ACCEPTANCE_MARKER_ONLY_IN_IMPLEMENT_CONTEXT",
+        )
+        .await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+
+        let runs = recorded.lock().unwrap();
+        let implement_run = runs
+            .iter()
+            .find(|r| r.stage == Stage::Implement)
+            .expect("implement stage must have run");
+        let fix_run = runs
+            .iter()
+            .find(|r| r.stage == Stage::Fix)
+            .expect("fix stage must have run");
+
+        // Sanity: the markers really are in the implement stage's prompt —
+        // otherwise their absence from the fix prompt would prove nothing.
+        assert!(implement_run.prompt.contains("SPEC_MARKER_ONLY_IN_IMPLEMENT_CONTEXT"));
+        assert!(implement_run.prompt.contains("ACCEPTANCE_MARKER_ONLY_IN_IMPLEMENT_CONTEXT"));
+        assert!(implement_run.prompt.contains("## Epic Context"));
+
+        // The headline assertion: the fix prompt has the test output...
+        assert!(
+            fix_run.prompt.contains("THE_TESTS_ARE_BROKEN_MARKER"),
+            "fix prompt must contain the failing test output: {}",
+            fix_run.prompt
+        );
+        // ...and none of the implement stage's own context.
+        assert!(!fix_run.prompt.contains("SPEC_MARKER_ONLY_IN_IMPLEMENT_CONTEXT"));
+        assert!(!fix_run.prompt.contains("ACCEPTANCE_MARKER_ONLY_IN_IMPLEMENT_CONTEXT"));
+        assert!(!fix_run.prompt.contains("## Epic Context"));
+        assert!(!fix_run.prompt.contains("D19 Task"));
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// Absent `test_cmd` ⇒ no gate at all: zero `test_gate`/`fix` rows, and
+    /// the commit still lands (mirrors T-521's identically-named preflight
+    /// proof, but for the per-task gate, and with an implement stage that
+    /// actually writes something so "commit still happens" is a real
+    /// assertion rather than the no-diff-no-commit case).
+    #[tokio::test]
+    async fn absent_test_cmd_skips_the_gate_and_commits_immediately() {
+        let agent = Arc::new(ScriptedTaskAgent::new().script(Stage::Implement, writes_file("a.txt", "a\n")));
+        let (state, _app) = test_app_with_task_agent(agent).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await; // no test_cmd
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let a = seed_task(&state, &epic_id, &project_id, "A").await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+
+        let rows = gate_and_fix_rows(&state, &a).await;
+        assert!(rows.is_empty(), "no test_cmd must mean zero test_gate/fix rows: {rows:?}");
+
+        let branch = epic_branch_name_column(&state, &epic_id).await;
+        let subjects = git_log_subjects_for_ref(&fixture.dir, &branch).await;
+        assert_eq!(
+            subjects,
+            vec!["init".to_string(), format!("impl({}): A", spec::short_id(&a))],
+            "the commit must still happen with no gate in the way"
+        );
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// A green-first-try gate writes exactly one `test_gate` row at
+    /// `attempt = 0` and no `fix` row at all.
+    #[tokio::test]
+    async fn green_first_try_writes_one_test_gate_row_and_no_fix_row() {
+        let agent = Arc::new(ScriptedTaskAgent::new().script(Stage::Implement, writes_file("a.txt", "a\n")));
+        let (state, _app) = test_app_with_task_agent(agent).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_test_cmd(&state, &fixture, "true").await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let a = seed_task(&state, &epic_id, &project_id, "A").await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+
+        let rows = gate_and_fix_rows(&state, &a).await;
+        assert_eq!(rows, vec![("test_gate".to_string(), 0, "ok".to_string())]);
 
         cleanup_clone_root(&state, &project_id, &[&epic_id]);
     }

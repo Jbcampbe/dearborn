@@ -239,6 +239,41 @@ pub fn assemble_prompt(stage: Stage, context: &crate::spec::TaskContext) -> Opti
     Some(format!("{base}\n\n---\n\n{context_block}"))
 }
 
+/// Assemble the `Fix` stage's prompt for T-522's test-driven fix loop (and,
+/// later, T-531's review-findings fix loop — the same function serves both
+/// kinds of "one round of feedback"): `prompts/fix.md` followed by **only**
+/// `feedback` — the failing test output today, a reviewer's findings once
+/// T-531 lands. Deliberately **not** [`assemble_prompt`] +
+/// [`crate::spec::TaskContext`] — that pairing is what `Stage::Implement`
+/// gets (the rendered spec, the epic's background, the sibling manifest),
+/// and this is the literal reading of T-522's AC: "the fix agent receives
+/// the test output and no other stage's context." A test in `worker.rs`'s
+/// module asserts this directly against what a `ScriptedTaskAgent` recorded:
+/// the fix prompt contains the feedback and does **not** contain the spec
+/// block, the epic-context heading, or the sibling manifest.
+///
+/// **Open concern, flagged rather than quietly resolved:** `prompts/fix.md`
+/// asks the fix agent to address "only what the feedback raises" and to
+/// avoid "anything the sibling manifest marks as owned by a later task" —
+/// but with no spec, no acceptance criteria, and no sibling manifest in its
+/// prompt at all, the fix agent has no way to independently judge whether a
+/// change satisfies the *task's* intent versus merely making the immediate
+/// symptom go away, and no way to know which files belong to a sibling task
+/// it must leave alone. It can still often do the job well (many test
+/// failures are self-describing — a stack trace, an assertion diff, a type
+/// error — and `git diff`/reading the surrounding code fills in a lot), but
+/// this is a real gap relative to what `references/prompts/fix-task-v2.md`
+/// (ralph's own fix prompt, whose bash caller passed only a feedback file
+/// path too, but ralph never had a sibling-manifest concept to omit) assumed
+/// its agent would have. Worth revisiting — most naturally when T-531 wires
+/// this same function up for review findings, since a NEEDS_CHANGES verdict
+/// is even more likely to hinge on acceptance criteria the fix agent can't
+/// see under the current contract.
+pub fn assemble_fix_prompt(feedback: &str) -> String {
+    let base = crate::spec::prompt_for(Stage::Fix).expect("Stage::Fix always has a prompt");
+    format!("{base}\n\n---\n\n## Feedback\n\n{feedback}")
+}
+
 /// The seam that makes task-stage runs hermetically testable (mirrors
 /// [`crate::planning::PlanningAgent`] / [`crate::breakdown::BreakdownAgent`]).
 ///

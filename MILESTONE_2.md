@@ -319,7 +319,7 @@ with `agent_error` and gets thickened in later phases.
   agent ever spawned**; green preflight proceeds; absent `test_cmd` skips
   silently; the epic card shows the reason.
 
-- [ ] **T-522 — Test gate + test-driven fix loop.** *deps: T-513, T-520*
+- [x] **T-522 — Test gate + test-driven fix loop.** *deps: T-513, T-520*
   After implement: `test_cmd` → red routes to `Stage::Fix` with the failing
   output as the sole feedback → re-test, up to `MAX_TEST_FIX_ATTEMPTS`. Commit
   only at known-green. **AC:** red-then-green (fixture `test_cmd` flipped by the
