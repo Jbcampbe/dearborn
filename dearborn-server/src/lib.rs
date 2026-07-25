@@ -123,12 +123,11 @@ pub struct AppState {
     /// actual (long-held, across-await) exclusion.
     pub refresh_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Test-only seam (T-510) letting a test observe/gate the claimed-epic
-    /// pipeline body without sleeps: if set, [`worker::run_stub_worker`] awaits
-    /// it once, immediately after claiming an epic and before doing any work.
-    /// A concurrency test uses this to hold N claims in flight simultaneously
-    /// and assert the pool never exceeds `worker_concurrency`. `None` (the
-    /// default) is a no-op — production code never sets it. Superseded
-    /// whenever T-513 replaces the stub pipeline with the real one.
+    /// pipeline body without sleeps: if set, [`worker::run_epic_pipeline`]
+    /// awaits it once, immediately after claiming an epic and before doing
+    /// any work. A concurrency test uses this to hold N claims in flight
+    /// simultaneously and assert the pool never exceeds `worker_concurrency`.
+    /// `None` (the default) is a no-op — production code never sets it.
     #[cfg(test)]
     pub test_pipeline_hook: Option<worker::PipelineHook>,
 }

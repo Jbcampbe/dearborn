@@ -26,6 +26,20 @@
 //! of a local path needs no PAT at all (it's disk-to-disk), so these never
 //! take one — the token only ever re-enters the picture at [`refresh_repo`]
 //! (the canonical checkout's fetch) and, later, at push time (T-514).
+//!
+//! ## The implement-walk's commit helpers (T-513)
+//!
+//! [`add_all`], [`status_porcelain`], [`current_commit`], and [`commit_all`]
+//! back the T-513 DAG walk's per-task commit step. `status_porcelain` (rather
+//! than e.g. `git diff --cached --quiet`) is deliberate: git's `--quiet`
+//! diff variants signal "there is a diff" via a **non-zero exit code**, which
+//! [`run_git`]/[`run_git_capture`] treat uniformly as failure — reusing them
+//! for a check that is allowed to come back either way would mean special-
+//! casing exit code 1 as "not an error" right there, muddying the "non-zero
+//! means [`GitError`]" contract every other helper in this module relies on.
+//! `git status --porcelain` always exits `0`, clean or not, so it composes
+//! with the rest of this module unchanged: an empty (trimmed) result means
+//! nothing to commit.
 
 use std::fmt;
 use std::path::Path;
@@ -235,6 +249,63 @@ pub async fn reset_hard_and_clean(repo_dir: &Path) -> Result<(), GitError> {
     run_git(&["clean", "-fd"], Some(repo_dir), None).await
 }
 
+/// Stage every change in `repo_dir` (`git add -A`) — T-513's first commit-step
+/// action, run unconditionally before checking whether there is anything to
+/// commit ([`status_porcelain`]), so a brand-new untracked file the implement
+/// stage created is staged too, not just edits to files already tracked.
+pub async fn add_all(repo_dir: &Path) -> Result<(), GitError> {
+    run_git(&["add", "-A"], Some(repo_dir), None).await
+}
+
+/// `git status --porcelain` in `repo_dir`, trimmed. See the module doc's
+/// "implement-walk's commit helpers" section for why this (rather than a
+/// `--quiet` diff variant) is the right primitive here: it always exits `0`,
+/// so an empty result unambiguously means "nothing to commit" without
+/// needing to special-case a nonzero-but-not-an-error exit code. Callers
+/// call this **after** [`add_all`], so a nonempty result here always means
+/// something is staged.
+pub async fn status_porcelain(repo_dir: &Path) -> Result<String, GitError> {
+    run_git_capture(&["status", "--porcelain"], Some(repo_dir), None).await
+}
+
+/// The current `HEAD` commit SHA (`git rev-parse HEAD`) in `repo_dir` — T-513
+/// records this as a task's `base_sha` the moment the task starts (before the
+/// implement stage runs), so a later review (T-530) can diff the cumulative
+/// change against exactly the tree the task began from, no matter how many
+/// commits land on top of it in the meantime.
+pub async fn current_commit(repo_dir: &Path) -> Result<String, GitError> {
+    run_git_capture(&["rev-parse", "HEAD"], Some(repo_dir), None).await
+}
+
+/// Commit everything currently staged in `repo_dir` with `subject`, using an
+/// explicit, deterministic committer identity (`-c user.name=<committer_name>
+/// -c user.email=<committer_email>`) passed on the commit invocation itself —
+/// never written to `repo_dir`'s `.git/config` (mirrors how a PAT is injected
+/// transiently elsewhere in this module rather than persisted). This is
+/// deliberate, not incidental: the workspace is a fresh local clone (D3) on a
+/// server host that may have **no** global `user.name`/`user.email`
+/// configured at all, and git refuses to commit without one; overriding it
+/// per-invocation means every Dearborn-authored commit succeeds and is
+/// attributed to Dearborn itself, regardless of the host's own git config.
+/// Returns the resulting commit's SHA ([`current_commit`] read back
+/// immediately after the commit succeeds).
+pub async fn commit_all(
+    repo_dir: &Path,
+    subject: &str,
+    committer_name: &str,
+    committer_email: &str,
+) -> Result<String, GitError> {
+    let name_arg = format!("user.name={committer_name}");
+    let email_arg = format!("user.email={committer_email}");
+    run_git(
+        &["-c", &name_arg, "-c", &email_arg, "commit", "-m", subject],
+        Some(repo_dir),
+        None,
+    )
+    .await?;
+    current_commit(repo_dir).await
+}
+
 /// Run `git` with `args`, optionally in `cwd`, discarding stdout. On
 /// non-zero exit the (redacted) stderr becomes the [`GitError`] message.
 /// `GIT_TERMINAL_PROMPT=0` guarantees git never blocks on an interactive
@@ -366,5 +437,117 @@ mod tests {
             .duration_since(std::time::UNIX_EPOCH)
             .map(|d| d.as_nanos())
             .unwrap_or(0)
+    }
+
+    // ---- T-513: add_all / status_porcelain / current_commit / commit_all ----
+
+    /// A local `git init`'d repo with one commit, entirely offline — the same
+    /// shape `worker.rs`'s/`workspace.rs`'s own fixtures use, kept local here
+    /// so this module's tests don't depend on either.
+    async fn init_repo(dir: &Path) {
+        tokio::fs::create_dir_all(dir).await.unwrap();
+        run_git_ok(dir, &["init", "-b", "main"]).await;
+        run_git_ok(dir, &["config", "user.email", "fixture@example.com"]).await;
+        run_git_ok(dir, &["config", "user.name", "Fixture"]).await;
+        std::fs::write(dir.join("README.md"), "hello\n").unwrap();
+        run_git_ok(dir, &["add", "."]).await;
+        run_git_ok(dir, &["commit", "-m", "init"]).await;
+    }
+
+    async fn run_git_ok(dir: &Path, args: &[&str]) {
+        let status = Command::new("git")
+            .args(args)
+            .current_dir(dir)
+            .status()
+            .await
+            .unwrap();
+        assert!(status.success(), "git {args:?} failed in {dir:?}");
+    }
+
+    fn temp_repo_dir(name: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!("dearborn-git-commit-{name}-{}-{}", std::process::id(), now_nanos()))
+    }
+
+    #[tokio::test]
+    async fn status_porcelain_is_empty_on_a_clean_tree() {
+        let dir = temp_repo_dir("clean");
+        init_repo(&dir).await;
+        let status = status_porcelain(&dir).await.unwrap();
+        assert!(status.trim().is_empty(), "a freshly committed tree must be clean: {status:?}");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn add_all_stages_new_and_modified_files_for_status_porcelain_to_see() {
+        let dir = temp_repo_dir("dirty");
+        init_repo(&dir).await;
+        std::fs::write(dir.join("README.md"), "changed\n").unwrap();
+        std::fs::write(dir.join("new.txt"), "brand new\n").unwrap();
+
+        add_all(&dir).await.unwrap();
+        let status = status_porcelain(&dir).await.unwrap();
+        assert!(!status.trim().is_empty(), "staged changes must show up: {status:?}");
+        assert!(status.contains("README.md"));
+        assert!(status.contains("new.txt"));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn current_commit_returns_the_head_sha() {
+        let dir = temp_repo_dir("head-sha");
+        init_repo(&dir).await;
+        let sha = current_commit(&dir).await.unwrap();
+        assert_eq!(sha.len(), 40, "a full SHA-1 hex string: {sha:?}");
+        assert!(sha.chars().all(|c| c.is_ascii_hexdigit()));
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn commit_all_commits_staged_changes_with_the_given_subject_and_identity() {
+        let dir = temp_repo_dir("commit-all");
+        init_repo(&dir).await;
+        let base_sha = current_commit(&dir).await.unwrap();
+
+        std::fs::write(dir.join("new.txt"), "brand new\n").unwrap();
+        add_all(&dir).await.unwrap();
+
+        let sha = commit_all(&dir, "impl(abc123): Do the thing", "Dearborn", "dearborn@noreply.localhost")
+            .await
+            .unwrap();
+        assert_ne!(sha, base_sha, "a new commit must have landed");
+        assert_eq!(current_commit(&dir).await.unwrap(), sha, "commit_all must return the new HEAD");
+
+        // Subject + identity landed on the commit itself, not the workspace's
+        // persistent git config.
+        let subject = run_git_capture(&["log", "-1", "--format=%s"], Some(&dir), None)
+            .await
+            .unwrap();
+        assert_eq!(subject, "impl(abc123): Do the thing");
+        let author = run_git_capture(&["log", "-1", "--format=%an <%ae>"], Some(&dir), None)
+            .await
+            .unwrap();
+        assert_eq!(author, "Dearborn <dearborn@noreply.localhost>");
+
+        let config = std::fs::read_to_string(dir.join(".git/config")).unwrap();
+        assert!(
+            !config.contains("Dearborn") && !config.contains("dearborn@noreply.localhost"),
+            "the -c identity must never be persisted to .git/config: {config}"
+        );
+
+        // Clean again after the commit.
+        let status = status_porcelain(&dir).await.unwrap();
+        assert!(status.trim().is_empty());
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn status_porcelain_after_add_all_with_no_changes_stays_empty() {
+        let dir = temp_repo_dir("noop-add");
+        init_repo(&dir).await;
+        add_all(&dir).await.unwrap();
+        let status = status_porcelain(&dir).await.unwrap();
+        assert!(status.trim().is_empty());
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

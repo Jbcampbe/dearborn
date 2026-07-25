@@ -256,7 +256,12 @@ pub fn build_context(ctx: &TaskContext) -> String {
 
 /// Shorten an id for display, per §2.8's "last 6 of id" naming convention.
 /// Returns the whole id unchanged if it's 6 characters or shorter.
-fn short_id(id: &str) -> &str {
+///
+/// `pub(crate)` rather than private: the T-513 DAG walk (`worker.rs`) reuses
+/// this exact convention to build the `impl(<short task id>): <title>` commit
+/// subject (§2.8) — the naming convention is decided in exactly one place,
+/// never re-derived at the call site.
+pub(crate) fn short_id(id: &str) -> &str {
     let len = id.len();
     if len <= 6 {
         id

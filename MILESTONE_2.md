@@ -271,7 +271,7 @@ with `agent_error` and gets thickened in later phases.
   elision marker; a stage that panics or errors still closes its row; runs list
   in `created_at` order with stage/attempt/status/verdict.
 
-- [ ] **T-513 — Implement stage in the walk (stub deleted).** *deps: T-511, T-512*
+- [x] **T-513 — Implement stage in the walk (stub deleted).** *deps: T-511, T-512*
   Walk the DAG in dependency order; per task: record `base_sha`, `Todo →
   InProgress`, render spec + context, run `Stage::Implement`, `git add -A`,
   commit (deterministic subject), `Done`. Delete `run_stub_worker` and

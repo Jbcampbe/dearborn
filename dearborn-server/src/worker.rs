@@ -75,8 +75,9 @@
 //! the owner?" read to race against, because the write's own affected-row
 //! count is authoritative. On zero rows the heartbeat flips the shared
 //! [`LeaseHandle`] to lost and stops renewing; the claimed-epic body
-//! ([`run_stub_worker`]) checks the handle every loop iteration and abandons
-//! the item — no further writes — the moment it observes the loss.
+//! ([`run_epic_pipeline_inner`]) checks the handle at the top of the loop and
+//! again immediately before each task's finalizing writes, abandoning the
+//! item — no further writes — the moment it observes the loss.
 //!
 //! ## No reaper (D4)
 //!
@@ -97,14 +98,93 @@
 //! the very first poll/notify rather than after however much of the TTL
 //! happened to elapse.
 //!
-//! ## The pipeline body is still the M1 stub (T-513 replaces it)
+//! ## The real implement walk (T-513)
 //!
-//! [`run_stub_worker`] is the same DB-only DAG walk from Milestone 1 — no
-//! agent, no git, no shell-out — now made **lease-aware**: it checks the
-//! [`LeaseHandle`] at the top of every loop iteration and returns immediately
-//! if the lease was lost, so a fenced-out worker never writes another task
-//! transition after another worker has taken over the epic. See the original
-//! module docs (preserved below in spirit) for the DAG-walk contract itself.
+//! [`run_epic_pipeline_inner`] is the real DAG walk that replaced Milestone
+//! 1's DB-only stub walk (that stub's pipeline functions are deleted
+//! outright, not kept around behind a flag; see MILESTONE_2 §10's definition
+//! of done). After [`workspace::provision_epic_workspace`] gates
+//! entry exactly as before (see the section above), the walk processes
+//! **ready** tasks (per [`compute_dag`]'s §2.3 readiness) one at a time, in
+//! full, before ever looking for the next one:
+//!
+//! 1. **`base_sha`** — the workspace's current `HEAD` (`git rev-parse HEAD`),
+//!    recorded on the task *before* anything else touches the tree. This has
+//!    to happen now, not after the implement stage runs, because the
+//!    implement stage's own commit (step 5) moves `HEAD` — capturing it any
+//!    later would record the *wrong* base, and the whole reason `base_sha`
+//!    exists (T-530's cumulative-diff review) is to diff against exactly the
+//!    tree this task started from, not the tree some other step happened to
+//!    leave behind.
+//! 2. **`Todo → InProgress`**, publishing `dag_updated` — identical in shape
+//!    to the M1 stub's transition, just earlier in a much longer step.
+//! 3. **The D8 prompt**: [`crate::spec::build_context`] assembled from the
+//!    task's own rendered spec, the epic's background (title/description/
+//!    product & technical context), and a sibling manifest built from every
+//!    *other* task in the epic, partitioned `Done` vs. not — this is what
+//!    stops an autonomous implement agent from building the whole epic in
+//!    one task (D7 gives it no other way to learn the epic's scope), so it is
+//!    wired from the real DAG state on every run, never a bare spec string.
+//! 4. **`Stage::Implement`** through the [`crate::task_agent::TaskAgent`]
+//!    seam (`RunMode::Edit`, `cwd` = the provisioned workspace), evidence
+//!    recorded by [`crate::task_agent::run_agent_stage`] exactly as T-512
+//!    built it. A stage that does not come back `ok`
+//!    ([`crate::task_agent::AgentStageOutcome::is_ok`]) — or fails to even
+//!    start — routes the *epic* to `Blocked(agent_error)` via
+//!    [`block_epic_on_agent_error`] and stops the walk. This is deliberately
+//!    coarse: MILESTONE_2 §4 calls Phase 1 a tracer bullet and says anything
+//!    that fails here blocks with `agent_error` and gets a real, structured
+//!    failure taxonomy later (T-540/T-541); this slice does not attempt to
+//!    distinguish *why* the stage failed.
+//! 5. **`git add -A`**, then a commit **only if there is something to
+//!    commit** ([`git::status_porcelain`] after staging) — an agent that made
+//!    no changes (it judged the task already satisfied by earlier work) is
+//!    committed as *nothing*, per MILESTONE_2 §4's explicit tracer-bullet AC;
+//!    verifying that "no diff" genuinely means "already done" is
+//!    [`crate::task_agent::Stage::VerifyComplete`]'s job, landing in T-532,
+//!    not this one. A real commit uses the frozen §2.8 subject
+//!    (`impl(<short task id>): <task title>`, [`crate::spec::short_id`]
+//!    reused rather than re-derived) and a deterministic committer identity
+//!    (`-c user.name=`/`-c user.email=`, never written to the workspace's own
+//!    `.git/config` — see [`git::commit_all`]'s doc for why) so a commit
+//!    succeeds even on a host with no configured global git identity. The
+//!    resulting SHA is recorded in a `Stage::Commit` `agent_run` row's `log`
+//!    (§2.2: "records the SHA in `log`") — opened only when a commit actually
+//!    happens, matching D13's "every stage that runs gets a row", not "every
+//!    stage that could have run".
+//! 6. **`Done`**, publishing `dag_updated`. The loop then returns to its top:
+//!    re-fetch the epic (still `InProgress`?), re-check the lease, recompute
+//!    the DAG, and only *then* look for the next ready task — this is the
+//!    same "one ready task at a time, no sibling ever `InProgress`
+//!    concurrently" (§2.3) discipline the M1 stub already had, just now
+//!    guarding a much more expensive step.
+//!
+//! ### Why the epic never reaches `Completed` here
+//!
+//! Unlike the M1 stub, this walk **never** sets `epic.status = 'Completed'`
+//! when the DAG finishes. T-514 owns that transition — it only happens after
+//! the epic's branch has been pushed and a PR has actually opened. An epic
+//! whose DAG is fully `Done` but has not yet been pushed/PR'd is not "done"
+//! in any sense a human watching the board should trust; T-513 stops the
+//! walk and leaves the epic sitting `InProgress` (still holding its lease)
+//! for whatever T-514 wiring runs next.
+//!
+//! ### Failure and cancellation both stop the walk the same way
+//!
+//! Every exit path out of the loop below — DAG fully done, DAG stuck, epic no
+//! longer `InProgress`, lease lost, an implement/commit failure routed to
+//! `Blocked(agent_error)` — is a plain `return`: no further writes, ever,
+//! after the decision to stop. In particular, cancelling an epic mid-walk (a
+//! lane move away from `InProgress`, or another worker stealing the lease)
+//! is checked **both** at the top of the loop (the "between tasks" moment)
+//! **and** again immediately after the implement stage returns but before
+//! the commit/`Done` writes (a slow agent run racing an external cancel must
+//! not finalize a task after the cancel landed) — mirroring the same
+//! belt-and-suspenders re-check [`block_epic_on_provision_failure`]'s call
+//! site already used for the provisioning-failure path. The full "kill the
+//! in-flight agent process" mechanism is T-542's job, out of scope here; this
+//! walk only guarantees that once a cancel/lease-loss is *observed*, nothing
+//! further gets written.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -115,10 +195,25 @@ use tokio::task::JoinHandle;
 
 use crate::board;
 use crate::epics::{fetch_epic, get_epic_project_id};
+use crate::evidence::{self, CloseStage, OpenStage};
+use crate::git;
 use crate::mcp;
+use crate::spec::{self, EpicContext, SiblingTask, SpecFields, TaskContext};
+use crate::task_agent::{self, AgentStageParams, Stage, TaskRunRequest};
 use crate::tasks::compute_dag;
-use crate::workspace::{self, ProvisionFailure};
+use crate::workspace::{self, ProvisionedWorkspace, ProvisionFailure};
 use crate::AppState;
+
+/// The deterministic git identity every T-513 commit is attributed to (§2.8's
+/// "Commits" naming section fixes the *subject* format but not an identity —
+/// this fills that gap). Passed as `-c user.name=`/`-c user.email=` on the
+/// commit invocation itself ([`git::commit_all`]), never written to the
+/// workspace's `.git/config`, so a commit succeeds even on a host with no
+/// configured global git identity, and every Dearborn-authored commit is
+/// attributable to the tool rather than to whatever OS user happens to run
+/// the server process.
+const COMMITTER_NAME: &str = "Dearborn";
+const COMMITTER_EMAIL: &str = "dearborn@noreply.localhost";
 
 /// Test-only pipeline hook (T-510): an async closure the claimed-epic body
 /// awaits once, immediately after a claim, before doing any DB work. See
@@ -411,7 +506,7 @@ async fn try_claim_and_run(state: &AppState, worker_id: &str) -> ClaimOutcome {
     // gets picked up again). Still awaited immediately: this worker handles
     // one item at a time; concurrency comes from having N worker loops, not
     // from overlapping bodies within one.
-    let body = tokio::spawn(run_stub_worker_inner(
+    let body = tokio::spawn(run_epic_pipeline_inner(
         state.clone(),
         claimed.id.clone(),
         lease,
@@ -433,94 +528,75 @@ async fn try_claim_and_run(state: &AppState, worker_id: &str) -> ClaimOutcome {
     ClaimOutcome::Claimed
 }
 
-/// Run the stub pipeline body to completion on `epic_id`, lease-unaware
-/// (always treats the lease as held). Kept as the direct-call seam Milestone
-/// 1's tests used and still use; the pool calls the lease-aware
-/// [`run_stub_worker_inner`] instead. See the module docs for why this is
-/// still the M1 stub (T-513 replaces it).
-pub async fn run_stub_worker(state: AppState, epic_id: String) {
-    run_stub_worker_inner(state, epic_id, LeaseHandle::new()).await;
+/// Run the claimed-epic pipeline body to completion on `epic_id`,
+/// lease-unaware (always treats the lease as held). Kept as the direct-call
+/// seam tests use to drive the walk hermetically without going through the
+/// claim/heartbeat machinery at all; the pool calls the lease-aware
+/// [`run_epic_pipeline_inner`] instead (see [`try_claim_and_run`]).
+pub async fn run_epic_pipeline(state: AppState, epic_id: String) {
+    run_epic_pipeline_inner(state, epic_id, LeaseHandle::new()).await;
 }
 
-/// The claimed-epic pipeline body (still the M1 stub DAG walk — T-513
-/// replaces this). Walks **ready** tasks one at a time (dependency order: a
-/// task is ready only when `status='Todo'` and every blocker is `Done`, per
-/// §2.3), flips each `Todo → InProgress → Done`, and when the DAG is fully
-/// `Done` sets `epic.status='Completed'`.
+/// The claimed-epic pipeline body: workspace provisioning (T-511) followed by
+/// the real per-task implement walk (T-513). See the module doc's "The real
+/// implement walk" section for the full per-task sequence and the rationale
+/// behind each step (`base_sha` timing, why the epic never reaches
+/// `Completed` here, how failure and cancellation both stop the walk the
+/// same way). This function is the orchestration shell around that sequence:
+/// the provisioning gate, then a loop that re-validates the epic/lease before
+/// every single task, processes exactly one task per iteration
+/// ([`process_one_task`]), and returns the moment there is nothing left to do
+/// or something says to stop.
 ///
 /// Lease-aware (T-510): checks `lease.is_lost()` at the top of every loop
 /// iteration and returns immediately, with no further writes, the moment the
 /// heartbeat has flagged the lease as fenced out. Also awaits the T-510
 /// test-only pipeline hook exactly once, before the first check, so a test
 /// can gate/observe the body without sleeps (see
-/// [`crate::AppState::test_pipeline_hook`]); superseded whenever T-513 lands.
-///
-/// ## Workspace provisioning gates the walk (T-511)
-///
-/// Immediately after the test hook, and only if the epic is (still)
-/// `InProgress`, this provisions the epic's workspace
-/// ([`workspace::provision_epic_workspace`]) exactly once per claim, before
-/// the DAG walk below ever runs. A provisioning failure never reaches the
-/// walk at all: it routes straight to [`block_epic_on_provision_failure`]
-/// (epic → `Blocked`, reason per §2.3, workspace retained, lease released by
-/// the caller as usual) and returns. This is deliberately still the M1 stub
-/// DAG walk underneath — provisioning is the only part of the *real*
-/// pipeline that exists yet; T-513 replaces the walk itself with one that
-/// actually uses the provisioned workspace.
-///
-/// ## The "no sibling InProgress" invariant (§2.3)
-///
-/// The claim predicate requires that no sibling task in the epic is
-/// `InProgress`. This body honors it by serializing: it claims at most one
-/// ready task at a time, fully completing it (`Done`) before looking for the
-/// next, so there is never a moment with two `InProgress` siblings.
-///
-/// ## Ownership of `InProgress → Completed`
-///
-/// This body owns the `InProgress → Completed` transition. Manual lane moves
-/// to `Completed` are rejected by [`crate::lanes`] (`409 conflict`) — only the
-/// pipeline sets it, once the DAG is fully `Done`.
-///
-/// ## Live publishing
-///
-/// Every task transition publishes a `dag_updated` frame on `epic:<id>`.
-/// When the epic reaches `Completed`, an `epic_updated` frame on `epic:<id>`
-/// and a `board_updated` frame on `project:<id>` are published.
-async fn run_stub_worker_inner(state: AppState, epic_id: String, lease: LeaseHandle) {
+/// [`crate::AppState::test_pipeline_hook`]).
+async fn run_epic_pipeline_inner(state: AppState, epic_id: String, lease: LeaseHandle) {
     #[cfg(test)]
     if let Some(hook) = state.test_pipeline_hook.clone() {
         hook().await;
     }
 
-    // T-511: provision the workspace once per claim, before the (still-stub)
-    // DAG walk. Only when the epic is actually InProgress — a claim racing a
+    // T-511: provision the workspace once per claim, before the walk below
+    // ever runs. Only when the epic is actually InProgress — a claim racing a
     // Cancel/Block, or (defensively) any other status, must leave the epic
     // untouched here exactly as the walk's own status guard below would.
-    if !lease.is_lost() {
+    let workspace = {
+        if lease.is_lost() {
+            return;
+        }
         let conn = state.db.conn();
-        if let Ok(Some(epic)) = fetch_epic(conn, &epic_id).await {
-            if epic.status == "InProgress" {
-                if let Err(failure) =
-                    workspace::provision_epic_workspace(&state, &epic_id, &epic.project_id).await
-                {
-                    // Re-check the lease right before writing: a slow
-                    // provisioning failure racing a fenced-out lease must not
-                    // stomp on the new owner's epic (mirrors the same
-                    // belt-and-suspenders fencing the Completed transition
-                    // below uses).
-                    if !lease.is_lost() {
-                        block_epic_on_provision_failure(&state, &epic_id, failure).await;
-                    }
-                    return;
+        let Ok(Some(epic)) = fetch_epic(conn, &epic_id).await else {
+            return;
+        };
+        if epic.status != "InProgress" {
+            return;
+        }
+        match workspace::provision_epic_workspace(&state, &epic_id, &epic.project_id).await {
+            Ok(ws) => ws,
+            Err(failure) => {
+                // Re-check the lease right before writing: a slow
+                // provisioning failure racing a fenced-out lease must not
+                // stomp on the new owner's epic (mirrors the same
+                // belt-and-suspenders fencing the walk's own writes use).
+                if !lease.is_lost() {
+                    block_epic_on_provision_failure(&state, &epic_id, failure).await;
                 }
+                return;
             }
         }
-    }
+    };
 
+    // ---- the real DAG walk (T-513) ----
     loop {
         // Lease-aware bail: a heartbeat renewal failure means another worker
         // now owns this epic. Stop writing immediately — any further mutation
-        // here could race the new owner's own walk.
+        // here could race the new owner's own walk. Checked first thing on
+        // every iteration — this is the "between tasks" re-check the module
+        // doc describes.
         if lease.is_lost() {
             tracing::warn!(
                 epic = %epic_id,
@@ -532,7 +608,8 @@ async fn run_stub_worker_inner(state: AppState, epic_id: String, lease: LeaseHan
         let conn = state.db.conn();
 
         // 1. Guard: only act on an InProgress epic. A Cancel/Block during the
-        //    walk makes this a clean no-op.
+        //    walk makes this a clean no-op — the other half of the "between
+        //    tasks" re-check.
         let Some(epic) = fetch_epic(conn, &epic_id).await.unwrap_or(None) else {
             tracing::debug!(epic = %epic_id, "pipeline: epic vanished; stopping");
             return;
@@ -559,14 +636,19 @@ async fn run_stub_worker_inner(state: AppState, epic_id: String, lease: LeaseHan
             }
         };
 
-        // 3. Defensive: if any task is already InProgress (shouldn't happen —
-        //    we serialize), wait for it to settle and retry.
+        // 3. Defensive: no task should ever be InProgress at loop-top — this
+        //    walk fully serializes (one task claimed, run to a terminal
+        //    state, before the next is even looked up), and any orphan left
+        //    by a previous owner was already reset to Todo as part of the
+        //    claim (`reset_orphaned_tasks`, called before this body ever
+        //    runs). Seeing one here means the DAG cannot be trusted; stop
+        //    rather than spin.
         if dag.nodes.iter().any(|n| n.task.status == "InProgress") {
-            let delay = state.config.stub_worker_delay_ms;
-            if delay > 0 {
-                tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-            }
-            continue;
+            tracing::warn!(
+                epic = %epic_id,
+                "pipeline: found an InProgress task at loop-top (unexpected); stopping"
+            );
+            return;
         }
 
         // 4. Find a ready task (Todo + all blockers Done).
@@ -574,31 +656,18 @@ async fn run_stub_worker_inner(state: AppState, epic_id: String, lease: LeaseHan
             // 5. No ready task.
             let all_done = dag.nodes.iter().all(|n| n.task.status == "Done");
             if all_done {
-                // The DAG is complete (or empty): mark the epic Completed.
-                // Fenced by lease_owner too — belt-and-suspenders alongside
-                // the loop-top check, since the lease could be lost between
-                // the check above and this write.
-                let now = now_ms();
-                let _ = conn
-                    .execute(
-                        "UPDATE epic SET status = 'Completed', updated_at = ?1 \
-                         WHERE id = ?2 AND status = 'InProgress'",
-                        params![now, epic_id.clone()],
-                    )
-                    .await;
-
-                // Publish the final DAG state + the updated epic + the board.
+                // The DAG is fully Done (or the epic has no tasks at all).
+                // T-514 — not this walk — is the only place that ever sets
+                // `epic.status = 'Completed'`, and only after a PR opens; see
+                // the module doc's "why the epic never reaches Completed
+                // here" section. Publish the final DAG state and stop; the
+                // epic stays InProgress, lease intact, until T-514's push+PR
+                // step (not yet wired) runs.
                 mcp::publish_dag(&state, &epic_id).await;
-                if let Ok(Some(updated)) = fetch_epic(conn, &epic_id).await {
-                    let payload =
-                        serde_json::to_value(&updated).unwrap_or(serde_json::Value::Null);
-                    state
-                        .hub
-                        .publish(&format!("epic:{epic_id}"), "epic_updated", payload);
-                    board::publish_board(&state, &updated.project_id).await;
-                }
-                tracing::info!(epic = %epic_id, "pipeline: DAG complete; epic → Completed");
-                return;
+                tracing::info!(
+                    epic = %epic_id,
+                    "pipeline: DAG fully Done; stopping (T-514 owns the Completed transition)"
+                );
             } else {
                 // Some Todo tasks remain but none are ready (all blocked) and
                 // none InProgress — the DAG cannot progress. A valid acyclic
@@ -608,69 +677,293 @@ async fn run_stub_worker_inner(state: AppState, epic_id: String, lease: LeaseHan
                     epic = %epic_id,
                     "pipeline: no ready task but not all Done; DAG is stuck; stopping"
                 );
-                return;
             }
+            return;
         };
 
-        let task_id = &ready.task.id;
-        let now = now_ms();
-
-        // Claim: Todo → InProgress.
-        let _ = conn
-            .execute(
-                "UPDATE task SET status = 'InProgress', updated_at = ?1 WHERE id = ?2",
-                params![now, task_id.clone()],
-            )
-            .await;
-        mcp::publish_dag(&state, &epic_id).await;
-
-        // Sleep so a browser can watch the walk (0 in tests).
-        let delay = state.config.stub_worker_delay_ms;
-        if delay > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
+        match process_one_task(&state, &epic_id, &epic, &dag, ready, &workspace, &lease).await {
+            TaskStepOutcome::Continue => continue,
+            TaskStepOutcome::Stop => return,
         }
-
-        // Complete: InProgress → Done.
-        let now = now_ms();
-        let _ = conn
-            .execute(
-                "UPDATE task SET status = 'Done', updated_at = ?1 WHERE id = ?2",
-                params![now, task_id.clone()],
-            )
-            .await;
-        mcp::publish_dag(&state, &epic_id).await;
-
-        // Sleep once more so the Done state is visible before the next claim.
-        if delay > 0 {
-            tokio::time::sleep(std::time::Duration::from_millis(delay)).await;
-        }
-
-        // Continue the loop — re-fetch the epic and look for the next ready task.
     }
 }
 
-/// Route a [`ProvisionFailure`] (T-511) to the epic `Blocked` transition:
-/// `status='Blocked'`, `blocked_reason` per §2.3 (`workspace_error` |
-/// `setup_failed`), publish `epic_updated` + `board_updated` (mirroring the
-/// `Completed` transition above). The workspace is **retained** — this
-/// function never deletes anything; deletion only ever happens after a PR
-/// opens (T-514). Fenced by `status = 'InProgress'` so a transition that
-/// already happened out from under us (a Cancel racing this same moment) is
-/// a no-op rather than an overwrite.
-async fn block_epic_on_provision_failure(state: &AppState, epic_id: &str, failure: ProvisionFailure) {
-    let (reason, log_message) = match failure {
-        ProvisionFailure::Workspace(message) => ("workspace_error", message),
-        ProvisionFailure::Setup { message, exit_code } => {
-            ("setup_failed", format!("exit_code={exit_code:?}: {message}"))
+/// What [`process_one_task`] tells the walk's loop to do next.
+enum TaskStepOutcome {
+    /// The task reached a terminal state (`Done`, committed or not); loop
+    /// back to the top and look for the next ready task.
+    Continue,
+    /// Something said to stop: a failure (routed to `Blocked(agent_error)`),
+    /// a cancelled/fenced-out epic observed mid-task, or a git-level error.
+    /// The caller returns immediately — no further writes.
+    Stop,
+}
+
+/// Process exactly one ready task through the full T-513 sequence: record
+/// `base_sha`, `Todo → InProgress`, assemble the D8 prompt, run
+/// `Stage::Implement`, `git add -A` + commit-if-dirty, `Done`. See the module
+/// doc's "The real implement walk" section for the rationale behind each
+/// step; this function is the literal implementation of that sequence.
+async fn process_one_task(
+    state: &AppState,
+    epic_id: &str,
+    epic: &crate::epics::Epic,
+    dag: &crate::tasks::Dag,
+    ready: &crate::tasks::DagNode,
+    workspace: &ProvisionedWorkspace,
+    lease: &LeaseHandle,
+) -> TaskStepOutcome {
+    let conn = state.db.conn();
+    let task_id = ready.task.id.clone();
+    let task_title = ready.task.title.clone();
+    let task_description = ready.task.description.clone();
+    let task_acceptance = ready.task.acceptance.clone();
+
+    // The sibling manifest (D8): every *other* task in the epic, partitioned
+    // Done vs. not by `build_context` below. Built from the DAG we already
+    // hold (fresher than any separate query could be, and avoids a second
+    // round trip) rather than re-querying the tasks table.
+    let siblings: Vec<(String, String, bool)> = dag
+        .nodes
+        .iter()
+        .filter(|n| n.task.id != task_id)
+        .map(|n| (n.task.id.clone(), n.task.title.clone(), n.task.status == "Done"))
+        .collect();
+
+    // 1. base_sha: the workspace's HEAD *before* this task's work — recorded
+    //    now, before the implement stage (or its eventual commit) can move
+    //    HEAD out from under us. See the module doc for why this ordering is
+    //    load-bearing, not incidental.
+    let base_sha = match git::current_commit(&workspace.workspace_path).await {
+        Ok(sha) => sha,
+        Err(err) => {
+            if !lease.is_lost() {
+                block_epic_on_agent_error(
+                    state,
+                    epic_id,
+                    &task_id,
+                    &format!("failed to read base_sha: {err}"),
+                )
+                .await;
+            }
+            return TaskStepOutcome::Stop;
         }
     };
-    tracing::warn!(
-        epic = %epic_id,
-        reason,
-        error = %log_message,
-        "workspace provisioning failed; epic -> Blocked"
-    );
 
+    let now = now_ms();
+    let _ = conn
+        .execute(
+            "UPDATE task SET status = 'InProgress', base_sha = ?1, updated_at = ?2 WHERE id = ?3",
+            params![base_sha, now, task_id.clone()],
+        )
+        .await;
+    mcp::publish_dag(state, epic_id).await;
+
+    // 2. The D8 prompt: rendered spec + epic background + sibling manifest.
+    let sibling_refs: Vec<SiblingTask> = siblings
+        .iter()
+        .map(|(id, title, done)| SiblingTask {
+            id,
+            title,
+            done: *done,
+        })
+        .collect();
+    let epic_ctx = EpicContext {
+        title: &epic.title,
+        description: epic.description.as_deref(),
+        product_context: epic.product_context.as_deref(),
+        technical_context: epic.technical_context.as_deref(),
+    };
+    let task_ctx = TaskContext {
+        spec: SpecFields {
+            title: &task_title,
+            description: task_description.as_deref(),
+            acceptance: task_acceptance.as_deref(),
+        },
+        epic: Some(epic_ctx),
+        siblings: &sibling_refs,
+    };
+    let prompt = task_agent::assemble_prompt(Stage::Implement, &task_ctx)
+        .expect("Stage::Implement always has a prompt (spec::prompt_for)");
+
+    // 3. Run the implement stage through the TaskAgent seam.
+    let run_id = ulid::Ulid::new().to_string();
+    let req = TaskRunRequest {
+        run_id,
+        stage: Stage::Implement,
+        prompt,
+        cwd: workspace.workspace_path.clone(),
+    };
+    let outcome = task_agent::run_agent_stage(
+        state,
+        &*state.task_agent,
+        AgentStageParams {
+            task_id: &task_id,
+            epic_id: Some(epic_id),
+            attempt: 1,
+        },
+        req,
+    )
+    .await;
+
+    let outcome = match outcome {
+        Ok(outcome) => outcome,
+        Err(err) => {
+            if !lease.is_lost() {
+                block_epic_on_agent_error(
+                    state,
+                    epic_id,
+                    &task_id,
+                    &format!("implement stage failed to start: {err}"),
+                )
+                .await;
+            }
+            return TaskStepOutcome::Stop;
+        }
+    };
+
+    // MILESTONE_2 §4 (tracer bullet): anything that fails here Blocks the
+    // epic with `agent_error`; a real, structured failure taxonomy is T-540's
+    // job, not this slice's.
+    if !outcome.is_ok() {
+        if !lease.is_lost() {
+            block_epic_on_agent_error(
+                state,
+                epic_id,
+                &task_id,
+                "implement stage did not complete successfully",
+            )
+            .await;
+        }
+        return TaskStepOutcome::Stop;
+    }
+
+    // Re-check the epic's status *and* the lease immediately before the
+    // commit/Done writes below — a slow implement run racing an external
+    // cancel (a lane move away from InProgress) or a lease theft must not
+    // finalize this task after either happened. This is the "cancelling
+    // mid-walk stops cleanly" AC; the full kill-the-in-flight-agent path is
+    // T-542's job.
+    let still_in_progress =
+        matches!(fetch_epic(conn, epic_id).await, Ok(Some(e)) if e.status == "InProgress");
+    if lease.is_lost() || !still_in_progress {
+        tracing::warn!(
+            epic = %epic_id,
+            task = %task_id,
+            "pipeline: epic cancelled or lease lost mid-task; stopping without finalizing"
+        );
+        return TaskStepOutcome::Stop;
+    }
+
+    // 4. git add -A, then commit iff there is something to commit. An agent
+    //    that made no changes is committed as *nothing* — see the module doc
+    //    for why (T-532 owns verifying that "no diff" really means done).
+    if let Err(err) = git::add_all(&workspace.workspace_path).await {
+        if !lease.is_lost() {
+            block_epic_on_agent_error(
+                state,
+                epic_id,
+                &task_id,
+                &format!("git add -A failed: {err}"),
+            )
+            .await;
+        }
+        return TaskStepOutcome::Stop;
+    }
+    let status = match git::status_porcelain(&workspace.workspace_path).await {
+        Ok(status) => status,
+        Err(err) => {
+            if !lease.is_lost() {
+                block_epic_on_agent_error(
+                    state,
+                    epic_id,
+                    &task_id,
+                    &format!("git status failed: {err}"),
+                )
+                .await;
+            }
+            return TaskStepOutcome::Stop;
+        }
+    };
+
+    if !status.trim().is_empty() {
+        // §2.8's frozen commit subject, reusing spec::short_id rather than
+        // re-deriving the "last 6 of id" convention.
+        let subject = format!("impl({}): {}", spec::short_id(&task_id), task_title);
+        match git::commit_all(
+            &workspace.workspace_path,
+            &subject,
+            COMMITTER_NAME,
+            COMMITTER_EMAIL,
+        )
+        .await
+        {
+            Ok(sha) => {
+                // §2.2: the Commit stage "records the SHA in log". Opened
+                // only now that a commit actually happened (D13: every stage
+                // that *runs* gets a row, not every stage that could have).
+                let open = OpenStage {
+                    task_id: Some(&task_id),
+                    epic_id: Some(epic_id),
+                    stage: Stage::Commit.as_str(),
+                    attempt: 1,
+                };
+                if let Ok(handle) = evidence::open_stage(conn, open).await {
+                    let _ = evidence::close_stage(
+                        conn,
+                        &handle,
+                        CloseStage {
+                            status: "ok",
+                            session_id: None,
+                            verdict: None,
+                            exit_code: Some(0),
+                            log: format!("commit {sha}: {subject}"),
+                        },
+                    )
+                    .await;
+                }
+            }
+            Err(err) => {
+                if !lease.is_lost() {
+                    block_epic_on_agent_error(
+                        state,
+                        epic_id,
+                        &task_id,
+                        &format!("git commit failed: {err}"),
+                    )
+                    .await;
+                }
+                return TaskStepOutcome::Stop;
+            }
+        }
+    }
+
+    // 5. Done.
+    if lease.is_lost() {
+        return TaskStepOutcome::Stop;
+    }
+    let now = now_ms();
+    let _ = conn
+        .execute(
+            "UPDATE task SET status = 'Done', updated_at = ?1 WHERE id = ?2",
+            params![now, task_id.clone()],
+        )
+        .await;
+    mcp::publish_dag(state, epic_id).await;
+
+    TaskStepOutcome::Continue
+}
+
+/// The shared "flip the epic to Blocked" write + publish, factored out so
+/// [`block_epic_on_provision_failure`] (T-511) and [`block_epic_on_agent_error`]
+/// (T-513) share one implementation instead of two copies of the same
+/// UPDATE/publish sequence. `status='Blocked'`, `blocked_reason = reason`,
+/// publish `epic_updated` + `board_updated`. The workspace is **retained** —
+/// this never deletes anything; deletion only ever happens after a PR opens
+/// (T-514). Fenced by `status = 'InProgress'` so a transition that already
+/// happened out from under us (a Cancel racing this same moment) is a no-op
+/// rather than an overwrite.
+async fn set_epic_blocked(state: &AppState, epic_id: &str, reason: &str) {
     let conn = state.db.conn();
     let now = now_ms();
     let _ = conn
@@ -688,6 +981,42 @@ async fn block_epic_on_provision_failure(state: &AppState, epic_id: &str, failur
             .publish(&format!("epic:{epic_id}"), "epic_updated", payload);
         board::publish_board(state, &updated.project_id).await;
     }
+}
+
+/// Route a [`ProvisionFailure`] (T-511) to the epic `Blocked` transition via
+/// [`set_epic_blocked`]: `blocked_reason` per §2.3 (`workspace_error` |
+/// `setup_failed`).
+async fn block_epic_on_provision_failure(state: &AppState, epic_id: &str, failure: ProvisionFailure) {
+    let (reason, log_message) = match failure {
+        ProvisionFailure::Workspace(message) => ("workspace_error", message),
+        ProvisionFailure::Setup { message, exit_code } => {
+            ("setup_failed", format!("exit_code={exit_code:?}: {message}"))
+        }
+    };
+    tracing::warn!(
+        epic = %epic_id,
+        reason,
+        error = %log_message,
+        "workspace provisioning failed; epic -> Blocked"
+    );
+    set_epic_blocked(state, epic_id, reason).await;
+}
+
+/// Route a T-513 implement-walk failure (a failed/erroring implement stage,
+/// or a git-level failure reading `base_sha`/staging/committing) to the epic
+/// `Blocked` transition via [`set_epic_blocked`], with `blocked_reason =
+/// 'agent_error'` — the single, coarse tracer-bullet reason MILESTONE_2 §4
+/// specifies for Phase 1 ("anything that fails here Blocks the epic with
+/// `agent_error` and gets thickened in later phases": T-540's structured
+/// failure taxonomy, T-541's retry).
+async fn block_epic_on_agent_error(state: &AppState, epic_id: &str, task_id: &str, message: &str) {
+    tracing::warn!(
+        epic = %epic_id,
+        task = %task_id,
+        error = %message,
+        "task pipeline step failed; epic -> Blocked(agent_error)"
+    );
+    set_epic_blocked(state, epic_id, "agent_error").await;
 }
 
 /// Resolve the project id for an epic (best-effort, for the board publish).
@@ -714,16 +1043,20 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use crate::breakdown::testing::SilentBreakdownAgent;
-    use crate::planning::testing::SilentPlanningAgent;
-    use crate::{app, Config, Db};
+    use crate::planning::testing::{Gate, SilentPlanningAgent};
+    use crate::task_agent::testing::{ScriptedRun, ScriptedTaskAgent};
+    use crate::{app, Config, Db, TaskAgent};
     use axum::body::Body;
     use axum::http::{
         header::{AUTHORIZATION, CONTENT_TYPE},
         Request, StatusCode,
     };
+    use harness::{HarnessError, RunEvent, RunHandle};
     use libsql::params;
     use serde_json::{json, Value};
+    use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
+    use std::sync::mpsc::Receiver;
     use std::sync::Arc;
     use std::time::Duration;
     use tower::ServiceExt;
@@ -754,16 +1087,28 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
-    /// Boot an app over an in-memory db with silent agents (delay 0 via
-    /// `Config::for_test`). Returns (state, app).
+    /// Boot an app over an in-memory db with silent planning/breakdown agents
+    /// and a bare [`ScriptedTaskAgent`] (no scripted runs — every stage falls
+    /// back to [`crate::task_agent::testing::ScriptedRun::default`]: exit 0,
+    /// no files written, i.e. a no-op success). Fine for every test that
+    /// doesn't care what the implement stage does, just that it succeeds
+    /// (fast, via `Config::for_test`). Returns (state, app).
     async fn test_app() -> (AppState, axum::Router) {
+        test_app_with_task_agent(Arc::new(ScriptedTaskAgent::new())).await
+    }
+
+    /// Like [`test_app`] but with an explicit [`TaskAgent`] — the seam T-513's
+    /// tests use to script the implement stage's behavior (write files,
+    /// fail, or gate in-flight) instead of accepting the bare no-op default.
+    async fn test_app_with_task_agent(task_agent: Arc<dyn TaskAgent>) -> (AppState, axum::Router) {
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
-        let state = AppState::with_agents(
+        let state = AppState::with_all_agents(
             Config::for_test(TOKEN),
             db,
             Arc::new(SilentPlanningAgent),
             Arc::new(SilentBreakdownAgent),
+            task_agent,
         );
         let app = app(state.clone());
         (state, app)
@@ -801,7 +1146,7 @@ mod tests {
     //
     // Since T-511, the claimed-epic body provisions a workspace (a real
     // `git clone`/`git fetch`) before the DAG walk. Any test that drives the
-    // body to completion (`run_stub_worker`, or the pool via `spawn_pool`)
+    // body to completion (`run_epic_pipeline`, or the pool via `spawn_pool`)
     // needs a project whose `clone_path`/`repo_url` point at something git can
     // actually clone from — the plain `seed_project` above (no `clone_path`,
     // a fake `repo_url`) is intentionally kept for the claim/heartbeat/lease
@@ -973,16 +1318,27 @@ mod tests {
         (row.get(0).unwrap(), row.get(1).unwrap())
     }
 
-    // ---- run_stub_worker direct tests (unchanged from M1) ----
+    // ---- run_epic_pipeline direct tests: real DAG walk (T-513) ----
+    //
+    // These use the bare `test_app()` (a `ScriptedTaskAgent` with no scripted
+    // runs, i.e. every implement stage is a no-op success — see `test_app`'s
+    // doc). A no-op implement stage produces no diff, so no commit ever
+    // lands for these tests; that's fine, they're only asserting the DAG
+    // walk's task-status/epic-status contract, not the commit machinery
+    // (covered separately below). Note the epic is asserted to stay
+    // `InProgress`, never `Completed` — T-513 never sets that transition;
+    // only T-514 does, after a PR opens (see the module doc).
 
-    /// Linear DAG (A → B → C): after the worker, all Done + epic Completed.
+    /// Linear DAG (A → B → C): after the walk, all Done, epic still
+    /// InProgress.
     ///
     /// The dependency ORDER is respected implicitly: B can only become ready
     /// after A is Done (its only blocker), and C after B. So asserting the
     /// final state (all Done) IS the order assertion — a reversed walk could
-    /// never reach all-Done.
+    /// never reach all-Done. See `implement_stage_runs_respect_dependency_order`
+    /// below for a stronger, order-observing proof.
     #[tokio::test]
-    async fn linear_dag_walks_to_completion() {
+    async fn linear_dag_walks_every_task_to_done_epic_stays_in_progress() {
         let (state, _app) = test_app().await;
         let fixture = GitFixture::new().await;
         let project_id = seed_project_with_workspace(&state, &fixture).await;
@@ -995,19 +1351,24 @@ mod tests {
         link(&state, &a, &b).await;
         link(&state, &b, &c).await;
 
-        run_stub_worker(state.clone(), epic_id.clone()).await;
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
 
         let statuses = task_statuses(&state, &epic_id).await;
         assert_eq!(statuses["A"], "Done");
         assert_eq!(statuses["B"], "Done");
         assert_eq!(statuses["C"], "Done");
-        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        assert_eq!(
+            epic_status(&state, &epic_id).await,
+            "InProgress",
+            "T-513 never sets Completed — that's T-514's job, after a PR opens"
+        );
         cleanup_clone_root(&state, &project_id, &[&epic_id]);
     }
 
-    /// Branching DAG (A blocks B and C; B and C both block D): all Done.
+    /// Branching DAG (A blocks B and C; B and C both block D): all Done,
+    /// epic still InProgress.
     #[tokio::test]
-    async fn branching_dag_walks_to_completion() {
+    async fn branching_dag_walks_every_task_to_done_epic_stays_in_progress() {
         let (state, _app) = test_app().await;
         let fixture = GitFixture::new().await;
         let project_id = seed_project_with_workspace(&state, &fixture).await;
@@ -1023,32 +1384,35 @@ mod tests {
         link(&state, &b, &d).await;
         link(&state, &c, &d).await;
 
-        run_stub_worker(state.clone(), epic_id.clone()).await;
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
 
         let statuses = task_statuses(&state, &epic_id).await;
         assert_eq!(statuses["A"], "Done");
         assert_eq!(statuses["B"], "Done");
         assert_eq!(statuses["C"], "Done");
         assert_eq!(statuses["D"], "Done");
-        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        assert_eq!(epic_status(&state, &epic_id).await, "InProgress");
         cleanup_clone_root(&state, &project_id, &[&epic_id]);
     }
 
-    /// Empty epic (no tasks): worker sets the epic Completed.
+    /// Empty epic (no tasks): the walk finds the (vacuously) fully-Done DAG
+    /// immediately and stops; the epic stays InProgress (never Completed —
+    /// T-514's job).
     #[tokio::test]
-    async fn empty_epic_completes() {
+    async fn empty_epic_leaves_epic_in_progress() {
         let (state, _app) = test_app().await;
         let fixture = GitFixture::new().await;
         let project_id = seed_project_with_workspace(&state, &fixture).await;
         let epic_id = seed_epic(&state, &project_id, "InProgress").await;
 
-        run_stub_worker(state.clone(), epic_id.clone()).await;
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
 
-        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        assert_eq!(epic_status(&state, &epic_id).await, "InProgress");
         cleanup_clone_root(&state, &project_id, &[&epic_id]);
     }
 
-    /// Non-InProgress epic is a no-op: no task or epic status changes.
+    /// Non-InProgress epic is a no-op: no task or epic status changes (the
+    /// walk never even reaches provisioning).
     #[tokio::test]
     async fn non_in_progress_epic_is_no_op() {
         let (state, _app) = test_app().await;
@@ -1056,7 +1420,7 @@ mod tests {
         let epic_id = seed_epic(&state, &project_id, "Ready").await;
         seed_task(&state, &epic_id, &project_id, "A").await;
 
-        run_stub_worker(state.clone(), epic_id.clone()).await;
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
 
         let statuses = task_statuses(&state, &epic_id).await;
         assert_eq!(statuses["A"], "Todo", "task untouched");
@@ -1064,9 +1428,11 @@ mod tests {
     }
 
     /// No sibling InProgress invariant: after a full run, the final state is
-    /// consistent — all Done, none InProgress. The worker serializes by
-    /// construction (one ready task at a time); this final-state assertion
-    /// confirms it.
+    /// consistent — all Done, none InProgress, epic still InProgress. The
+    /// walk serializes by construction (one ready task at a time); this
+    /// final-state assertion confirms it. See
+    /// `implement_stage_never_observes_a_sibling_in_progress` below for a
+    /// stronger, moment-by-moment proof via the DB itself.
     #[tokio::test]
     async fn no_sibling_in_progress_after_run() {
         let (state, _app) = test_app().await;
@@ -1076,16 +1442,16 @@ mod tests {
         let a = seed_task(&state, &epic_id, &project_id, "A").await;
         let b = seed_task(&state, &epic_id, &project_id, "B").await;
         // A and B are independent (no edge between them) — both are ready from
-        // the start. The worker still claims one at a time.
+        // the start. The walk still claims one at a time.
         link(&state, &a, &b).await; // A → B: only A is ready initially.
 
-        run_stub_worker(state.clone(), epic_id.clone()).await;
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
 
         let statuses = task_statuses(&state, &epic_id).await;
         assert_eq!(statuses["A"], "Done");
         assert_eq!(statuses["B"], "Done");
         assert!(statuses.values().all(|s| s != "InProgress"));
-        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        assert_eq!(epic_status(&state, &epic_id).await, "InProgress");
         cleanup_clone_root(&state, &project_id, &[&epic_id]);
     }
 
@@ -1396,11 +1762,12 @@ mod tests {
         db.run_migrations().await.unwrap();
         let mut config = Config::for_test(TOKEN);
         config.executor.worker_concurrency = 2;
-        let state = AppState::with_agents(
+        let state = AppState::with_all_agents(
             config,
             db,
             Arc::new(SilentPlanningAgent),
             Arc::new(SilentBreakdownAgent),
+            Arc::new(ScriptedTaskAgent::new()),
         );
 
         let fixture = GitFixture::new().await;
@@ -1447,21 +1814,27 @@ mod tests {
 
         gate.release();
 
-        // All 3 epics eventually complete (bounded poll; the released bodies
-        // run to completion and the freed workers pick up the 3rd).
+        // All 3 epics' tasks eventually reach Done (bounded poll; the
+        // released bodies run to completion and the freed workers pick up
+        // the 3rd). The epics themselves stay InProgress — T-513 never sets
+        // Completed (T-514's job, after a PR opens).
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            let statuses: Vec<String> = futures_util::future::join_all(
-                [&epic_a, &epic_b, &epic_c].map(|id| epic_status(&state, id)),
-            )
-            .await;
-            if statuses.iter().all(|s| s == "Completed") {
+            let all_a = task_statuses(&state, &epic_a).await;
+            let all_b = task_statuses(&state, &epic_b).await;
+            let all_c = task_statuses(&state, &epic_c).await;
+            let done = |m: &std::collections::HashMap<String, String>| m.get("A").map(|s| s == "Done").unwrap_or(false);
+            if done(&all_a) && done(&all_b) && done(&all_c) {
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
-                panic!("not all epics completed in time: {statuses:?}");
+                panic!("not all epics' tasks reached Done in time: {all_a:?} {all_b:?} {all_c:?}");
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        for epic_id in [&epic_a, &epic_b, &epic_c] {
+            assert_eq!(epic_status(&state, epic_id).await, "InProgress");
         }
 
         cleanup_clone_root(&state, &project_id, &[&epic_a, &epic_b, &epic_c]);
@@ -1471,11 +1844,12 @@ mod tests {
 
     /// Enqueue writes the contract shape: hitting `POST /epics/:id/lane
     /// { status: "InProgress" }` on a Ready epic with a task, with a worker
-    /// pool running, drives the DAG to Completed. Since T-510 the lane
-    /// handler itself spawns nothing — the pool (started here by the test,
-    /// mirroring `main`) is what consumes the enqueue + notify.
+    /// pool running, drives the DAG to Done. Since T-510 the lane handler
+    /// itself spawns nothing — the pool (started here by the test, mirroring
+    /// `main`) is what consumes the enqueue + notify. The epic itself stays
+    /// InProgress with its lease released — T-513 never sets Completed.
     #[tokio::test]
-    async fn enqueue_via_lane_drives_dag_to_completed() {
+    async fn enqueue_via_lane_drives_dag_to_done() {
         let (state, app) = test_app().await;
         let fixture = GitFixture::new().await;
         let project_id = seed_project_with_workspace(&state, &fixture).await;
@@ -1501,23 +1875,42 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(body_json(response).await["status"], "InProgress");
 
-        // Poll the DB (bounded) until the epic is Completed.
+        // Poll the DB (bounded) until both tasks are Done.
+        //
+        // Deliberately NOT also asserting the lease is released at some
+        // stable snapshot: since T-513 leaves the epic InProgress once its
+        // DAG is fully Done (T-514 is the only thing that ever moves it to
+        // Completed, removing it from the claim predicate's `status =
+        // 'InProgress'` match), a fully-Done-but-still-InProgress epic
+        // remains claimable — the pool's worker loop immediately re-claims
+        // it, re-attaches the workspace, finds nothing left to do, and
+        // releases again, repeatedly, until either the process stops or
+        // T-514 lands. That makes "lease is None" a constantly-flickering,
+        // not a stable, snapshot here; asserting on it would be flaky by
+        // construction rather than by bug. §2.3's "lease NULL once claimable
+        // work is exhausted" contract shape is exercised properly by
+        // `pool_runs_exactly_worker_concurrency_epics_at_once` and the
+        // claim/heartbeat-specific tests above, against epics that actually
+        // reach a terminal, non-claimable status.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            if epic_status(&state, &epic_id).await == "Completed" {
+            let statuses = task_statuses(&state, &epic_id).await;
+            if statuses.get("A").map(|s| s == "Done").unwrap_or(false)
+                && statuses.get("B").map(|s| s == "Done").unwrap_or(false)
+            {
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
-                panic!("worker pool did not complete the epic in time");
+                panic!("worker pool did not walk the DAG to Done in time: {statuses:?}");
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        // Assert the §2.3 contract shape: lease NULL, epic Completed, all Done.
-        let (lease_owner, lease_expires_at) = epic_lease(&state, &epic_id).await;
-        assert!(lease_owner.is_none(), "lease_owner must be NULL");
-        assert!(lease_expires_at.is_none(), "lease_expires_at must be NULL");
-        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        assert_eq!(
+            epic_status(&state, &epic_id).await,
+            "InProgress",
+            "T-513 never sets Completed — that's T-514's job, after a PR opens"
+        );
 
         let statuses = task_statuses(&state, &epic_id).await;
         assert_eq!(statuses["A"], "Done");
@@ -1713,6 +2106,500 @@ mod tests {
         assert_eq!(row.get::<Option<i64>>(1).unwrap(), Some(5));
         let log: String = row.get(2).unwrap();
         assert!(log.contains("setup-boom"));
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    // ---- T-513: the real implement walk's commit machinery -------------------
+
+    /// Read `git log`'s subjects, oldest first, in `dir`. Used to prove the
+    /// walk's commit *order* and *subjects* directly from git itself rather
+    /// than trusting the DB's task-status transitions alone.
+    async fn git_log_subjects(dir: &std::path::Path) -> Vec<String> {
+        let output = tokio::process::Command::new("git")
+            .args(["log", "--reverse", "--format=%s"])
+            .current_dir(dir)
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success(), "git log failed: {output:?}");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    fn writes_file(path: &str, content: &str) -> ScriptedRun {
+        ScriptedRun {
+            files: vec![(PathBuf::from(path), content.to_string())],
+            ..ScriptedRun::default()
+        }
+    }
+
+    /// A linear DAG (A → B → C) with a `ScriptedTaskAgent` that writes a
+    /// distinct file per task: exactly one commit lands per task, each with
+    /// the §2.8 subject `impl(<short task id>): <title>`, in dependency
+    /// order — read directly out of `git log`, not just inferred from task
+    /// statuses.
+    #[tokio::test]
+    async fn implement_writes_produce_one_commit_per_task_with_section_2_8_subject() {
+        let agent = Arc::new(
+            ScriptedTaskAgent::new()
+                .script(Stage::Implement, writes_file("a.txt", "a"))
+                .script(Stage::Implement, writes_file("b.txt", "b"))
+                .script(Stage::Implement, writes_file("c.txt", "c")),
+        );
+        let (state, _app) = test_app_with_task_agent(agent).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+
+        let a = seed_task(&state, &epic_id, &project_id, "A").await;
+        let b = seed_task(&state, &epic_id, &project_id, "B").await;
+        let c = seed_task(&state, &epic_id, &project_id, "C").await;
+        link(&state, &a, &b).await;
+        link(&state, &b, &c).await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        let statuses = task_statuses(&state, &epic_id).await;
+        assert_eq!(statuses["A"], "Done");
+        assert_eq!(statuses["B"], "Done");
+        assert_eq!(statuses["C"], "Done");
+
+        let workspace_path = workspace::epic_workspace_path(&state.config.clone_root, &epic_id);
+        let subjects = git_log_subjects(&workspace_path).await;
+        assert_eq!(
+            subjects,
+            vec![
+                "init".to_string(),
+                format!("impl({}): A", spec::short_id(&a)),
+                format!("impl({}): B", spec::short_id(&b)),
+                format!("impl({}): C", spec::short_id(&c)),
+            ],
+        );
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// A branching (diamond) DAG: A blocks B and C; B and C both block D.
+    /// Every task's commit lands, in an order that is a valid topological
+    /// order of the DAG — checked both as an exact sequence (this walk always
+    /// picks the lowest-`position` ready task, and B/C were created in that
+    /// order, so the sequence is fully deterministic) and generically (every
+    /// blocker's commit index precedes every task it blocks).
+    #[tokio::test]
+    async fn branching_dag_commits_land_in_a_valid_topological_order() {
+        let agent = Arc::new(
+            ScriptedTaskAgent::new()
+                .script(Stage::Implement, writes_file("a.txt", "a"))
+                .script(Stage::Implement, writes_file("b.txt", "b"))
+                .script(Stage::Implement, writes_file("c.txt", "c"))
+                .script(Stage::Implement, writes_file("d.txt", "d")),
+        );
+        let (state, _app) = test_app_with_task_agent(agent).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+
+        let a = seed_task(&state, &epic_id, &project_id, "A").await;
+        let b = seed_task(&state, &epic_id, &project_id, "B").await;
+        let c = seed_task(&state, &epic_id, &project_id, "C").await;
+        let d = seed_task(&state, &epic_id, &project_id, "D").await;
+        link(&state, &a, &b).await;
+        link(&state, &a, &c).await;
+        link(&state, &b, &d).await;
+        link(&state, &c, &d).await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        let workspace_path = workspace::epic_workspace_path(&state.config.clone_root, &epic_id);
+        let subjects = git_log_subjects(&workspace_path).await;
+        assert_eq!(
+            subjects,
+            vec![
+                "init".to_string(),
+                format!("impl({}): A", spec::short_id(&a)),
+                format!("impl({}): B", spec::short_id(&b)),
+                format!("impl({}): C", spec::short_id(&c)),
+                format!("impl({}): D", spec::short_id(&d)),
+            ],
+        );
+
+        // Generic topological check, independent of this walk's specific
+        // tie-break: every blocker's commit index precedes its blocked task's.
+        let index_of = |short: &str| {
+            subjects
+                .iter()
+                .position(|s| s.contains(short))
+                .unwrap_or_else(|| panic!("no commit found for short id {short}"))
+        };
+        for (blocker, blocked) in [(&a, &b), (&a, &c), (&b, &d), (&c, &d)] {
+            assert!(
+                index_of(spec::short_id(blocker)) < index_of(spec::short_id(blocked)),
+                "{blocker} must commit before {blocked}: {subjects:?}"
+            );
+        }
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// A `TaskAgent` wrapper that, on every `run()` call, synchronously
+    /// records how many tasks are `InProgress` **at the exact moment** the
+    /// stage starts (before delegating to `inner`) — the deterministic,
+    /// no-sleep proof that the walk never runs two tasks concurrently (§2.3's
+    /// "no sibling InProgress" invariant), preferred per MILESTONE_2 T-513's
+    /// AC over a sleep-based probe. The probe query runs on its own
+    /// single-thread tokio runtime inside a plain `std::thread` — `run()`
+    /// itself is synchronous, so a fresh runtime gives the query somewhere
+    /// to `.await` without needing the caller's own async context here.
+    struct ConcurrencyProbeAgent {
+        inner: ScriptedTaskAgent,
+        conn: libsql::Connection,
+        observed: Arc<std::sync::Mutex<Vec<i64>>>,
+    }
+
+    impl TaskAgent for ConcurrencyProbeAgent {
+        fn run(&self, req: TaskRunRequest) -> Result<(RunHandle, Receiver<RunEvent>), HarnessError> {
+            let conn = self.conn.clone();
+            let count = std::thread::spawn(move || {
+                let rt = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .unwrap();
+                rt.block_on(async move {
+                    let mut rows = conn
+                        .query(
+                            "SELECT COUNT(*) FROM task WHERE status = 'InProgress'",
+                            (),
+                        )
+                        .await
+                        .unwrap();
+                    let row = rows.next().await.unwrap().unwrap();
+                    row.get::<i64>(0).unwrap()
+                })
+            })
+            .join()
+            .unwrap();
+            self.observed.lock().unwrap().push(count);
+            self.inner.run(req)
+        }
+    }
+
+    /// Two independent, simultaneously-ready tasks (A, B — no edge between
+    /// them) plus a third (C) that depends on both: nothing here *forces*
+    /// sequential ordering by dependency alone, so this is the strongest
+    /// exercise of the "no sibling InProgress" invariant — only the walk's
+    /// own serialization keeps A and B from ever running together.
+    #[tokio::test]
+    async fn implement_stage_never_observes_a_sibling_in_progress() {
+        let db = Db::connect(":memory:").await.unwrap();
+        db.run_migrations().await.unwrap();
+        let probe_conn = db.conn().clone();
+        let observed = Arc::new(std::sync::Mutex::new(Vec::new()));
+        let agent = Arc::new(ConcurrencyProbeAgent {
+            inner: ScriptedTaskAgent::new(),
+            conn: probe_conn,
+            observed: observed.clone(),
+        });
+        let state = AppState::with_all_agents(
+            Config::for_test(TOKEN),
+            db,
+            Arc::new(SilentPlanningAgent),
+            Arc::new(SilentBreakdownAgent),
+            agent,
+        );
+
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let a = seed_task(&state, &epic_id, &project_id, "A").await;
+        let b = seed_task(&state, &epic_id, &project_id, "B").await;
+        let c = seed_task(&state, &epic_id, &project_id, "C").await;
+        link(&state, &a, &c).await;
+        link(&state, &b, &c).await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        let statuses = task_statuses(&state, &epic_id).await;
+        assert_eq!(statuses["A"], "Done");
+        assert_eq!(statuses["B"], "Done");
+        assert_eq!(statuses["C"], "Done");
+
+        let counts = observed.lock().unwrap().clone();
+        assert_eq!(counts.len(), 3, "one probe reading per task's implement call");
+        assert!(
+            counts.iter().all(|&n| n == 1),
+            "exactly one InProgress task at every implement call: {counts:?}"
+        );
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// An implement stage that makes no changes: no commit lands, no `commit`
+    /// stage `agent_run` row is written, and the task is still left `Done` —
+    /// the tracer-bullet AC ("committed as nothing and left Done"); the real
+    /// already-complete verification is T-532's job.
+    #[tokio::test]
+    async fn no_diff_implement_stage_creates_no_commit_and_leaves_task_done() {
+        // Bare ScriptedTaskAgent (test_app's default): its ScriptedRun::default
+        // writes no files, so the implement stage produces no diff.
+        let (state, _app) = test_app().await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let task_id = seed_task(&state, &epic_id, &project_id, "A").await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        let statuses = task_statuses(&state, &epic_id).await;
+        assert_eq!(statuses["A"], "Done", "a no-diff task is still left Done");
+
+        let workspace_path = workspace::epic_workspace_path(&state.config.clone_root, &epic_id);
+        let subjects = git_log_subjects(&workspace_path).await;
+        assert_eq!(
+            subjects,
+            vec!["init".to_string()],
+            "no commit must land when the implement stage made no changes"
+        );
+
+        let mut rows = state
+            .db
+            .conn()
+            .query(
+                "SELECT COUNT(*) FROM agent_run WHERE task_id = ?1 AND stage = 'commit'",
+                params![task_id],
+            )
+            .await
+            .unwrap();
+        let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(count, 0, "the commit stage never runs when there is nothing to commit");
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// The `implement` and `commit` `agent_run` rows are both written, with
+    /// the right stages/status, and the commit row's `log` carries the
+    /// resulting SHA (§2.2: the Commit stage "records the SHA in log").
+    #[tokio::test]
+    async fn implement_and_commit_agent_run_rows_are_written_with_sha_in_commit_log() {
+        let agent = Arc::new(
+            ScriptedTaskAgent::new().script(Stage::Implement, writes_file("out.txt", "hello")),
+        );
+        let (state, _app) = test_app_with_task_agent(agent).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let task_id = seed_task(&state, &epic_id, &project_id, "A").await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        let workspace_path = workspace::epic_workspace_path(&state.config.clone_root, &epic_id);
+        let head_sha = git::current_commit(&workspace_path).await.unwrap();
+
+        let mut rows = state
+            .db
+            .conn()
+            .query(
+                "SELECT status FROM agent_run WHERE task_id = ?1 AND stage = 'implement'",
+                params![task_id.clone()],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("an implement agent_run row");
+        assert_eq!(row.get::<String>(0).unwrap(), "ok");
+
+        let mut rows = state
+            .db
+            .conn()
+            .query(
+                "SELECT status, log FROM agent_run WHERE task_id = ?1 AND stage = 'commit'",
+                params![task_id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("a commit agent_run row");
+        assert_eq!(row.get::<String>(0).unwrap(), "ok");
+        let log: String = row.get(1).unwrap();
+        assert!(log.contains(&head_sha), "commit row's log must carry the SHA: {log:?}");
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// The D8 prompt actually carries the epic's background and the sibling
+    /// manifest, not a bare spec: A's prompt lists B under "Owned by later
+    /// tasks" (with the epic's description/product/technical context all
+    /// present); once A is Done, B's prompt lists A under "Already built".
+    #[tokio::test]
+    async fn implement_prompt_includes_epic_context_and_sibling_manifest() {
+        let agent = Arc::new(ScriptedTaskAgent::new());
+        let recorded = agent.recorded();
+        let (state, _app) = test_app_with_task_agent(agent.clone()).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+
+        state
+            .db
+            .conn()
+            .execute(
+                "UPDATE epic SET description = ?1, product_context = ?2, technical_context = ?3 \
+                 WHERE id = ?4",
+                params![
+                    "Let users manage their profile.",
+                    "Users abandon onboarding at the profile step.",
+                    "REST endpoints backed by the existing user table.",
+                    epic_id.clone(),
+                ],
+            )
+            .await
+            .unwrap();
+
+        let a = seed_task(&state, &epic_id, &project_id, "Add the profile form").await;
+        let b = seed_task(&state, &epic_id, &project_id, "Wire the profile API").await;
+        link(&state, &a, &b).await; // A runs first, B second.
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        let runs = recorded.lock().unwrap();
+        assert_eq!(runs.len(), 2, "one implement call per task");
+
+        // A's prompt: epic context present; B listed as owned by a later task.
+        assert!(runs[0].prompt.contains("Epic Context"));
+        assert!(runs[0].prompt.contains("Let users manage their profile."));
+        assert!(runs[0]
+            .prompt
+            .contains("Users abandon onboarding at the profile step."));
+        assert!(runs[0]
+            .prompt
+            .contains("REST endpoints backed by the existing user table."));
+        assert!(runs[0].prompt.contains("Owned by later tasks"));
+        assert!(runs[0].prompt.contains("Wire the profile API"));
+
+        // B's prompt: A now shows up under "Already built".
+        assert!(runs[1].prompt.contains("Already built"));
+        assert!(runs[1].prompt.contains("Add the profile form"));
+
+        drop(runs);
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// A `TaskAgent` wrapper that gates only the *Nth* call's `Exited` event
+    /// (0-indexed) behind a [`Gate`], letting every other call through
+    /// untouched — unlike `ScriptedTaskAgent::with_gate`, which gates *every*
+    /// call uniformly. Needed so an earlier task can finish completely while
+    /// a later one is deliberately held in flight (the "cancel mid-walk"
+    /// test below).
+    struct SelectiveGateAgent {
+        inner: ScriptedTaskAgent,
+        call_index: AtomicUsize,
+        gate_at_index: usize,
+        gate: Arc<Gate>,
+    }
+
+    impl TaskAgent for SelectiveGateAgent {
+        fn run(&self, req: TaskRunRequest) -> Result<(RunHandle, Receiver<RunEvent>), HarnessError> {
+            let idx = self.call_index.fetch_add(1, AtomicOrdering::SeqCst);
+            let (handle, inner_rx) = self.inner.run(req)?;
+            if idx != self.gate_at_index {
+                return Ok((handle, inner_rx));
+            }
+            let gate = self.gate.clone();
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                for event in inner_rx {
+                    if matches!(event, RunEvent::Exited { .. }) {
+                        gate.wait();
+                    }
+                    if tx.send(event).is_err() {
+                        break;
+                    }
+                }
+            });
+            Ok((handle, rx))
+        }
+    }
+
+    /// Cancelling mid-walk stops cleanly: while task B's implement stage is
+    /// deliberately held in flight (gated before its terminal `Exited`), an
+    /// external cancel (a lane move away from `InProgress`, simulated by
+    /// writing the epic's status directly) lands. Releasing the gate lets
+    /// B's implement stage *finish*, but the walk's mid-task recheck must
+    /// catch the cancel before finalizing B — so B is never committed or
+    /// marked Done, C (never even reached) stays Todo, and no further
+    /// commits land beyond A's.
+    #[tokio::test]
+    async fn cancel_mid_walk_stops_cleanly_without_further_writes() {
+        let gate = Arc::new(Gate::default());
+        let agent = Arc::new(SelectiveGateAgent {
+            inner: ScriptedTaskAgent::new()
+                .script(Stage::Implement, writes_file("a.txt", "a"))
+                .script(Stage::Implement, writes_file("b.txt", "b"))
+                .script(Stage::Implement, writes_file("c.txt", "c")),
+            call_index: AtomicUsize::new(0),
+            gate_at_index: 1, // gate task B's implement call
+            gate: gate.clone(),
+        });
+
+        let (state, _app) = test_app_with_task_agent(agent).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let a = seed_task(&state, &epic_id, &project_id, "A").await;
+        let b = seed_task(&state, &epic_id, &project_id, "B").await;
+        let c = seed_task(&state, &epic_id, &project_id, "C").await;
+        link(&state, &a, &b).await;
+        link(&state, &b, &c).await;
+
+        let walk_state = state.clone();
+        let walk_epic = epic_id.clone();
+        let handle = tokio::spawn(async move {
+            run_epic_pipeline(walk_state, walk_epic).await;
+        });
+
+        // Bounded, no-sleep-as-the-proof readiness poll: wait until task B is
+        // InProgress — proves A already finished and B's implement call is
+        // now gated in flight.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let statuses = task_statuses(&state, &epic_id).await;
+            if statuses.get("B").map(|s| s == "InProgress").unwrap_or(false) {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("task B never reached InProgress");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Simulate an external cancel while B's implement stage is gated.
+        state
+            .db
+            .conn()
+            .execute(
+                "UPDATE epic SET status = 'Cancelled' WHERE id = ?1",
+                params![epic_id.clone()],
+            )
+            .await
+            .unwrap();
+
+        gate.release();
+        handle.await.unwrap();
+
+        let statuses = task_statuses(&state, &epic_id).await;
+        assert_eq!(statuses["C"], "Todo", "the walk must never have reached C");
+        assert_ne!(
+            statuses["B"], "Done",
+            "B must not be finalized once the cancel was observed mid-task"
+        );
+
+        let workspace_path = workspace::epic_workspace_path(&state.config.clone_root, &epic_id);
+        let subjects = git_log_subjects(&workspace_path).await;
+        assert_eq!(
+            subjects,
+            vec!["init".to_string(), format!("impl({}): A", spec::short_id(&a))],
+            "only A's commit may have landed before the cancel stopped the walk"
+        );
 
         cleanup_clone_root(&state, &project_id, &[&epic_id]);
     }

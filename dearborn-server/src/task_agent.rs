@@ -360,6 +360,18 @@ impl AgentStageOutcome {
             "error"
         }
     }
+
+    /// Whether this stage completed cleanly (`status() == "ok"`) — the
+    /// question a caller driving a multi-stage pipeline actually needs to
+    /// ask (T-513's DAG walk: did `Implement` succeed enough to proceed to
+    /// `git add`/commit, or must the task/epic be routed to a failure path
+    /// instead?). Exposed as its own method rather than making callers derive
+    /// it from the public `cancelled`/`errored`/`exit_code` fields themselves
+    /// — those fields stay public for diagnostics/logging, but the pass/fail
+    /// *decision* is made once, here.
+    pub fn is_ok(&self) -> bool {
+        self.status() == "ok"
+    }
 }
 
 /// Failure modes of [`run_agent_stage`] itself (as opposed to the stage's
