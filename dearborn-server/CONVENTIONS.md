@@ -138,15 +138,37 @@ disallowed move as `409 conflict`; an unknown lane value is `400 bad_request`;
 | `Completed`   | *(terminal)* |
 | `Cancelled`   | *(terminal)* |
 
-`Planning → Ready` is owned by breakdown; `InProgress → Completed` will be
-owned by the stub worker (T-403). Both are rejected by `POST /epics/{id}/lane`.
+`Planning → Ready` is owned by breakdown; `InProgress → Completed` is owned by
+the executor's finalize step (T-514) — set only after the epic's branch is
+pushed **and** its PR has actually opened, never on the DAG going fully `Done`
+alone. Both transitions are rejected by `POST /epics/{id}/lane`.
 
-#### Enqueue on In Progress + stub worker (T-403)
+An `Epic` additionally carries `pr_url` (`string | null`) and `pr_number`
+(`integer | null`), populated together, exactly once, by that same finalize
+step, and `blocked_reason` (`string | null`, one of the MILESTONE_2 §2.3
+values — e.g. `workspace_error`, `setup_failed`, `agent_error`, `pr_failed`),
+set whenever `status = 'Blocked'` and cleared on every other transition. A
+failed push or failed PR sets `blocked_reason = 'pr_failed'` and leaves
+`pr_url`/`pr_number` `null` — `Completed` and a populated `pr_url` always
+appear together.
+
+#### Enqueue on In Progress + the executor (T-403, superseded by T-510–T-514)
+
+> The rest of this subsection describes Milestone 1's **stub** worker,
+> replaced end to end by the real worker pool and pipeline (MILESTONE_2 Phase
+> 0/1: T-510 the lease/claim pool, T-511 workspace provisioning, T-512/T-513
+> the real per-task implement walk, T-514 push + PR + `Completed`). The
+> WS/HTTP contract shapes named below (`dag_updated`, `epic_updated`,
+> `board_updated`, the lane `POST` itself) are unchanged; only what drives
+> them changed. A full write-up of the executor's operational model (leases,
+> workspaces, recovery) is MILESTONE_2 T-564's job; see `MILESTONE_2.md` in
+> the meantime for the authoritative design.
 
 Moving an epic **Ready → In Progress** via `POST /epics/{id}/lane` does more
 than set `epic.status='InProgress'`: it writes the queue/lease shape from §2.3
 — `lease_owner = NULL`, `lease_expires_at = NULL` (explicit even though they
-are NULL from creation) — and **spawns the stub worker** in the background.
+are NULL from creation) — and, since T-510, notifies the executor's worker
+pool rather than spawning anything itself (see the callout above).
 
 The stub worker is a **stub**: no real agent, no git, no shell-out — pure DB
 writes and WS publishes. It claims **ready** tasks one at a time (a task is

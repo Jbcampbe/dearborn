@@ -15,10 +15,12 @@ pub mod epics;
 pub mod error;
 pub mod evidence;
 pub mod git;
+pub mod git_host;
 pub mod hub;
 pub mod lanes;
 pub mod mcp;
 pub mod planning;
+pub mod pr;
 pub mod projects;
 pub mod spec;
 pub mod task_agent;
@@ -44,6 +46,7 @@ pub use config::{Config, ConfigError, ExecutorConfig};
 pub use crypto::MasterKey;
 pub use db::{Db, DbError};
 pub use error::{AppError, AppResult};
+pub use git_host::GitHost;
 pub use hub::Hub;
 pub use mcp::CapabilityStore;
 pub use planning::PlanningAgent;
@@ -89,6 +92,14 @@ pub struct AppState {
     /// claimed task at a time, by construction of the DAG walk), not a
     /// per-epic guard like planning's.
     pub task_agent: Arc<dyn TaskAgent>,
+    /// The git-hosting seam (T-514): push the epic branch and open its PR.
+    /// Production is [`git_host::GithubHost`]; tests inject
+    /// [`git_host::testing::FakeHost`] so `just test` never talks to a real
+    /// GitHub API (MILESTONE_2 §10). Unlike `planner`/`breakdown`/
+    /// `task_agent`, this seam is pure network I/O with no in-flight-run
+    /// bookkeeping of its own — [`crate::worker`]'s finalize step is its only
+    /// caller, once per epic, at the very end of a successful DAG walk.
+    pub git_host: Arc<dyn GitHost>,
     /// Epics with a planning run currently in flight. A second trigger for an
     /// epic already in this set is ignored (its user message is still stored),
     /// so runs never interleave on `seq`/resume. See [`AppState::try_acquire_run`].
@@ -185,13 +196,38 @@ impl AppState {
 
     /// Like [`with_agents`](Self::with_agents) but also injecting the
     /// [`TaskAgent`] — the seam tests use to drive task-stage runs
-    /// hermetically (T-512) without spawning `claude`.
+    /// hermetically (T-512) without spawning `claude`. Defaults `git_host` to
+    /// the production [`git_host::GithubHost`] (override it via
+    /// [`with_all_agents_and_host`](Self::with_all_agents_and_host)).
     pub fn with_all_agents(
         config: Config,
         db: Db,
         planner: Arc<dyn PlanningAgent>,
         breakdown: Arc<dyn BreakdownAgent>,
         task_agent: Arc<dyn TaskAgent>,
+    ) -> AppState {
+        AppState::with_all_agents_and_host(
+            config,
+            db,
+            planner,
+            breakdown,
+            task_agent,
+            Arc::new(git_host::GithubHost::new()),
+        )
+    }
+
+    /// Like [`with_all_agents`](Self::with_all_agents) but also injecting the
+    /// [`GitHost`] — the seam T-514's tests use to drive the finalize
+    /// (push + open PR) step hermetically via
+    /// [`git_host::testing::FakeHost`] instead of the real
+    /// [`git_host::GithubHost`].
+    pub fn with_all_agents_and_host(
+        config: Config,
+        db: Db,
+        planner: Arc<dyn PlanningAgent>,
+        breakdown: Arc<dyn BreakdownAgent>,
+        task_agent: Arc<dyn TaskAgent>,
+        git_host: Arc<dyn GitHost>,
     ) -> AppState {
         let crypto = MasterKey::derive(&config.master_key)
             .expect("master key material validated non-empty at config load");
@@ -203,6 +239,7 @@ impl AppState {
             planner,
             breakdown,
             task_agent,
+            git_host,
             inflight: Arc::new(Mutex::new(HashSet::new())),
             caps: Arc::new(CapabilityStore::new()),
             advertised_base: Arc::new(Mutex::new(None)),

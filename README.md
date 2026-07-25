@@ -164,6 +164,22 @@ a log or persisted in `.git/config` (the remote is reset to the token-free URL
 after clone; fetch re-injects credentials transiently). Git operations that fail
 capture git's stderr with any token redacted.
 
+The same PAT is reused by the executor (Milestone 2) to push a completed
+epic's branch and to open its pull request via the GitHub API — see
+[Required PAT scope](#required-pat-scope) below for what the token needs to be
+able to do.
+
+## Required PAT scope
+
+A project's PAT needs, at minimum, GitHub's classic **`repo`** scope (or, for
+a fine-grained token, **Contents: Read and write** + **Pull requests: Read and
+write** on the target repository) — Dearborn uses it to clone/fetch (read),
+push the epic branch (write), and open the pull request via the REST API
+(pull-request write). A token missing write access fails at push or PR-open
+time with a redacted, readable `Blocked(pr_failed)` reason on the epic (see
+`dearborn-server/CONVENTIONS.md`'s epic lane-transition section); it is never
+silently ignored.
+
 ## Secret handling
 
 Per-project GitHub PATs are **encrypted at rest** with **AES-256-GCM** (T-102):

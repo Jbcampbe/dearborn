@@ -281,7 +281,7 @@ with `agent_error` and gets thickened in later phases.
   is committed as nothing and left `Done` (the real handling lands in T-532);
   cancelling mid-walk stops cleanly; the epic reaches `Completed` only via T-514.
 
-- [ ] **T-514 — `GitHost`, push, and the PR.** *deps: T-513*
+- [x] **T-514 — `GitHost`, push, and the PR.** *deps: T-513*
   Add `reqwest` (rustls-tls, json). `trait GitHost { push, open_pr, check_auth }`;
   `GithubHost` (owner/repo parsed from `repo_url`, PAT from the project) and
   `FakeHost`. Finalize: push the branch, `POST /repos/{owner}/{repo}/pulls`

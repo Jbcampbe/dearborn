@@ -40,6 +40,19 @@
 //! `git status --porcelain` always exits `0`, clean or not, so it composes
 //! with the rest of this module unchanged: an empty (trimmed) result means
 //! nothing to commit.
+//!
+//! ## Pushing the epic branch (T-514)
+//!
+//! [`push_branch`] is the last git-level step of the [`crate::worker`]
+//! finalize sequence: once every task is `Done`, the epic branch is pushed to
+//! `origin` before [`crate::git_host::GitHost::open_pr`] is even attempted (a
+//! PR needs somewhere real to point at). It follows the exact transient-
+//! credential shape [`refresh_repo`] already established for `fetch` —
+//! `-c remote.origin.url=<auth>`, process-scoped, never written to
+//! `repo_dir`'s `.git/config` — because a push is just as much a network
+//! operation needing the PAT as a fetch is, and the workspace's persisted
+//! `origin` must stay the clean, token-free URL
+//! [`crate::workspace::provision_epic_workspace`] set at clone time.
 
 use std::fmt;
 use std::path::Path;
@@ -306,6 +319,31 @@ pub async fn commit_all(
     current_commit(repo_dir).await
 }
 
+/// Push `branch` from `repo_dir` to `origin` at `repo_url`, injecting `pat`
+/// transiently exactly like [`refresh_repo`]'s fetch (`-c
+/// remote.origin.url=<auth>`, process-scoped — never persisted to
+/// `repo_dir`'s `.git/config`). `repo_url` is passed explicitly (rather than
+/// read back from the workspace's own `origin`) so the caller — T-514's
+/// finalize step — always pushes against the project's canonical `repo_url`,
+/// the same source of truth every other network operation in this crate
+/// uses, rather than trusting whatever `origin` happens to be configured to
+/// at push time.
+pub async fn push_branch(
+    repo_dir: &Path,
+    branch: &str,
+    repo_url: &str,
+    pat: Option<&str>,
+) -> Result<(), GitError> {
+    let auth_url = authenticated_url(repo_url, pat)?;
+    let url_override = format!("remote.origin.url={auth_url}");
+    run_git(
+        &["-c", &url_override, "push", "origin", branch],
+        Some(repo_dir),
+        pat,
+    )
+    .await
+}
+
 /// Run `git` with `args`, optionally in `cwd`, discarding stdout. On
 /// non-zero exit the (redacted) stderr becomes the [`GitError`] message.
 /// `GIT_TERMINAL_PROMPT=0` guarantees git never blocks on an interactive
@@ -549,5 +587,78 @@ mod tests {
         let status = status_porcelain(&dir).await.unwrap();
         assert!(status.trim().is_empty());
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- T-514: push_branch ---------------------------------------------
+
+    async fn init_bare_repo(dir: &Path) {
+        tokio::fs::create_dir_all(dir).await.unwrap();
+        run_git_ok(dir, &["init", "--bare", "-b", "main"]).await;
+    }
+
+    /// The AC's headline hermetic proof: a real `git push` (no network — the
+    /// origin is a local `git init --bare` fixture) lands **every** commit,
+    /// not just the tip. Reading the bare repo's own `git log` (rather than
+    /// trusting the workspace side) is the point: it proves the objects
+    /// actually transferred, not just that the local push command exited 0.
+    #[tokio::test]
+    async fn push_branch_lands_every_commit_in_a_bare_origin() {
+        let repo_dir = temp_repo_dir("push-src");
+        init_repo(&repo_dir).await; // "init" commit on main.
+        run_git_ok(&repo_dir, &["checkout", "-b", "feature"]).await;
+        std::fs::write(repo_dir.join("a.txt"), "a\n").unwrap();
+        run_git_ok(&repo_dir, &["add", "."]).await;
+        run_git_ok(&repo_dir, &["commit", "-m", "add a"]).await;
+        std::fs::write(repo_dir.join("b.txt"), "b\n").unwrap();
+        run_git_ok(&repo_dir, &["add", "."]).await;
+        run_git_ok(&repo_dir, &["commit", "-m", "add b"]).await;
+
+        let bare_dir = temp_repo_dir("push-bare");
+        init_bare_repo(&bare_dir).await;
+        let bare_url = bare_dir.to_string_lossy().to_string();
+
+        push_branch(&repo_dir, "feature", &bare_url, None)
+            .await
+            .expect("push to a local bare origin must succeed");
+
+        let subjects = run_git_capture(
+            &["log", "--reverse", "--format=%s", "feature"],
+            Some(&bare_dir),
+            None,
+        )
+        .await
+        .unwrap();
+        let subjects: Vec<&str> = subjects.lines().collect();
+        assert_eq!(
+            subjects,
+            vec!["init", "add a", "add b"],
+            "every commit must have landed in the bare origin, in order"
+        );
+
+        let _ = std::fs::remove_dir_all(&repo_dir);
+        let _ = std::fs::remove_dir_all(&bare_dir);
+    }
+
+    /// A push against an unreachable/bad URL fails, and the (redacted)
+    /// error is readable and never contains the token — mirrors
+    /// `clone_of_bad_url_errors_with_redacted_reason` above for the push path.
+    #[tokio::test]
+    async fn push_branch_bad_url_errors_with_redacted_reason() {
+        let repo_dir = temp_repo_dir("push-badurl");
+        init_repo(&repo_dir).await;
+        let pat = "ghp_pushSecretToken123";
+        let err = push_branch(
+            &repo_dir,
+            "main",
+            "https://dearborn.invalid/nope/nope.git",
+            Some(pat),
+        )
+        .await
+        .expect_err("push to an unreachable host must fail");
+        assert!(!err.message.is_empty(), "error reason must be readable");
+        assert!(!err.message.contains(pat), "no token in error: {}", err.message);
+        assert!(!err.message.contains("ghp_"));
+
+        let _ = std::fs::remove_dir_all(&repo_dir);
     }
 }

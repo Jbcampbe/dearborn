@@ -159,15 +159,20 @@
 //!    concurrently" (§2.3) discipline the M1 stub already had, just now
 //!    guarding a much more expensive step.
 //!
-//! ### Why the epic never reaches `Completed` here
+//! ### `Completed` only after a real PR opens (T-514)
 //!
-//! Unlike the M1 stub, this walk **never** sets `epic.status = 'Completed'`
-//! when the DAG finishes. T-514 owns that transition — it only happens after
-//! the epic's branch has been pushed and a PR has actually opened. An epic
-//! whose DAG is fully `Done` but has not yet been pushed/PR'd is not "done"
-//! in any sense a human watching the board should trust; T-513 stops the
-//! walk and leaves the epic sitting `InProgress` (still holding its lease)
-//! for whatever T-514 wiring runs next.
+//! Unlike the M1 stub, this walk does not set `epic.status = 'Completed'`
+//! the moment the DAG goes fully `Done` — [`finalize_epic`] does, and only
+//! after the epic's branch has been pushed **and** a PR has actually opened
+//! (D1). An epic whose DAG is fully `Done` but has not yet been pushed/PR'd
+//! is not "done" in any sense a human watching the board should trust, so
+//! the walk calls straight into [`finalize_epic`] the moment it observes
+//! `all_done` (still holding the lease, still `InProgress`) rather than
+//! stopping and leaving that step for something else to notice later. See
+//! [`finalize_epic`]'s own doc for the push/PR sequence, the `pr_failed`
+//! failure path, and why this also closes the re-claim spin a fully-`Done`-
+//! but-still-`InProgress` epic would otherwise cause (T-513 left exactly
+//! that gap open, by design, for this task to close).
 //!
 //! ### Failure and cancellation both stop the walk the same way
 //!
@@ -195,9 +200,11 @@ use tokio::task::JoinHandle;
 
 use crate::board;
 use crate::epics::{fetch_epic, get_epic_project_id};
-use crate::evidence::{self, CloseStage, OpenStage};
+use crate::evidence::{self, CloseStage, OpenStage, StageHandle};
 use crate::git;
+use crate::git_host::{OpenPrRequest, PushRequest};
 use crate::mcp;
+use crate::pr;
 use crate::spec::{self, EpicContext, SiblingTask, SpecFields, TaskContext};
 use crate::task_agent::{self, AgentStageParams, Stage, TaskRunRequest};
 use crate::tasks::compute_dag;
@@ -657,17 +664,15 @@ async fn run_epic_pipeline_inner(state: AppState, epic_id: String, lease: LeaseH
             let all_done = dag.nodes.iter().all(|n| n.task.status == "Done");
             if all_done {
                 // The DAG is fully Done (or the epic has no tasks at all).
-                // T-514 — not this walk — is the only place that ever sets
-                // `epic.status = 'Completed'`, and only after a PR opens; see
-                // the module doc's "why the epic never reaches Completed
-                // here" section. Publish the final DAG state and stop; the
-                // epic stays InProgress, lease intact, until T-514's push+PR
-                // step (not yet wired) runs.
+                // Publish the final DAG state, then hand off to T-514's
+                // finalize step (push + open PR); see the module doc's
+                // "Completed only after a real PR opens" section. A lost
+                // lease between the DAG check above and here must still be
+                // re-checked — finalize does its own writes.
                 mcp::publish_dag(&state, &epic_id).await;
-                tracing::info!(
-                    epic = %epic_id,
-                    "pipeline: DAG fully Done; stopping (T-514 owns the Completed transition)"
-                );
+                if !lease.is_lost() {
+                    finalize_epic(&state, &epic_id, &epic, &dag, &workspace, &lease).await;
+                }
             } else {
                 // Some Todo tasks remain but none are ready (all blocked) and
                 // none InProgress — the DAG cannot progress. A valid acyclic
@@ -1019,6 +1024,302 @@ async fn block_epic_on_agent_error(state: &AppState, epic_id: &str, task_id: &st
     set_epic_blocked(state, epic_id, "agent_error").await;
 }
 
+/// Finalize a fully-`Done` epic (T-514, D1): push the branch, open the PR,
+/// persist its identity, flip the epic to `Completed`, delete the workspace,
+/// and publish. This is the **only** place `epic.status` ever becomes
+/// `Completed` — see the module doc's "`Completed` only after a real PR
+/// opens" section for why that transition waits this long.
+///
+/// A failed push or a failed `open_pr` routes the epic to
+/// `Blocked(pr_failed)` (never `Completed`) via [`set_epic_blocked`] — the
+/// same helper, same workspace-retained/lease-released contract every other
+/// failure path in this module already uses — with the readable, redacted
+/// failure reason recorded in a `Stage::Push` `agent_run` row (§2.2 lists
+/// `push` as a non-agent stage; this finalize step is the one place that
+/// stage's row gets opened/closed). Persisting a short `blocked_reason` code
+/// on the epic plus a full message in evidence mirrors exactly how
+/// `setup_failed` splits reason-code vs. captured-output between the epic
+/// row and `agent_run`.
+///
+/// Either exit (`Completed` or `Blocked(pr_failed)`) moves the epic out of
+/// `InProgress`, so [`claim_epic`]'s predicate excludes it from then on —
+/// this is what closes the re-claim spin T-513 deliberately left open (its
+/// module doc says so): before this function existed, a fully-`Done` epic
+/// stayed `InProgress` with its lease released, so the pool would re-claim
+/// and re-walk it in a tight loop forever. Now every path out of a
+/// fully-`Done` DAG ends in a terminal-for-the-queue status.
+async fn finalize_epic(
+    state: &AppState,
+    epic_id: &str,
+    epic: &crate::epics::Epic,
+    dag: &crate::tasks::Dag,
+    workspace: &ProvisionedWorkspace,
+    lease: &LeaseHandle,
+) {
+    let conn = state.db.conn();
+
+    let project = match load_project_for_finalize(conn, &epic.project_id).await {
+        Ok(Some(project)) => project,
+        Ok(None) => {
+            if !lease.is_lost() {
+                block_epic_on_pr_failure(state, epic_id, "project vanished before finalize").await;
+            }
+            return;
+        }
+        Err(err) => {
+            if !lease.is_lost() {
+                block_epic_on_pr_failure(
+                    state,
+                    epic_id,
+                    &format!("failed to load project for finalize: {err}"),
+                )
+                .await;
+            }
+            return;
+        }
+    };
+    let pat = match crate::projects::load_decrypted_pat(state, &epic.project_id).await {
+        Ok(pat) => pat,
+        Err(err) => {
+            if !lease.is_lost() {
+                block_epic_on_pr_failure(
+                    state,
+                    epic_id,
+                    &format!("failed to load project PAT for finalize: {err}"),
+                )
+                .await;
+            }
+            return;
+        }
+    };
+
+    // One evidence row spans both the push and the open-PR call (§2.2 has a
+    // single `push` stage, no separate "open PR" entry) — opened once, here,
+    // before either network/git operation, closed exactly once below on
+    // whichever of the two paths this run takes.
+    let open = OpenStage {
+        task_id: None,
+        epic_id: Some(epic_id),
+        stage: Stage::Push.as_str(),
+        attempt: 1,
+    };
+    let stage_handle = evidence::open_stage(conn, open).await.ok();
+
+    let push_result = state
+        .git_host
+        .push(PushRequest {
+            workspace_path: &workspace.workspace_path,
+            branch: &workspace.branch_name,
+            repo_url: &project.repo_url,
+            pat: pat.as_deref(),
+        })
+        .await;
+
+    if let Err(err) = push_result {
+        let message = git::redact(&err.message, pat.as_deref());
+        close_push_stage(conn, &stage_handle, "error", &format!("push failed: {message}")).await;
+        if !lease.is_lost() {
+            block_epic_on_pr_failure(state, epic_id, &message).await;
+        }
+        return;
+    }
+
+    let title = pr::epic_pr_title(&epic.title);
+    let items = build_task_checklist(conn, epic_id, dag).await;
+    let body = pr::build_pr_body(epic.description.as_deref(), &items);
+
+    let open_result = state
+        .git_host
+        .open_pr(OpenPrRequest {
+            repo_url: &project.repo_url,
+            pat: pat.as_deref(),
+            head: &workspace.branch_name,
+            title: &title,
+            body: &body,
+        })
+        .await;
+
+    let opened = match open_result {
+        Ok(opened) => opened,
+        Err(err) => {
+            let message = git::redact(&err.message, pat.as_deref());
+            close_push_stage(conn, &stage_handle, "error", &format!("open_pr failed: {message}")).await;
+            if !lease.is_lost() {
+                block_epic_on_pr_failure(state, epic_id, &message).await;
+            }
+            return;
+        }
+    };
+
+    close_push_stage(
+        conn,
+        &stage_handle,
+        "ok",
+        &format!(
+            "pushed {} to origin; opened PR {} (#{})",
+            workspace.branch_name, opened.url, opened.number
+        ),
+    )
+    .await;
+
+    // Re-check immediately before the terminal writes: a slow push/PR racing
+    // an external cancel or a stolen lease must not overwrite whatever that
+    // race already did. The PR itself cannot be un-opened at this point —
+    // the fenced UPDATE below simply becomes a no-op if the epic moved on —
+    // but no further Dearborn-side state changes to a no-longer-ours epic.
+    if lease.is_lost() {
+        return;
+    }
+
+    let now = now_ms();
+    let affected = conn
+        .execute(
+            "UPDATE epic SET status = 'Completed', pr_url = ?1, pr_number = ?2, updated_at = ?3 \
+             WHERE id = ?4 AND status = 'InProgress'",
+            params![opened.url.clone(), opened.number, now, epic_id],
+        )
+        .await;
+
+    match affected {
+        Ok(n) if n > 0 => {
+            if let Ok(Some(updated)) = fetch_epic(conn, epic_id).await {
+                let payload = serde_json::to_value(&updated).unwrap_or(serde_json::Value::Null);
+                state
+                    .hub
+                    .publish(&format!("epic:{epic_id}"), "epic_updated", payload);
+                board::publish_board(state, &updated.project_id).await;
+            }
+            if let Err(err) = workspace::delete_workspace(&workspace.workspace_path).await {
+                tracing::warn!(
+                    epic = %epic_id,
+                    error = %err,
+                    "finalize: failed to delete workspace after the PR opened (retained on disk; not fatal — the PR already opened successfully)"
+                );
+            }
+        }
+        Ok(_) => {
+            tracing::warn!(
+                epic = %epic_id,
+                "finalize: epic was no longer InProgress when persisting the opened PR; \
+                 leaving DB state as-is (the PR already opened on GitHub and cannot be un-opened)"
+            );
+        }
+        Err(err) => {
+            tracing::error!(
+                epic = %epic_id,
+                error = %err,
+                "finalize: failed to persist the opened PR; the PR exists on GitHub but Dearborn's \
+                 record of it does not — a human needs to reconcile this"
+            );
+        }
+    }
+}
+
+/// Route a finalize failure (a failed push or a failed `open_pr`) to the
+/// epic `Blocked` transition via [`set_epic_blocked`], with `blocked_reason =
+/// 'pr_failed'` (§2.3). The full, redacted `message` is not stored on the
+/// epic row itself (`blocked_reason` is a short code, matching every other
+/// reason in §2.3) — it already landed in the `Stage::Push` evidence row
+/// ([`finalize_epic`]'s caller closes that row with `message` immediately
+/// before calling this).
+async fn block_epic_on_pr_failure(state: &AppState, epic_id: &str, message: &str) {
+    tracing::warn!(
+        epic = %epic_id,
+        error = %message,
+        "epic finalize (push/PR) failed; epic -> Blocked(pr_failed)"
+    );
+    set_epic_blocked(state, epic_id, "pr_failed").await;
+}
+
+/// Close the finalize step's single `Stage::Push` evidence row, if one was
+/// successfully opened (best-effort: a failure to open it at the very start
+/// of [`finalize_epic`] must not additionally block finalize from
+/// proceeding — the push/PR outcome itself is what matters).
+async fn close_push_stage(
+    conn: &Connection,
+    handle: &Option<StageHandle>,
+    status: &'static str,
+    log: &str,
+) {
+    let Some(handle) = handle else { return };
+    let _ = evidence::close_stage(
+        conn,
+        handle,
+        CloseStage {
+            status,
+            session_id: None,
+            verdict: None,
+            exit_code: if status == "ok" { Some(0) } else { None },
+            log: log.to_string(),
+        },
+    )
+    .await;
+}
+
+/// Just enough of a project row for [`finalize_epic`]'s push/PR step.
+struct ProjectForFinalize {
+    repo_url: String,
+}
+
+async fn load_project_for_finalize(
+    conn: &Connection,
+    project_id: &str,
+) -> Result<Option<ProjectForFinalize>, libsql::Error> {
+    let mut rows = conn
+        .query("SELECT repo_url FROM project WHERE id = ?1", params![project_id])
+        .await?;
+    match rows.next().await? {
+        Some(row) => Ok(Some(ProjectForFinalize { repo_url: row.get(0)? })),
+        None => Ok(None),
+    }
+}
+
+/// Build the PR body's task checklist (D16's template half): every task in
+/// `dag`, in `position` order, paired with the commit SHA its `Stage::Commit`
+/// evidence row recorded (`None` for a task that produced no diff). Reads the
+/// SHA back out of `agent_run.log` via [`pr::parse_commit_sha_from_commit_log`]
+/// — the same format `process_one_task`'s commit step writes — rather than
+/// re-deriving it from `git log`, so this stays a plain DB read next to
+/// everything else finalize already does.
+async fn build_task_checklist(
+    conn: &Connection,
+    epic_id: &str,
+    dag: &crate::tasks::Dag,
+) -> Vec<pr::TaskChecklistItem> {
+    let mut shas: std::collections::HashMap<String, String> = std::collections::HashMap::new();
+    if let Ok(mut rows) = conn
+        .query(
+            "SELECT task_id, log FROM agent_run \
+             WHERE epic_id = ?1 AND stage = 'commit' AND status = 'ok' \
+             ORDER BY created_at ASC",
+            params![epic_id],
+        )
+        .await
+    {
+        while let Ok(Some(row)) = rows.next().await {
+            let task_id: Option<String> = row.get(0).unwrap_or(None);
+            let log: String = row.get(1).unwrap_or_default();
+            if let (Some(task_id), Some(sha)) =
+                (task_id, pr::parse_commit_sha_from_commit_log(&log))
+            {
+                shas.insert(task_id, sha.to_string());
+            }
+        }
+    }
+
+    let mut nodes: Vec<&crate::tasks::DagNode> = dag.nodes.iter().collect();
+    nodes.sort_by_key(|n| n.task.position.unwrap_or(i64::MAX));
+
+    nodes
+        .into_iter()
+        .map(|n| pr::TaskChecklistItem {
+            title: n.task.title.clone(),
+            short_id: spec::short_id(&n.task.id).to_string(),
+            commit_sha: shas.get(&n.task.id).cloned(),
+        })
+        .collect()
+}
+
 /// Resolve the project id for an epic (best-effort, for the board publish).
 /// Re-fetches the epic to read `.project_id` directly. Kept for completeness;
 /// the pipeline body uses `fetch_epic` + `.project_id` instead.
@@ -1043,6 +1344,8 @@ fn now_ms() -> i64 {
 mod tests {
     use super::*;
     use crate::breakdown::testing::SilentBreakdownAgent;
+    use crate::git_host::testing::FakeHost;
+    use crate::git_host::GitHost;
     use crate::planning::testing::{Gate, SilentPlanningAgent};
     use crate::task_agent::testing::{ScriptedRun, ScriptedTaskAgent};
     use crate::{app, Config, Db, TaskAgent};
@@ -1100,15 +1403,26 @@ mod tests {
     /// Like [`test_app`] but with an explicit [`TaskAgent`] — the seam T-513's
     /// tests use to script the implement stage's behavior (write files,
     /// fail, or gate in-flight) instead of accepting the bare no-op default.
+    ///
+    /// Uses [`FakeHost`] (T-514) rather than the default production
+    /// [`git_host::GithubHost`) so that once a test's DAG walk goes fully
+    /// `Done`, finalize's push (real, local — the fixture repos this module
+    /// uses have no PAT and no real network) + open-PR (faked) both succeed
+    /// deterministically: every pre-existing T-513 test in this module that
+    /// drives a walk to completion now also exercises T-514's finalize step,
+    /// which is why several of them assert `Completed` (not `InProgress`)
+    /// below — that assertion changed *because* T-514 landed, not because
+    /// this test scaffolding changed independently of it.
     async fn test_app_with_task_agent(task_agent: Arc<dyn TaskAgent>) -> (AppState, axum::Router) {
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
-        let state = AppState::with_all_agents(
+        let state = AppState::with_all_agents_and_host(
             Config::for_test(TOKEN),
             db,
             Arc::new(SilentPlanningAgent),
             Arc::new(SilentBreakdownAgent),
             task_agent,
+            Arc::new(FakeHost::new()),
         );
         let app = app(state.clone());
         (state, app)
@@ -1325,12 +1639,15 @@ mod tests {
     // doc). A no-op implement stage produces no diff, so no commit ever
     // lands for these tests; that's fine, they're only asserting the DAG
     // walk's task-status/epic-status contract, not the commit machinery
-    // (covered separately below). Note the epic is asserted to stay
-    // `InProgress`, never `Completed` — T-513 never sets that transition;
-    // only T-514 does, after a PR opens (see the module doc).
+    // (covered separately below). Since T-514, a full walk's finalize step
+    // pushes the branch (real, local — `FakeHost::push` delegates to the
+    // genuine `git::push_branch`) and opens a (faked) PR, so the epic now
+    // reaches `Completed`, not the `InProgress`-forever state T-513 alone
+    // left it in (see `finalize_epic`'s doc for why that transition waits
+    // this long, and `enqueue_via_lane_drives_dag_to_done` below for the
+    // dedicated proof that a `Completed` epic is never re-claimed).
 
-    /// Linear DAG (A → B → C): after the walk, all Done, epic still
-    /// InProgress.
+    /// Linear DAG (A → B → C): after the walk, all Done, epic Completed.
     ///
     /// The dependency ORDER is respected implicitly: B can only become ready
     /// after A is Done (its only blocker), and C after B. So asserting the
@@ -1338,7 +1655,7 @@ mod tests {
     /// never reach all-Done. See `implement_stage_runs_respect_dependency_order`
     /// below for a stronger, order-observing proof.
     #[tokio::test]
-    async fn linear_dag_walks_every_task_to_done_epic_stays_in_progress() {
+    async fn linear_dag_walks_every_task_to_done_epic_completes() {
         let (state, _app) = test_app().await;
         let fixture = GitFixture::new().await;
         let project_id = seed_project_with_workspace(&state, &fixture).await;
@@ -1359,16 +1676,16 @@ mod tests {
         assert_eq!(statuses["C"], "Done");
         assert_eq!(
             epic_status(&state, &epic_id).await,
-            "InProgress",
-            "T-513 never sets Completed — that's T-514's job, after a PR opens"
+            "Completed",
+            "T-514's finalize step must complete the epic once every task is Done"
         );
         cleanup_clone_root(&state, &project_id, &[&epic_id]);
     }
 
     /// Branching DAG (A blocks B and C; B and C both block D): all Done,
-    /// epic still InProgress.
+    /// epic Completed.
     #[tokio::test]
-    async fn branching_dag_walks_every_task_to_done_epic_stays_in_progress() {
+    async fn branching_dag_walks_every_task_to_done_epic_completes() {
         let (state, _app) = test_app().await;
         let fixture = GitFixture::new().await;
         let project_id = seed_project_with_workspace(&state, &fixture).await;
@@ -1391,15 +1708,16 @@ mod tests {
         assert_eq!(statuses["B"], "Done");
         assert_eq!(statuses["C"], "Done");
         assert_eq!(statuses["D"], "Done");
-        assert_eq!(epic_status(&state, &epic_id).await, "InProgress");
+        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
         cleanup_clone_root(&state, &project_id, &[&epic_id]);
     }
 
     /// Empty epic (no tasks): the walk finds the (vacuously) fully-Done DAG
-    /// immediately and stops; the epic stays InProgress (never Completed —
-    /// T-514's job).
+    /// immediately, and finalize still pushes + opens a PR for it — an
+    /// epic with zero tasks is a degenerate but valid case, not a special
+    /// one finalize needs to skip.
     #[tokio::test]
-    async fn empty_epic_leaves_epic_in_progress() {
+    async fn empty_epic_still_completes() {
         let (state, _app) = test_app().await;
         let fixture = GitFixture::new().await;
         let project_id = seed_project_with_workspace(&state, &fixture).await;
@@ -1407,7 +1725,7 @@ mod tests {
 
         run_epic_pipeline(state.clone(), epic_id.clone()).await;
 
-        assert_eq!(epic_status(&state, &epic_id).await, "InProgress");
+        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
         cleanup_clone_root(&state, &project_id, &[&epic_id]);
     }
 
@@ -1428,8 +1746,8 @@ mod tests {
     }
 
     /// No sibling InProgress invariant: after a full run, the final state is
-    /// consistent — all Done, none InProgress, epic still InProgress. The
-    /// walk serializes by construction (one ready task at a time); this
+    /// consistent — all Done, none InProgress, epic Completed. The walk
+    /// serializes by construction (one ready task at a time); this
     /// final-state assertion confirms it. See
     /// `implement_stage_never_observes_a_sibling_in_progress` below for a
     /// stronger, moment-by-moment proof via the DB itself.
@@ -1451,7 +1769,7 @@ mod tests {
         assert_eq!(statuses["A"], "Done");
         assert_eq!(statuses["B"], "Done");
         assert!(statuses.values().all(|s| s != "InProgress"));
-        assert_eq!(epic_status(&state, &epic_id).await, "InProgress");
+        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
         cleanup_clone_root(&state, &project_id, &[&epic_id]);
     }
 
@@ -1762,12 +2080,13 @@ mod tests {
         db.run_migrations().await.unwrap();
         let mut config = Config::for_test(TOKEN);
         config.executor.worker_concurrency = 2;
-        let state = AppState::with_all_agents(
+        let state = AppState::with_all_agents_and_host(
             config,
             db,
             Arc::new(SilentPlanningAgent),
             Arc::new(SilentBreakdownAgent),
             Arc::new(ScriptedTaskAgent::new()),
+            Arc::new(FakeHost::new()),
         );
 
         let fixture = GitFixture::new().await;
@@ -1814,27 +2133,29 @@ mod tests {
 
         gate.release();
 
-        // All 3 epics' tasks eventually reach Done (bounded poll; the
-        // released bodies run to completion and the freed workers pick up
-        // the 3rd). The epics themselves stay InProgress — T-513 never sets
-        // Completed (T-514's job, after a PR opens).
+        // All 3 epics eventually reach Completed (bounded poll; the released
+        // bodies run their tasks to Done, then T-514's finalize step pushes
+        // + opens a (faked) PR and flips each epic to Completed — the freed
+        // workers pick up the 3rd along the way).
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            let all_a = task_statuses(&state, &epic_a).await;
-            let all_b = task_statuses(&state, &epic_b).await;
-            let all_c = task_statuses(&state, &epic_c).await;
-            let done = |m: &std::collections::HashMap<String, String>| m.get("A").map(|s| s == "Done").unwrap_or(false);
-            if done(&all_a) && done(&all_b) && done(&all_c) {
+            let statuses = (
+                epic_status(&state, &epic_a).await,
+                epic_status(&state, &epic_b).await,
+                epic_status(&state, &epic_c).await,
+            );
+            if statuses.0 == "Completed" && statuses.1 == "Completed" && statuses.2 == "Completed" {
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
-                panic!("not all epics' tasks reached Done in time: {all_a:?} {all_b:?} {all_c:?}");
+                panic!("not all epics reached Completed in time: {statuses:?}");
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
 
         for epic_id in [&epic_a, &epic_b, &epic_c] {
-            assert_eq!(epic_status(&state, epic_id).await, "InProgress");
+            let statuses = task_statuses(&state, epic_id).await;
+            assert_eq!(statuses["A"], "Done");
         }
 
         cleanup_clone_root(&state, &project_id, &[&epic_a, &epic_b, &epic_c]);
@@ -1844,12 +2165,19 @@ mod tests {
 
     /// Enqueue writes the contract shape: hitting `POST /epics/:id/lane
     /// { status: "InProgress" }` on a Ready epic with a task, with a worker
-    /// pool running, drives the DAG to Done. Since T-510 the lane handler
-    /// itself spawns nothing — the pool (started here by the test, mirroring
-    /// `main`) is what consumes the enqueue + notify. The epic itself stays
-    /// InProgress with its lease released — T-513 never sets Completed.
+    /// pool running, drives the DAG to Done and then (T-514) all the way to
+    /// `Completed` — push (real, local, via `FakeHost::push` delegating to
+    /// `git::push_branch`) + a faked PR, `pr_url`/`pr_number` persisted and
+    /// returned by `GET /epics/{id}`, and the workspace deleted. This is the
+    /// full happy-path end-to-end proof MILESTONE_2 T-514's AC asks for
+    /// (`ScriptedTaskAgent` + `FakeHost` + the local git fixture, enqueue all
+    /// the way to a deleted workspace), plus the dedicated proof that the
+    /// re-claim spin T-513's module doc flagged is now closed: a `Completed`
+    /// epic is never claimable again, and a fresh pool notify leaves it
+    /// alone (see also `completed_epic_is_never_reclaimable` below for the
+    /// minimal, pipeline-independent version of the same claim).
     #[tokio::test]
-    async fn enqueue_via_lane_drives_dag_to_done() {
+    async fn enqueue_via_lane_drives_dag_to_done_and_completes_with_pr() {
         let (state, app) = test_app().await;
         let fixture = GitFixture::new().await;
         let project_id = seed_project_with_workspace(&state, &fixture).await;
@@ -1857,6 +2185,8 @@ mod tests {
         let a = seed_task(&state, &epic_id, &project_id, "A").await;
         let b = seed_task(&state, &epic_id, &project_id, "B").await;
         link(&state, &a, &b).await; // A → B.
+
+        let workspace_path = workspace::epic_workspace_path(&state.config.clone_root, &epic_id);
 
         // Start the pool (T-510): the lane handler no longer spawns anything
         // itself, so a pool must be running to consume the enqueue+notify.
@@ -1875,47 +2205,105 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(body_json(response).await["status"], "InProgress");
 
-        // Poll the DB (bounded) until both tasks are Done.
-        //
-        // Deliberately NOT also asserting the lease is released at some
-        // stable snapshot: since T-513 leaves the epic InProgress once its
-        // DAG is fully Done (T-514 is the only thing that ever moves it to
-        // Completed, removing it from the claim predicate's `status =
-        // 'InProgress'` match), a fully-Done-but-still-InProgress epic
-        // remains claimable — the pool's worker loop immediately re-claims
-        // it, re-attaches the workspace, finds nothing left to do, and
-        // releases again, repeatedly, until either the process stops or
-        // T-514 lands. That makes "lease is None" a constantly-flickering,
-        // not a stable, snapshot here; asserting on it would be flaky by
-        // construction rather than by bug. §2.3's "lease NULL once claimable
-        // work is exhausted" contract shape is exercised properly by
-        // `pool_runs_exactly_worker_concurrency_epics_at_once` and the
-        // claim/heartbeat-specific tests above, against epics that actually
-        // reach a terminal, non-claimable status.
+        // Poll (bounded) until the epic reaches Completed — finalize runs
+        // strictly after the DAG's last task-status write, in the same
+        // pipeline body, so bounding on the epic's own terminal status (not
+        // just the tasks') is what actually proves finalize ran.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            let statuses = task_statuses(&state, &epic_id).await;
-            if statuses.get("A").map(|s| s == "Done").unwrap_or(false)
-                && statuses.get("B").map(|s| s == "Done").unwrap_or(false)
-            {
+            if epic_status(&state, &epic_id).await == "Completed" {
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
-                panic!("worker pool did not walk the DAG to Done in time: {statuses:?}");
+                panic!(
+                    "worker pool never completed the epic in time: status={}, tasks={:?}",
+                    epic_status(&state, &epic_id).await,
+                    task_statuses(&state, &epic_id).await,
+                );
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        assert_eq!(
-            epic_status(&state, &epic_id).await,
-            "InProgress",
-            "T-513 never sets Completed — that's T-514's job, after a PR opens"
-        );
-
         let statuses = task_statuses(&state, &epic_id).await;
         assert_eq!(statuses["A"], "Done");
         assert_eq!(statuses["B"], "Done");
+
+        // pr_url/pr_number persisted and returned by GET /epics/{id}.
+        let get_response = app
+            .clone()
+            .oneshot(req("GET", &format!("/epics/{epic_id}"), None))
+            .await
+            .unwrap();
+        assert_eq!(get_response.status(), StatusCode::OK);
+        let epic_body = body_json(get_response).await;
+        assert_eq!(epic_body["status"], "Completed");
+        assert!(epic_body["pr_url"]
+            .as_str()
+            .expect("pr_url must be persisted and returned")
+            .starts_with("https://"));
+        assert!(
+            epic_body["pr_number"].as_i64().is_some(),
+            "pr_number must be persisted and returned"
+        );
+
+        // The workspace is deleted once the PR opens (T-511's delete_workspace,
+        // finally called) — bounded-poll rather than an immediate check:
+        // finalize commits `status = 'Completed'` and only *then* awaits the
+        // delete, so a concurrent reader can observe `Completed` a moment
+        // before the delete's own await resolves.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if !workspace_path.exists() {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("the workspace must be deleted after a successful finalize");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // ---- the re-claim spin T-513 left behind is closed (T-514) ----
+        //
+        // T-513's module doc flagged this explicitly: a fully-Done-but-
+        // still-InProgress epic would remain claimable, so the pool would
+        // re-claim and re-walk it in a tight loop forever. Now that the epic
+        // is Completed, `claim_epic`'s own predicate (`status = 'InProgress'`)
+        // excludes it — proven directly, then again by observing the live
+        // pool leave it untouched across a fresh notify.
+        let direct_claim = claim_epic(state.db.conn(), "re-claim-prober", 30)
+            .await
+            .unwrap();
+        assert!(
+            direct_claim.is_none(),
+            "a Completed epic must never be claimable again"
+        );
+
+        state.notify.notify_waiters();
+        tokio::time::sleep(Duration::from_millis(50)).await;
+        assert_eq!(
+            epic_status(&state, &epic_id).await,
+            "Completed",
+            "a Completed epic must not be disturbed by a fresh pool notify"
+        );
+        let (lease_owner, lease_expires_at) = epic_lease(&state, &epic_id).await;
+        assert!(lease_owner.is_none(), "a Completed epic must never hold a lease");
+        assert!(lease_expires_at.is_none());
+
         cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// The minimal, pipeline-independent version of the same regression: a
+    /// `Completed` epic (seeded directly, however it got there) is never
+    /// claimable. See `enqueue_via_lane_drives_dag_to_done_and_completes_with_pr`
+    /// above for the full pipeline-driven proof.
+    #[tokio::test]
+    async fn completed_epic_is_never_reclaimable() {
+        let (state, _app) = test_app().await;
+        let project_id = seed_project(&state).await;
+        seed_epic(&state, &project_id, "Completed").await;
+
+        let claimed = claim_epic(state.db.conn(), "prober", 30).await.unwrap();
+        assert!(claimed.is_none(), "a Completed epic must never be claimable");
     }
 
     // ---- T-511: provisioning-failure wiring (workspace_error / setup_failed) ----
@@ -2116,8 +2504,21 @@ mod tests {
     /// walk's commit *order* and *subjects* directly from git itself rather
     /// than trusting the DB's task-status transitions alone.
     async fn git_log_subjects(dir: &std::path::Path) -> Vec<String> {
+        git_log_subjects_for_ref(dir, "HEAD").await
+    }
+
+    /// Like [`git_log_subjects`] but against an explicit ref — since T-514,
+    /// a test that drives a walk all the way to `Completed` has its
+    /// workspace **deleted** by finalize once the PR opens (T-511's
+    /// `delete_workspace`, finally called), so a test that still wants to
+    /// see the exact commits (subjects, order, SHA) has to read them back
+    /// from wherever finalize actually pushed them — the `GitFixture`'s own
+    /// directory, which doubles as the project's `repo_url`/canonical
+    /// checkout/origin all at once in these tests — on the epic's own
+    /// branch, rather than from the now-gone workspace directory.
+    async fn git_log_subjects_for_ref(dir: &std::path::Path, git_ref: &str) -> Vec<String> {
         let output = tokio::process::Command::new("git")
-            .args(["log", "--reverse", "--format=%s"])
+            .args(["log", "--reverse", "--format=%s", git_ref])
             .current_dir(dir)
             .output()
             .await
@@ -2127,6 +2528,37 @@ mod tests {
             .lines()
             .map(|s| s.to_string())
             .collect()
+    }
+
+    /// `git rev-parse <git_ref>` in `dir`, trimmed — used the same way
+    /// [`git_log_subjects_for_ref`] is: reading a commit SHA back from
+    /// wherever the epic branch was actually pushed, once the workspace
+    /// itself is gone.
+    async fn git_rev_parse(dir: &std::path::Path, git_ref: &str) -> String {
+        let output = tokio::process::Command::new("git")
+            .args(["rev-parse", git_ref])
+            .current_dir(dir)
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success(), "git rev-parse failed: {output:?}");
+        String::from_utf8_lossy(&output.stdout).trim().to_string()
+    }
+
+    /// Read back the `branch_name` T-511's provisioning persisted on the
+    /// epic row — needed (post-T-514) to look up commits on the pushed
+    /// branch once the workspace itself is deleted.
+    async fn epic_branch_name_column(state: &AppState, epic_id: &str) -> String {
+        let mut rows = state
+            .db
+            .conn()
+            .query("SELECT branch_name FROM epic WHERE id = ?1", params![epic_id])
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        row.get::<Option<String>>(0)
+            .unwrap()
+            .expect("branch_name must be persisted by provisioning")
     }
 
     fn writes_file(path: &str, content: &str) -> ScriptedRun {
@@ -2166,9 +2598,12 @@ mod tests {
         assert_eq!(statuses["A"], "Done");
         assert_eq!(statuses["B"], "Done");
         assert_eq!(statuses["C"], "Done");
+        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
 
-        let workspace_path = workspace::epic_workspace_path(&state.config.clone_root, &epic_id);
-        let subjects = git_log_subjects(&workspace_path).await;
+        // The workspace is deleted post-finalize; read the pushed commits
+        // back from the fixture (the project's origin) on the epic branch.
+        let branch = epic_branch_name_column(&state, &epic_id).await;
+        let subjects = git_log_subjects_for_ref(&fixture.dir, &branch).await;
         assert_eq!(
             subjects,
             vec![
@@ -2213,8 +2648,10 @@ mod tests {
 
         run_epic_pipeline(state.clone(), epic_id.clone()).await;
 
-        let workspace_path = workspace::epic_workspace_path(&state.config.clone_root, &epic_id);
-        let subjects = git_log_subjects(&workspace_path).await;
+        // The workspace is deleted post-finalize; read the pushed commits
+        // back from the fixture (the project's origin) on the epic branch.
+        let branch = epic_branch_name_column(&state, &epic_id).await;
+        let subjects = git_log_subjects_for_ref(&fixture.dir, &branch).await;
         assert_eq!(
             subjects,
             vec![
@@ -2302,12 +2739,13 @@ mod tests {
             conn: probe_conn,
             observed: observed.clone(),
         });
-        let state = AppState::with_all_agents(
+        let state = AppState::with_all_agents_and_host(
             Config::for_test(TOKEN),
             db,
             Arc::new(SilentPlanningAgent),
             Arc::new(SilentBreakdownAgent),
             agent,
+            Arc::new(FakeHost::new()),
         );
 
         let fixture = GitFixture::new().await;
@@ -2355,8 +2793,10 @@ mod tests {
         let statuses = task_statuses(&state, &epic_id).await;
         assert_eq!(statuses["A"], "Done", "a no-diff task is still left Done");
 
-        let workspace_path = workspace::epic_workspace_path(&state.config.clone_root, &epic_id);
-        let subjects = git_log_subjects(&workspace_path).await;
+        // The workspace is deleted post-finalize; read the pushed branch
+        // back from the fixture (the project's origin).
+        let branch = epic_branch_name_column(&state, &epic_id).await;
+        let subjects = git_log_subjects_for_ref(&fixture.dir, &branch).await;
         assert_eq!(
             subjects,
             vec!["init".to_string()],
@@ -2394,8 +2834,10 @@ mod tests {
 
         run_epic_pipeline(state.clone(), epic_id.clone()).await;
 
-        let workspace_path = workspace::epic_workspace_path(&state.config.clone_root, &epic_id);
-        let head_sha = git::current_commit(&workspace_path).await.unwrap();
+        // The workspace is deleted post-finalize; read HEAD back from the
+        // fixture (the project's origin) on the epic branch instead.
+        let branch = epic_branch_name_column(&state, &epic_id).await;
+        let head_sha = git_rev_parse(&fixture.dir, &branch).await;
 
         let mut rows = state
             .db
@@ -2481,6 +2923,187 @@ mod tests {
         assert!(runs[1].prompt.contains("Add the profile form"));
 
         drop(runs);
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    // ---- T-514: finalize (push + open PR) -------------------------------
+
+    /// Like [`test_app_with_task_agent`] but also injecting an explicit
+    /// [`GitHost`] — the seam T-514's tests use to script/inspect the
+    /// finalize step's push/PR calls instead of accepting the default
+    /// [`FakeHost`].
+    async fn test_app_with_task_agent_and_host(
+        task_agent: Arc<dyn TaskAgent>,
+        git_host: Arc<dyn GitHost>,
+    ) -> (AppState, axum::Router) {
+        let db = Db::connect(":memory:").await.unwrap();
+        db.run_migrations().await.unwrap();
+        let state = AppState::with_all_agents_and_host(
+            Config::for_test(TOKEN),
+            db,
+            Arc::new(SilentPlanningAgent),
+            Arc::new(SilentBreakdownAgent),
+            task_agent,
+            git_host,
+        );
+        let app = app(state.clone());
+        (state, app)
+    }
+
+    /// `open_pr` sends the right title/head/base: asserted via `FakeHost`'s
+    /// recorded call, against a walk that actually completes.
+    #[tokio::test]
+    async fn finalize_open_pr_sends_the_right_title_head_and_base() {
+        let fake = Arc::new(FakeHost::new());
+        let (state, _app) =
+            test_app_with_task_agent_and_host(Arc::new(ScriptedTaskAgent::new()), fake.clone())
+                .await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        seed_task(&state, &epic_id, &project_id, "A").await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+
+        let branch = epic_branch_name_column(&state, &epic_id).await;
+        let calls = fake.open_pr_calls();
+        assert_eq!(calls.len(), 1, "exactly one open_pr call per finalize");
+        assert_eq!(calls[0].head, branch, "PR must be opened from the epic branch");
+        assert_eq!(calls[0].base, "main", "PR must target the (fake) default branch");
+        assert_eq!(calls[0].title, "E", "PR title must be the epic's own title (seed_epic's 'E')");
+        assert!(calls[0].body.contains("## Tasks"));
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// `Completed` is set **only** after the PR opens: a `FakeHost` scripted
+    /// to fail `open_pr` leaves the epic `Blocked(pr_failed)`, the workspace
+    /// retained, and `pr_url`/`pr_number` unset — and the readable, redacted
+    /// failure reason lands in the `Stage::Push` evidence row without ever
+    /// leaking the token, even when the (contrived) failure message itself
+    /// contained it.
+    ///
+    /// Calls [`finalize_epic`] directly rather than through the full
+    /// `run_epic_pipeline` walk, and stubs `push` to succeed trivially
+    /// (`FakeHost::stub_push_success`): a project's PAT reaches the
+    /// *canonical* checkout's own refresh during provisioning too
+    /// (`workspace::provision_epic_workspace`), and separately reaches
+    /// `push` itself — and [`git::authenticated_url`] requires an
+    /// `https://` `repo_url` the instant a PAT is present, which this test's
+    /// local git-fixture `repo_url` never is (there is no network in `just
+    /// test`). Provisioning without a PAT first, then setting one and
+    /// calling `finalize_epic` directly with push stubbed out, isolates
+    /// exactly the thing this test cares about — does *finalize's own*
+    /// redaction hold on the `open_pr` failure path when the project
+    /// genuinely has a PAT configured — from both of those unrelated
+    /// PAT/https constraints.
+    #[tokio::test]
+    async fn failed_open_pr_blocks_epic_retains_workspace_and_never_persists_a_pr() {
+        let pat = "ghp_openPrFailureLeak123";
+        let fake = Arc::new(
+            FakeHost::new()
+                .stub_push_success()
+                .fail_open_pr(format!("GitHub API returned HTTP 422: bad token {pat}")),
+        );
+        let (state, _app) =
+            test_app_with_task_agent_and_host(Arc::new(ScriptedTaskAgent::new()), fake).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        seed_task(&state, &epic_id, &project_id, "A").await;
+
+        let ws = workspace::provision_epic_workspace(&state, &epic_id, &project_id)
+            .await
+            .expect("provisioning without a PAT must succeed against the local fixture");
+
+        // Only now give the project a real, decryptable PAT — see the doc
+        // comment above for why this has to happen after provisioning, not
+        // before.
+        let blob = state.crypto.encrypt_pat(pat).unwrap();
+        state
+            .db
+            .conn()
+            .execute(
+                "UPDATE project SET pat_encrypted = ?1 WHERE id = ?2",
+                params![blob, project_id.clone()],
+            )
+            .await
+            .unwrap();
+
+        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        let dag = compute_dag(state.db.conn(), &epic_id).await.unwrap();
+        finalize_epic(&state, &epic_id, &epic, &dag, &ws, &LeaseHandle::new()).await;
+
+        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        assert_eq!(epic.status, "Blocked");
+        assert_eq!(epic.blocked_reason.as_deref(), Some("pr_failed"));
+        assert!(epic.pr_url.is_none(), "pr_url must never be set when open_pr fails");
+        assert!(epic.pr_number.is_none());
+
+        let (lease_owner, lease_expires_at) = epic_lease(&state, &epic_id).await;
+        assert!(lease_owner.is_none(), "lease must be released on Blocked");
+        assert!(lease_expires_at.is_none());
+
+        let workspace_path = workspace::epic_workspace_path(&state.config.clone_root, &epic_id);
+        assert!(
+            workspace_path.join(".git").exists(),
+            "the workspace must be retained (never deleted) when finalize fails"
+        );
+
+        let mut rows = state
+            .db
+            .conn()
+            .query(
+                "SELECT status, log FROM agent_run WHERE epic_id = ?1 AND stage = 'push'",
+                params![epic_id.clone()],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("a push agent_run row");
+        assert_eq!(row.get::<String>(0).unwrap(), "error");
+        let log: String = row.get(1).unwrap();
+        assert!(log.contains("422"), "the failure reason must be readable: {log:?}");
+        assert!(!log.contains(pat), "the token must never leak into evidence: {log:?}");
+        assert!(!log.contains("ghp_"));
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// A failed `push` blocks the epic the same way, with the workspace
+    /// retained and `open_pr` never even attempted.
+    #[tokio::test]
+    async fn failed_push_blocks_epic_retains_workspace_and_never_calls_open_pr() {
+        let fake = Arc::new(FakeHost::new().fail_push("simulated push failure"));
+        let (state, _app) = test_app_with_task_agent_and_host(
+            Arc::new(ScriptedTaskAgent::new()),
+            fake.clone(),
+        )
+        .await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        seed_task(&state, &epic_id, &project_id, "A").await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        assert_eq!(epic.status, "Blocked");
+        assert_eq!(epic.blocked_reason.as_deref(), Some("pr_failed"));
+        assert!(epic.pr_url.is_none());
+
+        let workspace_path = workspace::epic_workspace_path(&state.config.clone_root, &epic_id);
+        assert!(
+            workspace_path.join(".git").exists(),
+            "the workspace must be retained when the push fails"
+        );
+
+        assert!(
+            fake.open_pr_calls().is_empty(),
+            "open_pr must never be attempted once the push has failed"
+        );
+
         cleanup_clone_root(&state, &project_id, &[&epic_id]);
     }
 
