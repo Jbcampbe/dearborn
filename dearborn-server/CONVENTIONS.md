@@ -152,6 +152,37 @@ failed push or failed PR sets `blocked_reason = 'pr_failed'` and leaves
 `pr_url`/`pr_number` `null` — `Completed` and a populated `pr_url` always
 appear together.
 
+#### Structured failure & `Blocked` (T-540)
+
+Every failure path in the executor — preflight/provisioning failures with no
+task at fault, and per-task failures (a failed agent stage, an exhausted test
+gate, a review that never converged, an agent-reported `BLOCKED`) — funnels
+through one centralized router (`worker::fail_item`). It sets the epic
+`Blocked` with `blocked_reason` set to the exact MILESTONE_2 §2.3 reason
+(`preflight_red | setup_failed | workspace_error | test_gate_exhausted |
+review_not_converged | blocked | agent_error | timeout | cancelled |
+pr_failed`); when the failure has a specific task at fault, that `Task` is
+also set `Failed` with the identical string in its own `failure_reason`
+column, so `POST /tasks/{id}/retry` (T-541) can find it. Both writes always
+carry the same reason string.
+
+On every `Blocked` transition the executor also attempts to **push the
+epic's branch** to the project's remote — whatever is already committed, so
+a human can `git clone`/`fetch` the branch and triage locally without VPS
+access (§7). This push only ever sends committed work: a failing task's
+uncommitted, in-progress changes are never staged or pushed, and the
+retained workspace still has them on disk for inspection. The push is
+best-effort — its outcome (success or failure) is recorded as a `push`
+`agent_run` row, but a push failure never changes `blocked_reason` or
+prevents the `Blocked` transition. The push is skipped entirely (no `push`
+row at all) when the failure predates any provisioned workspace
+(`workspace_error`/`setup_failed`) or when the finalize step's own push/PR
+sequence already handled it (`pr_failed`).
+
+A failure is epic-scoped, not fatal to the worker: the same worker loop that
+just blocked one epic claims its next item (a different epic, or the same
+project's next one) immediately, with no extra delay.
+
 #### Enqueue on In Progress + the executor (T-403, superseded by T-510–T-514)
 
 > The rest of this subsection describes Milestone 1's **stub** worker,

@@ -157,10 +157,10 @@
 //! entered — no task is looked up, no `Stage::Implement` request is ever
 //! built, and [`crate::task_agent::TaskAgent::run`] is never called. The
 //! epic's tasks stay exactly `Todo` (or whatever they already were), the
-//! workspace is retained (routed through [`set_epic_blocked`], the same
-//! helper every other blocked path here uses — never a bespoke write), and
-//! the lease is released by [`try_claim_and_run`] exactly as it is on every
-//! other exit path.
+//! workspace is retained (routed through [`fail_item`], the same T-540
+//! router every other failure path in this module funnels through — never a
+//! bespoke write), and the lease is released by [`try_claim_and_run`]
+//! exactly as it is on every other exit path.
 //!
 //! ## The real implement walk (T-513)
 //!
@@ -194,12 +194,13 @@
 //!    recorded by [`crate::task_agent::run_agent_stage`] exactly as T-512
 //!    built it. A stage that does not come back `ok`
 //!    ([`crate::task_agent::AgentStageOutcome::is_ok`]) — or fails to even
-//!    start — routes the *epic* to `Blocked(agent_error)` via
-//!    [`block_epic_on_agent_error`] and stops the walk. This is deliberately
-//!    coarse: MILESTONE_2 §4 calls Phase 1 a tracer bullet and says anything
-//!    that fails here blocks with `agent_error` and gets a real, structured
-//!    failure taxonomy later (T-540/T-541); this slice does not attempt to
-//!    distinguish *why* the stage failed.
+//!    start — routes the *task* to `Failed(agent_error)` and the epic to
+//!    `Blocked(agent_error)` via [`fail_item`] (T-540's centralized router;
+//!    see its own section below) and stops the walk. `agent_error` stays
+//!    deliberately coarse here: MILESTONE_2 §4 calls Phase 1 a tracer bullet
+//!    and this slice still does not attempt to distinguish *why* the stage
+//!    failed — T-540 only centralizes *where* every failure lands, not the
+//!    granularity of this particular reason.
 //! 5. **`git add -A`**, then a commit **only if there is something to
 //!    commit** ([`git::status_porcelain`] after staging) — an agent that made
 //!    no changes (it judged the task already satisfied by earlier work) is
@@ -249,8 +250,9 @@
 //! **and** again immediately after the implement stage returns but before
 //! the commit/`Done` writes (a slow agent run racing an external cancel must
 //! not finalize a task after the cancel landed) — mirroring the same
-//! belt-and-suspenders re-check [`block_epic_on_provision_failure`]'s call
-//! site already used for the provisioning-failure path. The full "kill the
+//! belt-and-suspenders re-check the provisioning-failure call site (just
+//! above, in [`run_epic_pipeline_inner`]) already uses around its own
+//! [`fail_item`] call. The full "kill the
 //! in-flight agent process" mechanism is T-542's job, out of scope here; this
 //! walk only guarantees that once a cancel/lease-loss is *observed*, nothing
 //! further gets written.
@@ -303,35 +305,18 @@
 //! ### Exhaustion: the task fails, the epic blocks, nothing is committed
 //!
 //! Once `attempt` reaches `DEARBORN_MAX_TEST_FIX_ATTEMPTS` and the gate is
-//! still red, [`run_test_gate_loop`] gives up: [`fail_task_and_block_epic`]
-//! sets `task.status = 'Failed'`/`task.failure_reason = 'test_gate_exhausted'`
-//! *and* routes the epic to `Blocked` with the identical reason string (D10:
-//! a failed task halts its epic immediately). Nothing above this point ever
-//! called `git add`, so the dirty tree the last fix round produced simply
-//! stays in the workspace exactly as it was — retained on disk (this path
-//! never deletes anything, same as every other failure path in this module)
-//! but never staged, never committed, never pushed. A human inspecting the
+//! still red, [`run_test_gate_loop`] gives up: [`fail_item`] (T-540's
+//! centralized router — see its own section below) sets `task.status =
+//! 'Failed'`/`task.failure_reason = 'test_gate_exhausted'` *and* routes the
+//! epic to `Blocked` with the identical reason string (D10: a failed task
+//! halts its epic immediately). Nothing above this point ever called
+//! `git add`, so the dirty tree the last fix round produced simply stays in
+//! the workspace exactly as it was — retained on disk (this path never
+//! deletes anything, same as every other failure path in this module) but
+//! never staged, never committed, never pushed. A human inspecting the
 //! retained workspace sees precisely what the last fix attempt left behind,
 //! which is the whole point of not committing it: there's nothing to `git
 //! revert`, no history to clean up, just an ordinary dirty working tree.
-//!
-//! ### Why `fail_task_and_block_epic` exists alongside `block_epic_on_agent_error`
-//!
-//! Every T-513 failure path (`block_epic_on_agent_error`) blocks the epic but
-//! leaves the failing task's own `status` wherever the walk left it
-//! (`InProgress`) — MILESTONE_2 §4 calls that acceptable for the Phase 1
-//! tracer bullet and names T-540 as the task that centralizes a real
-//! `Failed`/`Blocked` router. T-522's AC is more specific than that
-//! tracer-bullet allowance, though: it names `Failed(test_gate_exhausted)` as
-//! a **task**-level outcome (not just something the epic's `blocked_reason`
-//! implies), because T-541's retry contract (`POST /tasks/{id}/retry`, `409`
-//! unless the task is `Failed`) needs `task.status = 'Failed'` to find this
-//! task at all once it's fixed by hand. [`fail_task_and_block_epic`] is
-//! written narrowly for the two failure shapes T-522 itself introduces
-//! (gate exhaustion, and a fix stage that errors — see the AC's point 6);
-//! it is deliberately not offered as a drop-in replacement for
-//! `block_epic_on_agent_error`'s other call sites, so as not to quietly
-//! pre-build T-540's centralization ahead of that task actually landing.
 //!
 //! ### Why the fix agent sees only the failing output (D19)
 //!
@@ -405,11 +390,11 @@
 //! **same** review prompt with [`VERDICT_CONTRACT_REMINDER`] appended — a
 //! short, literal restatement of the exact required line, not a second
 //! review request. If the re-run still doesn't parse, the contract is
-//! considered broken: [`fail_task_and_block_epic`] routes the task to
-//! `Failed(agent_error)` and the epic to `Blocked` — the same helper T-522's
-//! exhausted test-gate loop uses, reused rather than duplicated, because both
-//! are "this stage could not produce a usable result after its bounded
-//! retries" in the same shape.
+//! considered broken: [`fail_item`] routes the task to `Failed(agent_error)`
+//! and the epic to `Blocked` — the same T-540 router T-522's exhausted
+//! test-gate loop calls, reused rather than duplicated, because both are
+//! "this stage could not produce a usable result after its bounded retries"
+//! in the same shape.
 //!
 //! ### Both raw outputs survive, by construction
 //!
@@ -478,8 +463,8 @@
 //! [`process_one_task`] hands every verdict to
 //! [`run_review_fix_converge`] (T-531, next section): `PASS` proceeds
 //! straight to `Done`, exactly as an epic with no review stage at all would
-//! have; `BLOCKED` routes through [`fail_task_and_block_epic`] as
-//! `Failed(blocked)` (§2.3's reason for "the agent returned BLOCKED"); and
+//! have; `BLOCKED` routes through [`fail_item`] as `Failed(blocked)` (§2.3's
+//! reason for "the agent returned BLOCKED"); and
 //! `NEEDS_CHANGES` re-enters `Stage::Fix` and re-reviews against the same
 //! `base_sha`, capped by `MAX_FIX_ROUNDS` — the real ralph-equivalent
 //! treatment (`references/ralph-v2.sh`'s `# ---- review / judge / fix loop
@@ -678,10 +663,10 @@
 //!   `Done` with the branch's commit count **unchanged** — no `Stage::Commit`
 //!   row, no `Stage::Review` row, ever, on this path. This is the AC's
 //!   headline scripted test.
-//! - **`BLOCKED`** — routed through [`fail_task_and_block_epic`] as
-//!   `Failed(blocked)`, byte-for-byte the same treatment a `BLOCKED` review
-//!   verdict gets (§2.3's reason for "the agent returned BLOCKED" makes no
-//!   distinction by stage).
+//! - **`BLOCKED`** — routed through [`fail_item`] as `Failed(blocked)`,
+//!   byte-for-byte the same treatment a `BLOCKED` review verdict gets
+//!   (§2.3's reason for "the agent returned BLOCKED" makes no distinction
+//!   by stage).
 //! - **`NEEDS_CHANGES`** — the interesting case, and where MILESTONE_2 §6's
 //!   own wording ("route findings to `Fix` and **re-enter the normal
 //!   pipeline**") is load-bearing: this is deliberately *not* a bounded
@@ -752,6 +737,148 @@
 //! /tasks/{id}/runs` lists it with `stage='verify_complete'`,
 //! `verdict='PASS'` (or `NEEDS_CHANGES`/`BLOCKED`) for any task that took
 //! this path — nothing extra to build for this half of the AC.
+//!
+//! ## T-540: structured failure & Blocked (§2.3, §7)
+//!
+//! Every section above this one was written against a *scattered* failure
+//! story: T-513's tracer bullet introduced `block_epic_on_agent_error`
+//! (blocks the epic, leaves the failing task `InProgress`); T-522 needed
+//! more — a **task**-level `Failed(reason)` T-541's retry contract could find
+//! — and added a second, narrower helper (`fail_task_and_block_epic`)
+//! rather than fix the first one, explicitly deferring that unification to
+//! "T-540" by name in both helpers' own doc comments; T-511's provisioning
+//! failures and T-514's finalize failures each grew their own thin
+//! `block_epic_on_*` wrapper around a shared `set_epic_blocked` write. Four
+//! call shapes, one inconsistency (a failing task's own `status` depended on
+//! *which* helper happened to fail it), and §2.3's full ten-reason
+//! vocabulary reachable only by accident of which call site a future task
+//! happened to touch.
+//!
+//! [`fail_item`] replaces all of it: **one** router, taking a
+//! [`FailureContext`], that every failure path above (and T-542/T-543's,
+//! once those land) now calls. [`FailureReason`] makes §2.3's vocabulary a
+//! type instead of bare string literals — the same discipline [`Stage`]
+//! already applies to §2.2 — so a reason reaching [`fail_item`] is something
+//! the compiler enforces (a match must name every variant) and a test
+//! enumerates ([`FailureReason::ALL`]) rather than something only visible by
+//! grepping call sites.
+//!
+//! ### One shape for a task-scoped and a no-task failure
+//!
+//! [`FailureContext::task_id`] is `Option<&str>`: `Some` for every failure
+//! that has one task at fault (`agent_error`, `test_gate_exhausted`,
+//! `review_not_converged`, `blocked`, and T-542/T-543's `cancelled`/
+//! `timeout`), `None` for the four that don't (`preflight_red`,
+//! `setup_failed`, `workspace_error` — the DAG walk never even started — and
+//! `pr_failed` — every task already finished; the failure is finalize's
+//! own). [`fail_item`] only ever touches the `task` table when `task_id` is
+//! `Some`; every other step (the epic write, the publishes, the push) runs
+//! unconditionally. This is what "a failure with no associated task and one
+//! with a task both fit without a second function" (this task's own design
+//! brief) means concretely: nothing about the router's shape assumes a task
+//! exists.
+//!
+//! ### Fixing the inconsistency: every failure now reaches `Failed`/`Blocked`
+//! ### together
+//!
+//! The five former `block_epic_on_agent_error` call sites (in
+//! [`process_one_task`], [`run_verdict_stage`], and
+//! [`run_verify_complete`]) used to leave the failing task `InProgress` —
+//! the exact gap those functions' own (now-deleted) doc comments named T-540
+//! as the fix for. Migrating them onto [`fail_item`] with `task_id: Some(..)`
+//! closes it: every one of those five now sets `task.status = 'Failed'`
+//! (with the identical `agent_error` reason the epic gets) as part of the
+//! same call. A base-`sha` read failure is a special case worth naming: it
+//! happens *before* [`process_one_task`]'s own `Todo → InProgress` write, so
+//! pre-T-540 that task was left `Todo`, not even `InProgress` — post-T-540 it
+//! reaches `Failed(agent_error)` exactly like every other implement-walk
+//! failure, which is the more useful state for a human (and for T-541's
+//! retry) to find it in either way.
+//!
+//! ### Push, and where it's skipped (§7: "push the epic branch so the user
+//! ### clones & triages locally")
+//!
+//! [`fail_item`]'s last step, [`push_on_failure`], pushes whatever is
+//! already committed on the failing epic's branch — never anything more,
+//! because nothing between a task's last successful commit and its failure
+//! ever calls `git add`/`git commit` again (every commit step in this walk
+//! runs *before* any failure path, never after). A failing task's dirty
+//! working tree therefore cannot reach `origin` through this function by
+//! construction, not by a check it has to remember to perform — the AC's
+//! "never staged, committed, or pushed" is structural.
+//!
+//! Whether to even attempt it is [`PushIntent`], decided per call site:
+//!
+//! - **`workspace_error`/`setup_failed`** — `PushIntent::Skip`, and not by
+//!   choice: the old `block_epic_on_provision_failure` helper's call site
+//!   (now inlined directly in [`run_epic_pipeline_inner`]) never obtains a
+//!   [`ProvisionedWorkspace`] at all — [`workspace::provision_epic_workspace`]
+//!   returned `Err`, so there is no local clone/branch this process knows
+//!   about to push. There is nothing to skip *past*; the type system simply
+//!   never offers `Attempt` a value to construct here.
+//! - **`preflight_red`** — `PushIntent::Attempt`, even though a *first*
+//!   claim's preflight failure pushes a branch with nothing Dearborn-authored
+//!   on it yet (harmless — it just mirrors canonical under the epic's branch
+//!   name). [`run_preflight`] runs after provisioning fully succeeds, so a
+//!   real, checked-out [`ProvisionedWorkspace`] exists; on a *re-claim*'s
+//!   preflight failure that branch may already carry earlier tasks' committed
+//!   work from a prior successful claim, which is exactly what a human
+//!   triaging the board benefits from seeing.
+//! - **every task-scoped reason** (`agent_error`, `test_gate_exhausted`,
+//!   `review_not_converged`, `blocked`) — `PushIntent::Attempt`: every call
+//!   site sits inside [`process_one_task`]'s walk or a function it calls,
+//!   all of which already hold a [`ProvisionedWorkspace`].
+//! - **`pr_failed`** — `PushIntent::Skip`: [`finalize_epic`] *is* the push
+//!   (and, on success, the open-PR call) — it already ran its own push
+//!   attempt with its own `Stage::Push` evidence row before ever reaching a
+//!   failure exit. Routing back through [`fail_item`]'s own push step would
+//!   either push nothing new (a project/PAT load failure, which happens
+//!   before any push attempt) or push a second, redundant time (the
+//!   push-itself-failed and open-PR-failed cases, each already evidenced).
+//!
+//! ### A push failure is never fatal to the failure it's trying to surface
+//!
+//! By the time [`push_on_failure`] runs, the task (if any) is already
+//! `Failed` and the epic is already `Blocked(ctx.reason)` — both committed
+//! writes, not provisional. A push failure here can only add a
+//! `Stage::Push` evidence row with `status = 'error'` and a `tracing::warn!`
+//! line; there is no code path from it back to `ctx.reason`, so the epic's
+//! `blocked_reason` can never become `pr_failed` as a side effect of a
+//! *different* failure's best-effort triage push failing to land.
+//!
+//! ### Losing the fencing race skips the push too
+//!
+//! [`fail_item`]'s epic `UPDATE ... WHERE status = 'InProgress'` is fenced
+//! exactly like the pre-T-540 `set_epic_blocked` was — a race with an
+//! external `Cancel` (T-542) makes it a no-op. When that happens (`took_epic
+//! == false`), [`fail_item`] skips the push step entirely, even if
+//! `ctx.push` was `Attempt`: something else already moved this epic on, and
+//! pushing on its behalf would be guessing at intent that belongs to
+//! whatever actually won the race — the same "no further writes once you
+//! observe you no longer own this" discipline every other pause point in
+//! this walk already follows.
+//!
+//! ### The lease, and moving on to the next epic
+//!
+//! [`fail_item`] never touches the lease — releasing it remains
+//! [`try_claim_and_run`]'s job, exactly as it was before this task. Every
+//! call site's failure branch still ends in a plain `return`/`Stop`
+//! (unchanged by this task) that propagates back up through
+//! [`run_epic_pipeline_inner`] to [`try_claim_and_run`], which releases the
+//! lease and lets [`worker_loop`]'s inner loop try another claim immediately
+//! — a failure is epic-scoped (D10, §7), so the worker is free to pick up a
+//! different epic (or the same project's next one) on its very next
+//! iteration, no poll-interval delay involved.
+//!
+//! ### `timeout`/`cancelled`: accepted, not yet constructed
+//!
+//! [`FailureReason::Timeout`] and [`FailureReason::Cancelled`] exist in the
+//! enum and are handled by [`fail_item`] exactly like every other reason —
+//! but nothing in this module constructs them yet. T-542 (the cancel
+//! registry) and T-543 (agent-stage timeouts) are the tasks that will,
+//! and per this task's brief, they only ever need to call [`fail_item`] with
+//! the right reason; no new routing function should exist by the time either
+//! lands.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -1152,8 +1279,30 @@ async fn run_epic_pipeline_inner(state: AppState, epic_id: String, lease: LeaseH
                 // provisioning failure racing a fenced-out lease must not
                 // stomp on the new owner's epic (mirrors the same
                 // belt-and-suspenders fencing the walk's own writes use).
+                //
+                // T-540: no `ProvisionedWorkspace` exists at this point
+                // (`provision_epic_workspace` returned `Err`, never `Ok`) —
+                // `PushIntent::Skip` is the only option this call site can
+                // even construct, not a choice among alternatives.
                 if !lease.is_lost() {
-                    block_epic_on_provision_failure(&state, &epic_id, failure).await;
+                    let (reason, message) = match failure {
+                        ProvisionFailure::Workspace(message) => (FailureReason::WorkspaceError, message),
+                        ProvisionFailure::Setup { message, exit_code } => (
+                            FailureReason::SetupFailed,
+                            format!("exit_code={exit_code:?}: {message}"),
+                        ),
+                    };
+                    fail_item(
+                        &state,
+                        FailureContext {
+                            epic_id: &epic_id,
+                            task_id: None,
+                            reason,
+                            message: &message,
+                            push: PushIntent::Skip,
+                        },
+                    )
+                    .await;
                 }
                 return;
             }
@@ -1406,11 +1555,15 @@ async fn process_one_task(
         Ok(sha) => sha,
         Err(err) => {
             if !lease.is_lost() {
-                block_epic_on_agent_error(
+                fail_item(
                     state,
-                    epic_id,
-                    &task_id,
-                    &format!("failed to read base_sha: {err}"),
+                    FailureContext {
+                        epic_id,
+                        task_id: Some(&task_id),
+                        reason: FailureReason::AgentError,
+                        message: &format!("failed to read base_sha: {err}"),
+                        push: PushIntent::Attempt(workspace),
+                    },
                 )
                 .await;
             }
@@ -1483,11 +1636,15 @@ async fn process_one_task(
         Ok(outcome) => outcome,
         Err(err) => {
             if !lease.is_lost() {
-                block_epic_on_agent_error(
+                fail_item(
                     state,
-                    epic_id,
-                    &task_id,
-                    &format!("implement stage failed to start: {err}"),
+                    FailureContext {
+                        epic_id,
+                        task_id: Some(&task_id),
+                        reason: FailureReason::AgentError,
+                        message: &format!("implement stage failed to start: {err}"),
+                        push: PushIntent::Attempt(workspace),
+                    },
                 )
                 .await;
             }
@@ -1496,15 +1653,19 @@ async fn process_one_task(
     };
 
     // MILESTONE_2 §4 (tracer bullet): anything that fails here Blocks the
-    // epic with `agent_error`; a real, structured failure taxonomy is T-540's
-    // job, not this slice's.
+    // epic (and, since T-540, fails the task itself) with `agent_error` via
+    // the centralized `fail_item` router.
     if !outcome.is_ok() {
         if !lease.is_lost() {
-            block_epic_on_agent_error(
+            fail_item(
                 state,
-                epic_id,
-                &task_id,
-                "implement stage did not complete successfully",
+                FailureContext {
+                    epic_id,
+                    task_id: Some(&task_id),
+                    reason: FailureReason::AgentError,
+                    message: "implement stage did not complete successfully",
+                    push: PushIntent::Attempt(workspace),
+                },
             )
             .await;
         }
@@ -1549,11 +1710,15 @@ async fn process_one_task(
         Ok(committed) => committed,
         Err(err) => {
             if !lease.is_lost() {
-                block_epic_on_agent_error(
+                fail_item(
                     state,
-                    epic_id,
-                    &task_id,
-                    &format!("git commit failed: {err}"),
+                    FailureContext {
+                        epic_id,
+                        task_id: Some(&task_id),
+                        reason: FailureReason::AgentError,
+                        message: &format!("git commit failed: {err}"),
+                        push: PushIntent::Attempt(workspace),
+                    },
                 )
                 .await;
             }
@@ -1759,12 +1924,15 @@ async fn run_test_gate_loop(
             Ok(StageOutcome::Ran(ran)) => ran,
             Err(err) => {
                 if !lease.is_lost() {
-                    fail_task_and_block_epic(
+                    fail_item(
                         state,
-                        epic_id,
-                        task_id,
-                        "agent_error",
-                        &format!("failed to record test_gate evidence: {err}"),
+                        FailureContext {
+                            epic_id,
+                            task_id: Some(task_id),
+                            reason: FailureReason::AgentError,
+                            message: &format!("failed to record test_gate evidence: {err}"),
+                            push: PushIntent::Attempt(workspace),
+                        },
                     )
                     .await;
                 }
@@ -1781,12 +1949,15 @@ async fn run_test_gate_loop(
                 "test gate still red after the configured fix attempts; task -> Failed(test_gate_exhausted)"
             );
             if !lease.is_lost() {
-                fail_task_and_block_epic(
+                fail_item(
                     state,
-                    epic_id,
-                    task_id,
-                    "test_gate_exhausted",
-                    &format!("tests still failing after {max_attempts} fix attempt(s)"),
+                    FailureContext {
+                        epic_id,
+                        task_id: Some(task_id),
+                        reason: FailureReason::TestGateExhausted,
+                        message: &format!("tests still failing after {max_attempts} fix attempt(s)"),
+                        push: PushIntent::Attempt(workspace),
+                    },
                 )
                 .await;
             }
@@ -1834,12 +2005,15 @@ async fn run_test_gate_loop(
             }
             Ok(_) => {
                 if !lease.is_lost() {
-                    fail_task_and_block_epic(
+                    fail_item(
                         state,
-                        epic_id,
-                        task_id,
-                        "agent_error",
-                        "fix stage did not complete successfully",
+                        FailureContext {
+                            epic_id,
+                            task_id: Some(task_id),
+                            reason: FailureReason::AgentError,
+                            message: "fix stage did not complete successfully",
+                            push: PushIntent::Attempt(workspace),
+                        },
                     )
                     .await;
                 }
@@ -1847,12 +2021,15 @@ async fn run_test_gate_loop(
             }
             Err(err) => {
                 if !lease.is_lost() {
-                    fail_task_and_block_epic(
+                    fail_item(
                         state,
-                        epic_id,
-                        task_id,
-                        "agent_error",
-                        &format!("fix stage failed to start: {err}"),
+                        FailureContext {
+                            epic_id,
+                            task_id: Some(task_id),
+                            reason: FailureReason::AgentError,
+                            message: &format!("fix stage failed to start: {err}"),
+                            push: PushIntent::Attempt(workspace),
+                        },
                     )
                     .await;
                 }
@@ -1999,12 +2176,15 @@ async fn run_verdict_stage(
             Ok(outcome) => outcome,
             Err(err) => {
                 if !lease.is_lost() {
-                    fail_task_and_block_epic(
+                    fail_item(
                         state,
-                        epic_id,
-                        task_id,
-                        "agent_error",
-                        &format!("{stage_label} stage failed to start: {err}"),
+                        FailureContext {
+                            epic_id,
+                            task_id: Some(task_id),
+                            reason: FailureReason::AgentError,
+                            message: &format!("{stage_label} stage failed to start: {err}"),
+                            push: PushIntent::Attempt(workspace),
+                        },
                     )
                     .await;
                 }
@@ -2014,12 +2194,15 @@ async fn run_verdict_stage(
 
         if !outcome.is_ok() {
             if !lease.is_lost() {
-                fail_task_and_block_epic(
+                fail_item(
                     state,
-                    epic_id,
-                    task_id,
-                    "agent_error",
-                    &format!("{stage_label} stage did not complete successfully"),
+                    FailureContext {
+                        epic_id,
+                        task_id: Some(task_id),
+                        reason: FailureReason::AgentError,
+                        message: &format!("{stage_label} stage did not complete successfully"),
+                        push: PushIntent::Attempt(workspace),
+                    },
                 )
                 .await;
             }
@@ -2057,14 +2240,17 @@ async fn run_verdict_stage(
                 "verdict stage did not emit a parseable VERDICT: line after the configured retries; task -> Failed(agent_error)"
             );
             if !lease.is_lost() {
-                fail_task_and_block_epic(
+                fail_item(
                     state,
-                    epic_id,
-                    task_id,
-                    "agent_error",
-                    &format!(
-                        "{stage_label} stage produced no parseable VERDICT: line after {max_tries} attempt(s)"
-                    ),
+                    FailureContext {
+                        epic_id,
+                        task_id: Some(task_id),
+                        reason: FailureReason::AgentError,
+                        message: &format!(
+                            "{stage_label} stage produced no parseable VERDICT: line after {max_tries} attempt(s)"
+                        ),
+                        push: PushIntent::Attempt(workspace),
+                    },
                 )
                 .await;
             }
@@ -2163,12 +2349,15 @@ async fn run_review_fix_converge(
             spec::Verdict::Pass => return ConvergenceOutcome::Done,
             spec::Verdict::Blocked => {
                 if !lease.is_lost() {
-                    fail_task_and_block_epic(
+                    fail_item(
                         state,
-                        epic_id,
-                        task_id,
-                        "blocked",
-                        "reviewer returned BLOCKED — needs a human to resolve",
+                        FailureContext {
+                            epic_id,
+                            task_id: Some(task_id),
+                            reason: FailureReason::Blocked,
+                            message: "reviewer returned BLOCKED — needs a human to resolve",
+                            push: PushIntent::Attempt(workspace),
+                        },
                     )
                     .await;
                 }
@@ -2184,14 +2373,17 @@ async fn run_review_fix_converge(
                         "review did not converge after the configured fix rounds; task -> Failed(review_not_converged)"
                     );
                     if !lease.is_lost() {
-                        fail_task_and_block_epic(
+                        fail_item(
                             state,
-                            epic_id,
-                            task_id,
-                            "review_not_converged",
-                            &format!(
-                                "review still NEEDS_CHANGES after {max_fix_rounds} fix round(s)"
-                            ),
+                            FailureContext {
+                                epic_id,
+                                task_id: Some(task_id),
+                                reason: FailureReason::ReviewNotConverged,
+                                message: &format!(
+                                    "review still NEEDS_CHANGES after {max_fix_rounds} fix round(s)"
+                                ),
+                                push: PushIntent::Attempt(workspace),
+                            },
                         )
                         .await;
                     }
@@ -2239,12 +2431,15 @@ async fn run_review_fix_converge(
                     Ok(outcome) if outcome.is_ok() => {}
                     Ok(_) => {
                         if !lease.is_lost() {
-                            fail_task_and_block_epic(
+                            fail_item(
                                 state,
-                                epic_id,
-                                task_id,
-                                "agent_error",
-                                "review-round fix stage did not complete successfully",
+                                FailureContext {
+                                    epic_id,
+                                    task_id: Some(task_id),
+                                    reason: FailureReason::AgentError,
+                                    message: "review-round fix stage did not complete successfully",
+                                    push: PushIntent::Attempt(workspace),
+                                },
                             )
                             .await;
                         }
@@ -2252,12 +2447,15 @@ async fn run_review_fix_converge(
                     }
                     Err(err) => {
                         if !lease.is_lost() {
-                            fail_task_and_block_epic(
+                            fail_item(
                                 state,
-                                epic_id,
-                                task_id,
-                                "agent_error",
-                                &format!("review-round fix stage failed to start: {err}"),
+                                FailureContext {
+                                    epic_id,
+                                    task_id: Some(task_id),
+                                    reason: FailureReason::AgentError,
+                                    message: &format!("review-round fix stage failed to start: {err}"),
+                                    push: PushIntent::Attempt(workspace),
+                                },
                             )
                             .await;
                         }
@@ -2320,12 +2518,15 @@ async fn run_review_fix_converge(
                 .await
                 {
                     if !lease.is_lost() {
-                        fail_task_and_block_epic(
+                        fail_item(
                             state,
-                            epic_id,
-                            task_id,
-                            "agent_error",
-                            &format!("git commit failed (review round {round}): {err}"),
+                            FailureContext {
+                                epic_id,
+                                task_id: Some(task_id),
+                                reason: FailureReason::AgentError,
+                                message: &format!("git commit failed (review round {round}): {err}"),
+                                push: PushIntent::Attempt(workspace),
+                            },
                         )
                         .await;
                     }
@@ -2417,12 +2618,15 @@ async fn run_verify_complete(
         }
         spec::Verdict::Blocked => {
             if !lease.is_lost() {
-                fail_task_and_block_epic(
+                fail_item(
                     state,
-                    epic_id,
-                    task_id,
-                    "blocked",
-                    "verify-complete verifier returned BLOCKED — needs a human to resolve",
+                    FailureContext {
+                        epic_id,
+                        task_id: Some(task_id),
+                        reason: FailureReason::Blocked,
+                        message: "verify-complete verifier returned BLOCKED — needs a human to resolve",
+                        push: PushIntent::Attempt(workspace),
+                    },
                 )
                 .await;
             }
@@ -2469,12 +2673,15 @@ async fn run_verify_complete(
                 Ok(outcome) if outcome.is_ok() => {}
                 Ok(_) => {
                     if !lease.is_lost() {
-                        fail_task_and_block_epic(
+                        fail_item(
                             state,
-                            epic_id,
-                            task_id,
-                            "agent_error",
-                            "verify-complete fix stage did not complete successfully",
+                            FailureContext {
+                                epic_id,
+                                task_id: Some(task_id),
+                                reason: FailureReason::AgentError,
+                                message: "verify-complete fix stage did not complete successfully",
+                                push: PushIntent::Attempt(workspace),
+                            },
                         )
                         .await;
                     }
@@ -2482,12 +2689,15 @@ async fn run_verify_complete(
                 }
                 Err(err) => {
                     if !lease.is_lost() {
-                        fail_task_and_block_epic(
+                        fail_item(
                             state,
-                            epic_id,
-                            task_id,
-                            "agent_error",
-                            &format!("verify-complete fix stage failed to start: {err}"),
+                            FailureContext {
+                                epic_id,
+                                task_id: Some(task_id),
+                                reason: FailureReason::AgentError,
+                                message: &format!("verify-complete fix stage failed to start: {err}"),
+                                push: PushIntent::Attempt(workspace),
+                            },
                         )
                         .await;
                     }
@@ -2541,11 +2751,15 @@ async fn run_verify_complete(
                 Ok(committed) => committed,
                 Err(err) => {
                     if !lease.is_lost() {
-                        block_epic_on_agent_error(
+                        fail_item(
                             state,
-                            epic_id,
-                            task_id,
-                            &format!("git commit failed (verify-complete fix): {err}"),
+                            FailureContext {
+                                epic_id,
+                                task_id: Some(task_id),
+                                reason: FailureReason::AgentError,
+                                message: &format!("git commit failed (verify-complete fix): {err}"),
+                                push: PushIntent::Attempt(workspace),
+                            },
                         )
                         .await;
                     }
@@ -2571,12 +2785,15 @@ async fn run_verify_complete(
                 // team lead's second look: this is a judgment call, not
                 // something MILESTONE_2 §6 specifies directly.
                 if !lease.is_lost() {
-                    fail_task_and_block_epic(
+                    fail_item(
                         state,
-                        epic_id,
-                        task_id,
-                        "agent_error",
-                        "verify-complete verdict was NEEDS_CHANGES but the fix stage produced no changes",
+                        FailureContext {
+                            epic_id,
+                            task_id: Some(task_id),
+                            reason: FailureReason::AgentError,
+                            message: "verify-complete verdict was NEEDS_CHANGES but the fix stage produced no changes",
+                            push: PushIntent::Attempt(workspace),
+                        },
                     )
                     .await;
                 }
@@ -2654,92 +2871,325 @@ async fn publish_stage_changed(
     }
 }
 
-/// Route a T-522 failure (test-gate exhaustion, or a fix stage that errored
-/// or never started) to a terminal state: the **task** moves to
-/// `Failed(reason)` and the epic moves to `Blocked` via [`set_epic_blocked`]
-/// with the **same** reason string (T-522's AC). Unlike every T-513 failure
-/// path (`block_epic_on_agent_error`), which blocks the epic but leaves the
-/// task's own status wherever the walk left it (T-540's job to fix
-/// retroactively), T-522's AC names `Failed(test_gate_exhausted)` as a
-/// task-level outcome — T-541's retry contract (`409` unless the task is
-/// `Failed`) needs `task.status = 'Failed'` to find this task once a human
-/// has fixed it by hand. This function is written narrowly for the two
-/// failure shapes T-522 itself introduces; it is deliberately not offered as
-/// a drop-in replacement for `block_epic_on_agent_error`'s other call sites,
-/// so as not to quietly pre-build T-540's centralized failure router ahead
-/// of that task actually landing.
-async fn fail_task_and_block_epic(
-    state: &AppState,
-    epic_id: &str,
-    task_id: &str,
-    reason: &str,
-    message: &str,
-) {
-    tracing::warn!(
-        epic = %epic_id,
-        task = %task_id,
-        reason,
-        error = %message,
-        "task failed; task -> Failed, epic -> Blocked"
-    );
-    let conn = state.db.conn();
-    let now = now_ms();
-    let _ = conn
-        .execute(
-            "UPDATE task SET status = 'Failed', failure_reason = ?1, updated_at = ?2 WHERE id = ?3",
-            params![reason, now, task_id],
-        )
-        .await;
-    mcp::publish_dag(state, epic_id).await;
-    set_epic_blocked(state, epic_id, reason).await;
+// ---- T-540: structured failure & Blocked -----------------------------------
+//
+// See the module doc's own "T-540: structured failure & Blocked" section for
+// the full design rationale. [`FailureReason`] is the §2.3 vocabulary made a
+// type (mirroring [`Stage::as_str`]); [`fail_item`] is the single router
+// every failure path in this module now calls through, replacing the
+// scattered `fail_task_and_block_epic`/`block_epic_on_agent_error`/
+// `block_epic_on_provision_failure`/`block_epic_on_pr_failure`/
+// `set_epic_blocked` cluster T-513/T-522 left behind (see those functions'
+// own now-deleted doc comments, quoted in the module doc section, for
+// exactly what inconsistency this replaces).
+
+/// The full §2.3 failure-reason vocabulary, typed rather than left as bare
+/// string literals scattered across call sites (mirrors [`Stage::as_str`]).
+/// `Timeout` and `Cancelled` are T-543's and T-542's respectively — nothing
+/// in this module constructs them yet (those tasks own the cancel registry
+/// and the stage-timeout wrapper), but [`fail_item`] already accepts them so
+/// those tasks only ever need to call it, never build their own routing.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum FailureReason {
+    /// `test_cmd` was not green on the untouched tree — including a timeout;
+    /// see [`run_preflight`]'s own doc for why a slow `test_cmd` still
+    /// collapses into this reason rather than [`FailureReason::Timeout`].
+    /// No task at fault: the DAG walk never even started.
+    PreflightRed,
+    /// `setup_cmd` exited non-zero (or failed to spawn). No task at fault —
+    /// provisioning failed before any task's implement stage could run.
+    SetupFailed,
+    /// Any other provisioning failure: a git/filesystem error, or a project
+    /// whose clone isn't `ready`. No task at fault.
+    WorkspaceError,
+    /// A task's test gate never went green within
+    /// `DEARBORN_MAX_TEST_FIX_ATTEMPTS` (T-522).
+    TestGateExhausted,
+    /// A task's review never converged within `DEARBORN_MAX_FIX_ROUNDS`
+    /// (T-531).
+    ReviewNotConverged,
+    /// A review or verify-complete verdict was `BLOCKED` — the agent itself
+    /// asked for a human (T-530/T-532).
+    Blocked,
+    /// The coarse catch-all MILESTONE_2 §4 names for Phase 1: an agent stage
+    /// that never started, exited non-`ok`, or never produced a parseable
+    /// `VERDICT:` line after its bounded retry, or a `git`-level failure
+    /// (`rev-parse`/`add`/`commit`) around one. Still the right label for
+    /// all of these post-T-540 — they are "the agent/git step itself failed
+    /// in a way nothing more specific names," not a distinct §2.3 reason of
+    /// their own.
+    AgentError,
+    /// An agent stage was killed for exceeding
+    /// `DEARBORN_AGENT_STAGE_TIMEOUT_SECS`. T-543's reason; not yet
+    /// constructed anywhere in this module.
+    #[allow(dead_code)] // T-543 constructs this once the timeout wrapper lands
+    Timeout,
+    /// A human cancelled the epic while a stage was in flight. T-542's
+    /// reason; not yet constructed anywhere in this module.
+    #[allow(dead_code)] // T-542 constructs this once the cancel registry lands
+    Cancelled,
+    /// The epic's branch failed to push, or `open_pr` failed, after every
+    /// task had already reached `Done` (T-514's finalize step). No task at
+    /// fault — every task already succeeded; the failure is finalize's own.
+    PrFailed,
 }
 
-/// The shared "flip the epic to Blocked" write + publish, factored out so
-/// [`block_epic_on_provision_failure`] (T-511) and [`block_epic_on_agent_error`]
-/// (T-513) share one implementation instead of two copies of the same
-/// UPDATE/publish sequence. `status='Blocked'`, `blocked_reason = reason`,
-/// publish `epic_updated` + `board_updated`. The workspace is **retained** —
-/// this never deletes anything; deletion only ever happens after a PR opens
-/// (T-514). Fenced by `status = 'InProgress'` so a transition that already
-/// happened out from under us (a Cancel racing this same moment) is a no-op
-/// rather than an overwrite.
-async fn set_epic_blocked(state: &AppState, epic_id: &str, reason: &str) {
+impl FailureReason {
+    /// The exact `task.failure_reason` / `epic.blocked_reason` string
+    /// (§2.3), frozen exactly like [`Stage::as_str`] — every persisted row
+    /// and every published frame reads this same value back out of the
+    /// database, so it must never drift from the milestone doc's list.
+    fn as_str(self) -> &'static str {
+        match self {
+            FailureReason::PreflightRed => "preflight_red",
+            FailureReason::SetupFailed => "setup_failed",
+            FailureReason::WorkspaceError => "workspace_error",
+            FailureReason::TestGateExhausted => "test_gate_exhausted",
+            FailureReason::ReviewNotConverged => "review_not_converged",
+            FailureReason::Blocked => "blocked",
+            FailureReason::AgentError => "agent_error",
+            FailureReason::Timeout => "timeout",
+            FailureReason::Cancelled => "cancelled",
+            FailureReason::PrFailed => "pr_failed",
+        }
+    }
+
+    /// Every §2.3 reason, exactly once — a test iterates this so "every
+    /// reason reaches [`fail_item`]" is checked by the compiler (add a
+    /// variant, the array below won't compile until it's listed) and by a
+    /// test that actually drives each one through the router, rather than
+    /// trusting the `as_str` match arms above by inspection alone.
+    #[cfg(test)]
+    const ALL: [FailureReason; 10] = [
+        FailureReason::PreflightRed,
+        FailureReason::SetupFailed,
+        FailureReason::WorkspaceError,
+        FailureReason::TestGateExhausted,
+        FailureReason::ReviewNotConverged,
+        FailureReason::Blocked,
+        FailureReason::AgentError,
+        FailureReason::Timeout,
+        FailureReason::Cancelled,
+        FailureReason::PrFailed,
+    ];
+}
+
+/// What [`fail_item`] should do about pushing the epic branch. See the
+/// module doc's "push, and where it's skipped" section for the full
+/// rationale behind each variant.
+enum PushIntent<'a> {
+    /// Push whatever is already committed on `workspace`'s branch. Used by
+    /// every failure whose call site has a real, provisioned workspace —
+    /// [`push_on_failure`] never stages or commits anything itself, so a
+    /// failing task's dirty tree cannot reach `origin` through this path no
+    /// matter what state the workspace is in.
+    Attempt(&'a ProvisionedWorkspace),
+    /// Skip cleanly — no evidence row opened at all (D13: a stage that never
+    /// ran gets no row), no push attempted. Two distinct reasons collapse to
+    /// this one variant:
+    ///
+    /// - There is no [`ProvisionedWorkspace`] to push from at all
+    ///   (`workspace_error`/`setup_failed`): the failure happened *inside*
+    ///   [`workspace::provision_epic_workspace`], which returned `Err`
+    ///   before this process ever obtained a local clone/branch — there is
+    ///   structurally nothing to push, not a choice to skip something that
+    ///   exists.
+    /// - The caller already handled its own push (`pr_failed`):
+    ///   [`finalize_epic`]'s push/`open_pr` sequence already ran, with its
+    ///   own `Stage::Push` evidence row — pushing again here would be
+    ///   redundant at best, and doubly so when `open_pr` (not `push`) is
+    ///   what actually failed, since the branch is already on `origin`.
+    Skip,
+}
+
+/// Everything [`fail_item`] needs to route one failure through the T-540
+/// path. `task_id: None` is what lets a no-task failure (`preflight_red`,
+/// `setup_failed`, `workspace_error`, `pr_failed`) and a task-scoped one
+/// (`agent_error`, `test_gate_exhausted`, `review_not_converged`, `blocked`,
+/// and T-542/T-543's `cancelled`/`timeout`) share the identical call shape —
+/// nothing else about the struct varies by failure kind.
+struct FailureContext<'a> {
+    epic_id: &'a str,
+    task_id: Option<&'a str>,
+    reason: FailureReason,
+    /// Human-readable detail for the `tracing::warn!` line only — §2.3's
+    /// reasons are the persisted, structured vocabulary; `message` never
+    /// itself lands in a column (mirrors every pre-T-540 failure helper's
+    /// own `message` parameter).
+    message: &'a str,
+    push: PushIntent<'a>,
+}
+
+/// T-540: the single, centralized failure router every failure path in this
+/// module funnels through — task → `Failed(reason)` (if there is a task at
+/// fault), epic → `Blocked(reason)`, push the branch for triage, retain the
+/// workspace, publish, and return so the caller's own `return`/`Stop`
+/// propagates back to [`try_claim_and_run`], which releases the lease and
+/// lets the worker claim its next item. See the module doc's "T-540:
+/// structured failure & Blocked" section for the full design rationale; this
+/// is that section's literal implementation.
+///
+/// 1. If `ctx.task_id` is `Some`, that task moves to `Failed` with
+///    `failure_reason = ctx.reason.as_str()` — **unconditionally**, not
+///    fenced on the epic's own status. This matches every pre-T-540 helper
+///    it replaces: §2.3's "no sibling task ever `InProgress` concurrently"
+///    invariant means no other worker is touching this task, so there is
+///    nothing for the write to race against.
+/// 2. The epic moves to `Blocked` with the identical reason, fenced by
+///    `WHERE status = 'InProgress'` — exactly the fencing the pre-T-540
+///    `set_epic_blocked` used. A race with an external Cancel (T-542) makes
+///    this a no-op rather than an overwrite.
+/// 3. `dag_updated` (unconditional — even a no-task failure re-renders the
+///    epic's DAG view with whatever the current task statuses are) +
+///    `epic_updated` + `board_updated` are published, the latter two by
+///    re-fetching the epic once after both writes above.
+/// 4. Iff step 2's fenced UPDATE actually took the epic (this call didn't
+///    lose a race for it), [`push_on_failure`] runs per `ctx.push` —
+///    best-effort and never fatal to the failure already recorded (see that
+///    function's own doc). Losing the race is the same "no further writes
+///    once you observe you no longer own this" discipline every other pause
+///    point in this walk already follows — if something else already moved
+///    the epic on, pushing on its behalf here would be guessing at intent
+///    that belongs to whatever actually won the race.
+async fn fail_item(state: &AppState, ctx: FailureContext<'_>) {
+    let reason = ctx.reason.as_str();
+    tracing::warn!(
+        epic = %ctx.epic_id,
+        task = ?ctx.task_id,
+        reason,
+        error = %ctx.message,
+        "structured failure (T-540): task -> Failed (if any), epic -> Blocked"
+    );
+
     let conn = state.db.conn();
     let now = now_ms();
-    let _ = conn
+
+    if let Some(task_id) = ctx.task_id {
+        let _ = conn
+            .execute(
+                "UPDATE task SET status = 'Failed', failure_reason = ?1, updated_at = ?2 WHERE id = ?3",
+                params![reason, now, task_id],
+            )
+            .await;
+    }
+    mcp::publish_dag(state, ctx.epic_id).await;
+
+    let took_epic = conn
         .execute(
             "UPDATE epic SET status = 'Blocked', blocked_reason = ?1, updated_at = ?2 \
              WHERE id = ?3 AND status = 'InProgress'",
-            params![reason, now, epic_id],
+            params![reason, now, ctx.epic_id],
         )
-        .await;
+        .await
+        .map(|n| n > 0)
+        .unwrap_or(false);
 
-    if let Ok(Some(updated)) = fetch_epic(conn, epic_id).await {
-        let payload = serde_json::to_value(&updated).unwrap_or(serde_json::Value::Null);
-        state
-            .hub
-            .publish(&format!("epic:{epic_id}"), "epic_updated", payload);
-        board::publish_board(state, &updated.project_id).await;
+    let project_id = match fetch_epic(conn, ctx.epic_id).await {
+        Ok(Some(updated)) => {
+            let payload = serde_json::to_value(&updated).unwrap_or(serde_json::Value::Null);
+            state
+                .hub
+                .publish(&format!("epic:{}", ctx.epic_id), "epic_updated", payload);
+            board::publish_board(state, &updated.project_id).await;
+            Some(updated.project_id)
+        }
+        _ => None,
+    };
+
+    if took_epic {
+        if let (PushIntent::Attempt(workspace), Some(project_id)) = (ctx.push, project_id) {
+            push_on_failure(state, ctx.epic_id, &project_id, workspace).await;
+        }
     }
 }
 
-/// Route a [`ProvisionFailure`] (T-511) to the epic `Blocked` transition via
-/// [`set_epic_blocked`]: `blocked_reason` per §2.3 (`workspace_error` |
-/// `setup_failed`).
-async fn block_epic_on_provision_failure(state: &AppState, epic_id: &str, failure: ProvisionFailure) {
-    let (reason, log_message) = match failure {
-        ProvisionFailure::Workspace(message) => ("workspace_error", message),
-        ProvisionFailure::Setup { message, exit_code } => {
-            ("setup_failed", format!("exit_code={exit_code:?}: {message}"))
+/// Best-effort push of `workspace`'s branch, the last thing [`fail_item`]
+/// does — the task/epic have already reached their terminal states by the
+/// time this runs, so nothing here can change *whether* the failure landed,
+/// only whether a human can `git clone`/`fetch` the branch to see it (§7:
+/// "on Blocked, push the epic branch to the remote so the user clones &
+/// triages locally"). A failure here is recorded (`Stage::Push`, redacted)
+/// and logged, never propagated — there is no code path back to
+/// [`fail_item`] that could overwrite `ctx.reason` with `pr_failed`, which is
+/// exactly the AC ("the epic still reaches `Blocked(<original reason>)`, not
+/// `pr_failed`").
+///
+/// Never stages or commits anything: [`GitHost::push`] (in production,
+/// [`git::push_branch`]) only ever pushes what is already committed on
+/// `workspace`'s branch. A failing task's dirty working tree was never
+/// `git add`ed by anything upstream of this call (every commit step in this
+/// module runs `commit_if_dirty` *before* any failure path, never after), so
+/// there is nothing for this function to accidentally sweep up — the AC's
+/// "never staged, committed, or pushed" holds by construction, not by a
+/// check this function has to perform.
+async fn push_on_failure(
+    state: &AppState,
+    epic_id: &str,
+    project_id: &str,
+    workspace: &ProvisionedWorkspace,
+) {
+    let conn = state.db.conn();
+    let project = match load_project_for_finalize(conn, project_id).await {
+        Ok(Some(project)) => project,
+        Ok(None) => {
+            tracing::warn!(epic = %epic_id, "failure push: project vanished; skipping push");
+            return;
+        }
+        Err(err) => {
+            tracing::warn!(
+                epic = %epic_id,
+                error = %err,
+                "failure push: failed to load project; skipping push"
+            );
+            return;
         }
     };
-    tracing::warn!(
-        epic = %epic_id,
-        reason,
-        error = %log_message,
-        "workspace provisioning failed; epic -> Blocked"
-    );
-    set_epic_blocked(state, epic_id, reason).await;
+    let pat = crate::projects::load_decrypted_pat(state, project_id)
+        .await
+        .ok()
+        .flatten();
+
+    let open = OpenStage {
+        task_id: None,
+        epic_id: Some(epic_id),
+        stage: Stage::Push.as_str(),
+        attempt: 1,
+    };
+    let stage_handle = evidence::open_stage(conn, open).await.ok();
+
+    let push_result = state
+        .git_host
+        .push(PushRequest {
+            workspace_path: &workspace.workspace_path,
+            branch: &workspace.branch_name,
+            repo_url: &project.repo_url,
+            pat: pat.as_deref(),
+        })
+        .await;
+
+    match push_result {
+        Ok(()) => {
+            close_push_stage(
+                conn,
+                &stage_handle,
+                "ok",
+                &format!(
+                    "pushed {} to origin (failure triage push)",
+                    workspace.branch_name
+                ),
+            )
+            .await;
+        }
+        Err(err) => {
+            let message = git::redact(&err.message, pat.as_deref());
+            tracing::warn!(
+                epic = %epic_id,
+                error = %message,
+                "failure push: push failed; non-fatal — the task/epic already reached their Failed/Blocked states"
+            );
+            close_push_stage(conn, &stage_handle, "error", &format!("push failed: {message}")).await;
+        }
+    }
 }
 
 /// What [`run_preflight`] tells its caller to do next. See the module doc's
@@ -2752,7 +3202,7 @@ enum PreflightOutcome {
     /// `test_cmd` failed, timed out, or could not even be evaluated (a
     /// database error recording the attempt). The epic is already `Blocked`
     /// by the time this variant is returned — [`run_preflight`] performs that
-    /// write itself via [`set_epic_blocked`] — so the caller's only job is to
+    /// write itself via [`fail_item`] — so the caller's only job is to
     /// `return` immediately without ever looking at a task.
     Blocked,
 }
@@ -2812,6 +3262,13 @@ async fn run_preflight(
     ))
     .await;
 
+    // T-540: preflight *does* have a real, provisioned `workspace` at this
+    // point (unlike `workspace_error`/`setup_failed` above) — on a re-claim
+    // it may already carry earlier tasks' committed work from a prior
+    // successful claim, so `PushIntent::Attempt` (not `Skip`) is the right
+    // call here even though a *first* claim's preflight failure pushes a
+    // branch with nothing Dearborn-authored on it yet (harmless: the push
+    // just mirrors canonical under the epic's branch name).
     match outcome {
         Ok(StageOutcome::Skipped) => PreflightOutcome::Proceed,
         Ok(StageOutcome::Ran(ran)) if ran.status == "ok" => PreflightOutcome::Proceed,
@@ -2822,7 +3279,17 @@ async fn run_preflight(
                 exit_code = ?ran.exit_code,
                 "preflight: test_cmd is not green on the untouched tree; epic -> Blocked(preflight_red)"
             );
-            set_epic_blocked(state, epic_id, "preflight_red").await;
+            fail_item(
+                state,
+                FailureContext {
+                    epic_id,
+                    task_id: None,
+                    reason: FailureReason::PreflightRed,
+                    message: &format!("test_cmd not green (status={}, exit_code={:?})", ran.status, ran.exit_code),
+                    push: PushIntent::Attempt(workspace),
+                },
+            )
+            .await;
             PreflightOutcome::Blocked
         }
         Err(err) => {
@@ -2831,27 +3298,20 @@ async fn run_preflight(
                 error = %err,
                 "preflight: failed to record test_cmd evidence; epic -> Blocked(preflight_red)"
             );
-            set_epic_blocked(state, epic_id, "preflight_red").await;
+            fail_item(
+                state,
+                FailureContext {
+                    epic_id,
+                    task_id: None,
+                    reason: FailureReason::PreflightRed,
+                    message: &format!("failed to record test_cmd evidence: {err}"),
+                    push: PushIntent::Attempt(workspace),
+                },
+            )
+            .await;
             PreflightOutcome::Blocked
         }
     }
-}
-
-/// Route a T-513 implement-walk failure (a failed/erroring implement stage,
-/// or a git-level failure reading `base_sha`/staging/committing) to the epic
-/// `Blocked` transition via [`set_epic_blocked`], with `blocked_reason =
-/// 'agent_error'` — the single, coarse tracer-bullet reason MILESTONE_2 §4
-/// specifies for Phase 1 ("anything that fails here Blocks the epic with
-/// `agent_error` and gets thickened in later phases": T-540's structured
-/// failure taxonomy, T-541's retry).
-async fn block_epic_on_agent_error(state: &AppState, epic_id: &str, task_id: &str, message: &str) {
-    tracing::warn!(
-        epic = %epic_id,
-        task = %task_id,
-        error = %message,
-        "task pipeline step failed; epic -> Blocked(agent_error)"
-    );
-    set_epic_blocked(state, epic_id, "agent_error").await;
 }
 
 /// Finalize a fully-`Done` epic (T-514, D1): push the branch, open the PR,
@@ -2861,15 +3321,17 @@ async fn block_epic_on_agent_error(state: &AppState, epic_id: &str, task_id: &st
 /// opens" section for why that transition waits this long.
 ///
 /// A failed push or a failed `open_pr` routes the epic to
-/// `Blocked(pr_failed)` (never `Completed`) via [`set_epic_blocked`] — the
-/// same helper, same workspace-retained/lease-released contract every other
-/// failure path in this module already uses — with the readable, redacted
-/// failure reason recorded in a `Stage::Push` `agent_run` row (§2.2 lists
-/// `push` as a non-agent stage; this finalize step is the one place that
-/// stage's row gets opened/closed). Persisting a short `blocked_reason` code
-/// on the epic plus a full message in evidence mirrors exactly how
-/// `setup_failed` splits reason-code vs. captured-output between the epic
-/// row and `agent_run`.
+/// `Blocked(pr_failed)` (never `Completed`) via [`fail_item`] — the same
+/// T-540 router, same workspace-retained/lease-released contract every other
+/// failure path in this module already uses, called here with
+/// `PushIntent::Skip` (this function *is* the push — see [`PushIntent::Skip`]'s
+/// own doc for why routing `pr_failed` back through the router's own push
+/// step would be redundant or a no-op) — with the readable, redacted failure
+/// reason recorded in a `Stage::Push` `agent_run` row (§2.2 lists `push` as a
+/// non-agent stage; this finalize step is the one place that stage's row
+/// gets opened/closed). Persisting a short `blocked_reason` code on the epic
+/// plus a full message in evidence mirrors exactly how `setup_failed` splits
+/// reason-code vs. captured-output between the epic row and `agent_run`.
 ///
 /// Either exit (`Completed` or `Blocked(pr_failed)`) moves the epic out of
 /// `InProgress`, so [`claim_epic`]'s predicate excludes it from then on —
@@ -2888,20 +3350,43 @@ async fn finalize_epic(
 ) {
     let conn = state.db.conn();
 
+    // T-540: every `pr_failed` exit below passes `PushIntent::Skip` — this
+    // function *is* the push (and, on success, the open-PR call) already;
+    // routing its own failure back through `fail_item`'s own push step would
+    // either push nothing new (the project/PAT load failures below, which
+    // happen before any push is even attempted) or push a second, redundant
+    // time (the push-itself-failed and open-PR-failed cases further down,
+    // each of which already recorded its own `Stage::Push` evidence row via
+    // `close_push_stage` immediately before the call).
     let project = match load_project_for_finalize(conn, &epic.project_id).await {
         Ok(Some(project)) => project,
         Ok(None) => {
             if !lease.is_lost() {
-                block_epic_on_pr_failure(state, epic_id, "project vanished before finalize").await;
+                fail_item(
+                    state,
+                    FailureContext {
+                        epic_id,
+                        task_id: None,
+                        reason: FailureReason::PrFailed,
+                        message: "project vanished before finalize",
+                        push: PushIntent::Skip,
+                    },
+                )
+                .await;
             }
             return;
         }
         Err(err) => {
             if !lease.is_lost() {
-                block_epic_on_pr_failure(
+                fail_item(
                     state,
-                    epic_id,
-                    &format!("failed to load project for finalize: {err}"),
+                    FailureContext {
+                        epic_id,
+                        task_id: None,
+                        reason: FailureReason::PrFailed,
+                        message: &format!("failed to load project for finalize: {err}"),
+                        push: PushIntent::Skip,
+                    },
                 )
                 .await;
             }
@@ -2912,10 +3397,15 @@ async fn finalize_epic(
         Ok(pat) => pat,
         Err(err) => {
             if !lease.is_lost() {
-                block_epic_on_pr_failure(
+                fail_item(
                     state,
-                    epic_id,
-                    &format!("failed to load project PAT for finalize: {err}"),
+                    FailureContext {
+                        epic_id,
+                        task_id: None,
+                        reason: FailureReason::PrFailed,
+                        message: &format!("failed to load project PAT for finalize: {err}"),
+                        push: PushIntent::Skip,
+                    },
                 )
                 .await;
             }
@@ -2949,7 +3439,17 @@ async fn finalize_epic(
         let message = git::redact(&err.message, pat.as_deref());
         close_push_stage(conn, &stage_handle, "error", &format!("push failed: {message}")).await;
         if !lease.is_lost() {
-            block_epic_on_pr_failure(state, epic_id, &message).await;
+            fail_item(
+                state,
+                FailureContext {
+                    epic_id,
+                    task_id: None,
+                    reason: FailureReason::PrFailed,
+                    message: &message,
+                    push: PushIntent::Skip,
+                },
+            )
+            .await;
         }
         return;
     }
@@ -2975,7 +3475,17 @@ async fn finalize_epic(
             let message = git::redact(&err.message, pat.as_deref());
             close_push_stage(conn, &stage_handle, "error", &format!("open_pr failed: {message}")).await;
             if !lease.is_lost() {
-                block_epic_on_pr_failure(state, epic_id, &message).await;
+                fail_item(
+                    state,
+                    FailureContext {
+                        epic_id,
+                        task_id: None,
+                        reason: FailureReason::PrFailed,
+                        message: &message,
+                        push: PushIntent::Skip,
+                    },
+                )
+                .await;
             }
             return;
         }
@@ -3043,22 +3553,6 @@ async fn finalize_epic(
             );
         }
     }
-}
-
-/// Route a finalize failure (a failed push or a failed `open_pr`) to the
-/// epic `Blocked` transition via [`set_epic_blocked`], with `blocked_reason =
-/// 'pr_failed'` (§2.3). The full, redacted `message` is not stored on the
-/// epic row itself (`blocked_reason` is a short code, matching every other
-/// reason in §2.3) — it already landed in the `Stage::Push` evidence row
-/// ([`finalize_epic`]'s caller closes that row with `message` immediately
-/// before calling this).
-async fn block_epic_on_pr_failure(state: &AppState, epic_id: &str, message: &str) {
-    tracing::warn!(
-        epic = %epic_id,
-        error = %message,
-        "epic finalize (push/PR) failed; epic -> Blocked(pr_failed)"
-    );
-    set_epic_blocked(state, epic_id, "pr_failed").await;
 }
 
 /// Close the finalize step's single `Stage::Push` evidence row, if one was
@@ -6804,5 +7298,437 @@ mod tests {
         assert_eq!(subjects, vec!["init".to_string()], "nothing must ever be committed");
 
         cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    // ==== T-540: structured failure & Blocked ================================
+
+    /// [`FailureReason::as_str`] frozen against the literal §2.3 vocabulary —
+    /// independent of the `ALL`-iterating test below, which only proves each
+    /// variant is *distinguishable*, not that its string matches the milestone
+    /// doc (mirrors `task_agent.rs`'s own
+    /// `as_str_matches_the_section_2_2_table` convention for `Stage`).
+    #[test]
+    fn failure_reason_as_str_matches_the_section_2_3_vocabulary() {
+        assert_eq!(FailureReason::PreflightRed.as_str(), "preflight_red");
+        assert_eq!(FailureReason::SetupFailed.as_str(), "setup_failed");
+        assert_eq!(FailureReason::WorkspaceError.as_str(), "workspace_error");
+        assert_eq!(FailureReason::TestGateExhausted.as_str(), "test_gate_exhausted");
+        assert_eq!(FailureReason::ReviewNotConverged.as_str(), "review_not_converged");
+        assert_eq!(FailureReason::Blocked.as_str(), "blocked");
+        assert_eq!(FailureReason::AgentError.as_str(), "agent_error");
+        assert_eq!(FailureReason::Timeout.as_str(), "timeout");
+        assert_eq!(FailureReason::Cancelled.as_str(), "cancelled");
+        assert_eq!(FailureReason::PrFailed.as_str(), "pr_failed");
+    }
+
+    /// The AC's "every §2.3 reason reaches this path": every [`FailureReason`]
+    /// variant, driven directly through [`fail_item`], lands correctly in
+    /// both shapes a real call site ever uses — task-scoped (`task_id:
+    /// Some`, covering `agent_error`/`test_gate_exhausted`/
+    /// `review_not_converged`/`blocked`, and T-542/T-543's future
+    /// `cancelled`/`timeout`) and no-task (`task_id: None`, covering
+    /// `preflight_red`/`setup_failed`/`workspace_error`/`pr_failed`).
+    #[tokio::test]
+    async fn every_section_2_3_reason_reaches_fail_item_and_lands_correctly() {
+        let (state, _app) = test_app().await;
+        let project_id = seed_project(&state).await;
+
+        for reason in FailureReason::ALL {
+            // Task-scoped shape.
+            let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+            let task_id = seed_task(&state, &epic_id, &project_id, "A").await;
+            set_task_status(&state, &task_id, "InProgress").await;
+
+            fail_item(
+                &state,
+                FailureContext {
+                    epic_id: &epic_id,
+                    task_id: Some(&task_id),
+                    reason,
+                    message: "task-scoped test failure",
+                    push: PushIntent::Skip,
+                },
+            )
+            .await;
+
+            let task = fetch_task_row(&state, &task_id).await;
+            assert_eq!(task.0, "Failed", "{reason:?}: task must reach Failed");
+            assert_eq!(
+                task.1.as_deref(),
+                Some(reason.as_str()),
+                "{reason:?}: task.failure_reason must match the router's reason"
+            );
+
+            let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+            assert_eq!(epic.status, "Blocked", "{reason:?}: epic must reach Blocked");
+            assert_eq!(
+                epic.blocked_reason.as_deref(),
+                Some(reason.as_str()),
+                "{reason:?}: epic.blocked_reason must match the task's failure_reason"
+            );
+
+            // No-task shape: a fresh epic, no task at all.
+            let epic_id_no_task = seed_epic(&state, &project_id, "InProgress").await;
+            fail_item(
+                &state,
+                FailureContext {
+                    epic_id: &epic_id_no_task,
+                    task_id: None,
+                    reason,
+                    message: "no-task test failure",
+                    push: PushIntent::Skip,
+                },
+            )
+            .await;
+            let epic_no_task = fetch_epic(state.db.conn(), &epic_id_no_task).await.unwrap().unwrap();
+            assert_eq!(epic_no_task.status, "Blocked", "{reason:?}: no-task epic must reach Blocked");
+            assert_eq!(epic_no_task.blocked_reason.as_deref(), Some(reason.as_str()));
+        }
+    }
+
+    /// The AC's headline push behavior: the epic branch is pushed on failure
+    /// with the committed work only — a later task's dirty, uncommitted tree
+    /// never reaches the pushed branch. Task A completes normally (one
+    /// commit, `test_cmd` green); task B's implement stage writes a file that
+    /// never satisfies `test_cmd`, exhausting the fix loop with a dirty tree
+    /// still sitting, uncommitted, in the workspace. The pushed branch (read
+    /// back from the fixture, which doubles as `origin` in this module's
+    /// tests) must carry A's commit and nothing from B.
+    #[tokio::test]
+    async fn failure_pushes_committed_work_but_never_a_later_tasks_dirty_tree() {
+        let agent = Arc::new(
+            ScriptedTaskAgent::new()
+                .script(Stage::Implement, writes_file("a.txt", "a\n"))
+                .script(Stage::Implement, writes_file("broken.txt", "oops\n")),
+        );
+        let (state, _app) = test_app_with_task_agent(agent).await;
+        let fixture = GitFixture::new().await;
+        let project_id =
+            seed_project_with_test_cmd(&state, &fixture, "! test -f broken.txt").await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let a = seed_task(&state, &epic_id, &project_id, "A").await;
+        let b = seed_task(&state, &epic_id, &project_id, "B").await;
+        link(&state, &a, &b).await; // A must run (and commit) before B fails.
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        let task_a = fetch_task_row(&state, &a).await;
+        assert_eq!(task_a.0, "Done");
+        let task_b = fetch_task_row(&state, &b).await;
+        assert_eq!(task_b.0, "Failed");
+        assert_eq!(task_b.1.as_deref(), Some("test_gate_exhausted"));
+
+        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        assert_eq!(epic.status, "Blocked");
+        assert_eq!(epic.blocked_reason.as_deref(), Some("test_gate_exhausted"));
+
+        // The branch was pushed: origin (the fixture) has exactly A's commit
+        // on the epic branch — nothing from B's failed attempt.
+        let branch = epic_branch_name_column(&state, &epic_id).await;
+        let subjects = git_log_subjects_for_ref(&fixture.dir, &branch).await;
+        assert_eq!(
+            subjects,
+            vec!["init".to_string(), format!("impl({}): A", spec::short_id(&a))],
+            "the pushed branch must carry A's commit and nothing from B's failed attempt"
+        );
+
+        // B's dirty file must never have reached the pushed branch.
+        let show = tokio::process::Command::new("git")
+            .args(["show", &format!("{branch}:broken.txt")])
+            .current_dir(&fixture.dir)
+            .output()
+            .await
+            .unwrap();
+        assert!(
+            !show.status.success(),
+            "broken.txt (B's uncommitted dirty file) must never appear on the pushed branch"
+        );
+
+        // The push itself lands in evidence, ok.
+        let mut rows = state
+            .db
+            .conn()
+            .query(
+                "SELECT status FROM agent_run WHERE epic_id = ?1 AND stage = 'push'",
+                params![epic_id.clone()],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("a push agent_run row");
+        assert_eq!(row.get::<String>(0).unwrap(), "ok");
+
+        // The workspace itself still has B's dirty tree, retained on disk —
+        // pushing never touched the working tree or the index.
+        let workspace_path = workspace::epic_workspace_path(&state.config.clone_root, &epic_id);
+        let status = git::status_porcelain(&workspace_path).await.unwrap();
+        assert!(
+            !status.trim().is_empty(),
+            "B's dirty tree must still be sitting, uncommitted, in the retained workspace"
+        );
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// A push failure during a failure is non-fatal: the epic still reaches
+    /// `Blocked(<original reason>)`, never `pr_failed`, and the push failure
+    /// itself lands in a `Stage::Push` evidence row rather than being
+    /// silently dropped.
+    #[tokio::test]
+    async fn push_failure_during_a_failure_is_non_fatal_and_recorded_in_evidence() {
+        let fake = Arc::new(FakeHost::new().fail_push("simulated push failure"));
+        let agent = Arc::new(
+            ScriptedTaskAgent::new().script(Stage::Implement, writes_file("broken.txt", "oops\n")),
+        );
+        let (state, _app) = test_app_with_task_agent_and_host(agent, fake).await;
+        let fixture = GitFixture::new().await;
+        let project_id =
+            seed_project_with_test_cmd(&state, &fixture, "! test -f broken.txt").await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let a = seed_task(&state, &epic_id, &project_id, "A").await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        let task = fetch_task_row(&state, &a).await;
+        assert_eq!(task.0, "Failed");
+        assert_eq!(task.1.as_deref(), Some("test_gate_exhausted"));
+
+        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        assert_eq!(epic.status, "Blocked");
+        assert_eq!(
+            epic.blocked_reason.as_deref(),
+            Some("test_gate_exhausted"),
+            "a push failure during triage must never overwrite the original reason with pr_failed"
+        );
+
+        let mut rows = state
+            .db
+            .conn()
+            .query(
+                "SELECT status, log FROM agent_run WHERE epic_id = ?1 AND stage = 'push'",
+                params![epic_id.clone()],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("a push agent_run row");
+        assert_eq!(row.get::<String>(0).unwrap(), "error");
+        let log: String = row.get(1).unwrap();
+        assert!(log.contains("simulated push failure"));
+
+        let (lease_owner, lease_expires_at) = epic_lease(&state, &epic_id).await;
+        assert!(
+            lease_owner.is_none(),
+            "the lease must still be released even though the triage push itself failed"
+        );
+        assert!(lease_expires_at.is_none());
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// Assert that `epic_id` opened no `Stage::Push` `agent_run` row at
+    /// all — used by the two provisioning-failure push-skip tests below.
+    /// Split into a plain (non-`#[tokio::test]`) helper called from two
+    /// separate test functions, each with its own `run_epic_pipeline` call
+    /// — rather than one test running the pipeline twice — because this
+    /// module's large per-task async frames (see e.g. `run_preflight`'s own
+    /// doc on why its nested call is `Box::pin`ned) can overflow the test
+    /// harness's thread stack if two full pipeline runs share one `async
+    /// fn`'s generated state machine.
+    async fn assert_no_push_row(state: &AppState, epic_id: &str) {
+        let mut rows = state
+            .db
+            .conn()
+            .query(
+                "SELECT COUNT(*) FROM agent_run WHERE epic_id = ?1 AND stage = 'push'",
+                params![epic_id.to_string()],
+            )
+            .await
+            .unwrap();
+        let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(count, 0, "no ProvisionedWorkspace ever existed — there must be no push row at all");
+    }
+
+    /// `workspace_error` (an unreachable repo) predates any
+    /// `ProvisionedWorkspace` at all — the push is skipped cleanly, not
+    /// merely non-fatal. Driven through `spawn_pool` + the lane endpoint
+    /// (matching `workspace_error_blocks_epic_releases_lease_and_publishes`'s
+    /// own convention above) rather than an unspawned direct
+    /// `run_epic_pipeline(...).await` — the pipeline body's per-task async
+    /// frames are large enough (see `run_preflight`'s own doc on why its
+    /// nested call is `Box::pin`ned) that running one outside its own
+    /// `tokio::spawn`'d task, on the test harness's own thread, can overflow
+    /// the stack.
+    #[tokio::test]
+    async fn workspace_error_skips_the_push_cleanly() {
+        let (state, app) = test_app().await;
+        let project_id = seed_project_bad_repo(&state).await;
+        let epic_id = seed_epic(&state, &project_id, "Ready").await;
+        seed_task(&state, &epic_id, &project_id, "A").await;
+
+        let _handles = spawn_pool(state.clone());
+        let response = app
+            .oneshot(req(
+                "POST",
+                &format!("/epics/{epic_id}/lane"),
+                Some(json!({ "status": "InProgress" })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if epic_status(&state, &epic_id).await == "Blocked" {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("epic never reached Blocked");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        assert_eq!(epic.blocked_reason.as_deref(), Some("workspace_error"));
+        assert_no_push_row(&state, &epic_id).await;
+    }
+
+    /// `setup_failed` (a failing `setup_cmd`) likewise predates any
+    /// `ProvisionedWorkspace` at all — the push is skipped cleanly. Same
+    /// `spawn_pool` + lane-endpoint convention as the test above, for the
+    /// identical stack-size reason.
+    #[tokio::test]
+    async fn setup_failed_skips_the_push_cleanly() {
+        let (state, app) = test_app().await;
+        let fixture = GitFixture::new().await;
+        let project_id =
+            seed_project_with_setup_cmd(&state, &fixture, "echo setup-boom && exit 5").await;
+        let epic_id = seed_epic(&state, &project_id, "Ready").await;
+        seed_task(&state, &epic_id, &project_id, "A").await;
+
+        let _handles = spawn_pool(state.clone());
+        let response = app
+            .oneshot(req(
+                "POST",
+                &format!("/epics/{epic_id}/lane"),
+                Some(json!({ "status": "InProgress" })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if epic_status(&state, &epic_id).await == "Blocked" {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("epic never reached Blocked");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        assert_eq!(epic.blocked_reason.as_deref(), Some("setup_failed"));
+        assert_no_push_row(&state, &epic_id).await;
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// The AC's "the worker immediately claims a different epic (a failure is
+    /// epic-scoped, not fatal)": with `worker_concurrency = 1`
+    /// (`Config::for_test`'s default), a single worker loop fails the first
+    /// epic and — with no manual re-trigger and no reliance on the slow poll
+    /// fallback (`state.notify.notify_waiters()` is called exactly once, up
+    /// front) — goes straight on to claim and complete the second.
+    #[tokio::test]
+    async fn worker_moves_on_to_a_different_epic_immediately_after_a_failure() {
+        assert_eq!(
+            Config::for_test(TOKEN).executor.worker_concurrency,
+            1,
+            "this test's proof depends on exactly one worker loop existing"
+        );
+
+        let (state, _app) = test_app().await;
+        let fixture1 = GitFixture::new().await;
+        let project1 = seed_project_with_test_cmd(&state, &fixture1, "exit 1").await;
+        let epic1 = seed_epic(&state, &project1, "InProgress").await;
+        seed_task(&state, &epic1, &project1, "A").await;
+
+        let fixture2 = GitFixture::new().await;
+        let project2 = seed_project_with_workspace(&state, &fixture2).await;
+        let epic2 = seed_epic(&state, &project2, "InProgress").await;
+        seed_task(&state, &epic2, &project2, "B").await;
+
+        let _handles = spawn_pool(state.clone());
+        state.notify.notify_waiters();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let (s1, s2) = (epic_status(&state, &epic1).await, epic_status(&state, &epic2).await);
+            if s1 == "Blocked" && s2 == "Completed" {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("epics never reached their expected terminal states: epic1={s1:?} epic2={s2:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let epic1_row = fetch_epic(state.db.conn(), &epic1).await.unwrap().unwrap();
+        assert_eq!(epic1_row.blocked_reason.as_deref(), Some("preflight_red"));
+
+        cleanup_clone_root(&state, &project1, &[&epic1]);
+        cleanup_clone_root(&state, &project2, &[&epic2]);
+    }
+
+    /// The AC's "a second epic in the same project is unaffected": both
+    /// epics share a project (the same canonical checkout, the same
+    /// per-project refresh lock); the first epic's only task fails via a
+    /// scripted implement error, and — the fix this task makes, not just an
+    /// existing behavior — reaches `Failed(agent_error)` itself (not left
+    /// `InProgress`, as every `block_epic_on_agent_error` call site used to
+    /// leave it pre-T-540); the second epic's task still completes normally.
+    #[tokio::test]
+    async fn second_epic_in_the_same_project_is_unaffected_by_a_failure() {
+        let agent = Arc::new(ScriptedTaskAgent::new().script(
+            Stage::Implement,
+            ScriptedRun {
+                exit_code: Some(1),
+                ..ScriptedRun::default()
+            },
+        ));
+        let (state, _app) = test_app_with_task_agent(agent).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+
+        let epic_a = seed_epic(&state, &project_id, "InProgress").await;
+        let task_a_id = seed_task(&state, &epic_a, &project_id, "A").await;
+        let epic_b = seed_epic(&state, &project_id, "InProgress").await;
+        seed_task(&state, &epic_b, &project_id, "B").await;
+
+        let _handles = spawn_pool(state.clone());
+        state.notify.notify_waiters();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let (sa, sb) = (epic_status(&state, &epic_a).await, epic_status(&state, &epic_b).await);
+            if sa == "Blocked" && sb == "Completed" {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("epics never reached their expected terminal states: epic_a={sa:?} epic_b={sb:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        let epic_a_row = fetch_epic(state.db.conn(), &epic_a).await.unwrap().unwrap();
+        assert_eq!(epic_a_row.blocked_reason.as_deref(), Some("agent_error"));
+        let task_a = fetch_task_row(&state, &task_a_id).await;
+        assert_eq!(task_a.0, "Failed", "the T-540 fix: a failing implement stage now fails the task too");
+        assert_eq!(task_a.1.as_deref(), Some("agent_error"));
+
+        let statuses_b = task_statuses(&state, &epic_b).await;
+        assert_eq!(statuses_b["B"], "Done", "epic B must be unaffected by epic A's failure");
+
+        cleanup_clone_root(&state, &project_id, &[&epic_a, &epic_b]);
     }
 }

@@ -363,7 +363,7 @@ with `agent_error` and gets thickened in later phases.
 
 ## 7. Phase 4 — Failure, recovery, cancellation
 
-- [ ] **T-540 — Structured failure & Blocked.** *deps: T-522, T-531*
+- [x] **T-540 — Structured failure & Blocked.** *deps: T-522, T-531*
   Centralize: task → `Failed(reason)`, epic → `Blocked(reason)`, **push the epic
   branch** (§7) so the user can clone and triage locally, release the lease,
   retain the workspace, publish `dag_updated` + `epic_updated` +
