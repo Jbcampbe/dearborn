@@ -222,8 +222,9 @@ verdict, session_id, started_at, ended_at, exit_code, created_at }`.
 several capped-256KB logs, and a stage-timeline view only needs to know what
 happened (stage/attempt/status/verdict/timing), not download every stage's
 full transcript just to render a list; `GET /runs/{id}` fetches one stage's
-full log on demand. `verdict` is only ever non-null for a `review` stage
-(T-530); `session_id` is `null` for every non-agent stage.
+full log on demand. `verdict` is only ever non-null for a `review` (T-530) or
+`verify_complete` (T-532) stage — the two stages whose prompt ends with a D9
+`VERDICT:` line; `session_id` is `null` for every non-agent stage.
 
 An agent stage additionally streams its `RunEvent`s live — see the new
 `task:<id>` WS topic below — and flushes its accumulated log to the row
@@ -329,9 +330,10 @@ existence at the transport layer):
   project kanban subscribed only to `epic:<id>`/`project:<id>` never receives
   the token-by-token stream of every task in the epic — only a client that has
   opened that specific task's detail view subscribes here.
-- `task:<id>` and `epic:<id>` both also carry `stage_changed` (T-530): a
-  task-stage transition with a known outcome (today, a review verdict).
-  `payload`: `{ task_id, stage, attempt, status, verdict? }` — see below.
+- `task:<id>` and `epic:<id>` both also carry `stage_changed` (T-530, T-532): a
+  task-stage transition with a known outcome (today, a `review` or
+  `verify_complete` verdict). `payload`: `{ task_id, stage, attempt, status,
+  verdict? }` — see below.
 
 ### Client → server (control frames)
 
@@ -353,7 +355,7 @@ malformed frames get an `error` frame back (the connection stays open).
 | `epic_updated` | An epic's record changed (planning `update_epic`, the breakdown `Planning → Ready` transition, or a lane transition via `POST /epics/{id}/lane`). `payload` = the updated epic. |
 | `dag_updated`  | A task or dependency changed under the epic (T-301). `payload` = `{ nodes: [DagNode], edges: [{ blocker_id, blocked_id }] }` (same shape as `GET /epics/{id}/dag`; nodes carry `ready` + `blocked_by`). |
 | `board_updated` | The project board changed (epic lane transition via `POST /epics/{id}/lane`, breakdown's `Planning → Ready`, or a standalone task create/patch/delete). `payload` = `{ epics: [Epic], tasks: [Task] }` (same shape as `GET /projects/{id}/board`; `tasks` are standalone). Published on `project:<id>`. |
-| `stage_changed` | A task-stage transition with a known outcome (T-530: today, only a review verdict). `payload` = `{ task_id, stage, attempt, status, verdict? }` (`verdict` present only for a `review` stage; `status` is the `agent_run.status` vocabulary — `ok`\|`error`\|`timeout`\|`cancelled`). Published on **both** `task:<id>` and, coarse, `epic:<id>` (identical payload) — see below. |
+| `stage_changed` | A task-stage transition with a known outcome (T-530, T-532: a `review` or `verify_complete` verdict). `payload` = `{ task_id, stage, attempt, status, verdict? }` (`verdict` present only for those two verdict-emitting stages; `status` is the `agent_run.status` vocabulary — `ok`\|`error`\|`timeout`\|`cancelled`). Published on **both** `task:<id>` and, coarse, `epic:<id>` (identical payload) — see below. |
 | *(any other)*  | A published event, delivered only to connections subscribed to its `topic`. |
 
 ### Planning `RunEvent` stream (T-202)
@@ -400,22 +402,25 @@ receives the accumulated log every ~2 seconds while the stage streams (D14),
 so a client that opens a task mid-run can hydrate from REST and then follow
 the rest live with no gap.
 
-### `stage_changed` (T-530)
+### `stage_changed` (T-530, T-532)
 
-A task-stage transition whose *outcome* a client cares about — today, only a
-review's D9 verdict — publishes `stage_changed` on `task:<id>` **and**,
-coarse (identical payload), on `epic:<id>`: `{ task_id, stage, attempt,
-status, verdict? }`. The two-topic fan-out mirrors why `dag_updated`/
-`epic_updated` already live on `epic:<id>`: a project board or epic detail
-view watching `epic:<id>` can drive a task card's sub-label ("reviewing",
-verdict) without subscribing to that task's own `RunEvent` firehose (which
-stays `task:<id>`-only, per the section above), while a task detail view
-already on `task:<id>` gets the same summary alongside the token stream it's
-already receiving. Published once, after the verdict is parsed and written to
-the `agent_run` row (`verdict` is only ever non-null for a `review` stage,
-matching `GET /tasks/{id}/runs`' own `AgentRunSummary.verdict`) — a
-contract-miss retry does **not** publish until a parseable verdict is finally
-recorded (or the stage gives up, at which point the failure surfaces through
+A task-stage transition whose *outcome* a client cares about — today, a
+`review` or `verify_complete` stage's D9 verdict (the two verdict-emitting
+stages, sharing one retry/publish implementation,
+`worker::run_verdict_stage`) — publishes `stage_changed` on `task:<id>`
+**and**, coarse (identical payload), on `epic:<id>`: `{ task_id, stage,
+attempt, status, verdict? }`. The two-topic fan-out mirrors why
+`dag_updated`/`epic_updated` already live on `epic:<id>`: a project board or
+epic detail view watching `epic:<id>` can drive a task card's sub-label
+("reviewing", "verifying already-complete", verdict) without subscribing to
+that task's own `RunEvent` firehose (which stays `task:<id>`-only, per the
+section above), while a task detail view already on `task:<id>` gets the same
+summary alongside the token stream it's already receiving. Published once,
+after the verdict is parsed and written to the `agent_run` row (`verdict` is
+only ever non-null for a `review` or `verify_complete` stage, matching `GET
+/tasks/{id}/runs`' own `AgentRunSummary.verdict`) — a contract-miss retry
+does **not** publish until a parseable verdict is finally recorded (or the
+stage gives up, at which point the failure surfaces through
 `dag_updated`/`epic_updated`/`board_updated` instead, the same as any other
 task failure).
 

@@ -350,7 +350,7 @@ with `agent_error` and gets thickened in later phases.
   with every round's findings retained; a fix that breaks the tests fails the
   task rather than committing red; each round re-reviews the cumulative diff.
 
-- [ ] **T-532 — Already-complete verification.** *deps: T-513, T-530*
+- [x] **T-532 — Already-complete verification.** *deps: T-513, T-530*
   Implement produced no diff ⇒ `Stage::VerifyComplete` against the spec, verdict
   parsed by the same D9 parser. `PASS` ⇒ close with zero commits;
   `NEEDS_CHANGES` ⇒ route findings to `Fix` and re-enter the normal pipeline;
