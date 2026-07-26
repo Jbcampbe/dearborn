@@ -189,9 +189,12 @@ the router can express it), but in practice **no path ever routes a
 cancellation through `fail_item`**: `Blocked` and `Cancelled` are distinct
 epic statuses, and `fail_item`'s task write is unconditionally `Failed` —
 exactly wrong for a cancelled task, which returns to `Todo` instead (see
-"Cancellation as a kill (T-542)" below). `timeout` is genuinely unconstructed
-so far; T-543 (agent-stage timeouts) is expected to route through this same
-router unmodified.
+"Cancellation as a kill (T-542)" below). `timeout` **is** constructed, and
+routes through this same router unmodified (T-543, see "Agent stage
+timeouts (T-543)" below): a stage that exceeds its deadline is, from
+`fail_item`'s point of view, just another agent-stage failure with a more
+precise reason string — the task fails and the epic blocks exactly as they
+do for `agent_error`.
 
 #### Recovery: retry a failed task (T-541)
 
@@ -257,6 +260,36 @@ Once a worker re-claims the unblocked epic, provisioning re-attaches its
 retained workspace (T-511: `git reset --hard HEAD` + `git clean -fd`), which
 is what actually drops the failed attempt's dirty tree before the walk
 re-enters at the now-`Todo` task.
+
+#### Agent stage timeouts (T-543)
+
+Every agent stage (`implement`/`fix`/`review`/`verify_complete`/`summarize`)
+carries a wall-clock deadline, `DEARBORN_AGENT_STAGE_TIMEOUT_SECS` (default
+`1800`, 30 minutes — no separate per-stage override; D18 explicitly rejects
+an epic-level budget instead). Exceeding it kills the stage through the
+identical mechanism T-542 built for a human-initiated cancel (D12: one
+`RunControl::cancel()`, looked up in the same `AppState.cancel_registry`) —
+there is no second kill path to keep in sync with the first. What differs is
+what happens *after*: a human cancel resets the task to `Todo` (resumable); a
+timeout instead takes the **ordinary failure route** — `fail_item` with
+`failure_reason`/`blocked_reason = 'timeout'` — exactly like any other
+agent-stage failure (`agent_error`), because a stage that ran too long is a
+failure of that attempt, not a request to stop. A non-agent stage
+(`setup`/`preflight`/`test_gate`/`commit`/`push`) has its own, separate
+timeout (`DEARBORN_CMD_TIMEOUT_SECS`, T-520) and is never subject to this
+one.
+
+The killed stage's `agent_run` row closes `status='timeout'` (not
+`'cancelled'`, even though the kill itself set `cancelled` too internally —
+see `AgentStageOutcome::timed_out`'s own doc in `task_agent.rs`) with
+whatever partial log had already flushed (D14). The server waits, bounded by
+a short fixed grace period past the deadline, for the killed process to
+actually be reaped before giving up and closing the row from the last known
+partial state regardless — a stage is never left hanging indefinitely even
+if the underlying kill is unexpectedly slow to land. The worker slot itself
+is released exactly as it is for any other task-scoped failure: no special
+handling, the same lease-release/workspace-retention/no-PR/next-claim
+behavior D10 already gives `agent_error`.
 
 #### Enqueue on In Progress + the executor (T-403, superseded by T-510–T-514)
 

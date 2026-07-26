@@ -756,8 +756,9 @@
 //! happened to touch.
 //!
 //! [`fail_item`] replaces all of it: **one** router, taking a
-//! [`FailureContext`], that every failure path above (and T-542/T-543's,
-//! once those land) now calls. [`FailureReason`] makes §2.3's vocabulary a
+//! [`FailureContext`], that every failure path above (and T-543's timeout
+//! route, once it landed — see "T-543: agent stage timeouts" near the end of
+//! this doc) now calls. [`FailureReason`] makes §2.3's vocabulary a
 //! type instead of bare string literals — the same discipline [`Stage`]
 //! already applies to §2.2 — so a reason reaching [`fail_item`] is something
 //! the compiler enforces (a match must name every variant) and a test
@@ -768,8 +769,10 @@
 //!
 //! [`FailureContext::task_id`] is `Option<&str>`: `Some` for every failure
 //! that has one task at fault (`agent_error`, `test_gate_exhausted`,
-//! `review_not_converged`, `blocked`, and T-542/T-543's `cancelled`/
-//! `timeout`), `None` for the four that don't (`preflight_red`,
+//! `review_not_converged`, `blocked`, and T-543's `timeout` —
+//! `FailureContext` can express `cancelled` too, but T-542's cancel path
+//! never actually constructs one; see "T-542: cancellation as a kill"
+//! below), `None` for the four that don't (`preflight_red`,
 //! `setup_failed`, `workspace_error` — the DAG walk never even started — and
 //! `pr_failed` — every task already finished; the failure is finalize's
 //! own). [`fail_item`] only ever touches the `task` table when `task_id` is
@@ -871,15 +874,20 @@
 //! different epic (or the same project's next one) on its very next
 //! iteration, no poll-interval delay involved.
 //!
-//! ### `timeout`/`cancelled`: accepted, and — for `cancelled` — deliberately
-//! ### still never constructed (revised by T-542)
+//! ### `timeout`/`cancelled`: one constructed, one deliberately never
+//! ### (revised by T-542, settled by T-543)
 //!
 //! [`FailureReason::Timeout`] and [`FailureReason::Cancelled`] both exist in
 //! the enum and are handled by [`fail_item`] exactly like every other
 //! reason — [`FailureReason::ALL`]'s own test still drives both through the
-//! router directly to prove the plumbing works generically. `Timeout` is
-//! still simply unconstructed, waiting on T-543. `Cancelled` is different:
-//! T-542 (below) landed and, after actually building the cancel path,
+//! router directly to prove the plumbing works generically. `Timeout` is now
+//! genuinely constructed: [`route_stage_failure`]'s `outcome.timed_out`
+//! branch (T-543, see that function's own doc) is the one and only call site
+//! that ever builds a `FailureContext { reason: FailureReason::Timeout, .. }`
+//! — a timed-out stage takes T-540's ordinary `fail_item` route, same as
+//! `AgentError`, just with a more precise reason string. `Cancelled` is
+//! different: T-542 (below) landed and, after actually building the cancel
+//! path,
 //! **deliberately does not** route a cancelled stage through [`fail_item`]
 //! at all — the paragraph above this section, written before T-542 existed,
 //! predicted "they only ever need to call `fail_item` with the right
@@ -981,6 +989,72 @@
 //! path already uses, and `finalize_epic` (the only place a PR ever opens)
 //! is never reached because the walk stops mid-task, long before the DAG
 //! could ever read fully `Done`.
+//!
+//! ## T-543: agent stage timeouts (D18)
+//!
+//! D18 ("per-stage wall-clock timeouts... no epic-level budget") is enforced
+//! for agent stages inside [`task_agent::run_agent_stage`] itself — see that
+//! function's own "T-543: agent stage timeouts" doc section for the
+//! deadline/grace-period mechanics — never at a call site in this module.
+//! What belongs here is the other half: once `run_agent_stage` hands back a
+//! not-`ok` [`task_agent::AgentStageOutcome`] whose `timed_out` field is set,
+//! what does the walk *do* about it?
+//!
+//! ### The same choke point T-542 already built
+//!
+//! Every call site in this module that inspects an agent stage's outcome —
+//! `process_one_task`'s implement step, `run_test_gate_loop`'s fix step,
+//! `run_verdict_stage`'s review/verify-complete step,
+//! `run_review_fix_converge`'s review-driven fix step — already goes through
+//! [`route_stage_failure`] (T-542's own choke point, built to decide
+//! ordinary-failure-vs-cancelled). T-543 does not add a fourth call site or a
+//! second router: it adds a third branch, checked *first*, to the one that
+//! already exists. See [`route_stage_failure`]'s own doc for the exact
+//! three-way decision and why `timed_out` has to be checked before
+//! `cancelled` rather than after (a deadline-killed outcome has
+//! `cancelled: true` too — the kill mechanism is D12's single
+//! `RunControl::cancel()`, T-542's and T-543's own "T-543" doc section make
+//! the same point from the `task_agent.rs` side).
+//!
+//! ### An implement timeout blocks the epic; a fix/review timeout fails that
+//! ### stage's own way
+//!
+//! Because `route_stage_failure`'s `timed_out` branch calls the *identical*
+//! [`fail_item`] every ordinary `AgentError` failure already calls (just with
+//! [`FailureReason::Timeout`] instead), a timed-out stage inherits whichever
+//! call site it happened at, with no new logic to keep in sync:
+//!
+//! - A timed-out `Stage::Implement` (`process_one_task`) fails the task
+//!   `Failed(timeout)` and blocks the epic `Blocked(timeout)` exactly as an
+//!   ordinary implement failure does — this task's own headline AC line.
+//! - A timed-out `Stage::Fix` inside the test-gate loop
+//!   (`run_test_gate_loop`) fails exactly as that loop's other fix failures
+//!   do — the loop never gets a chance to retry a timed-out fix, because
+//!   `route_stage_failure` already stopped the walk before the loop's own
+//!   retry logic would run again.
+//! - A timed-out `Stage::Review`/`Stage::VerifyComplete`
+//!   (`run_verdict_stage`) fails exactly as a contract-miss-after-retry does.
+//! - A timed-out `Stage::Fix` inside the review/fix/re-review loop
+//!   (`run_review_fix_converge`) fails exactly as that loop's other fix
+//!   failures do.
+//!
+//! No new "what should a timeout at *this particular* stage mean" judgment
+//! call was made anywhere — the whole point of routing through the existing
+//! per-stage failure handling is that a timeout is indistinguishable, in its
+//! *consequences*, from any other way that same stage could have failed.
+//! Only `agent_run.status` (`"timeout"` vs `"error"`) and
+//! `task.failure_reason`/`epic.blocked_reason` (`"timeout"` vs
+//! `"agent_error"`) tell a human which one actually happened.
+//!
+//! ### The worker slot
+//!
+//! Unchanged from every other stop path this module has: `route_stage_failure`
+//! (or, on the `Stop`-returning path out of whichever loop observed the
+//! timeout) ends in a plain `return`, no further writes, which propagates
+//! back to [`try_claim_and_run`] — the lease is released, the workspace is
+//! retained (`PushIntent::Attempt` — the same triage-push every task-scoped
+//! failure gets), and the worker's own loop tries its next claim immediately,
+//! exactly as it does after any other epic-scoped failure (D10, §7).
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -2975,10 +3049,13 @@ async fn publish_stage_changed(
 
 /// The full §2.3 failure-reason vocabulary, typed rather than left as bare
 /// string literals scattered across call sites (mirrors [`Stage::as_str`]).
-/// `Timeout` and `Cancelled` are T-543's and T-542's respectively — nothing
-/// in this module constructs them yet (those tasks own the cancel registry
-/// and the stage-timeout wrapper), but [`fail_item`] already accepts them so
-/// those tasks only ever need to call it, never build their own routing.
+/// `Timeout` (T-543) and `Cancelled` (T-542) both exist because [`fail_item`]
+/// was built to accept the whole vocabulary up front, not just the reasons
+/// its first caller needed — but only `Timeout` is actually ever constructed,
+/// by [`route_stage_failure`] (see that function's own doc for why a timeout
+/// takes the same route as any other agent-stage failure). `Cancelled` stays
+/// permanently unconstructed by design; see [`FailureReason::Cancelled`]'s
+/// own doc.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum FailureReason {
     /// `test_cmd` was not green on the untouched tree — including a timeout;
@@ -3010,9 +3087,13 @@ enum FailureReason {
     /// their own.
     AgentError,
     /// An agent stage was killed for exceeding
-    /// `DEARBORN_AGENT_STAGE_TIMEOUT_SECS`. T-543's reason; not yet
-    /// constructed anywhere in this module.
-    #[allow(dead_code)] // T-543 constructs this once the timeout wrapper lands
+    /// `DEARBORN_AGENT_STAGE_TIMEOUT_SECS` (T-543) — constructed by
+    /// [`route_stage_failure`] when [`task_agent::AgentStageOutcome::timed_out`]
+    /// is set, and routed through [`fail_item`] exactly like
+    /// [`FailureReason::AgentError`]: a timed-out implement fails the task
+    /// and blocks the epic exactly as a failed implement does (this task's
+    /// AC — "an implement timeout follows the ordinary failure route, not a
+    /// special one").
     Timeout,
     /// §2.3 names `cancelled` as a valid `task.failure_reason`/
     /// `epic.blocked_reason` value, so this variant stays defined and
@@ -3104,8 +3185,8 @@ enum PushIntent<'a> {
 /// path. `task_id: None` is what lets a no-task failure (`preflight_red`,
 /// `setup_failed`, `workspace_error`, `pr_failed`) and a task-scoped one
 /// (`agent_error`, `test_gate_exhausted`, `review_not_converged`, `blocked`,
-/// and T-542/T-543's `cancelled`/`timeout`) share the identical call shape —
-/// nothing else about the struct varies by failure kind.
+/// and T-543's `timeout`) share the identical call shape — nothing else
+/// about the struct varies by failure kind.
 struct FailureContext<'a> {
     epic_id: &'a str,
     task_id: Option<&'a str>,
@@ -3296,21 +3377,41 @@ async fn push_on_failure(
 // full design (the registry, the guard, why `fail_item` doesn't fit). This
 // is that section's literal implementation.
 
-/// Route a not-`ok` [`task_agent::AgentStageOutcome`] to either T-542's
-/// cancel path ([`handle_cancelled_task`]) or T-540's [`fail_item`],
-/// depending on `outcome.cancelled` — the single decision every call site in
+/// Route a not-`ok` [`task_agent::AgentStageOutcome`] to whichever of three
+/// paths matches *why* it isn't `ok` — the single decision every call site in
 /// this module that inspects an agent stage's outcome now makes through this
-/// function instead of calling `fail_item` inline. See the module doc's
-/// "Observing the kill" section for why the two paths cannot share
-/// `fail_item` unmodified (a cancelled task must land `Todo`, not `Failed`).
+/// function instead of calling `fail_item` inline:
+///
+/// 1. **`outcome.timed_out`** (T-543) — `DEARBORN_AGENT_STAGE_TIMEOUT_SECS`
+///    fired. Routed through T-540's [`fail_item`] with
+///    [`FailureReason::Timeout`], **exactly** the same route
+///    `outcome.errored`/a non-zero exit takes below — this task's AC is
+///    explicit that a timeout is "that stage's ordinary failure," not a
+///    special case, so the only thing that changes relative to the
+///    `AgentError` branch is which reason string lands in the column. Checked
+///    *before* `outcome.cancelled` because a deadline-killed outcome has
+///    `cancelled: true` too (see [`task_agent::AgentStageOutcome::timed_out`]'s
+///    own doc for why one flag alone can't distinguish the two callers of the
+///    identical `RunControl::cancel()`).
+/// 2. **`outcome.cancelled`** (and not timed out) — a human moved the epic
+///    `InProgress → Cancelled` (T-542) and this stage was in flight. Routed
+///    to [`handle_cancelled_task`], **not** `fail_item` — see the module
+///    doc's "Observing the kill" section for why the two paths cannot share
+///    `fail_item` unmodified (a cancelled task must land `Todo`, not
+///    `Failed`).
+/// 3. Anything else — an ordinary agent-stage failure (non-zero exit, an
+///    `Error` event, or a stage that never produced a clean `ok`). Routed
+///    through `fail_item` with [`FailureReason::AgentError`], unchanged from
+///    before T-542/T-543 existed.
 ///
 /// `message`/`workspace` are exactly what the caller would have passed
-/// `fail_item` directly before this task; they are simply ignored on the
+/// `fail_item` directly before T-542; they are simply ignored on the
 /// cancelled branch (there is no `FailureContext` to build — see
 /// `handle_cancelled_task`'s own, much smaller, argument list). Checking
 /// `lease.is_lost()` here (rather than at each call site, as every
 /// pre-existing `fail_item` call already did) keeps that fencing discipline
-/// intact for both branches with one check instead of two copies of it.
+/// intact for all three branches with one check instead of three copies of
+/// it.
 async fn route_stage_failure(
     state: &AppState,
     epic_id: &str,
@@ -3323,7 +3424,19 @@ async fn route_stage_failure(
     if lease.is_lost() {
         return;
     }
-    if outcome.cancelled {
+    if outcome.timed_out {
+        fail_item(
+            state,
+            FailureContext {
+                epic_id,
+                task_id: Some(task_id),
+                reason: FailureReason::Timeout,
+                message,
+                push: PushIntent::Attempt(workspace),
+            },
+        )
+        .await;
+    } else if outcome.cancelled {
         handle_cancelled_task(state, epic_id, task_id).await;
     } else {
         fail_item(
@@ -7529,8 +7642,9 @@ mod tests {
     /// variant, driven directly through [`fail_item`], lands correctly in
     /// both shapes a real call site ever uses — task-scoped (`task_id:
     /// Some`, covering `agent_error`/`test_gate_exhausted`/
-    /// `review_not_converged`/`blocked`, and T-542/T-543's future
-    /// `cancelled`/`timeout`) and no-task (`task_id: None`, covering
+    /// `review_not_converged`/`blocked`/T-543's `timeout`, and — though no
+    /// real call site ever does this, per `FailureReason::Cancelled`'s own
+    /// doc — `cancelled`) and no-task (`task_id: None`, covering
     /// `preflight_red`/`setup_failed`/`workspace_error`/`pr_failed`).
     #[tokio::test]
     async fn every_section_2_3_reason_reaches_fail_item_and_lands_correctly() {
@@ -8438,5 +8552,160 @@ mod tests {
         assert!(state.cancel_registry.lock().unwrap().is_empty());
 
         cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    // ---- T-543: agent stage timeouts ---------------------------------------
+    //
+    // `run_agent_stage`'s own test module (`task_agent.rs`) already proves the
+    // deadline/grace-period mechanics in isolation: the row closes
+    // `status='timeout'` with the flushed partial log, `AgentStageOutcome::
+    // timed_out` is set, and the cancel-registry entry is removed. What this
+    // module owns, and what wasn't yet proven anywhere before this test, is
+    // [`route_stage_failure`]'s own three-way branch actually being reached by
+    // a *real* deadline (not a hand-built `AgentStageOutcome`) — i.e. that a
+    // timed-out stage genuinely takes T-540's ordinary `fail_item` route
+    // (`Failed(timeout)` / `Blocked(timeout)`), not T-542's
+    // `handle_cancelled_task` route, even though both share the identical
+    // `RunControl::cancel()` kill underneath.
+
+    /// This task's headline AC, end to end: with
+    /// `agent_stage_timeout_secs` configured tiny and `Stage::Implement`
+    /// gated so it never exits, the deadline fires for real inside
+    /// `run_agent_stage` (no hand-built outcome) and the walk observes a
+    /// `timed_out` outcome through the live pool — proving
+    /// `route_stage_failure` sends it through `fail_item` exactly like any
+    /// other agent-stage failure (this task's AC line: "the stage counts as
+    /// that stage's ordinary failure... not a special one"), not through
+    /// T-542's `Todo`-resetting cancel path: the task lands `Failed` with
+    /// `failure_reason = 'timeout'`, the epic blocks `Blocked` with
+    /// `blocked_reason = 'timeout'` (never `Cancelled` — nobody cancelled
+    /// anything), the `implement` row's partial log survives, the workspace
+    /// is retained, no PR ever opens, the cancel-registry entry is gone, and
+    /// — the AC's own "the worker slot is released" clause — the claimed
+    /// epic's lease is released same as any other task-scoped failure.
+    #[tokio::test]
+    async fn implement_timeout_fails_the_task_and_blocks_the_epic_the_ordinary_way() {
+        let mut config = Config::for_test(TOKEN);
+        config.executor.agent_stage_timeout_secs = 1;
+
+        let gate = Arc::new(Gate::default());
+        let agent: Arc<dyn TaskAgent> = Arc::new(ScriptedTaskAgent::new().with_gate(gate.clone()).script(
+            Stage::Implement,
+            ScriptedRun {
+                text: vec!["partial output before the deadline kill".to_string()],
+                ..ScriptedRun::default()
+            },
+        ));
+        let fake = Arc::new(FakeHost::new());
+        let db = Db::connect(":memory:").await.unwrap();
+        db.run_migrations().await.unwrap();
+        let state = AppState::with_all_agents_and_host(
+            config,
+            db,
+            Arc::new(SilentPlanningAgent),
+            Arc::new(SilentBreakdownAgent),
+            agent,
+            fake.clone(),
+        );
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let task_id = seed_task(&state, &epic_id, &project_id, "A").await;
+
+        let _handles = spawn_pool(state.clone());
+        state.notify.notify_waiters();
+
+        // Bounded readiness poll: first prove the epic was actually claimed
+        // (lease held) — otherwise a lease that reads `None` from the very
+        // first check below would be a false positive (nothing claimed yet),
+        // not the "released after a real walk" signal this test needs.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let (lease_owner, _) = epic_lease(&state, &epic_id).await;
+            if lease_owner.is_some() {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("the epic was never claimed at all");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Now the unambiguous "the walk has stopped" signal (same pattern
+        // `cancel_during_a_non_agent_stage_never_touches_the_registry` uses
+        // above): the lease released, well past the 1s deadline plus
+        // `AGENT_TIMEOUT_KILL_GRACE_PERIOD`.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(15);
+        loop {
+            let (lease_owner, _) = epic_lease(&state, &epic_id).await;
+            if lease_owner.is_none() {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("the claimed epic's lease was never released after the timeout should have stopped the walk");
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+
+        // The task failed with the timeout reason, not agent_error/cancelled.
+        let (status, failure_reason) = fetch_task_row(&state, &task_id).await;
+        assert_eq!(status, "Failed");
+        assert_eq!(failure_reason.as_deref(), Some("timeout"));
+
+        // The epic blocked with the matching reason — never Cancelled.
+        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        assert_eq!(epic.status, "Blocked");
+        assert_eq!(epic.blocked_reason.as_deref(), Some("timeout"));
+
+        // The `implement` agent_run row closed `timeout` with its partial
+        // (pre-kill) log intact.
+        let mut rows = state
+            .db
+            .conn()
+            .query(
+                "SELECT status, log FROM agent_run WHERE task_id = ?1 AND stage = 'implement'",
+                params![task_id.clone()],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("the implement row must exist");
+        assert_eq!(row.get::<String>(0).unwrap(), "timeout");
+        let log: String = row.get(1).unwrap();
+        assert!(
+            log.contains("partial output before the deadline kill"),
+            "the flushed partial log must be preserved: {log:?}"
+        );
+
+        // The workspace is retained on disk — same triage-push every
+        // task-scoped failure gets (D10, §7), unchanged by this task.
+        let workspace_path = workspace::epic_workspace_path(&state.config.clone_root, &epic_id);
+        assert!(
+            workspace_path.join(".git").exists(),
+            "the workspace must be retained after a timeout"
+        );
+
+        // No PR was ever opened.
+        assert!(
+            fake.open_pr_calls().is_empty(),
+            "a timed-out epic must never reach finalize/open_pr"
+        );
+
+        // The registry entry is gone — removed once run_agent_stage returned,
+        // timeout or not (T-542's guard, unchanged by this task).
+        assert!(
+            state.cancel_registry.lock().unwrap().is_empty(),
+            "the registry entry must be removed once the timed-out stage's drain finishes"
+        );
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+        // Deliberately never `gate.release()`d during the assertions above —
+        // release now, purely as teardown hygiene (same reasoning as
+        // `task_agent.rs`'s own gated timeout test): by this point the
+        // deadline, the cancel, and the full grace period have already
+        // happened and every assertion above already passed, so releasing
+        // here only lets the scripted thread's `tx` drop and the pool's
+        // background loops wind down cleanly instead of leaking a parked
+        // thread for the rest of the test binary's life.
+        gate.release();
     }
 }

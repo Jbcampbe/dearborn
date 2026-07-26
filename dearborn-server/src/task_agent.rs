@@ -90,6 +90,72 @@
 //! for what the worker does once it observes the resulting
 //! `RunEvent::Exited { cancelled: true }`.
 //!
+//! ## T-543: agent stage timeouts (D18)
+//!
+//! T-542 gave every agent stage a *reachable* kill switch — something has to
+//! actually call `RunControl::cancel()`. Until this task, the only caller was
+//! a human, through `lanes::set_epic_lane`'s `InProgress → Cancelled` lane
+//! move. D18 ("per-stage wall-clock timeouts") asks for a second caller: a
+//! stage that has simply run too long, with nobody watching, has to cancel
+//! *itself*. [`run_agent_stage`] is the single place to put that — it is
+//! already the one choke point every agent stage's `RunHandle` passes
+//! through (the section above), so wrapping the whole function's drain in a
+//! deadline means no call site (`process_one_task`, `run_test_gate_loop`,
+//! `run_verdict_stage`, `run_review_fix_converge`, `run_verify_complete`)
+//! has to opt in, exactly the same "for free" property T-542 established for
+//! the human-initiated kill.
+//!
+//! ### The same kill, a different caller, a different reason
+//!
+//! On a `DEARBORN_AGENT_STAGE_TIMEOUT_SECS` deadline, [`run_agent_stage`]
+//! does not build a second cancellation mechanism — it looks the handle up
+//! in [`AppState::cancel_registry`] (the exact entry its own [`CancelGuard`]
+//! just inserted) and calls `.cancel()` on it, the identical call
+//! `lanes::set_epic_lane` makes for a human-initiated cancel. This is D12's
+//! "cancel is a kill" contract satisfied by construction: there is only ever
+//! one way an agent stage's process dies before it would have exited on its
+//! own, whether a human clicked Cancel or the clock ran out. What has to
+//! differ is what happens *after* — a human cancel means "stop, the task is
+//! resumable, put it back in `Todo`" (T-542's `handle_cancelled_task`); a
+//! timeout means "this attempt failed, same as any other failed attempt"
+//! (this task's AC: "an implement timeout follows the ordinary failure route,
+//! not a special one"). [`AgentStageOutcome::timed_out`] is the bit that
+//! carries that distinction from this function through to
+//! `worker::route_stage_failure`, which checks it *before* `cancelled` for
+//! exactly this reason — see that field's own doc for the full contract.
+//!
+//! ### Waiting for the kill to actually land, bounded
+//!
+//! A deadline does not simply abandon the drain and move on — that would
+//! leave the killed process's output mid-flush and, worse, leave nothing
+//! actually confirming the process died (the AC: "a timed-out stage must not
+//! leave an orphaned `claude` process behind"). Instead [`run_agent_stage`]
+//! keeps awaiting the same drain task, now racing it against
+//! [`AGENT_TIMEOUT_KILL_GRACE_PERIOD`] instead of the (already-expired)
+//! stage deadline — the drain finishing means the row closes with the real
+//! terminal `Exited` event (a real, reaped exit, a complete log). Only if
+//! *that* also elapses — `cancel()` issued, and still no `Exited` — does this
+//! function give up waiting and close the row itself from whatever partial
+//! `AgentStageOutcome` the drain thread had accumulated as of that moment
+//! (shared via `shared_outcome`, updated after every event exactly like the
+//! log-only accumulator T-512/D14 already had). This is the "decide and
+//! document" case MILESTONE_2 asks for explicitly: `spawn_blocking`'s
+//! `JoinHandle::abort()` cannot actually preempt a thread already inside its
+//! blocking closure (draining `rx`), so there is no way to *force* the drain
+//! to stop — it is left running, detached, and will finish whenever the
+//! underlying channel eventually closes (whenever the process, or the
+//! harness's own reader threads, eventually exit), writing to a
+//! `shared_outcome` nothing downstream reads anymore.
+//! [`AGENT_TIMEOUT_KILL_GRACE_PERIOD`]'s own doc has the timing rationale
+//! (comfortably past `cli-stream`'s own SIGTERM→SIGKILL escalation) for why
+//! this should never actually fire against a real subprocess — the true
+//! backstop is `RunControl::cancel()` itself reliably killing within seconds
+//! (T-542's own AC), not this grace period; this is the belt-and-suspenders
+//! "must terminate regardless" guarantee for the case where that reliability
+//! assumption is ever wrong (or, in this crate's own tests, deliberately
+//! never satisfied — a gated `ScriptedTaskAgent` run whose gate the test
+//! never releases is exactly what exercises this path).
+//!
 //! ## Soft read-only enforcement for `Review`/`VerifyComplete`/`Summarize`
 //!
 //! These three stages run in `RunMode::Ask` (no edits expected) *and*
@@ -490,6 +556,22 @@ pub struct AgentStageOutcome {
     pub session_id: Option<String>,
     pub exit_code: Option<i32>,
     pub cancelled: bool,
+    /// T-543: `true` when this stage's `cancelled` came from
+    /// `DEARBORN_AGENT_STAGE_TIMEOUT_SECS` firing, not a user-initiated
+    /// `POST /epics/{id}/lane` cancel (T-542). Both paths kill the stage
+    /// through the identical `RunControl::cancel()` call (D12), so
+    /// `cancelled` alone can't tell them apart — which is exactly why
+    /// `agent_run.status` needs a value distinct from `cancelled`
+    /// (§2.1/§2.2's `timeout`), and why `worker::route_stage_failure`
+    /// checks this field *before* `cancelled` to decide whether a not-`ok`
+    /// outcome takes T-540's ordinary failure route
+    /// (`Failed(FailureReason::Timeout)`, this task's AC — "an implement
+    /// timeout follows the ordinary failure route, not a special one") or
+    /// T-542's `Todo`-resetting cancel route. Set by [`run_agent_stage`]
+    /// itself (see its own "T-543" doc section) — never by
+    /// [`AgentStageOutcome::absorb`], which only sees the harness's own
+    /// `RunEvent` stream and has no notion of *why* a cancel happened.
+    pub timed_out: bool,
     /// Whether an `Error` event was seen anywhere in the stream.
     pub errored: bool,
     /// The `agent_run.id` this outcome's row was opened/closed under (T-530).
@@ -529,9 +611,17 @@ impl AgentStageOutcome {
         }
     }
 
-    /// The §2.1 terminal `agent_run.status` this outcome implies.
+    /// The §2.1 terminal `agent_run.status` this outcome implies. `timed_out`
+    /// is checked *before* `cancelled` (T-543): both are `true` for a
+    /// deadline-killed stage (see [`Self::timed_out`]'s own doc — the kill
+    /// mechanism is identical, so `cancelled` is always set alongside it),
+    /// but `"timeout"` is the more precise, more actionable status for a
+    /// human reading `agent_run.status` — `"cancelled"` reads as "a human
+    /// asked to stop," which is specifically *not* what happened here.
     fn status(&self) -> &'static str {
-        if self.cancelled {
+        if self.timed_out {
+            "timeout"
+        } else if self.cancelled {
             "cancelled"
         } else if self.errored {
             "error"
@@ -608,10 +698,11 @@ pub async fn run_agent_stage(
     req: TaskRunRequest,
 ) -> Result<AgentStageOutcome, AgentStageError> {
     let conn = state.db.conn();
+    let stage_str = req.stage.as_str();
     let open = OpenStage {
         task_id: Some(params.task_id),
         epic_id: params.epic_id,
-        stage: req.stage.as_str(),
+        stage: stage_str,
         attempt: params.attempt,
     };
     let stage_row = evidence::open_stage(conn, open)
@@ -650,20 +741,28 @@ pub async fn run_agent_stage(
     let hub = state.hub.clone();
     let topic = format!("task:{}", params.task_id);
 
-    // Shared with the periodic-flush task below: the blocking drain thread
-    // writes the latest accumulated log text here; the async flush loop reads
-    // a snapshot every tick. A plain `std::sync::Mutex` is fine — both sides
-    // only ever hold it for a `String` clone/replace, never across an `.await`.
-    let shared_log = std::sync::Arc::new(std::sync::Mutex::new(String::new()));
-    let shared_log_writer = shared_log.clone();
+    // Shared with the periodic-flush task below AND (T-543) with the
+    // deadline-timeout path a few lines down: the blocking drain thread
+    // writes its latest accumulated *outcome* here after absorbing every
+    // event, not just the log text — [`AgentStageOutcome`] is a cheap
+    // `#[derive(Clone)]` (a `String` plus a handful of small fields), so
+    // sharing the whole thing costs nothing extra and means a deadline that
+    // gives up waiting on the drain (below) has the same session id/exit
+    // state a normal close would, not just the text. A plain
+    // `std::sync::Mutex` is fine — every side only ever holds it for a
+    // clone/replace, never across an `.await`.
+    let shared_outcome = std::sync::Arc::new(std::sync::Mutex::new(AgentStageOutcome::default()));
+    let shared_outcome_writer = shared_outcome.clone();
 
-    let drain_task = tokio::task::spawn_blocking(move || {
+    let mut drain_task = tokio::task::spawn_blocking(move || {
         let mut outcome = AgentStageOutcome::default();
         for event in rx {
             let payload = serde_json::to_value(&event).unwrap_or(Value::Null);
             hub.publish(&topic, crate::planning::ws_type(&event), payload);
             outcome.absorb(&event);
-            *shared_log_writer.lock().expect("shared_log mutex poisoned") = outcome.text.clone();
+            *shared_outcome_writer
+                .lock()
+                .expect("shared_outcome mutex poisoned") = outcome.clone();
         }
         outcome
     });
@@ -674,11 +773,12 @@ pub async fn run_agent_stage(
     // drain) because flushing is an async DB write and the drain thread is a
     // plain blocking one — this avoids reaching for `Handle::block_on` from
     // inside `spawn_blocking`, which works but is a subtler pattern than two
-    // independent tasks sharing a `Mutex<String>`. Stopped via `abort()` the
-    // instant the drain finishes; the *final* close below writes the
-    // complete, un-raced log regardless of this loop's last tick.
+    // independent tasks sharing a `Mutex`. Stopped via `abort()` the instant
+    // the drain finishes (or T-543's deadline gives up on it); the *final*
+    // close below writes the complete, un-raced log regardless of this
+    // loop's last tick.
     let flush_conn = conn.clone();
-    let flush_log = shared_log.clone();
+    let flush_shared = shared_outcome.clone();
     let flush_row_id = stage_row.id.clone();
     let flush_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(PARTIAL_FLUSH_INTERVAL);
@@ -686,7 +786,11 @@ pub async fn run_agent_stage(
                                 // first *real* flush is ~PARTIAL_FLUSH_INTERVAL in.
         loop {
             interval.tick().await;
-            let snapshot = flush_log.lock().expect("shared_log mutex poisoned").clone();
+            let snapshot = flush_shared
+                .lock()
+                .expect("shared_outcome mutex poisoned")
+                .text
+                .clone();
             let handle = StageHandle {
                 id: flush_row_id.clone(),
                 started_at: stage_row.started_at,
@@ -695,10 +799,78 @@ pub async fn run_agent_stage(
         }
     });
 
-    let drained = drain_task.await;
+    // ---- T-543: DEARBORN_AGENT_STAGE_TIMEOUT_SECS, enforced through the
+    // exact same RunControl::cancel() T-542 wired up (D12) — see this
+    // module's "T-543: agent stage timeouts" doc section (top of file) for
+    // the full design. In short: race the drain against the deadline; on a
+    // deadline, look the handle up in the registry `_cancel_guard` above
+    // just populated and call `cancel()` on it (the identical call
+    // `lanes::set_epic_lane`'s user-initiated cancel makes), then keep
+    // waiting — bounded by `AGENT_TIMEOUT_KILL_GRACE_PERIOD` — for the drain
+    // to actually finish, so the row closes with a complete partial log and
+    // the process is genuinely reaped rather than abandoned mid-flight.
+    let stage_timeout = Duration::from_secs(state.config.executor.agent_stage_timeout_secs);
+    let mut deadline_fired = false;
+
+    let drained = match tokio::time::timeout(stage_timeout, &mut drain_task).await {
+        Ok(res) => res,
+        Err(_elapsed) => {
+            deadline_fired = true;
+            tracing::warn!(
+                task = %params.task_id,
+                stage = stage_str,
+                timeout_secs = state.config.executor.agent_stage_timeout_secs,
+                "agent stage exceeded DEARBORN_AGENT_STAGE_TIMEOUT_SECS; cancelling"
+            );
+            let cancel_result = state
+                .cancel_registry
+                .lock()
+                .expect("cancel_registry mutex poisoned")
+                .get(cancel_registry_key(&params))
+                .map(|h| h.cancel());
+            if let Some(Err(err)) = cancel_result {
+                tracing::warn!(
+                    task = %params.task_id,
+                    stage = stage_str,
+                    error = %err,
+                    "agent stage timeout: cancel() itself returned an error"
+                );
+            }
+
+            match tokio::time::timeout(AGENT_TIMEOUT_KILL_GRACE_PERIOD, &mut drain_task).await {
+                Ok(res) => res,
+                Err(_) => {
+                    // `cancel()` did not produce an `Exited` event within the
+                    // grace period. Documented, not a bug: `spawn_blocking`
+                    // gives no way to preempt an in-progress blocking
+                    // closure, so there is no way to *force* the drain
+                    // thread to stop here — it is left running, detached,
+                    // and will finish (writing nothing further anyone reads)
+                    // whenever the underlying process/channel eventually
+                    // does exit. This call stops waiting and closes the row
+                    // itself from the last outcome snapshot the drain
+                    // thread wrote — the "do not hang forever" requirement
+                    // wins over holding out for a terminal event that may
+                    // never come from a stuck handle.
+                    tracing::warn!(
+                        task = %params.task_id,
+                        stage = stage_str,
+                        grace_period_secs = AGENT_TIMEOUT_KILL_GRACE_PERIOD.as_secs(),
+                        "agent stage timeout: cancel() did not produce Exited within the grace \
+                         period; closing the row from the last known partial outcome and moving on"
+                    );
+                    Ok(shared_outcome
+                        .lock()
+                        .expect("shared_outcome mutex poisoned")
+                        .clone())
+                }
+            }
+        }
+    };
+
     flush_handle.abort();
 
-    let outcome = match drained {
+    let mut outcome = match drained {
         Ok(mut outcome) => {
             // Stamp the row id now that we have it — see the field's own doc
             // for why this can't ride through `CloseStage` instead (T-530).
@@ -731,6 +903,23 @@ pub async fn run_agent_stage(
         }
     };
 
+    // T-543: a stage that did not finish within its deadline is a *timeout*,
+    // full stop — even in the (vanishingly unlikely, given `cancel()`'s own
+    // sub-two-second kill latency) case where the grace-period wait above
+    // caught a real `Exited` whose own `cancelled` flag was already `true`
+    // for the ordinary reason (it *is* true: `cancel()` is what produced
+    // it). Setting both fields unconditionally here — rather than trying to
+    // distinguish "genuinely timed out" from "would have exited a moment
+    // later anyway" — is what makes `AgentStageOutcome::status` and
+    // `worker::route_stage_failure` able to treat "the deadline fired" as
+    // the single source of truth for `timeout` vs `cancelled`, instead of
+    // reconstructing it from a race that has no meaningfully "correct" other
+    // answer (see the module doc section for the full rationale).
+    if deadline_fired {
+        outcome.timed_out = true;
+        outcome.cancelled = true;
+    }
+
     evidence::close_stage(
         conn,
         &stage_row,
@@ -749,6 +938,24 @@ pub async fn run_agent_stage(
 
     Ok(outcome)
 }
+
+/// T-543: how long [`run_agent_stage`] keeps waiting for the drain to
+/// actually finish *after* it has already called `RunControl::cancel()` on a
+/// deadline. Not zero — the whole point of routing the deadline through the
+/// same kill T-542 built (rather than just abandoning the drain outright) is
+/// to get a complete partial log and a reaped process, and both need the
+/// drain to actually observe the terminal `Exited` event. Not unbounded
+/// either — this task's own "do not hang forever" requirement. `claude`
+/// (and, in the harness's own `cli-stream` engine, every adapter's process
+/// handle) escalates `SIGTERM` to `SIGKILL` after 1.5s if the process hasn't
+/// exited on its own; this grace period is comfortably longer than that
+/// escalation plus reader-thread teardown and the event's trip back through
+/// this stage's channel, so a real subprocess should essentially never hit
+/// it. It exists as the documented backstop for a handle that, for whatever
+/// reason, never reports `Exited` at all (e.g. a stuck harness, or — in this
+/// crate's own tests — a `testing::ScriptedTaskAgent` gated run whose gate
+/// the test deliberately never releases).
+const AGENT_TIMEOUT_KILL_GRACE_PERIOD: Duration = Duration::from_secs(5);
 
 // ---- test doubles (crate-visible so worker/DAG-walk tests can inject them,
 // T-513+) --------------------------------------------------------------------
@@ -862,6 +1069,15 @@ pub(crate) mod testing {
         scripts: Mutex<std::collections::HashMap<&'static str, std::collections::VecDeque<ScriptedRun>>>,
         recorded: Arc<Mutex<Vec<RecordedTaskRun>>>,
         gate: Option<Arc<Gate>>,
+        /// T-543: when `Some`, `gate` (above) only pins a run whose
+        /// `req.stage` matches — every other stage runs ungated. `None`
+        /// (the default, and [`with_gate`](ScriptedTaskAgent::with_gate)'s
+        /// behavior, unchanged) means `gate` pins **every** stage's run, as
+        /// it always has. Exists so a test can drive a multi-stage walk
+        /// (e.g. `Implement` writes a file and commits normally, then
+        /// `Review` hangs) instead of every gated test necessarily being
+        /// about the *first* stage a walk reaches.
+        gate_stage: Option<Stage>,
     }
 
     impl Default for ScriptedTaskAgent {
@@ -870,6 +1086,7 @@ pub(crate) mod testing {
                 scripts: Mutex::new(std::collections::HashMap::new()),
                 recorded: Arc::new(Mutex::new(Vec::new())),
                 gate: None,
+                gate_stage: None,
             }
         }
     }
@@ -890,11 +1107,27 @@ pub(crate) mod testing {
             self
         }
 
-        /// Attach a gate that pins each run in-flight (before its terminal
-        /// `Exited`) until released — lets a test hold a stage in flight
-        /// deterministically to exercise cancellation or a mid-run WS join.
+        /// Attach a gate that pins **every** run in-flight (before its
+        /// terminal `Exited`) until released — lets a test hold a stage in
+        /// flight deterministically to exercise cancellation or a mid-run WS
+        /// join. See [`with_gate_on`](ScriptedTaskAgent::with_gate_on) for
+        /// the stage-scoped variant.
         pub fn with_gate(mut self, gate: Arc<Gate>) -> ScriptedTaskAgent {
             self.gate = Some(gate);
+            self.gate_stage = None;
+            self
+        }
+
+        /// Like [`with_gate`](ScriptedTaskAgent::with_gate), but only pins
+        /// runs at `stage` — every other stage's run proceeds to `Exited`
+        /// normally (per its own script/default). T-543's timeout tests use
+        /// this to prove a *later* stage's deadline (e.g. `Fix` inside the
+        /// test-gate loop, or `Review`) is handled exactly like `Implement`'s
+        /// without also gating every earlier stage the walk has to pass
+        /// through first.
+        pub fn with_gate_on(mut self, stage: Stage, gate: Arc<Gate>) -> ScriptedTaskAgent {
+            self.gate = Some(gate);
+            self.gate_stage = Some(stage);
             self
         }
 
@@ -924,7 +1157,13 @@ pub(crate) mod testing {
             let (tx, rx) = std::sync::mpsc::channel();
             let run_id = req.run_id;
             let cwd = req.cwd;
-            let gate = self.gate.clone();
+            // T-543: honor `gate_stage` — a gate applies to this run only
+            // when no stage filter was set (`with_gate`) or the filter names
+            // this exact stage (`with_gate_on`).
+            let gate = match self.gate_stage {
+                Some(only) if only != req.stage => None,
+                _ => self.gate.clone(),
+            };
             let cancelled = Arc::new(AtomicBool::new(false));
             let cancelled_for_thread = cancelled.clone();
 
@@ -1205,6 +1444,14 @@ mod tests {
     // ---- run_agent_stage: evidence + WS streaming ----------------------
 
     async fn test_state() -> AppState {
+        test_state_with_config(Config::for_test("tok")).await
+    }
+
+    /// Like [`test_state`] but with a caller-supplied [`Config`] — T-543's
+    /// timeout tests need `agent_stage_timeout_secs` far shorter than
+    /// `Config::for_test`'s own 10s default (still too slow for a gated-run
+    /// test to wait out) so the deadline fires in well under a second.
+    async fn test_state_with_config(config: Config) -> AppState {
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
         db.conn()
@@ -1231,7 +1478,7 @@ mod tests {
             )
             .await
             .unwrap();
-        AppState::new(Config::for_test("tok"), db)
+        AppState::new(config, db)
     }
 
     #[tokio::test]
@@ -1497,6 +1744,242 @@ mod tests {
         run.await.unwrap().expect("scripted stage must still close its row");
         assert!(state.cancel_registry.lock().unwrap().is_empty());
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- T-543: agent stage timeouts ------------------------------------
+
+    /// The headline AC: an agent that never exits (a gated run whose gate
+    /// this test deliberately never releases) is cancelled at
+    /// `DEARBORN_AGENT_STAGE_TIMEOUT_SECS`'s deadline, and `run_agent_stage`
+    /// itself returns anyway — proving the "must terminate" grace-period
+    /// backstop this module's own doc documents, not just the ordinary
+    /// drain-finishes-normally path every other test here exercises. Bounded
+    /// throughout: the outer `tokio::time::timeout` is a hard ceiling well
+    /// above the deadline (1s) plus the fixed grace period, so a broken
+    /// implementation (one that actually hangs) fails this test fast rather
+    /// than hanging the suite.
+    #[tokio::test]
+    async fn run_agent_stage_cancels_a_never_exiting_stage_at_the_deadline_and_still_returns() {
+        let mut config = Config::for_test("tok");
+        config.executor.agent_stage_timeout_secs = 1;
+        let state = test_state_with_config(config).await;
+
+        let gate = Arc::new(Gate::default());
+        let agent = ScriptedTaskAgent::new().with_gate(gate.clone()).script(
+            Stage::Implement,
+            ScriptedRun {
+                text: vec!["partial output before the deadline kill".to_string()],
+                ..ScriptedRun::default()
+            },
+        );
+
+        let dir = std::env::temp_dir().join(format!("dearborn-timeout-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            run_agent_stage(
+                &state,
+                &agent,
+                AgentStageParams {
+                    task_id: "task-1",
+                    epic_id: Some("epic-1"),
+                    attempt: 1,
+                },
+                TaskRunRequest {
+                    run_id: "run-timeout".to_string(),
+                    stage: Stage::Implement,
+                    prompt: "go".to_string(),
+                    cwd: dir.clone(),
+                },
+            ),
+        )
+        .await
+        .expect(
+            "run_agent_stage must return well within the test's own bound — the gate is \
+             NEVER released, so only the deadline + grace-period backstop can end this",
+        )
+        .expect("a deadline-killed stage still returns Ok with a terminal outcome");
+
+        assert!(outcome.timed_out, "AgentStageOutcome::timed_out must be set");
+        assert!(outcome.cancelled, "the deadline kill is a cancel too — same RunControl::cancel()");
+        assert_eq!(outcome.status(), "timeout");
+
+        // The row closed status='timeout' (not 'cancelled', not 'error') with
+        // whatever partial log had accumulated by the time the deadline fired.
+        let mut rows = state
+            .db
+            .conn()
+            .query("SELECT status, log FROM agent_run WHERE task_id = 'task-1'", ())
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("a row was written");
+        assert_eq!(row.get::<String>(0).unwrap(), "timeout");
+        let log: String = row.get(1).unwrap();
+        assert!(
+            log.contains("partial output before the deadline kill"),
+            "the flushed partial log must be preserved: {log:?}"
+        );
+
+        // T-542's guard still covers a timeout: removed once run_agent_stage
+        // returns, even though the underlying scripted thread is still
+        // parked on the gate forever.
+        assert!(
+            state.cancel_registry.lock().unwrap().is_empty(),
+            "the registry entry must be removed once run_agent_stage returns, timeout or not"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        // Release the gate now, purely as teardown hygiene — this does not
+        // weaken the scenario above. By this line, the deadline has already
+        // fired, `RunControl::cancel()` has already been issued, the full
+        // `AGENT_TIMEOUT_KILL_GRACE_PERIOD` has already elapsed with no
+        // `Exited` observed, and `run_agent_stage` has already returned its
+        // `timed_out` outcome and had every assertion above pass against it
+        // — so the gate was genuinely never released *during* the window
+        // this test is about. What it's for: a `#[tokio::test]`'s runtime is
+        // dropped when the test body returns, and dropping it drains the
+        // Tokio blocking pool (`BlockingPool::shutdown`), which blocks
+        // **indefinitely** for every outstanding `spawn_blocking` task to
+        // finish — including the drain task started inside `run_agent_stage`
+        // above, which `run_agent_stage` itself gave up waiting on (per the
+        // grace-period backstop this test proves) but did not, and cannot,
+        // abort (`spawn_blocking` has no preemption). That drain thread is
+        // still blocked reading `rx`, which stays open only because the
+        // `ScriptedTaskAgent`'s own `std::thread` is still parked in
+        // `Gate::wait` — so without this release, the thread never finishes,
+        // `tx` never drops, `rx` never closes, the drain task never returns,
+        // and the runtime drop hangs forever at teardown, after the test has
+        // already passed. Releasing here lets that thread finish, closing
+        // the channel and letting the drain task (and thus the runtime) exit
+        // cleanly — the same teardown pattern `worker.rs`'s T-542
+        // cancellation tests use (`gate.release()` only after every
+        // assertion about the in-flight window has already been made).
+        gate.release();
+    }
+
+    /// A stage that finishes comfortably inside its deadline is unaffected —
+    /// `timed_out` stays `false` and `status()` reads the ordinary `"ok"`,
+    /// not `"timeout"`. Guards against a timer implementation that fires on
+    /// every stage regardless of whether the deadline was actually exceeded.
+    #[tokio::test]
+    async fn a_stage_that_finishes_within_the_deadline_is_not_marked_timed_out() {
+        let mut config = Config::for_test("tok");
+        config.executor.agent_stage_timeout_secs = 30; // generous; must not fire
+        let state = test_state_with_config(config).await;
+        let agent = ScriptedTaskAgent::new();
+
+        let dir = std::env::temp_dir().join(format!("dearborn-no-timeout-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let outcome = run_agent_stage(
+            &state,
+            &agent,
+            AgentStageParams {
+                task_id: "task-1",
+                epic_id: Some("epic-1"),
+                attempt: 1,
+            },
+            TaskRunRequest {
+                run_id: "run-fast".to_string(),
+                stage: Stage::Implement,
+                prompt: "go".to_string(),
+                cwd: dir.clone(),
+            },
+        )
+        .await
+        .expect("an unscripted, ungated stage finishes immediately");
+
+        assert!(!outcome.timed_out);
+        assert!(!outcome.cancelled);
+        assert_eq!(outcome.status(), "ok");
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// The deadline/grace-period mechanics are a property of
+    /// [`run_agent_stage`] itself, not of `Stage::Implement` specifically —
+    /// worker.rs's own module doc is explicit that `route_stage_failure`
+    /// makes "no new judgment call... at *this particular* stage" (T-543).
+    /// Proves it two ways at once, using
+    /// [`with_gate_on`](ScriptedTaskAgent::with_gate_on) for the first time
+    /// since it was added: a `Stage::Review` run gated via `with_gate_on`
+    /// times out exactly like `Stage::Implement` did above (same
+    /// `timed_out`/`status()` outcome), while a `Stage::Implement` run on
+    /// the *same* agent instance — which `with_gate_on`'s stage filter does
+    /// not pin — finishes immediately beforehand, proving the filter itself
+    /// (only the named stage gates) as well as the genericity.
+    #[tokio::test]
+    async fn run_agent_stage_times_out_a_non_implement_stage_the_same_way() {
+        let mut config = Config::for_test("tok");
+        config.executor.agent_stage_timeout_secs = 1;
+        let state = test_state_with_config(config).await;
+
+        let gate = Arc::new(Gate::default());
+        let agent = ScriptedTaskAgent::new().with_gate_on(Stage::Review, gate.clone());
+
+        let dir = std::env::temp_dir().join(format!("dearborn-timeout-review-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Stage::Implement is not pinned by this agent's gate (`gate_stage`
+        // names only `Review`) — it must finish immediately, proving the
+        // filter itself works before the gated stage is ever reached.
+        let implement_outcome = run_agent_stage(
+            &state,
+            &agent,
+            AgentStageParams {
+                task_id: "task-1",
+                epic_id: Some("epic-1"),
+                attempt: 1,
+            },
+            TaskRunRequest {
+                run_id: "run-implement".to_string(),
+                stage: Stage::Implement,
+                prompt: "go".to_string(),
+                cwd: dir.clone(),
+            },
+        )
+        .await
+        .expect("Stage::Implement is not gated by this agent and must finish immediately");
+        assert!(!implement_outcome.timed_out);
+        assert!(!implement_outcome.cancelled);
+
+        // Stage::Review *is* pinned — it never exits, so the same
+        // deadline + grace-period backstop from the headline test above
+        // must fire here too, for a stage other than Implement.
+        let review_outcome = tokio::time::timeout(
+            std::time::Duration::from_secs(20),
+            run_agent_stage(
+                &state,
+                &agent,
+                AgentStageParams {
+                    task_id: "task-1",
+                    epic_id: Some("epic-1"),
+                    attempt: 1,
+                },
+                TaskRunRequest {
+                    run_id: "run-review-timeout".to_string(),
+                    stage: Stage::Review,
+                    prompt: "go".to_string(),
+                    cwd: dir.clone(),
+                },
+            ),
+        )
+        .await
+        .expect("must return well within the test's own bound — Review's gate is never released")
+        .expect("a deadline-killed stage still returns Ok with a terminal outcome");
+
+        assert!(review_outcome.timed_out, "Stage::Review must time out exactly like Stage::Implement does");
+        assert!(review_outcome.cancelled);
+        assert_eq!(review_outcome.status(), "timeout");
+
+        std::fs::remove_dir_all(&dir).ok();
+
+        // Teardown hygiene only — see the headline timeout test's own doc
+        // above for why this release doesn't weaken the scenario (the
+        // deadline and grace period have both already fired and
+        // `run_agent_stage` has already returned).
+        gate.release();
     }
 
     /// Collect published frames from a hub subscription until an `exited`

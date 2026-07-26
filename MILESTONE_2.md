@@ -392,7 +392,7 @@ with `agent_error` and gets thickened in later phases.
   stage-boundary DB check still catches a cancel issued between stages; no PR is
   opened; the registry entry is removed on every exit path.
 
-- [ ] **T-543 — Agent stage timeouts.** *deps: T-542*
+- [x] **T-543 — Agent stage timeouts.** *deps: T-542*
   `DEARBORN_AGENT_STAGE_TIMEOUT_SECS` around every agent stage, enforced through
   the same cancel path. **AC:** an agent that never exits is cancelled at the
   deadline, its row closes `status='timeout'` with the flushed partial log, and
