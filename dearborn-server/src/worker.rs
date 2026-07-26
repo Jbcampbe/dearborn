@@ -252,10 +252,11 @@
 //! not finalize a task after the cancel landed) — mirroring the same
 //! belt-and-suspenders re-check the provisioning-failure call site (just
 //! above, in [`run_epic_pipeline_inner`]) already uses around its own
-//! [`fail_item`] call. The full "kill the
-//! in-flight agent process" mechanism is T-542's job, out of scope here; this
-//! walk only guarantees that once a cancel/lease-loss is *observed*, nothing
-//! further gets written.
+//! [`fail_item`] call. This section describes the DB-boundary half of
+//! cancellation — the backstop D12 keeps even after T-542 below adds the
+//! actual kill; see that section for the other half (an agent stage
+//! terminated *while it's running*, not just observed as stale at the next
+//! boundary).
 //!
 //! ## The test gate & fix loop (T-522, §2.2/§5)
 //!
@@ -870,15 +871,116 @@
 //! different epic (or the same project's next one) on its very next
 //! iteration, no poll-interval delay involved.
 //!
-//! ### `timeout`/`cancelled`: accepted, not yet constructed
+//! ### `timeout`/`cancelled`: accepted, and — for `cancelled` — deliberately
+//! ### still never constructed (revised by T-542)
 //!
-//! [`FailureReason::Timeout`] and [`FailureReason::Cancelled`] exist in the
-//! enum and are handled by [`fail_item`] exactly like every other reason —
-//! but nothing in this module constructs them yet. T-542 (the cancel
-//! registry) and T-543 (agent-stage timeouts) are the tasks that will,
-//! and per this task's brief, they only ever need to call [`fail_item`] with
-//! the right reason; no new routing function should exist by the time either
-//! lands.
+//! [`FailureReason::Timeout`] and [`FailureReason::Cancelled`] both exist in
+//! the enum and are handled by [`fail_item`] exactly like every other
+//! reason — [`FailureReason::ALL`]'s own test still drives both through the
+//! router directly to prove the plumbing works generically. `Timeout` is
+//! still simply unconstructed, waiting on T-543. `Cancelled` is different:
+//! T-542 (below) landed and, after actually building the cancel path,
+//! **deliberately does not** route a cancelled stage through [`fail_item`]
+//! at all — the paragraph above this section, written before T-542 existed,
+//! predicted "they only ever need to call `fail_item` with the right
+//! reason"; building the feature showed that prediction wrong. See the
+//! "T-542: cancellation as a kill" section immediately below for why:
+//! `fail_item`'s task write is unconditionally `Failed`, but a cancelled
+//! task must land `Todo` (T-542's own AC), so `fail_item` cannot be reused
+//! unmodified — and modifying it to branch on `Cancelled` would have made
+//! the one router two routers wearing a single function's skin. This is a
+//! documented deviation from this section's original plan, not an oversight:
+//! `FailureReason::Cancelled` stays defined (§2.3 names `cancelled` as a
+//! valid `task.failure_reason`/`epic.blocked_reason` value, and
+//! [`fail_item`] genuinely can express it if some future call site ever
+//! legitimately needs to), it is simply never the reason a *cancel* reaches
+//! `Failed` through, because a cancel never reaches `Failed` at all.
+//!
+//! ## T-542: cancellation as a kill (§7, D12)
+//!
+//! Every section above this one describes cancellation as something the
+//! walk *notices* — a DB read at a boundary that happens to find the epic no
+//! longer `InProgress`. That is real and stays load-bearing (see "Failure
+//! and cancellation both stop the walk the same way", above), but by itself
+//! it only stops the walk **between** stages; an agent turn already in
+//! flight runs to its own completion regardless, which could be however
+//! long `claude` takes to finish its current turn. D12 ("Cancel is a
+//! **kill**") and this task's AC ("terminates it in seconds, not at the next
+//! stage boundary") require more: the in-flight process itself has to die.
+//!
+//! ### The registry and the guard
+//!
+//! [`AppState::cancel_registry`] holds the live [`harness::RunHandle`] for
+//! whatever agent stage is currently running, keyed by the claimed item's
+//! id. [`task_agent::run_agent_stage`] populates it — via a private
+//! `task_agent::CancelGuard`, RAII, so the entry is removed on **every**
+//! exit path (normal completion, an ordinary error, a harness spawn
+//! failure, a panicked drain thread, or a cancel itself) by construction,
+//! not by review — for the duration of exactly one agent stage. Because
+//! `run_agent_stage` is the single choke point every agent stage already
+//! goes through (implement/fix/review/verify_complete/summarize alike, per
+//! D6), this is what makes every one of them cancellable with **zero**
+//! opt-in from any call site in this module: `process_one_task`,
+//! `run_test_gate_loop`, `run_verdict_stage`, `run_review_fix_converge`, and
+//! `run_verify_complete` call `run_agent_stage` exactly as they did before
+//! T-542, and the registration/removal happens underneath them. See
+//! [`AppState::cancel_registry`]'s own doc for the registry's full shape
+//! (including the 1:1-not-1:many assumption it leans on) and
+//! `task_agent::run_agent_stage`'s doc for exactly when an entry exists.
+//!
+//! Non-agent stages (`setup`/`preflight`/`test_gate`/`commit`/`push`) never
+//! register a handle — there is no `RunHandle` for a shell command, only a
+//! [`crate::cmd`] child process this module does not expose for killing.
+//! MILESTONE_2 T-542's own AC only asks for agent-stage cancellation; a
+//! cancel that lands while a shell stage is running is caught by the
+//! ordinary stage-boundary check the moment that command returns, exactly as
+//! it always was — the "stage-boundary DB check still catches a cancel
+//! issued between stages" AC.
+//!
+//! ### Issuing the kill (`lanes.rs`)
+//!
+//! [`crate::lanes::set_epic_lane`]'s `InProgress → Cancelled` transition is
+//! the only thing that ever calls `RunControl::cancel()`. See that module's
+//! own doc for the full sequence; the short version: the epic's `status`
+//! column commits `Cancelled` first, *then* the registry is consulted — so a
+//! cancelled outcome this module later observes is guaranteed to find the
+//! epic already `Cancelled` in the DB, never a race against it. The lookup
+//! finding nothing is a silent, correct no-op (D12's stage-boundary backstop
+//! applies). `RunControl::cancel()` itself is fire-and-forget — it signals
+//! the process and returns immediately, it does not block on the process
+//! actually exiting — so the HTTP handler issuing the cancel never waits on
+//! this module noticing it.
+//!
+//! ### Observing the kill: `handle_cancelled_task`, not `fail_item`
+//!
+//! Every call site in this module that inspects an
+//! [`task_agent::AgentStageOutcome`] for `is_ok() == false` now routes
+//! through [`route_stage_failure`] instead of calling [`fail_item`]
+//! directly. That helper checks `outcome.cancelled` first: an ordinary
+//! failure (a non-zero exit, an `Error` event, no exit at all) still goes to
+//! [`fail_item`] exactly as before T-542; a cancelled outcome goes to
+//! [`handle_cancelled_task`] instead. The two cannot share `fail_item`'s
+//! path unmodified because their task-side writes disagree by design: a
+//! *failure* sets the task `Failed(reason)` so [`crate::tasks::retry_task`]
+//! (T-541) can find and resume it; a *cancellation* sets the task back to
+//! `Todo` directly — T-542's own AC — because nothing about the task's work
+//! was wrong, a human just asked to stop. [`handle_cancelled_task`] also
+//! does **not** touch the epic (already `Cancelled`, written by
+//! `lanes::set_epic_lane` before it ever looked in the registry) and does
+//! **not** push anything (nothing between a task's last successful commit
+//! and a mid-stage cancellation ever calls `git add`/`git commit`, so there
+//! is nothing new on top of what a prior stop-and-triage push already
+//! covered) — see that function's own doc for the complete accounting.
+//!
+//! The net effect satisfies every clause of this task's AC without a new
+//! epic-level write: the task returns to `Todo` (resumable, not `Failed`),
+//! the epic stays exactly `Cancelled` (never flipped to `Blocked` — there is
+//! no epic write here at all to race `fail_item`'s fencing against), the
+//! lease is released and the workspace retained by the same
+//! [`try_claim_and_run`]/`return`-propagation machinery every other stop
+//! path already uses, and `finalize_epic` (the only place a PR ever opens)
+//! is never reached because the walk stops mid-task, long before the DAG
+//! could ever read fully `Done`.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -1654,21 +1756,20 @@ async fn process_one_task(
 
     // MILESTONE_2 §4 (tracer bullet): anything that fails here Blocks the
     // epic (and, since T-540, fails the task itself) with `agent_error` via
-    // the centralized `fail_item` router.
+    // the centralized `fail_item` router — unless T-542 killed it, in which
+    // case `route_stage_failure` sends this to `handle_cancelled_task`
+    // instead (see the module doc's "T-542: cancellation as a kill" section).
     if !outcome.is_ok() {
-        if !lease.is_lost() {
-            fail_item(
-                state,
-                FailureContext {
-                    epic_id,
-                    task_id: Some(&task_id),
-                    reason: FailureReason::AgentError,
-                    message: "implement stage did not complete successfully",
-                    push: PushIntent::Attempt(workspace),
-                },
-            )
-            .await;
-        }
+        route_stage_failure(
+            state,
+            epic_id,
+            &task_id,
+            &outcome,
+            "implement stage did not complete successfully",
+            workspace,
+            lease,
+        )
+        .await;
         return TaskStepOutcome::Stop;
     }
 
@@ -1676,8 +1777,9 @@ async fn process_one_task(
     // test-gate/commit/Done writes below — a slow implement run racing an
     // external cancel (a lane move away from InProgress) or a lease theft
     // must not finalize this task after either happened. This is the
-    // "cancelling mid-walk stops cleanly" AC; the full kill-the-in-flight-agent
-    // path is T-542's job.
+    // "cancelling mid-walk stops cleanly" AC (the D12 stage-boundary
+    // backstop); the implement stage's own `is_ok()` check just above is
+    // where an actual kill (T-542, `outcome.cancelled`) gets observed.
     if lease.is_lost() || !epic_still_in_progress(conn, epic_id).await {
         tracing::warn!(
             epic = %epic_id,
@@ -2003,20 +2105,17 @@ async fn run_test_gate_loop(
                 // `attempt` — that retest is what decides whether this fix
                 // round actually worked.
             }
-            Ok(_) => {
-                if !lease.is_lost() {
-                    fail_item(
-                        state,
-                        FailureContext {
-                            epic_id,
-                            task_id: Some(task_id),
-                            reason: FailureReason::AgentError,
-                            message: "fix stage did not complete successfully",
-                            push: PushIntent::Attempt(workspace),
-                        },
-                    )
-                    .await;
-                }
+            Ok(outcome) => {
+                route_stage_failure(
+                    state,
+                    epic_id,
+                    task_id,
+                    &outcome,
+                    "fix stage did not complete successfully",
+                    workspace,
+                    lease,
+                )
+                .await;
                 return GateOutcome::Stop;
             }
             Err(err) => {
@@ -2193,19 +2292,16 @@ async fn run_verdict_stage(
         };
 
         if !outcome.is_ok() {
-            if !lease.is_lost() {
-                fail_item(
-                    state,
-                    FailureContext {
-                        epic_id,
-                        task_id: Some(task_id),
-                        reason: FailureReason::AgentError,
-                        message: &format!("{stage_label} stage did not complete successfully"),
-                        push: PushIntent::Attempt(workspace),
-                    },
-                )
-                .await;
-            }
+            route_stage_failure(
+                state,
+                epic_id,
+                task_id,
+                &outcome,
+                &format!("{stage_label} stage did not complete successfully"),
+                workspace,
+                lease,
+            )
+            .await;
             return VerdictOutcome::Stop;
         }
 
@@ -2429,20 +2525,17 @@ async fn run_review_fix_converge(
 
                 match fix_outcome {
                     Ok(outcome) if outcome.is_ok() => {}
-                    Ok(_) => {
-                        if !lease.is_lost() {
-                            fail_item(
-                                state,
-                                FailureContext {
-                                    epic_id,
-                                    task_id: Some(task_id),
-                                    reason: FailureReason::AgentError,
-                                    message: "review-round fix stage did not complete successfully",
-                                    push: PushIntent::Attempt(workspace),
-                                },
-                            )
-                            .await;
-                        }
+                    Ok(outcome) => {
+                        route_stage_failure(
+                            state,
+                            epic_id,
+                            task_id,
+                            &outcome,
+                            "review-round fix stage did not complete successfully",
+                            workspace,
+                            lease,
+                        )
+                        .await;
                         return ConvergenceOutcome::Stop;
                     }
                     Err(err) => {
@@ -2671,20 +2764,17 @@ async fn run_verify_complete(
 
             match fix_outcome {
                 Ok(outcome) if outcome.is_ok() => {}
-                Ok(_) => {
-                    if !lease.is_lost() {
-                        fail_item(
-                            state,
-                            FailureContext {
-                                epic_id,
-                                task_id: Some(task_id),
-                                reason: FailureReason::AgentError,
-                                message: "verify-complete fix stage did not complete successfully",
-                                push: PushIntent::Attempt(workspace),
-                            },
-                        )
-                        .await;
-                    }
+                Ok(outcome) => {
+                    route_stage_failure(
+                        state,
+                        epic_id,
+                        task_id,
+                        &outcome,
+                        "verify-complete fix stage did not complete successfully",
+                        workspace,
+                        lease,
+                    )
+                    .await;
                     return TaskStepOutcome::Stop;
                 }
                 Err(err) => {
@@ -2924,9 +3014,17 @@ enum FailureReason {
     /// constructed anywhere in this module.
     #[allow(dead_code)] // T-543 constructs this once the timeout wrapper lands
     Timeout,
-    /// A human cancelled the epic while a stage was in flight. T-542's
-    /// reason; not yet constructed anywhere in this module.
-    #[allow(dead_code)] // T-542 constructs this once the cancel registry lands
+    /// §2.3 names `cancelled` as a valid `task.failure_reason`/
+    /// `epic.blocked_reason` value, so this variant stays defined and
+    /// [`fail_item`] can genuinely express it — but T-542 (the cancel
+    /// registry) deliberately never constructs it: `fail_item`'s task write
+    /// is unconditionally `Failed`, which is exactly wrong for a cancelled
+    /// task (it returns to `Todo` instead, and the epic is already
+    /// `Cancelled`, never `Blocked`, by the time a cancel is observed). See
+    /// the module doc's "T-542: cancellation as a kill" section and
+    /// [`handle_cancelled_task`], the actual (separate, `fail_item`-free)
+    /// path a cancel takes.
+    #[allow(dead_code)] // see the doc above — genuinely never constructed by design
     Cancelled,
     /// The epic's branch failed to push, or `open_pr` failed, after every
     /// task had already reached `Done` (T-514's finalize step). No task at
@@ -3190,6 +3288,112 @@ async fn push_on_failure(
             close_push_stage(conn, &stage_handle, "error", &format!("push failed: {message}")).await;
         }
     }
+}
+
+// ---- T-542: cancellation as a kill -----------------------------------------
+//
+// See the module doc's own "T-542: cancellation as a kill" section for the
+// full design (the registry, the guard, why `fail_item` doesn't fit). This
+// is that section's literal implementation.
+
+/// Route a not-`ok` [`task_agent::AgentStageOutcome`] to either T-542's
+/// cancel path ([`handle_cancelled_task`]) or T-540's [`fail_item`],
+/// depending on `outcome.cancelled` — the single decision every call site in
+/// this module that inspects an agent stage's outcome now makes through this
+/// function instead of calling `fail_item` inline. See the module doc's
+/// "Observing the kill" section for why the two paths cannot share
+/// `fail_item` unmodified (a cancelled task must land `Todo`, not `Failed`).
+///
+/// `message`/`workspace` are exactly what the caller would have passed
+/// `fail_item` directly before this task; they are simply ignored on the
+/// cancelled branch (there is no `FailureContext` to build — see
+/// `handle_cancelled_task`'s own, much smaller, argument list). Checking
+/// `lease.is_lost()` here (rather than at each call site, as every
+/// pre-existing `fail_item` call already did) keeps that fencing discipline
+/// intact for both branches with one check instead of two copies of it.
+async fn route_stage_failure(
+    state: &AppState,
+    epic_id: &str,
+    task_id: &str,
+    outcome: &task_agent::AgentStageOutcome,
+    message: &str,
+    workspace: &ProvisionedWorkspace,
+    lease: &LeaseHandle,
+) {
+    if lease.is_lost() {
+        return;
+    }
+    if outcome.cancelled {
+        handle_cancelled_task(state, epic_id, task_id).await;
+    } else {
+        fail_item(
+            state,
+            FailureContext {
+                epic_id,
+                task_id: Some(task_id),
+                reason: FailureReason::AgentError,
+                message,
+                push: PushIntent::Attempt(workspace),
+            },
+        )
+        .await;
+    }
+}
+
+/// T-542: an agent stage came back `Exited { cancelled: true }` — a human
+/// moved the epic `InProgress → Cancelled` (`lanes::set_epic_lane`) while
+/// this stage was in flight, and the `RunControl::cancel()` that transition
+/// issued killed it. Unlike every other stage outcome this module handles,
+/// this is **not** routed through [`fail_item`] (T-540) — see
+/// [`route_stage_failure`]'s doc and the module doc's "Observing the kill"
+/// section for the full reasoning; in short, `fail_item`'s task write is
+/// unconditionally `Failed`, but this task's own AC requires `Todo` instead
+/// (a cancelled task is resumable — it did not fail, a human just asked to
+/// stop).
+///
+/// Resets the task straight to `Todo` (mirrors [`reset_orphaned_tasks`]'s own
+/// write — the same "this task's in-flight attempt is abandoned, treat it as
+/// pending again" shape, just triggered by an observed cancel instead of a
+/// stale lease) and publishes `dag_updated` so a subscribed DAG editor sees
+/// the card move back. Nothing else:
+///
+/// - **No epic write.** By the time this runs, `lanes::set_epic_lane` has
+///   already committed `epic.status = 'Cancelled'` — that happened *before*
+///   it ever looked in the cancel registry, let alone before this stage's
+///   `RunEvent::Exited` could propagate all the way back here. Writing the
+///   epic again would be redundant, and there is nothing new to decide: it
+///   is already exactly `Cancelled`, never `Blocked`.
+/// - **No `epic_updated`/`board_updated`.** Also already published by that
+///   same handler; this function only has a task-level change to announce.
+/// - **No push, no PR.** Identical property to every `fail_item` failure
+///   path: nothing between a task's last successful commit and a mid-stage
+///   cancellation ever calls `git add`/`git commit`, so there is nothing new
+///   on the branch to push, and [`finalize_epic`] (the only place a PR ever
+///   opens) is never reached — the walk stops mid-task, long before the DAG
+///   could read fully `Done`.
+/// - **No lease release.** Unchanged from every other stop path in this
+///   module: [`try_claim_and_run`] releases the lease on every exit,
+///   including this one, once this function's caller's plain `return`/`Stop`
+///   propagates back up to it.
+/// - **The workspace is retained.** Nothing in this function (or anywhere
+///   upstream of it once a cancel is observed) deletes anything — the same
+///   "never clean up on a stop path" property `fail_item` and every
+///   between-stage cancel check already have.
+async fn handle_cancelled_task(state: &AppState, epic_id: &str, task_id: &str) {
+    tracing::info!(
+        epic = %epic_id,
+        task = %task_id,
+        "T-542: agent stage was cancelled; resetting task -> Todo"
+    );
+    let conn = state.db.conn();
+    let now = now_ms();
+    let _ = conn
+        .execute(
+            "UPDATE task SET status = 'Todo', updated_at = ?1 WHERE id = ?2",
+            params![now, task_id],
+        )
+        .await;
+    mcp::publish_dag(state, epic_id).await;
 }
 
 /// What [`run_preflight`] tells its caller to do next. See the module doc's
@@ -7917,6 +8121,321 @@ mod tests {
             !implement_runs[1].prompt.contains("ORIGINAL_SPEC_MARKER"),
             "the retried run must not still see the pre-edit spec"
         );
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    // ---- T-542: cancellation as a kill =====================================
+    //
+    // `spawn_pool` + the lane endpoint throughout (never `run_epic_pipeline(
+    // ...).await` called directly for the multi-step scenarios) per this
+    // module's own T-522/T-541 convention — see those sections' own notes on
+    // why a second inline await risks the test thread's stack.
+
+    /// This task's headline AC, end to end through the real
+    /// `POST /epics/{id}/lane` cancel path: while `Stage::Implement` is
+    /// gated in flight, cancelling the epic kills it — proven by the
+    /// registered handle's `was_cancelled()` turning true **while the stage
+    /// is still gated** (the proof the kill reached the process promptly,
+    /// not merely that the walk eventually noticed the epic was gone at the
+    /// next boundary; no sleep is ever used as that proof — every wait below
+    /// is a bounded, condition-polling loop). Once the gate is released and
+    /// the stage's `Exited { cancelled: true }` propagates back: the
+    /// `implement` `agent_run` row closes `status='cancelled'` with its
+    /// partial (pre-kill) log; the task returns to `Todo`; the epic stays
+    /// exactly `Cancelled` (never `Blocked`); the workspace is retained on
+    /// disk; no PR is ever opened; and the registry entry for the epic is
+    /// gone.
+    #[tokio::test]
+    async fn cancel_during_implement_kills_it_in_flight_resets_task_retains_workspace_no_pr() {
+        let gate = Arc::new(Gate::default());
+        let agent: Arc<dyn TaskAgent> = Arc::new(ScriptedTaskAgent::new().with_gate(gate.clone()).script(
+            Stage::Implement,
+            ScriptedRun {
+                text: vec!["partial output before the kill".to_string()],
+                ..ScriptedRun::default()
+            },
+        ));
+        let fake = Arc::new(FakeHost::new());
+        let (state, app) = test_app_with_task_agent_and_host(agent, fake.clone()).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let task_id = seed_task(&state, &epic_id, &project_id, "A").await;
+
+        let _handles = spawn_pool(state.clone());
+        state.notify.notify_waiters();
+
+        // Bounded readiness poll: wait until the cancel registry actually
+        // holds an entry for this epic — the precise signal that
+        // `Stage::Implement`'s handle is registered and the run is gated in
+        // flight (stronger than polling the task's own status, which can
+        // flip to `InProgress` slightly before `run_agent_stage` gets far
+        // enough to register the handle).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if state.cancel_registry.lock().unwrap().contains_key(&epic_id) {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("the cancel registry never gained an entry for the gated implement stage");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Issue the real cancel over HTTP.
+        let response = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                &format!("/epics/{epic_id}/lane"),
+                Some(json!({ "status": "Cancelled" })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // The kill reached the live handle immediately — while the stage is
+        // STILL gated, before this test ever releases it. This is the
+        // "seconds, not the next stage boundary" proof.
+        let was_cancelled_while_gated = state
+            .cancel_registry
+            .lock()
+            .unwrap()
+            .get(&epic_id)
+            .map(|h| h.was_cancelled())
+            .unwrap_or(false);
+        assert!(
+            was_cancelled_while_gated,
+            "RunControl::cancel() must reach the registered handle promptly, \
+             while the stage is still in flight"
+        );
+
+        // Now let the scripted stage actually exit, carrying `cancelled: true`.
+        gate.release();
+
+        // Bounded readiness poll: wait for the worker to observe the
+        // cancelled outcome and reset the task.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if fetch_task_row(&state, &task_id).await.0 == "Todo" {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "task never reset to Todo after the cancel: {:?}",
+                    fetch_task_row(&state, &task_id).await
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // The task is Todo, not Failed — resumable, no failure_reason.
+        let (status, failure_reason) = fetch_task_row(&state, &task_id).await;
+        assert_eq!(status, "Todo");
+        assert_eq!(failure_reason, None);
+
+        // The epic stayed exactly Cancelled — never flipped to Blocked.
+        assert_eq!(epic_status(&state, &epic_id).await, "Cancelled");
+
+        // The `implement` agent_run row closed `cancelled` with its partial
+        // log intact.
+        let mut rows = state
+            .db
+            .conn()
+            .query(
+                "SELECT status, log FROM agent_run WHERE task_id = ?1 AND stage = 'implement'",
+                params![task_id.clone()],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("the implement row must exist");
+        assert_eq!(row.get::<String>(0).unwrap(), "cancelled");
+        let log: String = row.get(1).unwrap();
+        assert!(
+            log.contains("partial output before the kill"),
+            "the partial (pre-kill) log must be preserved: {log:?}"
+        );
+
+        // The workspace is retained on disk.
+        let workspace_path = workspace::epic_workspace_path(&state.config.clone_root, &epic_id);
+        assert!(
+            workspace_path.join(".git").exists(),
+            "the workspace must be retained after a cancel"
+        );
+
+        // No PR was ever opened.
+        assert!(
+            fake.open_pr_calls().is_empty(),
+            "a cancelled epic must never reach finalize/open_pr"
+        );
+
+        // The registry entry is gone — removed on this (cancelled) exit path.
+        assert!(
+            state.cancel_registry.lock().unwrap().is_empty(),
+            "the registry entry must be removed once the cancelled stage's drain finishes"
+        );
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// The registry entry is removed on every exit path (this task's own
+    /// AC), the successful-walk case: once a walk with no cancel at all
+    /// finishes (`Completed`), nothing is left behind in
+    /// `state.cancel_registry`.
+    #[tokio::test]
+    async fn cancel_registry_is_empty_after_a_normal_successful_walk() {
+        let agent = Arc::new(ScriptedTaskAgent::new().script(Stage::Implement, writes_file("a.txt", "a")));
+        let (state, _app) = test_app_with_task_agent(agent).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        seed_task(&state, &epic_id, &project_id, "A").await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        assert!(
+            state.cancel_registry.lock().unwrap().is_empty(),
+            "the registry must be empty after every stage's guard has dropped"
+        );
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// The registry-empty AC, the failed-walk case: an ordinary (non-cancel)
+    /// agent-stage failure still routes through `fail_item` exactly as
+    /// before T-542 (`route_stage_failure`'s `outcome.cancelled == false`
+    /// branch), and the registry is just as empty afterward as it is on a
+    /// cancel — `CancelGuard::drop` doesn't care which way the stage ended.
+    #[tokio::test]
+    async fn cancel_registry_is_empty_after_a_failed_walk() {
+        let agent = Arc::new(ScriptedTaskAgent::new().script(
+            Stage::Implement,
+            ScriptedRun {
+                exit_code: Some(1),
+                ..ScriptedRun::default()
+            },
+        ));
+        let (state, _app) = test_app_with_task_agent(agent).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let task_id = seed_task(&state, &epic_id, &project_id, "A").await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        assert_eq!(epic_status(&state, &epic_id).await, "Blocked");
+        assert_eq!(fetch_task_row(&state, &task_id).await.0, "Failed");
+        assert!(
+            state.cancel_registry.lock().unwrap().is_empty(),
+            "the registry must be empty after an ordinary (non-cancel) failure too"
+        );
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// D12's stage-boundary backstop, specifically for a cancel that lands
+    /// while a **non-agent** stage is running: `test_gate`'s `test_cmd` is a
+    /// real (slow) shell command, so nothing is ever registered in
+    /// `state.cancel_registry` while it runs (only agent stages register a
+    /// handle) — a cancel issued during that window is a pure DB no-op at
+    /// the registry layer, and the walk only stops once the shell command
+    /// returns and the next `epic_still_in_progress` check (already built by
+    /// T-513/T-522, unchanged by this task) observes the epic is no longer
+    /// `InProgress`.
+    #[tokio::test]
+    async fn cancel_during_a_non_agent_stage_never_touches_the_registry() {
+        let agent = Arc::new(ScriptedTaskAgent::new());
+        let (state, app) = test_app_with_task_agent(agent).await;
+        let fixture = GitFixture::new().await;
+        // A real, slow-ish green test_cmd — long enough to reliably observe
+        // it "running" and issue the cancel mid-command, short enough to
+        // keep the test fast.
+        let project_id = seed_project_with_test_cmd(&state, &fixture, "sleep 0.5").await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let task_id = seed_task(&state, &epic_id, &project_id, "A").await;
+
+        let _handles = spawn_pool(state.clone());
+        state.notify.notify_waiters();
+
+        // Bounded readiness poll: wait until the test_gate stage's own
+        // agent_run row is open (`status = 'running'`) — proof the shell
+        // command is actually in flight.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut rows = state
+                .db
+                .conn()
+                .query(
+                    "SELECT status FROM agent_run WHERE task_id = ?1 AND stage = 'test_gate'",
+                    params![task_id.clone()],
+                )
+                .await
+                .unwrap();
+            if let Some(row) = rows.next().await.unwrap() {
+                if row.get::<String>(0).unwrap() == "running" {
+                    break;
+                }
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("test_gate never started running");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Nothing is registered — `test_gate` is not an agent stage.
+        assert!(
+            state.cancel_registry.lock().unwrap().is_empty(),
+            "a non-agent stage must never appear in the cancel registry"
+        );
+
+        let response = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                &format!("/epics/{epic_id}/lane"),
+                Some(json!({ "status": "Cancelled" })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // Still nothing registered — the lookup found no entry, so
+        // `RunControl::cancel()` was never called at all.
+        assert!(state.cancel_registry.lock().unwrap().is_empty());
+
+        // The walk stops cleanly once the shell command returns and the next
+        // stage-boundary check observes the epic is gone. There is no
+        // "the task changed status" signal to poll on here — the
+        // stage-boundary stop is a plain `return`, deliberately with no
+        // further writes (module doc: "Failure and cancellation both stop
+        // the walk the same way") — so the unambiguous "the walk has
+        // finished" signal is [`try_claim_and_run`] releasing the lease it
+        // took to run this claim.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let (lease_owner, _) = epic_lease(&state, &epic_id).await;
+            if lease_owner.is_none() {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("the claimed epic's lease was never released after the boundary check should have stopped the walk");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // The task was never finalized — the stage-boundary check stopped
+        // the walk before `commit_if_dirty`/`Done` could run (it was left
+        // exactly where the D12 backstop caught it, unchanged from every
+        // pre-T-542 between-stage stop).
+        assert_ne!(
+            fetch_task_row(&state, &task_id).await.0,
+            "Done",
+            "the task must never be finalized once the cancel landed mid-stage"
+        );
+        assert_eq!(epic_status(&state, &epic_id).await, "Cancelled");
+        assert!(state.cancel_registry.lock().unwrap().is_empty());
 
         cleanup_clone_root(&state, &project_id, &[&epic_id]);
     }

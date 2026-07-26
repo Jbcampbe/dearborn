@@ -23,6 +23,43 @@
 //! `state.notify.notify_waiters()` to wake an idle worker loop immediately.
 //! The long-lived worker pool ([`worker::spawn_pool`], started once in `main`)
 //! is what claims and drives the epic; this handler never touches it again.
+//!
+//! ## `InProgress → Cancelled` is a kill, not just a status write (T-542, D12)
+//!
+//! Every other transition in this module is a plain `UPDATE ... status`.
+//! `InProgress → Cancelled` does one thing more: after the `status` write
+//! above has committed, it looks the epic's id up in
+//! [`AppState::cancel_registry`] and, if an agent stage is currently running
+//! for it, calls `RunControl::cancel()` — the actual kill MILESTONE_2 D12
+//! promises ("Cancel is a kill"). The order matters: the DB write commits
+//! *first*, so by the time the worker (in another task, possibly another
+//! thread) observes the resulting `RunEvent::Exited { cancelled: true }` and
+//! decides what to do next, `epic.status` already reads `Cancelled` — it
+//! never has to guess whether the transition landed.
+//!
+//! **A cancel for an item with nothing in flight is a clean no-op**: the
+//! registry lookup simply finds no entry (nothing to call `cancel()` on),
+//! and [`crate::worker`]'s own stage-boundary DB checks
+//! (`epic_still_in_progress`, sprinkled throughout `run_epic_pipeline_inner`
+//! and its callees) are the backstop D12 requires for a cancel issued
+//! *between* stages — the worker's next check of the epic's status simply
+//! sees it is no longer `InProgress` and stops. This handler never needs to
+//! know which case it's in; the lookup is unconditional and harmless either
+//! way.
+//!
+//! **Never blocks on the kill completing.** `RunControl::cancel()` (the
+//! `agent-harness` crate) is fire-and-forget: it signals the child process
+//! (SIGTERM, with a delayed SIGKILL fallback on its own background thread if
+//! the process hasn't exited within ~1.5s) and returns immediately — it does
+//! not wait for the process to actually exit. This handler calls it
+//! synchronously, still inside the request, and returns `200` right after;
+//! the worker observes the eventual `Exited` event on its own time, tens to
+//! low hundreds of milliseconds later in the common case, well within this
+//! task's "terminates in seconds, not at the next stage boundary" AC.
+//!
+//! See [`AppState::cancel_registry`]'s own doc for the registry's shape and
+//! [`crate::worker`]'s "T-542: cancellation as a kill" module-doc section for
+//! what the worker does once it observes the cancelled outcome.
 
 use axum::extract::{Path, State};
 use axum::Json;
@@ -121,6 +158,41 @@ pub async fn set_epic_lane(
         params![target, now, id.clone()],
     )
     .await?;
+
+    // T-542/D12: `InProgress → Cancelled` is a kill, not just a status
+    // write. The status write above has already committed, so by the time
+    // any in-flight agent stage's worker observes the resulting
+    // `RunEvent::Exited { cancelled: true }`, `epic.status` already reads
+    // `Cancelled` — see this module's own doc for the full rationale. The
+    // registry lookup is unconditional and cheap; finding nothing is the
+    // correct, silent no-op for a cancel with no agent stage in flight
+    // (caught instead by the worker's own stage-boundary DB checks, D12's
+    // backstop). `RunControl::cancel()` is fire-and-forget (signals the
+    // process and returns immediately — see the module doc), so this never
+    // makes the response wait on the kill actually completing.
+    if epic.status == "InProgress" && target == "Cancelled" {
+        let in_flight = {
+            let registry = state
+                .cancel_registry
+                .lock()
+                .expect("cancel_registry mutex poisoned");
+            match registry.get(&id) {
+                Some(handle) => {
+                    if let Err(err) = handle.cancel() {
+                        tracing::warn!(
+                            epic = %id,
+                            error = %err,
+                            "T-542: RunControl::cancel() failed (best-effort; the worker's own \
+                             stage-boundary check remains the backstop)"
+                        );
+                    }
+                    true
+                }
+                None => false,
+            }
+        };
+        tracing::info!(epic = %id, in_flight, "T-542: epic cancelled");
+    }
 
     let updated = fetch_epic(conn, &id)
         .await?
@@ -416,6 +488,112 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(body_json(response).await["status"], "Blocked");
+    }
+
+    /// T-542/D12: `InProgress → Cancelled` looks the epic up in
+    /// `state.cancel_registry` and calls `RunControl::cancel()` on whatever
+    /// it finds. This test stands in for `run_agent_stage`'s real
+    /// registration (that wiring is `task_agent.rs`'s own job, proven there;
+    /// the full pipeline-level proof — a real gated `Stage::Implement`
+    /// killed mid-flight through this exact endpoint — lives in
+    /// `worker.rs`): it inserts a gated `ScriptedTaskAgent` run's handle
+    /// directly under the epic's id, exactly as a `CancelGuard` would while
+    /// that stage was in flight, then asserts the lane transition's own
+    /// cancel step reaches that live handle.
+    #[tokio::test]
+    async fn in_progress_to_cancelled_kills_a_registered_in_flight_handle() {
+        use crate::planning::testing::Gate;
+        use crate::task_agent::testing::ScriptedTaskAgent;
+        use crate::task_agent::{Stage, TaskAgent, TaskRunRequest};
+        use harness::RunEvent;
+
+        let (state, app) = test_app().await;
+        let project_id = seed_project(&state).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+
+        let gate = Arc::new(Gate::default());
+        let agent = ScriptedTaskAgent::new().with_gate(gate.clone());
+        let (handle, rx) = agent
+            .run(TaskRunRequest {
+                run_id: "run-lane-cancel".to_string(),
+                stage: Stage::Implement,
+                prompt: "go".to_string(),
+                cwd: std::env::temp_dir(),
+            })
+            .unwrap();
+        // Mirrors what `task_agent::CancelGuard::new` does while a real
+        // stage is in flight — insert under the claimed item's id.
+        state
+            .cancel_registry
+            .lock()
+            .unwrap()
+            .insert(epic_id.clone(), handle);
+
+        let response = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                &format!("/epics/{epic_id}/lane"),
+                Some(json!({ "status": "Cancelled" })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["status"], "Cancelled");
+
+        // The registered handle was actually cancelled — proven both via the
+        // handle's own `was_cancelled()` (still in the registry; this
+        // handler never removes an entry, only `CancelGuard`'s drop does)
+        // and via the scripted run's terminal event once released.
+        assert!(
+            state
+                .cancel_registry
+                .lock()
+                .unwrap()
+                .get(&epic_id)
+                .expect("still registered — only CancelGuard::drop removes it")
+                .was_cancelled(),
+            "the lane transition must call RunControl::cancel() on the registered handle"
+        );
+
+        gate.release();
+        let exited = rx.into_iter().find(|e| matches!(e, RunEvent::Exited { .. }));
+        match exited {
+            Some(RunEvent::Exited { cancelled, .. }) => {
+                assert!(cancelled, "the scripted run's own Exited must report cancelled: true")
+            }
+            other => panic!("expected an Exited event, got {other:?}"),
+        }
+    }
+
+    /// D12's explicit backstop clause: a cancel with **nothing** registered
+    /// (no agent stage in flight — e.g. between tasks, or during a non-agent
+    /// stage like `test_gate`) is a clean no-op at this layer. The lane
+    /// transition itself still succeeds; the worker's own stage-boundary DB
+    /// check is what actually stops the walk (proven in `worker.rs`).
+    #[tokio::test]
+    async fn in_progress_to_cancelled_with_nothing_in_flight_is_a_clean_no_op() {
+        let (state, app) = test_app().await;
+        let project_id = seed_project(&state).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+
+        assert!(state.cancel_registry.lock().unwrap().is_empty());
+
+        let response = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                &format!("/epics/{epic_id}/lane"),
+                Some(json!({ "status": "Cancelled" })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["status"], "Cancelled");
+        assert!(
+            state.cancel_registry.lock().unwrap().is_empty(),
+            "a cancel with nothing in flight must not touch the registry"
+        );
     }
 
     #[tokio::test]

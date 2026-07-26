@@ -133,6 +133,52 @@ pub struct AppState {
     /// `.await`); the per-project `tokio::sync::Mutex` it hands out is the
     /// actual (long-held, across-await) exclusion.
     pub refresh_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Live `RunHandle`s for whatever agent stage is currently running,
+    /// keyed by the claimed item's id (T-542, MILESTONE_2 D12/§7). Populated
+    /// by [`task_agent::run_agent_stage`] for the duration of exactly one
+    /// agent stage via a `task_agent::CancelGuard` (private to that module —
+    /// this field is the only thing outside it that ever sees the map), and
+    /// removed on **every** exit path out of that function — normal
+    /// completion, an ordinary (non-cancel) failure, a harness spawn error, a
+    /// panicked drain thread, or a cancel itself — by that guard's `Drop`,
+    /// never by a caller remembering to clean up. See
+    /// [`task_agent::CancelRegistry`] for the concrete type and
+    /// [`task_agent::run_agent_stage`]'s own doc for exactly when an entry
+    /// exists.
+    ///
+    /// [`lanes::set_epic_lane`]'s `InProgress → Cancelled` transition is the
+    /// only thing that ever *reads* this map: it looks up the epic's id
+    /// (already committed `Cancelled` in the DB by that point) and, if an
+    /// entry exists, calls `RunControl::cancel()` on it — best-effort,
+    /// fire-and-forget (the harness's own `cancel()` sends a signal and
+    /// returns immediately; it does not wait for the process to actually
+    /// exit), so the HTTP handler never blocks on the kill completing. **A
+    /// cancel for an item with nothing in flight is a clean no-op** — the
+    /// lookup simply finds no entry — because the stage-boundary DB checks
+    /// already sprinkled through `worker::run_epic_pipeline_inner` and its
+    /// callees are the backstop D12 requires for a cancel issued *between*
+    /// stages (non-agent stages — `setup`/`preflight`/`test_gate`/`commit`/
+    /// `push` — never register a handle here at all; a cancel that lands
+    /// while one of those is running is caught by that same backstop, not a
+    /// kill).
+    ///
+    /// **1:1, not 1:many.** MILESTONE_2 §2.3's DAG walk fully serializes: at
+    /// most one task per claimed epic is ever `InProgress`, and every call
+    /// site in `worker.rs` awaits one `run_agent_stage` call to completion
+    /// before starting the next, so at most one agent stage per claimed item
+    /// is ever in flight. The map is keyed accordingly — a plain
+    /// insert-on-start/remove-on-end, never a `Vec` or a ref-count. See
+    /// `task_agent::CancelGuard`'s own doc for what breaks if that
+    /// assumption is ever violated.
+    ///
+    /// **Shaped for T-550/T-551.** The key is "whatever id the claimed item
+    /// has" — the epic id for every stage today (T-513's DAG walk is
+    /// epic-scoped), the task id for a future standalone-task claim
+    /// (`epic_id: None`, T-551). This is already the same id
+    /// `WorkItem::Epic(id) | WorkItem::Standalone(task_id)` (T-550) will
+    /// carry once that unification lands, so neither this field nor
+    /// `task_agent::cancel_registry_key` needs to change shape when it does.
+    pub cancel_registry: Arc<task_agent::CancelRegistry>,
     /// Test-only seam (T-510) letting a test observe/gate the claimed-epic
     /// pipeline body without sleeps: if set, [`worker::run_epic_pipeline`]
     /// awaits it once, immediately after claiming an epic and before doing
@@ -245,6 +291,7 @@ impl AppState {
             advertised_base: Arc::new(Mutex::new(None)),
             notify: Arc::new(tokio::sync::Notify::new()),
             refresh_locks: Arc::new(Mutex::new(HashMap::new())),
+            cancel_registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
             #[cfg(test)]
             test_pipeline_hook: None,
         }

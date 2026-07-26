@@ -382,7 +382,7 @@ with `agent_error` and gets thickened in later phases.
   editing the spec with `PATCH /tasks/{id}` before retrying feeds the new spec
   to the re-run.
 
-- [ ] **T-542 — Cancellation as a kill.** *deps: T-512, T-540*
+- [x] **T-542 — Cancellation as a kill.** *deps: T-512, T-540*
   Cancel registry on `AppState` (`epic/task id → RunHandle`) populated for each
   agent stage. `InProgress → Cancelled` calls `cancel()`; the worker observes
   `Exited { cancelled: true }`, resets the in-flight task to `Todo`, sets the

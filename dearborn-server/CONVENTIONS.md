@@ -183,6 +183,16 @@ A failure is epic-scoped, not fatal to the worker: the same worker loop that
 just blocked one epic claims its next item (a different epic, or the same
 project's next one) immediately, with no extra delay.
 
+`cancelled` is listed above as part of the router's generic vocabulary (it is
+a valid `blocked_reason`/`failure_reason` string per MILESTONE_2 §2.3, and
+the router can express it), but in practice **no path ever routes a
+cancellation through `fail_item`**: `Blocked` and `Cancelled` are distinct
+epic statuses, and `fail_item`'s task write is unconditionally `Failed` —
+exactly wrong for a cancelled task, which returns to `Todo` instead (see
+"Cancellation as a kill (T-542)" below). `timeout` is genuinely unconstructed
+so far; T-543 (agent-stage timeouts) is expected to route through this same
+router unmodified.
+
 #### Recovery: retry a failed task (T-541)
 
 | Action | Method + path | Success status |
@@ -198,6 +208,39 @@ not exist; `409 conflict` if it exists but is not currently `Failed` (no
 body is required). A standalone task (`epic_id IS NULL`) has no epic to
 unblock — it still returns to `Todo`; nothing currently claims it (that's
 T-551's `POST /tasks/{id}/run`).
+
+#### Cancellation as a kill (T-542)
+
+`POST /epics/{id}/lane` with `{ status: "Cancelled" }` against an `InProgress`
+epic does more than the plain status write every other lane move does
+(§ "Project board & epic lanes" above): it also **kills** whatever agent
+stage is currently running for that epic (D12: "Cancel is a kill", not just a
+status flip a slow worker eventually notices). The server holds a live
+`RunHandle` for the in-flight stage, keyed by epic id, in an in-process
+registry (`AppState.cancel_registry`) populated for the duration of exactly
+one agent stage (`implement`/`fix`/`review`/`verify_complete`/`summarize` —
+never a non-agent stage like `setup`/`preflight`/`test_gate`/`commit`/`push`,
+which have no process handle to kill). The lane endpoint looks the epic up in
+that registry *after* its own `status = 'Cancelled'` write has committed, and
+calls the harness's cancel on whatever it finds — best-effort and
+fire-and-forget (it signals the process and returns immediately; the HTTP
+response never waits on the process actually exiting). A cancel for an epic
+with nothing currently in the registry (nothing in flight — e.g. between
+tasks, or while a non-agent stage is running) is a silent no-op at this
+layer: the worker's own stage-boundary check (unchanged, pre-existing since
+T-513) is the backstop that stops the walk the next time it looks.
+
+Once the worker observes the killed stage's terminal event
+(`agent_run.status = 'cancelled'`, its partial log already flushed per D14),
+it resets the in-flight **task** back to `Todo` — not `Failed` — because a
+cancellation is not a failure; the work is resumable, a human just asked to
+stop. The epic needs no further write at that point (already `Cancelled`,
+set synchronously by this same endpoint before the kill was even issued).
+No PR is ever opened on a cancelled epic; the workspace is retained on disk
+exactly as it is on every other stop path (`Blocked`, a lost lease). There is
+currently no equivalent for a standalone task (T-551) or a task-scoped
+cancel independent of its epic — cancellation today is epic-scoped, issued
+only through this one endpoint.
 
 Editing the task's spec via `PATCH /tasks/{id}` before calling `retry` needs
 no special support here: the next `implement`/`fix` stage simply re-renders

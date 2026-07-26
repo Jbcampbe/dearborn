@@ -55,16 +55,40 @@
 //! handle does NOT cancel; the run proceeds to completion"). [`TaskAgent`]
 //! does the opposite on purpose: `run` returns `(RunHandle, Receiver<RunEvent>)`
 //! and every implementation (below) hands **both** back rather than
-//! collapsing to just the receiver. The reason is T-542 (out of scope here,
-//! but the reason this matters *now*): cancelling a running task stage is a
-//! `RunControl::cancel()` call against the exact handle the stage's run
-//! produced, held in a registry keyed by task/epic id. A `TaskAgent` that
-//! discarded its handle the way `ClaudePlanningAgent` does would make that
-//! feature structurally impossible to add without changing this trait's
-//! signature later — so the contract is right the first time. Every caller
-//! of [`TaskAgent::run`] (today: [`run_agent_stage`] in this module) must
-//! keep the handle alive for the run's whole lifetime, not just long enough
-//! to hand the receiver off.
+//! collapsing to just the receiver. The reason is T-542: cancelling a running
+//! task stage is a `RunControl::cancel()` call against the exact handle the
+//! stage's run produced, held in [`AppState::cancel_registry`] keyed by the
+//! claimed item's id. A `TaskAgent` that discarded its handle the way
+//! `ClaudePlanningAgent` does would have made that feature structurally
+//! impossible to add without changing this trait's signature later — so the
+//! contract was right the first time. Every caller of [`TaskAgent::run`]
+//! (today: [`run_agent_stage`] in this module) keeps the handle alive for the
+//! run's whole lifetime, not just long enough to hand the receiver off — see
+//! [`CancelGuard`] for exactly how [`run_agent_stage`] does that now.
+//!
+//! ## T-542: registering the handle for the kill (D12)
+//!
+//! [`run_agent_stage`] is the **one** place every agent stage's `RunHandle`
+//! passes through (implement/fix/review/verify_complete/summarize alike — see
+//! the module doc's "the agent seam" section), so it is also the one place
+//! that needs to register that handle for a possible cancel. Immediately
+//! after `agent.run(req)` succeeds, [`run_agent_stage`] builds a
+//! [`CancelGuard`], which inserts the handle into
+//! [`AppState::cancel_registry`] under [`cancel_registry_key`] and removes it
+//! again on `Drop` — i.e. the instant the stage's evidence row closes,
+//! however it closes (`ok`/`error`/`cancelled`, or a panicked drain thread).
+//! This is what makes "every agent stage is cancellable without each call
+//! site opting in" (this task's AC) true: `worker::process_one_task` and its
+//! siblings never touch the registry themselves — they just call
+//! [`run_agent_stage`] exactly as they always have.
+//!
+//! [`crate::lanes::set_epic_lane`] is the only thing that ever calls
+//! `RunControl::cancel()` on a registered handle (an `InProgress → Cancelled`
+//! lane move); see that function's own doc for why the lookup happens
+//! *after* the epic's `status` column is already committed `Cancelled`, and
+//! [`crate::worker`]'s own "T-542: cancellation as a kill" module-doc section
+//! for what the worker does once it observes the resulting
+//! `RunEvent::Exited { cancelled: true }`.
 //!
 //! ## Soft read-only enforcement for `Review`/`VerifyComplete`/`Summarize`
 //!
@@ -106,8 +130,10 @@
 //! a caller-supplied `--permission-mode` override via `extra_args` (the
 //! adapter already supports last-wins), not a change to this reasoning.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
+use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use harness::{Claude, Harness, HarnessError, RunEvent, RunHandle, RunMode, RunRequest, RunTuning};
@@ -373,6 +399,85 @@ pub struct AgentStageParams<'a> {
     pub attempt: i64,
 }
 
+// ---- T-542: the cancel registry (D12) --------------------------------------
+
+/// The type [`AppState::cancel_registry`] wraps in an `Arc` — a plain
+/// `Mutex<HashMap<..>>`, the exact shape [`AppState::inflight`] and
+/// [`AppState::refresh_locks`] already use for a short-held, never-held-
+/// across-`.await` map guard (see those fields' own docs for the idiom this
+/// follows). Named here, next to [`RunHandle`]'s own import, rather than
+/// spelled out inline on the `AppState` field, so the concrete type is
+/// stated once.
+pub type CancelRegistry = Mutex<HashMap<String, RunHandle>>;
+
+/// The id [`AppState::cancel_registry`] keys a stage's entry under: the epic
+/// id when the stage belongs to one (every stage today — T-513's DAG walk is
+/// epic-scoped), the task id otherwise (`epic_id: None`, T-551's future
+/// standalone-task claim). This is deliberately "whatever id the claimed
+/// item has," not "task id" specifically or "epic id" specifically — it is
+/// the same id `WorkItem::Epic(id) | WorkItem::Standalone(task_id)` (T-550)
+/// will carry once that unification lands, so this function (and every
+/// registry lookup keyed by its result) costs nothing to adapt then.
+pub(crate) fn cancel_registry_key<'a>(params: &AgentStageParams<'a>) -> &'a str {
+    params.epic_id.unwrap_or(params.task_id)
+}
+
+/// RAII guard for one entry in [`AppState::cancel_registry`] (T-542, D12).
+/// Constructing a guard inserts `key -> handle`; `Drop` removes exactly that
+/// key. This is the structural guarantee behind this task's AC "the registry
+/// entry is removed on every exit path": [`run_agent_stage`] already has
+/// several early `return`s (a harness spawn failure, a panicked drain
+/// thread) plus its own two ordinary completion paths (an outcome that is
+/// `ok`, one that isn't) — a guard makes every one of them, including any a
+/// future author adds, correct by construction instead of by remembering to
+/// clean up at each return site.
+///
+/// ## The 1:1 assumption
+///
+/// At most one agent stage per claimed item is ever in flight: the DAG walk
+/// fully serializes (MILESTONE_2 §2.3 — one task `InProgress` at a time, one
+/// stage awaited to completion before the next begins), so a second entry
+/// for the same key can never legitimately exist while the first is still
+/// live. This guard leans on that invariant directly — it unconditionally
+/// `insert`s on construction (silently overwriting anything already at that
+/// key, which should never happen) and unconditionally `remove`s the same
+/// key on drop (which would incorrectly remove a *different* guard's live
+/// entry if the invariant were ever violated). Flagged here, not defended
+/// against, because defending against it would mean ref-counting entries
+/// that are never supposed to collide in the first place; a future author
+/// changing the concurrency model (e.g. running more than one stage per
+/// claimed item concurrently) needs to see this assumption before breaking
+/// it, not have it silently paper over the bug.
+struct CancelGuard {
+    registry: Arc<CancelRegistry>,
+    key: String,
+}
+
+impl CancelGuard {
+    /// Insert `handle` under `key` and hand back the guard that will remove
+    /// it again on drop. The handle lives inside the registry's map for the
+    /// guard's whole lifetime — this is also what satisfies "the handle is
+    /// held for the entire drain" (the module doc's "why the handle is
+    /// returned, not dropped" section): [`run_agent_stage`] no longer needs
+    /// a separate local binding just to keep the handle alive, because the
+    /// registry itself now owns it until this guard drops.
+    fn new(registry: Arc<CancelRegistry>, key: String, handle: RunHandle) -> CancelGuard {
+        registry
+            .lock()
+            .expect("cancel_registry mutex poisoned")
+            .insert(key.clone(), handle);
+        CancelGuard { registry, key }
+    }
+}
+
+impl Drop for CancelGuard {
+    fn drop(&mut self) {
+        if let Ok(mut map) = self.registry.lock() {
+            map.remove(&self.key);
+        }
+    }
+}
+
 /// What a completed (or failed) agent stage leaves behind for the caller
 /// (T-513's DAG walk) to act on — e.g. deciding whether `Fix` produced a
 /// diff, or handing `text` to [`crate::spec::parse_verdict`] for a review
@@ -486,13 +591,16 @@ impl std::error::Error for AgentStageError {}
 /// to the row roughly every [`PARTIAL_FLUSH_INTERVAL`] while it streams, then
 /// close the row with the terminal status/session id/exit code/log (D13
 /// capped). Returns the assembled [`AgentStageOutcome`] so a caller decides
-/// what happens next — T-512 does not call this from anywhere in production
-/// yet (the DAG walk is T-513's slice); it exists so the evidence + streaming
-/// contract can be built and tested now, ahead of the walk that will drive it.
+/// what happens next.
 ///
-/// The [`RunHandle`] `agent.run` returns is held for the **entire** drain,
-/// even though nothing here calls `cancel()` on it yet (T-542) — see the
-/// module doc.
+/// The [`RunHandle`] `agent.run` returns is held for the **entire** drain via
+/// a [`CancelGuard`] (T-542, D12): it lives inside
+/// [`AppState::cancel_registry`], keyed by [`cancel_registry_key`], from
+/// immediately after `agent.run` succeeds until this function returns —
+/// every exit path drops the guard, which removes the entry, so a stage that
+/// finishes (`ok` or otherwise), errors, or panics its drain thread always
+/// leaves the registry exactly as it found it. [`crate::lanes::set_epic_lane`]
+/// is the only external caller that ever reads this registry.
 pub async fn run_agent_stage(
     state: &AppState,
     agent: &dyn TaskAgent,
@@ -528,8 +636,16 @@ pub async fn run_agent_stage(
             return Err(AgentStageError::Harness(err));
         }
     };
-    // Held across the whole drain below — see the module doc.
-    let _run_handle = run_handle;
+    // T-542: register the handle for a possible external cancel (D12) — held
+    // in `state.cancel_registry` across the whole drain below, removed on
+    // every exit path when `_cancel_guard` drops. See `CancelGuard`'s own
+    // doc and the module doc's "T-542: registering the handle for the kill"
+    // section.
+    let _cancel_guard = CancelGuard::new(
+        state.cancel_registry.clone(),
+        cancel_registry_key(&params).to_string(),
+        run_handle,
+    );
 
     let hub = state.hub.clone();
     let topic = format!("task:{}", params.task_id);
@@ -1235,6 +1351,152 @@ mod tests {
         assert_eq!(row.get::<String>(0).unwrap(), "error");
         let log: String = row.get(1).unwrap();
         assert!(log.contains("no claude on PATH"));
+
+        // T-542: a spawn failure never obtains a `RunHandle` at all, so
+        // nothing was ever inserted — the registry stays exactly as empty as
+        // it started, not merely "cleaned up".
+        assert!(
+            state.cancel_registry.lock().unwrap().is_empty(),
+            "a harness spawn failure must never populate the cancel registry"
+        );
+    }
+
+    // ---- T-542: the cancel registry -------------------------------------
+
+    /// While an agent stage is gated in flight, [`AppState::cancel_registry`]
+    /// holds exactly one live entry keyed by [`cancel_registry_key`]
+    /// (`epic_id` here); calling `.cancel()` through that entry is
+    /// observable on the handle (`was_cancelled()`) immediately, and the
+    /// stage's eventual `Exited` event (once the gate releases) reports
+    /// `cancelled: true`. Once the drain finishes, the entry is gone —
+    /// proving [`CancelGuard`]'s insert-on-construct/remove-on-drop shape end
+    /// to end at this layer (the full pipeline-level proof, going through
+    /// the real `POST /epics/{id}/lane` cancel, lives in `worker.rs`).
+    #[tokio::test]
+    async fn run_agent_stage_registers_a_live_handle_and_removes_it_on_drop() {
+        let state = test_state().await;
+        let gate = Arc::new(Gate::default());
+        let agent: Arc<dyn TaskAgent> = Arc::new(ScriptedTaskAgent::new().with_gate(gate.clone()));
+
+        let dir = std::env::temp_dir().join(format!("dearborn-cancel-registry-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let run = {
+            let state = state.clone();
+            let agent = agent.clone();
+            let dir = dir.clone();
+            tokio::spawn(async move {
+                run_agent_stage(
+                    &state,
+                    agent.as_ref(),
+                    AgentStageParams {
+                        task_id: "task-1",
+                        epic_id: Some("epic-1"),
+                        attempt: 1,
+                    },
+                    TaskRunRequest {
+                        run_id: "run-cancel".to_string(),
+                        stage: Stage::Implement,
+                        prompt: "go".to_string(),
+                        cwd: dir,
+                    },
+                )
+                .await
+            })
+        };
+
+        // Bounded, no-sleep-as-the-proof readiness poll: wait until the
+        // registry actually has the entry (the drain thread races this test
+        // for a few scheduler ticks after `agent.run` returns).
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if state.cancel_registry.lock().unwrap().contains_key("epic-1") {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the cancel registry never gained an entry for the gated stage"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        {
+            let registry = state.cancel_registry.lock().unwrap();
+            assert_eq!(registry.len(), 1, "exactly one entry for the one in-flight stage");
+            let handle = registry.get("epic-1").expect("keyed by epic_id, not task_id");
+            assert!(!handle.was_cancelled(), "not cancelled yet");
+            handle.cancel().unwrap();
+            assert!(
+                handle.was_cancelled(),
+                "cancel() through the registry must be observable on the live handle"
+            );
+        }
+
+        gate.release();
+        let outcome = run.await.unwrap().expect("scripted stage must still close its row");
+        assert!(outcome.cancelled, "Exited must report cancelled: true after the registry cancel()");
+        assert_eq!(outcome.status(), "cancelled");
+
+        assert!(
+            state.cancel_registry.lock().unwrap().is_empty(),
+            "the entry must be removed once run_agent_stage returns (CancelGuard::drop)"
+        );
+
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    /// T-551 forward-compat: a standalone-task stage (`epic_id: None`) keys
+    /// its registry entry by `task_id` instead — [`cancel_registry_key`]'s
+    /// whole reason to exist rather than a bare `params.epic_id.unwrap()`.
+    #[tokio::test]
+    async fn run_agent_stage_keys_the_registry_by_task_id_when_standalone() {
+        let state = test_state().await;
+        let gate = Arc::new(Gate::default());
+        let agent: Arc<dyn TaskAgent> = Arc::new(ScriptedTaskAgent::new().with_gate(gate.clone()));
+
+        let dir = std::env::temp_dir().join(format!("dearborn-cancel-registry-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let run = {
+            let state = state.clone();
+            let agent = agent.clone();
+            let dir = dir.clone();
+            tokio::spawn(async move {
+                run_agent_stage(
+                    &state,
+                    agent.as_ref(),
+                    AgentStageParams {
+                        task_id: "task-1",
+                        epic_id: None,
+                        attempt: 1,
+                    },
+                    TaskRunRequest {
+                        run_id: "run-standalone".to_string(),
+                        stage: Stage::Implement,
+                        prompt: "go".to_string(),
+                        cwd: dir,
+                    },
+                )
+                .await
+            })
+        };
+
+        let deadline = tokio::time::Instant::now() + std::time::Duration::from_secs(5);
+        loop {
+            if state.cancel_registry.lock().unwrap().contains_key("task-1") {
+                break;
+            }
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "the cancel registry never gained an entry keyed by task_id"
+            );
+            tokio::time::sleep(std::time::Duration::from_millis(5)).await;
+        }
+
+        gate.release();
+        run.await.unwrap().expect("scripted stage must still close its row");
+        assert!(state.cancel_registry.lock().unwrap().is_empty());
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     /// Collect published frames from a hub subscription until an `exited`
