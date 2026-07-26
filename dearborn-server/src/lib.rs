@@ -174,10 +174,16 @@ pub struct AppState {
     /// **Shaped for T-550/T-551.** The key is "whatever id the claimed item
     /// has" — the epic id for every stage today (T-513's DAG walk is
     /// epic-scoped), the task id for a future standalone-task claim
-    /// (`epic_id: None`, T-551). This is already the same id
-    /// `WorkItem::Epic(id) | WorkItem::Standalone(task_id)` (T-550) will
-    /// carry once that unification lands, so neither this field nor
-    /// `task_agent::cancel_registry_key` needs to change shape when it does.
+    /// (`epic_id: None`, T-551). T-550 has since landed
+    /// `worker::WorkItem::Epic(id) | WorkItem::Standalone(task_id)` as
+    /// exactly this id (`WorkItem::id()`), confirming the bet this doc made
+    /// before that unification existed: neither this field nor
+    /// `task_agent::cancel_registry_key` needed to change shape when it did.
+    /// What's still missing is T-551 actually populating a `Standalone`
+    /// claim's agent stages through this registry in practice — T-550's own
+    /// standalone pipeline seam (`worker::run_standalone_pipeline_inner`)
+    /// runs no agent stage yet, so no `Standalone`-keyed entry exists here
+    /// until that lands.
     pub cancel_registry: Arc<task_agent::CancelRegistry>,
     /// Test-only seam (T-510) letting a test observe/gate the claimed-epic
     /// pipeline body without sleeps: if set, [`worker::run_epic_pipeline`]

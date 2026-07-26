@@ -481,9 +481,11 @@ pub type CancelRegistry = Mutex<HashMap<String, RunHandle>>;
 /// epic-scoped), the task id otherwise (`epic_id: None`, T-551's future
 /// standalone-task claim). This is deliberately "whatever id the claimed
 /// item has," not "task id" specifically or "epic id" specifically — it is
-/// the same id `WorkItem::Epic(id) | WorkItem::Standalone(task_id)` (T-550)
-/// will carry once that unification lands, so this function (and every
-/// registry lookup keyed by its result) costs nothing to adapt then.
+/// the same id `worker::WorkItem::Epic(id) | WorkItem::Standalone(task_id)`
+/// carries via `WorkItem::id()` now that T-550 has landed that unification,
+/// so this function (and every registry lookup keyed by its result) costs
+/// nothing to adapt once T-551 actually drives an agent stage for a
+/// `Standalone` claim.
 pub(crate) fn cancel_registry_key<'a>(params: &AgentStageParams<'a>) -> &'a str {
     params.epic_id.unwrap_or(params.task_id)
 }

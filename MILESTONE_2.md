@@ -403,7 +403,7 @@ with `agent_error` and gets thickened in later phases.
 
 ## 8. Phase 5 — Standalone tasks
 
-- [ ] **T-550 — `WorkItem` unification.** *deps: T-513, T-540*
+- [x] **T-550 — `WorkItem` unification.** *deps: T-513, T-540*
   Refactor the worker to claim
   `WorkItem::Epic(id) | WorkItem::Standalone(task_id)` — one loop, one shared
   `prepare → run_task → finalize`. Only the claim query, the next-task selector

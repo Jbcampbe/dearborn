@@ -1055,6 +1055,92 @@
 //! retained (`PushIntent::Attempt` — the same triage-push every task-scoped
 //! failure gets), and the worker's own loop tries its next claim immediately,
 //! exactly as it does after any other epic-scoped failure (D10, §7).
+//!
+//! ## T-550: `WorkItem` unification (§2.4, §8, D17)
+//!
+//! Every section above this one talks about "the claimed epic" as if that
+//! were the only kind of claim there could ever be — because through T-543 it
+//! was. D17 always meant otherwise: a standalone task (`task.epic_id IS
+//! NULL`) is its own leasable work item, with its own branch and PR, "via a
+//! unified `WorkItem` enum, *not* a parallel code path." [`WorkItem::Epic`] /
+//! [`WorkItem::Standalone`] is that enum — what a successful claim now
+//! returns — and this section is the seam that makes room for it without
+//! touching a single line of what Phases 1–4 already proved out.
+//!
+//! ### What actually had to change, and what didn't
+//!
+//! [`claim_epic`] itself is untouched in signature and behavior — every
+//! Phase 1–4 test that calls it directly still compiles and still passes.
+//! What moved is the SQL *inside* it: the `UPDATE ... WHERE id = (SELECT ...)
+//! ... RETURNING` race is now [`claim_row`], parameterized on
+//! [`LeaseTable`] (`epic` or `task`) and an extra `WHERE` fragment (the
+//! standalone claim's `AND epic_id IS NULL`, §2.4's own words for "same
+//! shape with…"). [`claim_task`] is the second, real caller of that shared
+//! core — not a hand-copied second race to keep in sync by hand. The same
+//! split happened to the heartbeat/lease trio: [`renew_lease_once`],
+//! [`spawn_heartbeat`], and [`release_lease`] all kept their exact
+//! pre-T-550 signatures (so, again, no existing call site — production or
+//! test — had to change), but each is now a one-line wrapper over a
+//! `LeaseTable`-parameterized core ([`renew_lease_generic`],
+//! [`spawn_heartbeat_generic`], [`release_lease_generic`]) that
+//! [`renew_task_lease_once`], [`spawn_task_heartbeat`], and
+//! [`release_task_lease`] call into for the `task` table. This is the literal
+//! meaning of the AC's "no duplicated lease/heartbeat/... code": there is
+//! exactly one fencing UPDATE, one heartbeat loop, one release UPDATE, each
+//! written once and reused for both tables — not two copies that happen to
+//! agree today and drift tomorrow.
+//!
+//! [`claim_next`] is the new thing with no pre-T-550 analogue: try
+//! [`claim_epic`], and only on `None` fall back to [`claim_task`]. This one
+//! function is where "epic claims are tried first so standalone work never
+//! starves an epic" is actually decided — every other function in the
+//! cluster above just does whatever table it's told to, with no opinion
+//! about order. [`try_claim_and_run`] calls `claim_next` and dispatches the
+//! `WorkItem` it gets back to [`run_claimed_epic`] (T-513/T-514's existing
+//! reset-orphans → heartbeat → [`run_epic_pipeline_inner`] → release
+//! sequence, moved out of `try_claim_and_run` verbatim, not rewritten) or
+//! [`run_claimed_standalone`] (the new, much smaller mirror: no orphans to
+//! reset, a task-table heartbeat, and [`run_standalone_pipeline_inner`]).
+//! `worker_loop` itself — the actual "one loop" — never changed at all: it
+//! still just calls `try_claim_and_run` in an inner drain loop, exactly as
+//! before.
+//!
+//! ### Why the pipeline body stops where it does
+//!
+//! [`run_standalone_pipeline_inner`] is the real, load-bearing hand-off point
+//! for T-551 — the same role [`pr::SUMMARY_MARKER`] plays for T-560, a named
+//! seam instead of a restructure deferred to later. It deliberately does not
+//! provision a workspace, run an implement stage, or open a PR: none of
+//! that's possible yet ([`workspace::provision_epic_workspace`] only knows
+//! how to provision an *epic's* workspace; there is no standalone-task
+//! finalize; [`fail_item`]'s `FailureContext` has no way to fail a task with
+//! no epic to `Block`), and building any of it now — on spec, before T-551's
+//! own endpoint exists to drive it — would mean guessing at shapes that
+//! task is better positioned to settle for real. MILESTONE_2 §8 says as much
+//! directly: T-550 builds the seam and proves it with tests; T-551 thickens
+//! it. See that function's own doc for exactly what it does today (log and
+//! return) and the one constraint that doc leaves for T-551: nothing in
+//! production ever sets a task `InProgress` with `epic_id IS NULL` yet (no
+//! endpoint does it — that's T-551's own addition), so a live pool never
+//! actually exercises this function's do-nothing body in practice. Every
+//! T-550 test that does reach it calls [`claim_task`] or
+//! [`try_claim_and_run`] directly — a single, bounded claim-run-release —
+//! never [`worker_loop`]'s continuously-draining inner loop, which would spin
+//! on a row this function leaves immediately re-claimable the moment its
+//! lease is released.
+//!
+//! ### Proven by test, not by inspection
+//!
+//! Every clause of this task's AC has a direct test: [`claim_task`] racing
+//! (many claimants, exactly one winner, mirroring [`claim_epic`]'s own
+//! concurrency test), an expired standalone lease being re-claimable and a
+//! live one not, [`renew_task_lease_once`]/[`spawn_task_heartbeat`] fencing
+//! out a stolen lease the same way the epic versions already did, and
+//! [`claim_next`]/[`try_claim_and_run`] preferring a queued epic over a
+//! queued standalone task. The boot-time lease clear covering `task` was
+//! already true and already tested before this task started — [`clear_all_leases`]
+//! has cleared both tables since T-510, once T-500's migration put the lease
+//! columns on `task` in the first place — so nothing there needed to change.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -1105,6 +1191,48 @@ pub struct ClaimedEpic {
     pub project_id: String,
 }
 
+/// The row identity returned by a successful [`claim_task`] (T-550) — the
+/// `task` table's mirror of [`ClaimedEpic`]. See [`claim_task`]'s own doc for
+/// the query this backs.
+#[derive(Debug, Clone)]
+pub struct ClaimedTask {
+    pub id: String,
+    #[allow(dead_code)] // not yet read; T-551 uses it for workspace paths
+    pub project_id: String,
+}
+
+/// What a successful claim returns (T-550, D17): the epic id or the
+/// standalone task id, tagged so everything downstream of the claim —
+/// which lease table to heartbeat/release against, which pipeline body to
+/// run, eventually (T-551) which workspace path and branch/PR naming apply —
+/// can dispatch on shape instead of re-deriving "is this epic-scoped" from a
+/// bare `Option`. This mirrors the convention [`task_agent::AgentStageParams`]
+/// (`epic_id: Option<&str>`) and [`FailureContext`] (`epic_id: &str`,
+/// `task_id: Option<&str>`) already use at the epic/standalone boundary —
+/// see [`try_claim_and_run`] for the one place a claim turns into a
+/// `WorkItem`, and the module doc's "T-550: `WorkItem` unification" section
+/// for why the claim order below (epic, then standalone) is load-bearing.
+#[derive(Debug, Clone)]
+pub enum WorkItem {
+    Epic(ClaimedEpic),
+    Standalone(ClaimedTask),
+}
+
+impl WorkItem {
+    /// The epic id or standalone task id this claim carries — whichever the
+    /// variant holds. Named `.id()` rather than exposing the variants'
+    /// fields directly at every call site, mirroring
+    /// [`task_agent::cancel_registry_key`]'s "whichever id the claimed item
+    /// has" framing.
+    #[allow(dead_code)] // read once a caller needs "just the id, don't care which kind" (T-551)
+    pub fn id(&self) -> &str {
+        match self {
+            WorkItem::Epic(c) => &c.id,
+            WorkItem::Standalone(c) => &c.id,
+        }
+    }
+}
+
 /// Shared flag signalling whether a claimed lease is still held (D4).
 ///
 /// Cloned into the heartbeat task and the claimed-epic body. The heartbeat is
@@ -1137,42 +1265,124 @@ impl LeaseHandle {
     }
 }
 
-/// §2.4 epic claim (tried first — standalone-task claim is T-550). See the
-/// module docs for the full race/RETURNING rationale. `lease_ttl_secs` sets
-/// how far in the future `lease_expires_at` is written; `worker_id` becomes
-/// `lease_owner`.
+/// Which table a lease operation targets (T-550) — the *only* axis
+/// [`claim_epic`]/[`claim_task`], [`renew_lease_once`]/[`renew_task_lease_once`],
+/// and [`release_lease`]/[`release_task_lease`] differ on. Kept private:
+/// nothing outside this claim/lease/heartbeat cluster needs to name a table —
+/// every caller already knows which kind of item it holds via [`WorkItem`].
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum LeaseTable {
+    Epic,
+    Task,
+}
+
+impl LeaseTable {
+    fn as_str(self) -> &'static str {
+        match self {
+            LeaseTable::Epic => "epic",
+            LeaseTable::Task => "task",
+        }
+    }
+}
+
+/// The shared guts of [`claim_epic`]/[`claim_task`]: the §2.4
+/// `UPDATE ... WHERE id = (SELECT ...) RETURNING id, project_id` race,
+/// against whichever `table` the caller names plus whatever extra predicate
+/// `extra_where` supplies (the standalone claim's `AND epic_id IS NULL`;
+/// the epic claim has none). `table`/`extra_where` are both compile-time
+/// string literals chosen by [`LeaseTable`] at the two call sites, never
+/// caller-supplied data, so building the query with [`format!`] carries none
+/// of the injection risk that would come with interpolating anything a
+/// request handler passed through — the same pattern `epics.rs`/`tasks.rs`
+/// already use for their column-list `SELECT`/dynamic-`SET` queries.
+async fn claim_row(
+    conn: &Connection,
+    table: LeaseTable,
+    extra_where: &str,
+    worker_id: &str,
+    lease_ttl_secs: u64,
+) -> Result<Option<(String, String)>, libsql::Error> {
+    let now = now_ms();
+    let expires_at = now + (lease_ttl_secs as i64) * 1000;
+    let table = table.as_str();
+    let sql = format!(
+        "UPDATE {table} SET lease_owner = ?1, lease_expires_at = ?2, updated_at = ?3 \
+         WHERE id = (SELECT id FROM {table} \
+                     WHERE status = 'InProgress' {extra_where} \
+                       AND (lease_owner IS NULL OR lease_expires_at < ?3) \
+                     ORDER BY updated_at ASC LIMIT 1) \
+         RETURNING id, project_id"
+    );
+    let mut rows = conn
+        .query(&sql, params![worker_id, expires_at, now])
+        .await?;
+    match rows.next().await? {
+        Some(row) => Ok(Some((row.get::<String>(0)?, row.get::<String>(1)?))),
+        None => Ok(None),
+    }
+}
+
+/// §2.4 epic claim (tried first — standalone-task claim is [`claim_task`],
+/// T-550). See the module docs for the full race/RETURNING rationale.
+/// `lease_ttl_secs` sets how far in the future `lease_expires_at` is
+/// written; `worker_id` becomes `lease_owner`.
 pub async fn claim_epic(
     conn: &Connection,
     worker_id: &str,
     lease_ttl_secs: u64,
 ) -> Result<Option<ClaimedEpic>, libsql::Error> {
-    let now = now_ms();
-    let expires_at = now + (lease_ttl_secs as i64) * 1000;
-    let mut rows = conn
-        .query(
-            "UPDATE epic SET lease_owner = ?1, lease_expires_at = ?2, updated_at = ?3 \
-             WHERE id = (SELECT id FROM epic \
-                         WHERE status = 'InProgress' \
-                           AND (lease_owner IS NULL OR lease_expires_at < ?3) \
-                         ORDER BY updated_at ASC LIMIT 1) \
-             RETURNING id, project_id",
-            params![worker_id, expires_at, now],
-        )
-        .await?;
-    match rows.next().await? {
-        Some(row) => Ok(Some(ClaimedEpic {
-            id: row.get::<String>(0)?,
-            project_id: row.get::<String>(1)?,
-        })),
-        None => Ok(None),
+    let claimed = claim_row(conn, LeaseTable::Epic, "", worker_id, lease_ttl_secs).await?;
+    Ok(claimed.map(|(id, project_id)| ClaimedEpic { id, project_id }))
+}
+
+/// §2.4 standalone-task claim (T-550, D17) — tried only after [`claim_epic`]
+/// finds nothing (see [`claim_next`], the one call site that orders the two
+/// this way, and the module doc's "T-550" section for why that order is
+/// load-bearing). Identical shape to [`claim_epic`] against the `task` table,
+/// restricted to `epic_id IS NULL` so a task that belongs to an epic (only
+/// ever claimed as part of that epic's own DAG walk, never directly) can
+/// never be picked up here.
+pub async fn claim_task(
+    conn: &Connection,
+    worker_id: &str,
+    lease_ttl_secs: u64,
+) -> Result<Option<ClaimedTask>, libsql::Error> {
+    let claimed = claim_row(
+        conn,
+        LeaseTable::Task,
+        "AND epic_id IS NULL",
+        worker_id,
+        lease_ttl_secs,
+    )
+    .await?;
+    Ok(claimed.map(|(id, project_id)| ClaimedTask { id, project_id }))
+}
+
+/// The full §2.4 claim (T-550, D17): try [`claim_epic`] first, falling back
+/// to [`claim_task`] only when no epic is claimable. This is the one place
+/// the "epic claims are tried first so standalone work never starves an
+/// epic" AC is actually decided — every other claim-adjacent function just
+/// takes whichever table it's told to. See [`try_claim_and_run`], the sole
+/// production caller, and the module doc's "T-550" section.
+async fn claim_next(
+    conn: &Connection,
+    worker_id: &str,
+    lease_ttl_secs: u64,
+) -> Result<Option<WorkItem>, libsql::Error> {
+    if let Some(claimed) = claim_epic(conn, worker_id, lease_ttl_secs).await? {
+        return Ok(Some(WorkItem::Epic(claimed)));
     }
+    Ok(claim_task(conn, worker_id, lease_ttl_secs)
+        .await?
+        .map(WorkItem::Standalone))
 }
 
 /// Part of the claim path (see module docs): reset any task of `epic_id` left
 /// `InProgress` by a previous (now-dead or fenced-out) owner back to `Todo`,
 /// so the new owner's DAG walk treats that abandoned work as pending again.
 /// Returns the number of tasks reset (`0` is the common case — a fresh claim
-/// with no orphans).
+/// with no orphans). Epic-only: a standalone claim has no sub-tasks of its
+/// own to orphan, so [`claim_task`] has no counterpart to call here.
 async fn reset_orphaned_tasks(conn: &Connection, epic_id: &str) -> Result<u64, libsql::Error> {
     let now = now_ms();
     conn.execute(
@@ -1182,37 +1392,70 @@ async fn reset_orphaned_tasks(conn: &Connection, epic_id: &str) -> Result<u64, l
     .await
 }
 
-/// A single heartbeat renewal attempt (D4's fencing update), factored out of
-/// [`spawn_heartbeat`] so it is directly unit-testable without waiting on a
-/// real timer: returns `Ok(true)` if the lease is still ours (the UPDATE
+/// The shared guts of [`renew_lease_once`]/[`renew_task_lease_once`] (T-550's
+/// fencing update, D4): `Ok(true)` if the lease is still ours (the UPDATE
 /// affected a row), `Ok(false)` if it was fenced out (zero rows — someone
-/// else's claim now owns this id).
+/// else's claim now owns this id). See [`claim_row`]'s doc for why
+/// interpolating `table` into the query text is safe here.
+async fn renew_lease_generic(
+    conn: &Connection,
+    table: LeaseTable,
+    id: &str,
+    worker_id: &str,
+    lease_ttl_secs: u64,
+) -> Result<bool, libsql::Error> {
+    let now = now_ms();
+    let expires_at = now + (lease_ttl_secs as i64) * 1000;
+    let table = table.as_str();
+    let sql = format!("UPDATE {table} SET lease_expires_at = ?1 WHERE id = ?2 AND lease_owner = ?3");
+    let affected = conn.execute(&sql, params![expires_at, id, worker_id]).await?;
+    Ok(affected > 0)
+}
+
+/// A single heartbeat renewal attempt against the `epic` table (D4's fencing
+/// update) — the pre-T-550 direct-unit-test seam, kept at its original
+/// signature so every Phase 1–4 test exercising the fencing check in
+/// isolation (no timer, no `spawn_heartbeat`) still compiles unchanged.
+/// [`spawn_heartbeat_generic`] itself calls [`renew_lease_generic`] straight
+/// through (it already carries a `LeaseTable`, so routing back through this
+/// table-fixed wrapper would add a layer for nothing) — this function's only
+/// caller since T-550 is this module's own tests. See
+/// [`renew_task_lease_once`] for the `task`-table mirror.
+#[allow(dead_code)] // test-only since T-550 — see doc above
 async fn renew_lease_once(
     conn: &Connection,
     epic_id: &str,
     worker_id: &str,
     lease_ttl_secs: u64,
 ) -> Result<bool, libsql::Error> {
-    let now = now_ms();
-    let expires_at = now + (lease_ttl_secs as i64) * 1000;
-    let affected = conn
-        .execute(
-            "UPDATE epic SET lease_expires_at = ?1 WHERE id = ?2 AND lease_owner = ?3",
-            params![expires_at, epic_id, worker_id],
-        )
-        .await?;
-    Ok(affected > 0)
+    renew_lease_generic(conn, LeaseTable::Epic, epic_id, worker_id, lease_ttl_secs).await
 }
 
-/// Spawn the per-claimed-item heartbeat task (D4). Renews `epic_id`'s lease
-/// every `period` using [`renew_lease_once`]; the first renewal it observes
-/// fail flips `lease` to lost and the task exits (no further renewals are
-/// meaningful once fenced out). The caller (`try_claim_and_run`) aborts this
-/// handle when the item is released, on every exit path — see the module
-/// docs' "no reaper" note for why there is nothing else watching leases.
-fn spawn_heartbeat(
+/// The `task`-table mirror of [`renew_lease_once`] (T-550): a standalone
+/// claim's heartbeat fences itself the identical way an epic's does, just
+/// against `task.lease_owner`/`task.lease_expires_at`. Test-only for the same
+/// reason `renew_lease_once` is — see its doc.
+#[allow(dead_code)] // test-only since T-550 — see renew_lease_once's doc
+async fn renew_task_lease_once(
+    conn: &Connection,
+    task_id: &str,
+    worker_id: &str,
+    lease_ttl_secs: u64,
+) -> Result<bool, libsql::Error> {
+    renew_lease_generic(conn, LeaseTable::Task, task_id, worker_id, lease_ttl_secs).await
+}
+
+/// The shared guts of [`spawn_heartbeat`]/[`spawn_task_heartbeat`] (D4,
+/// T-550): renews `id`'s lease in `table` every `period` via
+/// [`renew_lease_generic`]; the first renewal it observes fail flips `lease`
+/// to lost and the task exits (no further renewals are meaningful once
+/// fenced out). The caller (`try_claim_and_run`) aborts the returned handle
+/// when the item is released, on every exit path — see the module docs' "no
+/// reaper" note for why there is nothing else watching leases.
+fn spawn_heartbeat_generic(
     conn: Connection,
-    epic_id: String,
+    table: LeaseTable,
+    id: String,
     worker_id: String,
     period: Duration,
     lease_ttl_secs: u64,
@@ -1221,11 +1464,12 @@ fn spawn_heartbeat(
     tokio::spawn(async move {
         loop {
             tokio::time::sleep(period).await;
-            match renew_lease_once(&conn, &epic_id, &worker_id, lease_ttl_secs).await {
+            match renew_lease_generic(&conn, table, &id, &worker_id, lease_ttl_secs).await {
                 Ok(true) => continue,
                 Ok(false) => {
                     tracing::warn!(
-                        epic = %epic_id,
+                        item = %id,
+                        table = table.as_str(),
                         worker = %worker_id,
                         "heartbeat: lease fenced out (0 rows affected); abandoning"
                     );
@@ -1234,7 +1478,8 @@ fn spawn_heartbeat(
                 }
                 Err(err) => {
                     tracing::warn!(
-                        epic = %epic_id,
+                        item = %id,
+                        table = table.as_str(),
                         worker = %worker_id,
                         error = %err,
                         "heartbeat: renewal query failed; will retry next tick"
@@ -1245,30 +1490,73 @@ fn spawn_heartbeat(
     })
 }
 
-/// Release a held lease: clear `lease_owner`/`lease_expires_at`, fenced by
-/// `lease_owner = ?` so a lease already stolen by another worker (this one
-/// was fenced out mid-run) is never clobbered — releasing is a no-op in that
-/// case, which is correct: the new owner's lease must survive.
-async fn release_lease(conn: &Connection, epic_id: &str, worker_id: &str) {
-    let result = conn
-        .execute(
-            "UPDATE epic SET lease_owner = NULL, lease_expires_at = NULL \
-             WHERE id = ?1 AND lease_owner = ?2",
-            params![epic_id, worker_id],
-        )
-        .await;
+/// Spawn the per-claimed-epic heartbeat task (D4). See
+/// [`spawn_heartbeat_generic`] for the shared mechanics and
+/// [`spawn_task_heartbeat`] for the `task`-table mirror (T-550).
+fn spawn_heartbeat(
+    conn: Connection,
+    epic_id: String,
+    worker_id: String,
+    period: Duration,
+    lease_ttl_secs: u64,
+    lease: LeaseHandle,
+) -> JoinHandle<()> {
+    spawn_heartbeat_generic(conn, LeaseTable::Epic, epic_id, worker_id, period, lease_ttl_secs, lease)
+}
+
+/// The `task`-table mirror of [`spawn_heartbeat`] (T-550): a claimed
+/// standalone task's lease is fenced and renewed by the identical mechanism,
+/// just against `task.lease_owner`/`task.lease_expires_at`.
+fn spawn_task_heartbeat(
+    conn: Connection,
+    task_id: String,
+    worker_id: String,
+    period: Duration,
+    lease_ttl_secs: u64,
+    lease: LeaseHandle,
+) -> JoinHandle<()> {
+    spawn_heartbeat_generic(conn, LeaseTable::Task, task_id, worker_id, period, lease_ttl_secs, lease)
+}
+
+/// The shared guts of [`release_lease`]/[`release_task_lease`]: clear
+/// `lease_owner`/`lease_expires_at` in `table`, fenced by `lease_owner = ?`
+/// so a lease already stolen by another worker (this one was fenced out
+/// mid-run) is never clobbered — releasing is a no-op in that case, which is
+/// correct: the new owner's lease must survive.
+async fn release_lease_generic(conn: &Connection, table: LeaseTable, id: &str, worker_id: &str) {
+    let table_name = table.as_str();
+    let sql = format!(
+        "UPDATE {table_name} SET lease_owner = NULL, lease_expires_at = NULL \
+         WHERE id = ?1 AND lease_owner = ?2"
+    );
+    let result = conn.execute(&sql, params![id, worker_id]).await;
     if let Err(err) = result {
-        tracing::warn!(epic = %epic_id, worker = %worker_id, error = %err, "failed to release lease");
+        tracing::warn!(item = %id, table = table_name, worker = %worker_id, error = %err, "failed to release lease");
     }
 }
 
+/// Release a held epic lease. See [`release_lease_generic`] for the shared
+/// mechanics and [`release_task_lease`] for the `task`-table mirror (T-550).
+async fn release_lease(conn: &Connection, epic_id: &str, worker_id: &str) {
+    release_lease_generic(conn, LeaseTable::Epic, epic_id, worker_id).await
+}
+
+/// The `task`-table mirror of [`release_lease`] (T-550): a claimed
+/// standalone task's lease releases through the identical fenced clear, just
+/// against `task.lease_owner`/`task.lease_expires_at`.
+async fn release_task_lease(conn: &Connection, task_id: &str, worker_id: &str) {
+    release_lease_generic(conn, LeaseTable::Task, task_id, worker_id).await
+}
+
 /// Boot-time lease clear (D4, §13). NULLs every `lease_owner`/
-/// `lease_expires_at` on `epic` **and** `task` (task carries the same columns
-/// since T-500, for the standalone-task claim T-550 adds). Single-server
-/// assumption: nothing else could legitimately hold a lease across a
-/// restart, so this makes every previously-claimed row immediately
-/// claimable rather than making the pool wait out the TTL. Call once at boot,
-/// before [`spawn_pool`].
+/// `lease_expires_at` on `epic` **and** `task` (task has carried the same
+/// columns since T-500, for the standalone-task claim T-550 uses). Clearing
+/// both here — rather than adding a second boot-time call once T-550
+/// landed — is why this function's signature and query pair never had to
+/// change: it was already claim-agnostic. Single-server assumption: nothing
+/// else could legitimately hold a lease across a restart, so this makes
+/// every previously-claimed row immediately claimable rather than making the
+/// pool wait out the TTL. Call once at boot, before [`spawn_pool`].
 pub async fn clear_all_leases(db: &crate::Db) -> Result<(), libsql::Error> {
     let conn = db.conn();
     let epics = conn
@@ -1337,16 +1625,21 @@ enum ClaimOutcome {
 }
 
 /// One claim attempt and, if it succeeds, the full claimed-item lifecycle:
-/// reset orphaned tasks → start the heartbeat → run the pipeline body → stop
-/// the heartbeat → release the lease. The release happens on **every** exit
-/// path, including a panic in the body, because the body runs in its own
-/// `tokio::spawn`'d task — a panic there resolves the `JoinHandle` as `Err`
-/// rather than unwinding into this long-lived loop, so the release/heartbeat-
-/// abort below always runs.
+/// claim (epic first, standalone-task fallback — [`claim_next`], T-550) →
+/// run whichever [`WorkItem`] came back → `ClaimOutcome::Claimed`. This is
+/// the one loop the T-550 AC asks for: a single dispatch point rather than a
+/// second, parallel `try_claim_and_run`-shaped function for standalone work.
+/// See [`run_claimed_epic`]/[`run_claimed_standalone`] for the two lifecycles
+/// this delegates to and the module doc's "T-550" section for why splitting
+/// into two small functions here (rather than one function with an `if`
+/// keeping the borrow of `conn` and the lease alive across both arms) reads
+/// clearer without actually duplicating anything — every step either arm
+/// takes bottoms out in the shared [`claim_row`]/[`renew_lease_generic`]/
+/// [`spawn_heartbeat_generic`]/[`release_lease_generic`] core.
 async fn try_claim_and_run(state: &AppState, worker_id: &str) -> ClaimOutcome {
     let conn = state.db.conn();
 
-    let claimed = match claim_epic(conn, worker_id, state.config.executor.lease_ttl_secs).await {
+    let claimed = match claim_next(conn, worker_id, state.config.executor.lease_ttl_secs).await {
         Ok(Some(claimed)) => claimed,
         Ok(None) => return ClaimOutcome::EmptyOrError,
         Err(err) => {
@@ -1355,6 +1648,26 @@ async fn try_claim_and_run(state: &AppState, worker_id: &str) -> ClaimOutcome {
         }
     };
 
+    match claimed {
+        WorkItem::Epic(claimed) => run_claimed_epic(state, conn, worker_id, claimed).await,
+        WorkItem::Standalone(claimed) => run_claimed_standalone(state, conn, worker_id, claimed).await,
+    }
+
+    ClaimOutcome::Claimed
+}
+
+/// The claimed-**epic** half of [`try_claim_and_run`]'s dispatch: reset
+/// orphaned tasks → start the epic heartbeat → run [`run_epic_pipeline_inner`]
+/// → stop the heartbeat → release the lease. Byte-for-byte the same sequence
+/// this module ran inline before T-550 split it out of `try_claim_and_run` so
+/// the standalone counterpart ([`run_claimed_standalone`]) could sit next to
+/// it instead of behind an `if`/`else` sharing one function's local
+/// variables. The release happens on **every** exit path, including a panic
+/// in the body, because the body runs in its own `tokio::spawn`'d task — a
+/// panic there resolves the `JoinHandle` as `Err` rather than unwinding into
+/// the long-lived worker loop, so the release/heartbeat-abort below always
+/// runs.
+async fn run_claimed_epic(state: &AppState, conn: &Connection, worker_id: &str, claimed: ClaimedEpic) {
     if let Err(err) = reset_orphaned_tasks(conn, &claimed.id).await {
         tracing::warn!(
             epic = %claimed.id,
@@ -1397,8 +1710,79 @@ async fn try_claim_and_run(state: &AppState, worker_id: &str) -> ClaimOutcome {
             "claimed-epic body panicked; lease released for re-claim"
         );
     }
+}
 
-    ClaimOutcome::Claimed
+/// The claimed-**standalone-task** half of [`try_claim_and_run`]'s dispatch
+/// (T-550): start the task heartbeat → run [`run_standalone_pipeline_inner`]
+/// → stop the heartbeat → release the lease. No `reset_orphaned_tasks`
+/// equivalent — a standalone task has no sub-tasks of its own to orphan —
+/// and no `tokio::spawn` isolation the way [`run_claimed_epic`] uses one:
+/// [`run_standalone_pipeline_inner`] does no real work yet (see its own doc),
+/// so there is nothing here that could panic in a way worth isolating; T-551
+/// should reconsider this once that function actually drives a workspace and
+/// an agent stage the way the epic body does.
+async fn run_claimed_standalone(state: &AppState, conn: &Connection, worker_id: &str, claimed: ClaimedTask) {
+    let lease = LeaseHandle::new();
+    let heartbeat = spawn_task_heartbeat(
+        conn.clone(),
+        claimed.id.clone(),
+        worker_id.to_string(),
+        Duration::from_secs(state.config.executor.heartbeat_secs.max(1)),
+        state.config.executor.lease_ttl_secs,
+        lease.clone(),
+    );
+
+    run_standalone_pipeline_inner(state, &claimed.id, &lease).await;
+
+    heartbeat.abort();
+    release_task_lease(conn, &claimed.id, worker_id).await;
+}
+
+/// The claimed-standalone-task pipeline body — the **T-551 hand-off seam**
+/// (D21: tracer-bullet first, then thicken), named and documented here the
+/// way [`pr::SUMMARY_MARKER`] names T-560's hand-off point rather than
+/// leaving it to be rediscovered by a restructure later.
+///
+/// T-550's job was the claim/lease/heartbeat/ordering machinery around a
+/// standalone claim (see the module doc's "T-550" section) — not the
+/// pipeline itself. Running one for real needs three things that do not
+/// exist yet and are explicitly T-551's to build: a standalone workspace
+/// (`workspace::provision_epic_workspace`'s mirror, at
+/// `<clone_root>/tasks/<task id>`, §2.8), a "run just this one task" selector
+/// in place of [`run_epic_pipeline_inner`]'s DAG walk, and a standalone
+/// finalize (§2.8 branch/PR naming, writing `task.pr_url`/`pr_number`
+/// instead of the epic's). [`fail_item`]/[`FailureContext`] also assume an
+/// epic to `Block`, which a standalone failure has none of ("there is no
+/// epic to Block" is T-551's own AC) — deliberately left as T-551's problem
+/// too rather than widening `FailureContext.epic_id` to an `Option` now on
+/// spec alone, before the standalone failure path it would serve exists to
+/// exercise it.
+///
+/// So this function does the one thing it safely *can* today: confirm the
+/// claim/lease are real (logged, not asserted — a lost lease here is exactly
+/// as unremarkable as one lost between any two other steps in this module)
+/// and return. It intentionally does **not** touch `task`'s row, which means
+/// a second claim attempt could immediately re-claim the same task the
+/// instant [`run_claimed_standalone`] releases its lease below — harmless
+/// for the single, bounded claim attempts this task's own tests make
+/// ([`claim_task`]/[`try_claim_and_run`] called directly, never through
+/// [`worker_loop`]'s continuously-draining inner loop), but **not** a
+/// well-behaved body to leave running inside the live pool: T-551 must
+/// replace it with something that moves the task to a terminal (or at least
+/// not-immediately-reclaimable) state before any standalone task can ever
+/// legitimately reach `status = 'InProgress'` in production (today nothing
+/// does — `POST /tasks/{id}/run` is T-551's own addition, per MILESTONE_2
+/// §8's T-550 scope note).
+async fn run_standalone_pipeline_inner(_state: &AppState, task_id: &str, lease: &LeaseHandle) {
+    if lease.is_lost() {
+        tracing::debug!(task = %task_id, "standalone claim: lease lost before the pipeline body ran");
+        return;
+    }
+    tracing::debug!(
+        task = %task_id,
+        "standalone claim observed with a live lease; the pipeline itself \
+         (workspace, implement/test-gate/review, finalize) lands in T-551"
+    );
 }
 
 /// Run the claimed-epic pipeline body to completion on `epic_id`,
@@ -4274,6 +4658,56 @@ mod tests {
         (row.get(0).unwrap(), row.get(1).unwrap())
     }
 
+    /// The `task`-table mirror of [`epic_lease`] (T-550).
+    async fn task_lease(state: &AppState, task_id: &str) -> (Option<String>, Option<i64>) {
+        let conn = state.db.conn();
+        let mut rows = conn
+            .query(
+                "SELECT lease_owner, lease_expires_at FROM task WHERE id = ?1",
+                params![task_id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        (row.get(0).unwrap(), row.get(1).unwrap())
+    }
+
+    /// Create a **standalone** task (`epic_id IS NULL`, T-550/D17) directly
+    /// via SQL, with whatever `status` the test needs — mirrors [`seed_task`]
+    /// but for the claim/lease tests that need a task with no parent epic at
+    /// all rather than one seeded `Todo` under an epic.
+    async fn seed_standalone_task(
+        state: &AppState,
+        project_id: &str,
+        title: &str,
+        status: &str,
+    ) -> String {
+        let conn = state.db.conn();
+        let id = ulid::Ulid::new().to_string();
+        let now = now_ms();
+        conn.execute(
+            "INSERT INTO task (id, epic_id, project_id, title, status, created_at, updated_at) \
+             VALUES (?1, NULL, ?2, ?3, ?4, ?5, ?5)",
+            params![id.clone(), project_id, title, status, now],
+        )
+        .await
+        .unwrap();
+        id
+    }
+
+    /// A single task's `status` column, by id — used where a test needs to
+    /// check one standalone task (which has no `epic_id` for [`task_statuses`]
+    /// to key its map by).
+    async fn single_task_status(state: &AppState, task_id: &str) -> String {
+        let mut rows = state
+            .db
+            .conn()
+            .query("SELECT status FROM task WHERE id = ?1", params![task_id])
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    }
+
     // ---- run_epic_pipeline direct tests: real DAG walk (T-513) ----
     //
     // These use the bare `test_app()` (a `ScriptedTaskAgent` with no scripted
@@ -4658,6 +5092,322 @@ mod tests {
         seed_epic(&state, &project_id, "InProgress").await;
 
         clear_all_leases(&state.db).await.unwrap();
+    }
+
+    // ---- T-550: WorkItem unification — the standalone claim ----
+    //
+    // Mirrors the T-510 claim/heartbeat/fencing tests above, one table over:
+    // every test here proves `claim_task`/`renew_task_lease_once`/
+    // `spawn_task_heartbeat` honor the identical rules `claim_epic`/
+    // `renew_lease_once`/`spawn_heartbeat` already do, plus the one genuinely
+    // new behavior T-550 adds — `claim_next`/`try_claim_and_run` trying an
+    // epic before ever falling back to a standalone task. None of these go
+    // through `spawn_pool`/`worker_loop`'s continuously-draining loop — see
+    // `run_standalone_pipeline_inner`'s own doc for why that would be unsafe
+    // against a task this module's pipeline body doesn't yet move out of
+    // `InProgress`. `boot_clears_all_leases_on_epic_and_task` above already
+    // covers this AC's boot-time-clear clause (true since T-510, unchanged
+    // by this task).
+
+    /// Many workers racing the claim SQL against one enqueued standalone
+    /// task: exactly one succeeds — the `claim_task` counterpart to
+    /// `concurrent_claims_on_one_epic_yield_exactly_one_success`.
+    #[tokio::test]
+    async fn concurrent_claims_on_one_standalone_task_yield_exactly_one_success() {
+        let (state, _app) = test_app().await;
+        let project_id = seed_project(&state).await;
+        let task_id = seed_standalone_task(&state, &project_id, "Standalone", "InProgress").await;
+
+        let mut handles = Vec::new();
+        for i in 0..25 {
+            let db = state.db.clone();
+            handles.push(tokio::spawn(async move {
+                claim_task(db.conn(), &format!("racer-{i}"), 30).await
+            }));
+        }
+
+        let mut successes = 0;
+        let mut winner = None;
+        for h in handles {
+            if let Ok(Ok(Some(claimed))) = h.await {
+                successes += 1;
+                winner = Some(claimed.id);
+            }
+        }
+        assert_eq!(successes, 1, "exactly one racer must claim the standalone task");
+        assert_eq!(winner.as_deref(), Some(task_id.as_str()));
+    }
+
+    /// An expired standalone-task lease is re-claimable by a new owner — the
+    /// `claim_task` counterpart to `expired_lease_is_reclaimable_and_resets_orphaned_tasks`
+    /// (minus the orphan-reset clause: a standalone task has no sub-tasks).
+    #[tokio::test]
+    async fn expired_standalone_lease_is_reclaimable() {
+        let (state, _app) = test_app().await;
+        let project_id = seed_project(&state).await;
+        let task_id = seed_standalone_task(&state, &project_id, "Standalone", "InProgress").await;
+
+        let conn = state.db.conn();
+        let past = now_ms() - 60_000;
+        conn.execute(
+            "UPDATE task SET lease_owner = 'dead-worker', lease_expires_at = ?1 WHERE id = ?2",
+            params![past, task_id.clone()],
+        )
+        .await
+        .unwrap();
+
+        let claimed = claim_task(conn, "new-worker", 30).await.unwrap();
+        let claimed = claimed.expect("expired standalone lease must be reclaimable");
+        assert_eq!(claimed.id, task_id);
+
+        let (owner, _expires) = task_lease(&state, &task_id).await;
+        assert_eq!(owner.as_deref(), Some("new-worker"));
+    }
+
+    /// A live standalone-task lease is NOT re-claimable — the negative case
+    /// alongside the expired-lease test above.
+    #[tokio::test]
+    async fn live_standalone_lease_is_not_reclaimable() {
+        let (state, _app) = test_app().await;
+        let project_id = seed_project(&state).await;
+        let task_id = seed_standalone_task(&state, &project_id, "Standalone", "InProgress").await;
+
+        let conn = state.db.conn();
+        let future = now_ms() + 60_000;
+        conn.execute(
+            "UPDATE task SET lease_owner = 'alive-worker', lease_expires_at = ?1 WHERE id = ?2",
+            params![future, task_id.clone()],
+        )
+        .await
+        .unwrap();
+
+        let claimed = claim_task(conn, "other-worker", 30).await.unwrap();
+        assert!(claimed.is_none(), "a live standalone lease must not be reclaimable");
+    }
+
+    /// A standalone task with `epic_id` set (owned by an epic's DAG walk) is
+    /// never picked up by `claim_task`, even if some other bug left it
+    /// `InProgress` with no lease — the `AND epic_id IS NULL` predicate is
+    /// the whole reason `claim_task` exists as a distinct query rather than
+    /// `claim_epic`'s WHERE clause with the table swapped.
+    #[tokio::test]
+    async fn claim_task_never_picks_up_an_epic_owned_task() {
+        let (state, _app) = test_app().await;
+        let project_id = seed_project(&state).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let a = seed_task(&state, &epic_id, &project_id, "A").await;
+        set_task_status(&state, &a, "InProgress").await;
+
+        let claimed = claim_task(state.db.conn(), "worker", 30).await.unwrap();
+        assert!(claimed.is_none(), "an epic-owned task must never satisfy the standalone claim");
+    }
+
+    /// A heartbeat renewal against a standalone task's lease already stolen
+    /// by another worker reports the loss directly — the `task`-table mirror
+    /// of `heartbeat_against_stolen_lease_reports_lost`.
+    #[tokio::test]
+    async fn standalone_heartbeat_against_stolen_lease_reports_lost() {
+        let (state, _app) = test_app().await;
+        let project_id = seed_project(&state).await;
+        let task_id = seed_standalone_task(&state, &project_id, "Standalone", "InProgress").await;
+        let conn = state.db.conn();
+
+        conn.execute(
+            "UPDATE task SET lease_owner = 'me', lease_expires_at = ?1 WHERE id = ?2",
+            params![now_ms() + 60_000, task_id.clone()],
+        )
+        .await
+        .unwrap();
+        conn.execute(
+            "UPDATE task SET lease_owner = 'thief', lease_expires_at = ?1 WHERE id = ?2",
+            params![now_ms() + 60_000, task_id.clone()],
+        )
+        .await
+        .unwrap();
+
+        let still_held = renew_task_lease_once(conn, &task_id, "me", 30).await.unwrap();
+        assert!(!still_held, "renewal against a stolen standalone lease must report 0 rows / lost");
+
+        let (owner, _) = task_lease(&state, &task_id).await;
+        assert_eq!(owner.as_deref(), Some("thief"));
+    }
+
+    /// A live standalone-task lease renews successfully — the positive case.
+    #[tokio::test]
+    async fn standalone_heartbeat_against_live_lease_succeeds() {
+        let (state, _app) = test_app().await;
+        let project_id = seed_project(&state).await;
+        let task_id = seed_standalone_task(&state, &project_id, "Standalone", "InProgress").await;
+        let conn = state.db.conn();
+        conn.execute(
+            "UPDATE task SET lease_owner = 'me', lease_expires_at = ?1 WHERE id = ?2",
+            params![now_ms() + 60_000, task_id.clone()],
+        )
+        .await
+        .unwrap();
+
+        let still_held = renew_task_lease_once(conn, &task_id, "me", 30).await.unwrap();
+        assert!(still_held);
+    }
+
+    /// End-to-end wiring of `spawn_task_heartbeat` + `LeaseHandle`: a stolen
+    /// standalone-task lease flips the shared handle to lost within one
+    /// heartbeat period — the `task`-table mirror of
+    /// `spawn_heartbeat_flags_lease_handle_lost_on_theft`.
+    #[tokio::test]
+    async fn spawn_task_heartbeat_flags_lease_handle_lost_on_theft() {
+        let (state, _app) = test_app().await;
+        let project_id = seed_project(&state).await;
+        let task_id = seed_standalone_task(&state, &project_id, "Standalone", "InProgress").await;
+        let conn = state.db.conn();
+        conn.execute(
+            "UPDATE task SET lease_owner = 'me', lease_expires_at = ?1 WHERE id = ?2",
+            params![now_ms() + 60_000, task_id.clone()],
+        )
+        .await
+        .unwrap();
+
+        let lease = LeaseHandle::new();
+        let handle = spawn_task_heartbeat(
+            state.db.conn().clone(),
+            task_id.clone(),
+            "me".to_string(),
+            Duration::from_millis(15),
+            30,
+            lease.clone(),
+        );
+
+        conn.execute(
+            "UPDATE task SET lease_owner = 'thief' WHERE id = ?1",
+            params![task_id.clone()],
+        )
+        .await
+        .unwrap();
+
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if lease.is_lost() {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("standalone heartbeat never observed the stolen lease");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        handle.abort();
+    }
+
+    // ---- T-550: epic claims tried first ----
+
+    /// `claim_next` with both an `InProgress` epic and an `InProgress`
+    /// standalone task queued must return the epic — the literal AC clause
+    /// "epic claims are tried first so standalone work never starves an
+    /// epic". Run many times (fresh state each time is unnecessary; the
+    /// claim is deterministic, not racy, since only one call happens) is
+    /// unnecessary — `claim_epic`'s own SELECT ... LIMIT 1 always wins ties
+    /// deterministically by `updated_at`, and this test seeds only one of
+    /// each, so a single call already proves the order.
+    #[tokio::test]
+    async fn claim_next_prefers_a_queued_epic_over_a_queued_standalone_task() {
+        let (state, _app) = test_app().await;
+        let project_id = seed_project(&state).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let task_id = seed_standalone_task(&state, &project_id, "Standalone", "InProgress").await;
+
+        let claimed = claim_next(state.db.conn(), "worker", 30)
+            .await
+            .unwrap()
+            .expect("something must be claimable");
+        match claimed {
+            WorkItem::Epic(c) => assert_eq!(c.id, epic_id),
+            WorkItem::Standalone(c) => panic!(
+                "expected the queued epic {epic_id} to be claimed first, got standalone task {}",
+                c.id
+            ),
+        }
+
+        // The standalone task must still be untouched — genuinely not
+        // starved, not just "not returned this one time".
+        let (owner, _) = task_lease(&state, &task_id).await;
+        assert!(owner.is_none(), "the standalone task must not have been claimed at all");
+    }
+
+    /// With no epic queued, `claim_next` falls back to the standalone task —
+    /// the fallback half of the same AC clause.
+    #[tokio::test]
+    async fn claim_next_falls_back_to_a_standalone_task_when_no_epic_is_queued() {
+        let (state, _app) = test_app().await;
+        let project_id = seed_project(&state).await;
+        let task_id = seed_standalone_task(&state, &project_id, "Standalone", "InProgress").await;
+
+        let claimed = claim_next(state.db.conn(), "worker", 30)
+            .await
+            .unwrap()
+            .expect("the standalone task must be claimable");
+        match claimed {
+            WorkItem::Standalone(c) => assert_eq!(c.id, task_id),
+            WorkItem::Epic(c) => panic!("expected the standalone task, got epic {}", c.id),
+        }
+    }
+
+    /// With nothing queued at all, `claim_next` returns `None` — the same
+    /// "empty queue" contract `claim_epic` alone already had.
+    #[tokio::test]
+    async fn claim_next_returns_none_when_nothing_is_queued() {
+        let (state, _app) = test_app().await;
+        assert!(claim_next(state.db.conn(), "worker", 30).await.unwrap().is_none());
+    }
+
+    /// `try_claim_and_run` itself — not just `claim_next` in isolation —
+    /// prefers a queued epic over a queued standalone task. A single,
+    /// bounded call (never `worker_loop`'s continuously-draining inner loop —
+    /// see `run_standalone_pipeline_inner`'s doc for why that distinction
+    /// matters): the epic here has no ready task, so `run_claimed_epic`'s own
+    /// walk finalizes it as `Completed` immediately, proving the *real*
+    /// dispatch function — the one `worker_loop` actually calls — makes the
+    /// same choice `claim_next`'s own direct test already proved the query
+    /// makes.
+    #[tokio::test]
+    async fn try_claim_and_run_prefers_the_epic_end_to_end() {
+        let (state, _app) = test_app().await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let task_id = seed_standalone_task(&state, &project_id, "Standalone", "InProgress").await;
+
+        try_claim_and_run(&state, "worker").await;
+
+        // The epic (no tasks at all) went straight to Completed via
+        // finalize_epic; the standalone task was never touched at all — not
+        // claimed (no lease) and not even re-fetched into `InProgress`'s
+        // sibling states, still exactly the `InProgress` this test seeded.
+        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        let (owner, _) = task_lease(&state, &task_id).await;
+        assert!(owner.is_none(), "the standalone task must not have been claimed");
+        assert_eq!(single_task_status(&state, &task_id).await, "InProgress");
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// `try_claim_and_run` claims and runs the standalone-task branch when
+    /// that is the only thing queued: the lease is taken, held for the
+    /// (currently no-op, T-551-pending) pipeline body, and released again —
+    /// proving `run_claimed_standalone`'s wiring end to end, not just its
+    /// pieces in isolation.
+    #[tokio::test]
+    async fn try_claim_and_run_claims_and_releases_a_standalone_task() {
+        let (state, _app) = test_app().await;
+        let project_id = seed_project(&state).await;
+        let task_id = seed_standalone_task(&state, &project_id, "Standalone", "InProgress").await;
+
+        try_claim_and_run(&state, "worker").await;
+
+        // The pipeline body does no real work yet (T-551), but the claim
+        // lifecycle must still be exact: leased, then released, on the way
+        // through `run_claimed_standalone`.
+        let (owner, expires) = task_lease(&state, &task_id).await;
+        assert!(owner.is_none(), "the lease must be released once the (no-op) body returns");
+        assert!(expires.is_none());
     }
 
     // ---- T-510: pool concurrency ----
