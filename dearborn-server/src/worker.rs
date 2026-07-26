@@ -608,7 +608,7 @@
 //! A full round (fix → test-gate-with-its-own-retries → commit → re-review)
 //! is easily the longest stretch of agent turns anywhere in this walk.
 //! [`run_review_fix_converge`] re-checks `lease.is_lost()` and
-//! `epic_still_in_progress` at the top of every round, immediately before
+//! `container_still_in_progress` at the top of every round, immediately before
 //! the fix stage, immediately before the post-fix test gate, and
 //! immediately before the commit — the same pattern T-522's fix loop and
 //! T-530's review call already established, just applied at every one of
@@ -1141,6 +1141,156 @@
 //! already true and already tested before this task started — [`clear_all_leases`]
 //! has cleared both tables since T-510, once T-500's migration put the lease
 //! columns on `task` in the first place — so nothing there needed to change.
+//!
+//! ## T-551: run a standalone task end-to-end (§8, D17)
+//!
+//! T-550 built the claim/lease/heartbeat seam and left [`run_standalone_pipeline_inner`]
+//! as a documented stub, naming exactly three things as this task's to build:
+//! a standalone workspace, a "run just this one task" selector in place of
+//! the DAG walk, and a `FailureContext`/`fail_item` that can express "no epic
+//! to Block." This section is that design, plus the two judgment calls
+//! MILESTONE_2 §8 left open (the retry contract, cancellation's scope).
+//!
+//! ### Generalizing, not forking, the pipeline
+//!
+//! [`process_one_task`] — the T-513/T-522/T-530/T-531/T-532 sequence a single
+//! task walks (implement → test gate → commit → review-or-verify-complete →
+//! `Done`) — took an epic-shaped trio (`epic_id: &str`, `epic: &Epic`,
+//! `dag`/`ready: &DagNode`) through T-550. All three existed only to derive
+//! things a standalone task either has directly (its own spec fields, now
+//! read off a plain `&Task` — an epic's `DagNode::task` and a standalone
+//! claim's fetched row are the identical type) or doesn't have at all (an
+//! epic background, a sibling manifest — both already `Option`/slice-shaped
+//! in `spec::TaskContext`, D17, since T-502). Swapping those three params for
+//! `task: &Task`, `epic_ctx: Option<EpicContext>`, and `siblings:
+//! &[SiblingTask]` let one function serve both claims: `epic_id` itself is no
+//! longer even a separate argument — it's `task.epic_id.as_deref()`, since
+//! that column **is** the epic/standalone distinction. Every helper
+//! `process_one_task` calls ([`commit_if_dirty`], [`run_test_gate_loop`],
+//! [`run_verdict_stage`], [`run_review_fix_converge`], [`run_verify_complete`],
+//! [`route_stage_failure`], [`run_preflight`]) had its own `epic_id: &str`
+//! widened to `Option<&str>` the same way — a mechanical, call-site-preserving
+//! change for every existing (epic) caller, which is why none of Phase 1–4's
+//! tests needed their assertions touched, only their call sites recompiled.
+//! [`container_still_in_progress`] (renamed from `epic_still_in_progress`) is
+//! the one function whose *logic* actually branches: `Some(epic_id)` asks the
+//! epic row exactly as before; `None` asks the standalone task's own row,
+//! since a standalone task has no separate container to ask — it **is** its
+//! own claimable container (the same duality [`FailureContext`] documents).
+//!
+//! [`run_standalone_pipeline_inner`] is the new, flatter orchestration shell
+//! this generalization makes possible: provision ([`workspace::provision_task_workspace`])
+//! → preflight ([`run_preflight`]) → [`process_one_task`] → finalize
+//! ([`finalize_task`]) — [`run_epic_pipeline_inner`]'s exact shape minus the
+//! DAG walk (one task, not several to pick a "ready" one from) and minus
+//! `reset_orphaned_tasks` (no sub-tasks to orphan).
+//!
+//! ### Workspace provisioning: one body, two containers
+//!
+//! `workspace.rs`'s [`WorkspaceContainer`] enum (`Epic` | `Task`) plus a
+//! shared `provision_workspace` core is the identical move T-550 made for
+//! claim/lease/heartbeat (`LeaseTable`): [`workspace::provision_epic_workspace`]
+//! keeps its exact pre-T-551 signature and behavior (every T-511+ test still
+//! passes unchanged), and [`workspace::provision_task_workspace`] is the
+//! second real caller of the shared core, not a hand-copied second
+//! clone/reattach/setup sequence. `task_workspace_path`/`task_branch_name`
+//! supply §2.8's `<clone_root>/tasks/<task id>` and
+//! `dearborn/task-<slug>-<id>` shapes; everything else — the per-project
+//! refresh lock, the reattach-vs-reclone decision, `setup_cmd`, persisting a
+//! branch name once — is one function, run for both.
+//!
+//! ### One PR-opening core, two finalizers
+//!
+//! [`push_and_open_pr`] is [`finalize_epic`]'s pre-T-551 push/open-PR
+//! sequence, factored out so [`finalize_task`] calls the identical code
+//! rather than a copy. What's left in each caller is only what genuinely
+//! differs: which row's checklist builds the PR body
+//! ([`build_task_checklist`]'s DAG walk vs. [`build_standalone_checklist`]'s
+//! one-item list), and which row's terminal write persists the opened PR.
+//! That terminal write is the one place a standalone task's story actually
+//! diverges from an epic's: an epic has `Completed`, a status genuinely
+//! distinct from any task's own `Done` (the epic and its tasks are separate
+//! rows tracking separate things). A task's status enum has no `Completed`
+//! value — [`process_one_task`]'s own step 6 already left it `Done` before
+//! `finalize_task` ever runs, and opening the PR doesn't change what "done"
+//! means, only where to find the PR. `finalize_task`'s persisting `UPDATE` is
+//! fenced on `WHERE status = 'Done'`, mirroring `finalize_epic`'s own `WHERE
+//! status = 'InProgress'` fence.
+//!
+//! ### `FailureContext.epic_id: Option<&str>` — no epic to Block
+//!
+//! Every §2.3 reason a standalone task can fail with — including
+//! `preflight_red`/`setup_failed`/`workspace_error`, which for an epic have
+//! no task at fault yet (the DAG walk hasn't started) — names the standalone
+//! task itself (`task_id: Some(_)`), because there is only one row to be
+//! "the item that fails." [`fail_item`]'s `epic_id: None` branch skips
+//! everything epic-shaped (the fenced `Blocked` write, `dag_updated`,
+//! `epic_updated`) and does the two things that still apply: the task's own
+//! `Failed` write (unconditional, unchanged), and — since there's no epic to
+//! fetch a `project_id` from — a direct task fetch so `board_updated` still
+//! publishes and [`push_on_failure`] still runs. There is no "did this call
+//! win a race" gate on the standalone side (`took_epic`'s job on the epic
+//! side): a standalone task has no sibling ever concurrently touching the
+//! same row, so every standalone failure call pushes unconditionally.
+//!
+//! ### Retry: `Failed → InProgress`, not `Failed → Todo` (a T-541 contract
+//! ### revision)
+//!
+//! T-541 shipped `POST /tasks/{id}/retry` returning a standalone task to
+//! `Todo`, its own doc explicit that resuming it was "T-551's job." Taken
+//! literally that leaves a dead end: [`claim_task`]'s predicate only ever
+//! selects `status = 'InProgress'` (§2.4), so a task sitting in `Todo` is
+//! never picked up by any worker — retry would need a *second*, human-driven
+//! `POST /tasks/{id}/run` to actually resume anything, silently, with no
+//! error telling anyone that "retried" didn't mean "resumed." T-551 corrects
+//! this: for a standalone task specifically, `retry_task`'s single fenced
+//! `UPDATE` now writes `status = 'InProgress'` (via a `CASE WHEN epic_id IS
+//! NULL` in the same statement that writes `Todo` for an epic-scoped task),
+//! clears `failure_reason`, and clears the lease columns defensively — the
+//! literal mirror of what the epic branch already does to *its* container
+//! (`Blocked → InProgress`, `blocked_reason` cleared, lease cleared). The
+//! reasoning: a standalone task is simultaneously the claimable item and the
+//! unit of work, so "restore the claimable state" and "reset the unit of
+//! work" are the same write, not two — unlike an epic, where those are two
+//! different rows and thus two different statuses (task `Todo`, epic
+//! `InProgress`). `tasks::tests::retry_task_endpoint_standalone_task_returns_directly_to_in_progress`
+//! (renamed from `..._has_no_epic_to_unblock`, its assertion updated from
+//! `Todo` to `InProgress`) is that HTTP-level proof; `state.notify.notify_waiters()`
+//! (already called unconditionally) is what actually wakes a worker to
+//! reclaim it — this module's own test
+//! `retried_standalone_task_is_reclaimed_and_rerun` proves the whole loop
+//! actually resumes, not just that the HTTP response looks right.
+//!
+//! ### Cancellation: explicitly out of scope
+//!
+//! T-542's cancel path is `lanes::set_epic_lane`'s `InProgress → Cancelled`
+//! transition — an epic-only endpoint. There is no `POST /tasks/{id}/lane` or
+//! any other surface that could move a standalone task to `Cancelled`, so
+//! nothing today ever looks a standalone task's id up in
+//! `state.cancel_registry` expecting to find a live handle worth killing.
+//! T-561's own AC (client control surface) names "Cancel on in-flight
+//! **epics**" only — this milestone never asked for a standalone-task cancel
+//! surface at all, in Phase 4 or here. [`route_stage_failure`]/
+//! [`handle_cancelled_task`] are still widened to accept `epic_id:
+//! Option<&str>` for consistency with every other failure-adjacent function
+//! in this module, and degrade correctly if a future task ever does wire up
+//! a standalone cancel (task → `Todo`, `board_updated` in place of
+//! `dag_updated`) — but building the HTTP surface itself is left alone
+//! deliberately, not half-built.
+//!
+//! ### `board_updated` on every transition
+//!
+//! `Task` (`tasks.rs`) already serializes `pr_url`/`failure_reason` (T-500),
+//! and `board.rs`'s `Board.tasks` is exactly that struct — so a standalone
+//! task's PR link and failure reason reach the board for free once the
+//! underlying row has them; no board-side change was needed. What *did* need
+//! adding was making sure every standalone status transition actually
+//! publishes: `POST /tasks/{id}/run` (below) publishes on `Todo → InProgress`;
+//! [`process_one_task`]'s own `Done` step publishes when `epic_id` is `None`
+//! (an epic-owned task's `Done` doesn't — it's not board-visible on its own,
+//! the epic's lane is); [`fail_item`]'s standalone branch publishes on
+//! `Failed`; `retry_task` already published on every transition it makes
+//! (unchanged); [`finalize_task`] publishes once the PR persists.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -1715,12 +1865,17 @@ async fn run_claimed_epic(state: &AppState, conn: &Connection, worker_id: &str, 
 /// The claimed-**standalone-task** half of [`try_claim_and_run`]'s dispatch
 /// (T-550): start the task heartbeat → run [`run_standalone_pipeline_inner`]
 /// → stop the heartbeat → release the lease. No `reset_orphaned_tasks`
-/// equivalent — a standalone task has no sub-tasks of its own to orphan —
-/// and no `tokio::spawn` isolation the way [`run_claimed_epic`] uses one:
-/// [`run_standalone_pipeline_inner`] does no real work yet (see its own doc),
-/// so there is nothing here that could panic in a way worth isolating; T-551
-/// should reconsider this once that function actually drives a workspace and
-/// an agent stage the way the epic body does.
+/// equivalent — a standalone task has no sub-tasks of its own to orphan.
+///
+/// T-551 added the `tokio::spawn` isolation T-550 deliberately left out
+/// (that task's own doc: "there is nothing here that could panic in a way
+/// worth isolating" — true only while the body was a stub). Now that
+/// [`run_standalone_pipeline_inner`] drives a real workspace, real agent
+/// stages, and real git operations, a panic inside it must not be allowed to
+/// unwind into this long-lived worker loop — the identical concern
+/// [`run_claimed_epic`] already isolates its own body against. The task just
+/// stays `InProgress` with a soon-to-expire lease and gets picked up again,
+/// same as an epic's panicking body would.
 async fn run_claimed_standalone(state: &AppState, conn: &Connection, worker_id: &str, claimed: ClaimedTask) {
     let lease = LeaseHandle::new();
     let heartbeat = spawn_task_heartbeat(
@@ -1732,57 +1887,156 @@ async fn run_claimed_standalone(state: &AppState, conn: &Connection, worker_id: 
         lease.clone(),
     );
 
-    run_standalone_pipeline_inner(state, &claimed.id, &lease).await;
+    let body_state = state.clone();
+    let task_id = claimed.id.clone();
+    let body_lease = lease.clone();
+    let body = tokio::spawn(async move {
+        run_standalone_pipeline_inner(&body_state, &task_id, &body_lease).await;
+    });
+    let result = body.await;
 
     heartbeat.abort();
     release_task_lease(conn, &claimed.id, worker_id).await;
+
+    if let Err(join_err) = result {
+        tracing::error!(
+            task = %claimed.id,
+            worker = %worker_id,
+            error = %join_err,
+            "claimed-standalone-task body panicked; lease released for re-claim"
+        );
+    }
 }
 
-/// The claimed-standalone-task pipeline body — the **T-551 hand-off seam**
-/// (D21: tracer-bullet first, then thicken), named and documented here the
-/// way [`pr::SUMMARY_MARKER`] names T-560's hand-off point rather than
-/// leaving it to be rediscovered by a restructure later.
-///
-/// T-550's job was the claim/lease/heartbeat/ordering machinery around a
-/// standalone claim (see the module doc's "T-550" section) — not the
-/// pipeline itself. Running one for real needs three things that do not
-/// exist yet and are explicitly T-551's to build: a standalone workspace
-/// (`workspace::provision_epic_workspace`'s mirror, at
-/// `<clone_root>/tasks/<task id>`, §2.8), a "run just this one task" selector
-/// in place of [`run_epic_pipeline_inner`]'s DAG walk, and a standalone
-/// finalize (§2.8 branch/PR naming, writing `task.pr_url`/`pr_number`
-/// instead of the epic's). [`fail_item`]/[`FailureContext`] also assume an
-/// epic to `Block`, which a standalone failure has none of ("there is no
-/// epic to Block" is T-551's own AC) — deliberately left as T-551's problem
-/// too rather than widening `FailureContext.epic_id` to an `Option` now on
-/// spec alone, before the standalone failure path it would serve exists to
-/// exercise it.
-///
-/// So this function does the one thing it safely *can* today: confirm the
-/// claim/lease are real (logged, not asserted — a lost lease here is exactly
-/// as unremarkable as one lost between any two other steps in this module)
-/// and return. It intentionally does **not** touch `task`'s row, which means
-/// a second claim attempt could immediately re-claim the same task the
-/// instant [`run_claimed_standalone`] releases its lease below — harmless
-/// for the single, bounded claim attempts this task's own tests make
-/// ([`claim_task`]/[`try_claim_and_run`] called directly, never through
-/// [`worker_loop`]'s continuously-draining inner loop), but **not** a
-/// well-behaved body to leave running inside the live pool: T-551 must
-/// replace it with something that moves the task to a terminal (or at least
-/// not-immediately-reclaimable) state before any standalone task can ever
-/// legitimately reach `status = 'InProgress'` in production (today nothing
-/// does — `POST /tasks/{id}/run` is T-551's own addition, per MILESTONE_2
-/// §8's T-550 scope note).
-async fn run_standalone_pipeline_inner(_state: &AppState, task_id: &str, lease: &LeaseHandle) {
+/// The claimed-standalone-task pipeline body (T-551) — the seam T-550 left
+/// (D21: tracer-bullet first, then thicken; see the module doc's "T-550"
+/// section, and the "T-551" section below for the full design). Provisions
+/// the standalone workspace, runs the preflight gate, runs the task through
+/// the shared [`process_one_task`] sequence, and — on success — finalizes
+/// (push + open PR). Every step mirrors [`run_epic_pipeline_inner`]'s own
+/// shape exactly, one level flatter: no DAG walk (there is exactly one task,
+/// not several to pick a "ready" one from) and no `reset_orphaned_tasks`
+/// (a standalone task has no sub-tasks of its own to orphan).
+async fn run_standalone_pipeline_inner(state: &AppState, task_id: &str, lease: &LeaseHandle) {
+    // Mirrors run_epic_pipeline_inner's own opening guard: only act on a
+    // task that is actually InProgress — a claim racing a retry/edit or
+    // (defensively) any other status must leave the row untouched here
+    // exactly as the epic walk's own status guard does.
+    let workspace = {
+        if lease.is_lost() {
+            return;
+        }
+        let conn = state.db.conn();
+        let Ok(Some(task)) = crate::tasks::fetch_task(conn, task_id).await else {
+            return;
+        };
+        if task.status != "InProgress" {
+            return;
+        }
+        match workspace::provision_task_workspace(state, task_id, &task.project_id).await {
+            Ok(ws) => ws,
+            Err(failure) => {
+                // Re-check the lease right before writing — mirrors the
+                // epic branch's identical belt-and-suspenders check.
+                if !lease.is_lost() {
+                    let (reason, message) = match failure {
+                        ProvisionFailure::Workspace(message) => (FailureReason::WorkspaceError, message),
+                        ProvisionFailure::Setup { message, exit_code } => (
+                            FailureReason::SetupFailed,
+                            format!("exit_code={exit_code:?}: {message}"),
+                        ),
+                    };
+                    fail_item(
+                        state,
+                        FailureContext {
+                            epic_id: None,
+                            // T-551: unlike the epic branch's `task_id: None`
+                            // here (no task exists yet when an epic's
+                            // provisioning fails), a standalone task IS the
+                            // item that fails — every reason, including
+                            // these two, names it (see `FailureContext`'s own
+                            // doc on this invariant).
+                            task_id: Some(task_id),
+                            reason,
+                            message: &message,
+                            push: PushIntent::Skip,
+                        },
+                    )
+                    .await;
+                }
+                return;
+            }
+        }
+    };
+
+    // The preflight gate (T-521/D5), re-fetching the task first exactly as
+    // the epic branch re-fetches the epic — a Cancel/retry landing while
+    // provisioning was in flight must be honored before spending any more
+    // time running `test_cmd`. There is no standalone-task Cancel surface
+    // today (see the module doc's "T-551" section), but re-checking costs
+    // nothing and keeps this function's shape identical to the epic one.
+    {
+        if lease.is_lost() {
+            return;
+        }
+        let conn = state.db.conn();
+        let Ok(Some(task)) = crate::tasks::fetch_task(conn, task_id).await else {
+            return;
+        };
+        if task.status != "InProgress" {
+            return;
+        }
+        let pat = crate::projects::load_decrypted_pat(state, &task.project_id)
+            .await
+            .ok()
+            .flatten();
+        if let PreflightOutcome::Blocked =
+            run_preflight(state, None, Some(task_id), &workspace, pat.as_deref()).await
+        {
+            return;
+        }
+    }
+
+    // Re-fetch once more immediately before driving the task through the
+    // shared pipeline — the same "check right before the long stretch of
+    // agent turns" discipline every pause point in this module already
+    // follows.
     if lease.is_lost() {
-        tracing::debug!(task = %task_id, "standalone claim: lease lost before the pipeline body ran");
         return;
     }
-    tracing::debug!(
-        task = %task_id,
-        "standalone claim observed with a live lease; the pipeline itself \
-         (workspace, implement/test-gate/review, finalize) lands in T-551"
-    );
+    let conn = state.db.conn();
+    let Ok(Some(task)) = crate::tasks::fetch_task(conn, task_id).await else {
+        return;
+    };
+    if task.status != "InProgress" {
+        return;
+    }
+
+    // No epic background, no siblings — a standalone task has neither
+    // (D17; `spec::TaskContext` already treats both as optional/empty by
+    // design). `process_one_task` is the identical T-513/T-522/T-530/T-531/
+    // T-532 sequence an epic-owned task runs; see that function's own doc,
+    // "Generalized for T-551, not duplicated," for how it derives
+    // `epic_id: None` straight from `task.epic_id`.
+    match process_one_task(state, &task, None, &[], &workspace, lease).await {
+        TaskStepOutcome::Stop => return,
+        TaskStepOutcome::Continue => {}
+    }
+
+    // Finalize (push + open PR) — mirrors run_epic_pipeline_inner's own
+    // "all Done -> finalize" hand-off. Re-fetch once more: `process_one_task`
+    // already left `task.status = 'Done'`, but `finalize_task` wants a fresh
+    // row (title/description could theoretically have moved under a
+    // concurrent `PATCH /tasks/{id}`, exactly the same staleness concern
+    // `finalize_epic`'s own fresh `epic` re-fetch avoids).
+    if lease.is_lost() {
+        return;
+    }
+    let conn = state.db.conn();
+    let Ok(Some(task)) = crate::tasks::fetch_task(conn, task_id).await else {
+        return;
+    };
+    finalize_task(state, task_id, &task, &workspace, lease).await;
 }
 
 /// Run the claimed-epic pipeline body to completion on `epic_id`,
@@ -1792,6 +2046,15 @@ async fn run_standalone_pipeline_inner(_state: &AppState, task_id: &str, lease: 
 /// [`run_epic_pipeline_inner`] instead (see [`try_claim_and_run`]).
 pub async fn run_epic_pipeline(state: AppState, epic_id: String) {
     run_epic_pipeline_inner(state, epic_id, LeaseHandle::new()).await;
+}
+
+/// The standalone-task mirror of [`run_epic_pipeline`] (T-551): run
+/// [`run_standalone_pipeline_inner`] to completion on `task_id`,
+/// lease-unaware, for tests that want to drive a standalone claim's pipeline
+/// directly without going through `claim_task`/the pool at all. The pool
+/// itself calls the lease-aware body through [`try_claim_and_run`] instead.
+pub async fn run_standalone_pipeline(state: AppState, task_id: String) {
+    run_standalone_pipeline_inner(&state, &task_id, &LeaseHandle::new()).await;
 }
 
 /// The claimed-epic pipeline body: workspace provisioning (T-511) followed by
@@ -1855,7 +2118,7 @@ async fn run_epic_pipeline_inner(state: AppState, epic_id: String, lease: LeaseH
                     fail_item(
                         &state,
                         FailureContext {
-                            epic_id: &epic_id,
+                            epic_id: Some(&epic_id),
                             task_id: None,
                             reason,
                             message: &message,
@@ -1891,7 +2154,7 @@ async fn run_epic_pipeline_inner(state: AppState, epic_id: String, lease: LeaseH
             .ok()
             .flatten();
         if let PreflightOutcome::Blocked =
-            run_preflight(&state, &epic_id, &workspace, pat.as_deref()).await
+            run_preflight(&state, Some(&epic_id), None, &workspace, pat.as_deref()).await
         {
             return;
         }
@@ -1986,7 +2249,34 @@ async fn run_epic_pipeline_inner(state: AppState, epic_id: String, lease: LeaseH
             return;
         };
 
-        match process_one_task(&state, &epic_id, &epic, &dag, ready, &workspace, &lease).await {
+        // The sibling manifest (D8): every *other* task in the epic,
+        // partitioned Done vs. not by `build_context`. Built here (rather
+        // than inside `process_one_task`, since T-551 generalized that
+        // function to take a plain `siblings: &[SiblingTask]` an epic-less
+        // standalone caller can pass as `&[]`) from the DAG already in hand
+        // — fresher than any separate query, and avoids a second round trip.
+        let siblings: Vec<(String, String, bool)> = dag
+            .nodes
+            .iter()
+            .filter(|n| n.task.id != ready.task.id)
+            .map(|n| (n.task.id.clone(), n.task.title.clone(), n.task.status == "Done"))
+            .collect();
+        let sibling_refs: Vec<SiblingTask> = siblings
+            .iter()
+            .map(|(id, title, done)| SiblingTask {
+                id,
+                title,
+                done: *done,
+            })
+            .collect();
+        let epic_ctx = EpicContext {
+            title: &epic.title,
+            description: epic.description.as_deref(),
+            product_context: epic.product_context.as_deref(),
+            technical_context: epic.technical_context.as_deref(),
+        };
+
+        match process_one_task(&state, &ready.task, Some(epic_ctx), &sibling_refs, &workspace, &lease).await {
             TaskStepOutcome::Continue => continue,
             TaskStepOutcome::Stop => return,
         }
@@ -2032,7 +2322,7 @@ enum TaskStepOutcome {
 async fn commit_if_dirty(
     conn: &Connection,
     task_id: &str,
-    epic_id: &str,
+    epic_id: Option<&str>,
     workspace_path: &std::path::Path,
     subject: &str,
     commit_attempt: i64,
@@ -2047,7 +2337,7 @@ async fn commit_if_dirty(
     // a commit actually happened (D13, see this function's own doc).
     let open = OpenStage {
         task_id: Some(task_id),
-        epic_id: Some(epic_id),
+        epic_id,
         stage: Stage::Commit.as_str(),
         attempt: commit_attempt,
     };
@@ -2068,7 +2358,8 @@ async fn commit_if_dirty(
     Ok(Some(sha))
 }
 
-/// Process exactly one ready task through the full
+/// Process exactly one task (an epic's ready DAG node, or — T-551 — the sole
+/// task of a standalone claim) through the full
 /// T-513/T-522/T-530/T-531/T-532 sequence: record `base_sha`, `Todo →
 /// InProgress`, assemble the D8 prompt, run `Stage::Implement`, the T-522
 /// test-gate/fix loop, `git add -A` + commit-if-dirty
@@ -2081,31 +2372,41 @@ async fn commit_if_dirty(
 /// verdict, and convergence", "Review → fix → re-test → re-commit", and
 /// "Already-complete verification" sections for the rationale behind each
 /// step; this function is the literal implementation of that sequence.
+///
+/// ## Generalized for T-551, not duplicated
+///
+/// Through T-550 this function took `epic_id: &str` plus an `epic: &Epic`,
+/// `dag: &Dag`, and `ready: &DagNode` — three epic-shaped inputs it used only
+/// to derive the task's own spec fields, the epic background, and the
+/// sibling manifest. T-551 needs the identical sequence to run for a
+/// standalone task, which has a `Task` row but no epic, no DAG, and no
+/// siblings — rather than fork a second copy of this (large) function, the
+/// three epic-shaped inputs are replaced with what every step actually
+/// consumes: `task` (a plain `&Task` — an epic's `DagNode::task` and a
+/// standalone claim's directly-fetched row are both exactly this type),
+/// `epic_ctx` (`None` for a standalone task — `spec::TaskContext` already
+/// treats that as "no epic background" by design, D17/T-502), and `siblings`
+/// (an empty slice for a standalone task — likewise already a supported,
+/// tested shape). `epic_id` itself is no longer a separate parameter at all:
+/// it is `task.epic_id.as_deref()`, since that column **is** the
+/// epic/standalone distinction (`Task::epic_id`'s own doc: "`NULL` =>
+/// standalone"). The caller ([`run_epic_pipeline_inner`]'s DAG-walk loop, or
+/// — new — [`run_standalone_pipeline_inner`]) builds whichever of
+/// `epic_ctx`/`siblings` its own shape supports and hands this function a
+/// task row; every line below this point runs identically for both.
 async fn process_one_task(
     state: &AppState,
-    epic_id: &str,
-    epic: &crate::epics::Epic,
-    dag: &crate::tasks::Dag,
-    ready: &crate::tasks::DagNode,
+    task: &crate::tasks::Task,
+    epic_ctx: Option<EpicContext<'_>>,
+    siblings: &[SiblingTask<'_>],
     workspace: &ProvisionedWorkspace,
     lease: &LeaseHandle,
 ) -> TaskStepOutcome {
     let conn = state.db.conn();
-    let task_id = ready.task.id.clone();
-    let task_title = ready.task.title.clone();
-    let task_description = ready.task.description.clone();
-    let task_acceptance = ready.task.acceptance.clone();
-
-    // The sibling manifest (D8): every *other* task in the epic, partitioned
-    // Done vs. not by `build_context` below. Built from the DAG we already
-    // hold (fresher than any separate query could be, and avoids a second
-    // round trip) rather than re-querying the tasks table.
-    let siblings: Vec<(String, String, bool)> = dag
-        .nodes
-        .iter()
-        .filter(|n| n.task.id != task_id)
-        .map(|n| (n.task.id.clone(), n.task.title.clone(), n.task.status == "Done"))
-        .collect();
+    let epic_id: Option<&str> = task.epic_id.as_deref();
+    let task_id: &str = &task.id;
+    let task_title: &str = &task.title;
+    let project_id: &str = &task.project_id;
 
     // 1. base_sha: the workspace's HEAD *before* this task's work — recorded
     //    now, before the implement stage (or its eventual commit) can move
@@ -2119,7 +2420,7 @@ async fn process_one_task(
                     state,
                     FailureContext {
                         epic_id,
-                        task_id: Some(&task_id),
+                        task_id: Some(task_id),
                         reason: FailureReason::AgentError,
                         message: &format!("failed to read base_sha: {err}"),
                         push: PushIntent::Attempt(workspace),
@@ -2137,34 +2438,30 @@ async fn process_one_task(
             "UPDATE task SET status = 'InProgress', base_sha = ?1, updated_at = ?2 WHERE id = ?3",
             // Cloned, not moved: T-530's review stage (step 5b below) needs
             // `base_sha` again, well after this write.
-            params![base_sha.clone(), now, task_id.clone()],
+            params![base_sha.clone(), now, task_id],
         )
         .await;
-    mcp::publish_dag(state, epic_id).await;
+    if let Some(epic_id) = epic_id {
+        mcp::publish_dag(state, epic_id).await;
+    }
+    // A standalone task's own status is what the project board shows
+    // directly (there is no epic lane it moves instead) — this
+    // Todo→InProgress write is already reflected in the row `POST
+    // /tasks/{id}/run` returned, so no `board_updated` is needed here for
+    // that transition specifically; see `run_standalone_pipeline_inner`'s own
+    // doc for where this task's board-visible transitions actually get
+    // published.
 
-    // 2. The D8 prompt: rendered spec + epic background + sibling manifest.
-    let sibling_refs: Vec<SiblingTask> = siblings
-        .iter()
-        .map(|(id, title, done)| SiblingTask {
-            id,
-            title,
-            done: *done,
-        })
-        .collect();
-    let epic_ctx = EpicContext {
-        title: &epic.title,
-        description: epic.description.as_deref(),
-        product_context: epic.product_context.as_deref(),
-        technical_context: epic.technical_context.as_deref(),
-    };
+    // 2. The D8 prompt: rendered spec + epic background (if any) + sibling
+    //    manifest (empty for a standalone task).
     let task_ctx = TaskContext {
         spec: SpecFields {
-            title: &task_title,
-            description: task_description.as_deref(),
-            acceptance: task_acceptance.as_deref(),
+            title: task_title,
+            description: task.description.as_deref(),
+            acceptance: task.acceptance.as_deref(),
         },
-        epic: Some(epic_ctx),
-        siblings: &sibling_refs,
+        epic: epic_ctx,
+        siblings,
         // No cumulative-diff concept for Implement — only Review (T-530)
         // populates this. See spec::TaskContext's doc.
         base_sha: None,
@@ -2184,8 +2481,8 @@ async fn process_one_task(
         state,
         &*state.task_agent,
         AgentStageParams {
-            task_id: &task_id,
-            epic_id: Some(epic_id),
+            task_id,
+            epic_id,
             attempt: 1,
         },
         req,
@@ -2200,7 +2497,7 @@ async fn process_one_task(
                     state,
                     FailureContext {
                         epic_id,
-                        task_id: Some(&task_id),
+                        task_id: Some(task_id),
                         reason: FailureReason::AgentError,
                         message: &format!("implement stage failed to start: {err}"),
                         push: PushIntent::Attempt(workspace),
@@ -2221,7 +2518,7 @@ async fn process_one_task(
         route_stage_failure(
             state,
             epic_id,
-            &task_id,
+            task_id,
             &outcome,
             "implement stage did not complete successfully",
             workspace,
@@ -2231,18 +2528,18 @@ async fn process_one_task(
         return TaskStepOutcome::Stop;
     }
 
-    // Re-check the epic's status *and* the lease immediately before the
+    // Re-check the container's status *and* the lease immediately before the
     // test-gate/commit/Done writes below — a slow implement run racing an
     // external cancel (a lane move away from InProgress) or a lease theft
     // must not finalize this task after either happened. This is the
     // "cancelling mid-walk stops cleanly" AC (the D12 stage-boundary
     // backstop); the implement stage's own `is_ok()` check just above is
     // where an actual kill (T-542, `outcome.cancelled`) gets observed.
-    if lease.is_lost() || !epic_still_in_progress(conn, epic_id).await {
+    if lease.is_lost() || !container_still_in_progress(conn, epic_id, task_id).await {
         tracing::warn!(
-            epic = %epic_id,
+            epic = ?epic_id,
             task = %task_id,
-            "pipeline: epic cancelled or lease lost mid-task; stopping without finalizing"
+            "pipeline: container cancelled or lease lost mid-task; stopping without finalizing"
         );
         return TaskStepOutcome::Stop;
     }
@@ -2252,11 +2549,11 @@ async fn process_one_task(
     //    short, a red test_cmd never reaches the commit step below, and the
     //    fix agent this loop drives sees only the failing output, nothing
     //    else (D19).
-    let pat = crate::projects::load_decrypted_pat(state, &epic.project_id)
+    let pat = crate::projects::load_decrypted_pat(state, project_id)
         .await
         .ok()
         .flatten();
-    match run_test_gate_loop(state, epic_id, &task_id, workspace, pat.as_deref(), lease).await {
+    match run_test_gate_loop(state, epic_id, task_id, workspace, pat.as_deref(), lease).await {
         GateOutcome::Proceed => {}
         GateOutcome::Stop => return TaskStepOutcome::Stop,
     }
@@ -2265,8 +2562,8 @@ async fn process_one_task(
     //    ([`commit_if_dirty`]). An agent that made no changes is committed as
     //    *nothing* — see below (T-532) for why that's not the end of the
     //    story.
-    let subject = format!("impl({}): {}", spec::short_id(&task_id), task_title);
-    let committed = match commit_if_dirty(conn, &task_id, epic_id, &workspace.workspace_path, &subject, 1).await {
+    let subject = format!("impl({}): {}", spec::short_id(task_id), task_title);
+    let committed = match commit_if_dirty(conn, task_id, epic_id, &workspace.workspace_path, &subject, 1).await {
         Ok(committed) => committed,
         Err(err) => {
             if !lease.is_lost() {
@@ -2274,7 +2571,7 @@ async fn process_one_task(
                     state,
                     FailureContext {
                         epic_id,
-                        task_id: Some(&task_id),
+                        task_id: Some(task_id),
                         reason: FailureReason::AgentError,
                         message: &format!("git commit failed: {err}"),
                         push: PushIntent::Attempt(workspace),
@@ -2292,11 +2589,11 @@ async fn process_one_task(
             //     commit to review, converging on a verdict via the review ->
             //     fix -> re-test -> re-commit -> re-review loop
             //     ([`run_review_fix_converge`]).
-            if lease.is_lost() || !epic_still_in_progress(conn, epic_id).await {
+            if lease.is_lost() || !container_still_in_progress(conn, epic_id, task_id).await {
                 tracing::warn!(
-                    epic = %epic_id,
+                    epic = ?epic_id,
                     task = %task_id,
-                    "pipeline: epic cancelled or lease lost before the review stage; stopping without finalizing"
+                    "pipeline: container cancelled or lease lost before the review stage; stopping without finalizing"
                 );
                 return TaskStepOutcome::Stop;
             }
@@ -2311,8 +2608,8 @@ async fn process_one_task(
             match run_review_fix_converge(
                 state,
                 epic_id,
-                &task_id,
-                &task_title,
+                task_id,
+                task_title,
                 workspace,
                 &review_prompt,
                 pat.as_deref(),
@@ -2334,11 +2631,11 @@ async fn process_one_task(
             //     against the spec before this task is allowed to close with
             //     zero commits. See the module doc's "Already-complete
             //     verification (T-532)" section for the full rationale.
-            if lease.is_lost() || !epic_still_in_progress(conn, epic_id).await {
+            if lease.is_lost() || !container_still_in_progress(conn, epic_id, task_id).await {
                 tracing::warn!(
-                    epic = %epic_id,
+                    epic = ?epic_id,
                     task = %task_id,
-                    "pipeline: epic cancelled or lease lost before verify-complete; stopping without finalizing"
+                    "pipeline: container cancelled or lease lost before verify-complete; stopping without finalizing"
                 );
                 return TaskStepOutcome::Stop;
             }
@@ -2355,8 +2652,8 @@ async fn process_one_task(
             match run_verify_complete(
                 state,
                 epic_id,
-                &task_id,
-                &task_title,
+                task_id,
+                task_title,
                 workspace,
                 &verify_prompt,
                 task_ctx,
@@ -2384,21 +2681,46 @@ async fn process_one_task(
     let _ = conn
         .execute(
             "UPDATE task SET status = 'Done', updated_at = ?1 WHERE id = ?2",
-            params![now, task_id.clone()],
+            params![now, task_id],
         )
         .await;
-    mcp::publish_dag(state, epic_id).await;
+    match epic_id {
+        Some(epic_id) => mcp::publish_dag(state, epic_id).await,
+        // T-551: a standalone task reaching `Done` *is* the board-visible
+        // change (there is no epic lane it moves separately) — publish
+        // `board_updated` directly rather than relying on
+        // `run_standalone_pipeline_inner`'s later finalize publish, since a
+        // task that produces no diff (T-532's PASS path) still needs this
+        // announced even when finalize's own push/PR never has new work to
+        // report beyond what's already committed.
+        None => board::publish_board(state, project_id).await,
+    }
 
     TaskStepOutcome::Continue
 }
 
-/// Whether `epic_id` is still (or again) `InProgress` — the "between tasks" /
-/// "before a slow step's finalizing writes" re-check every stop-worthy pause
-/// in this walk performs. Factored out once [`process_one_task`]'s
-/// pre-existing T-513 check and [`run_test_gate_loop`]'s T-522 checks both
-/// needed the identical query.
-async fn epic_still_in_progress(conn: &Connection, epic_id: &str) -> bool {
-    matches!(fetch_epic(conn, epic_id).await, Ok(Some(e)) if e.status == "InProgress")
+/// Whether the work item backing this task is still active enough to keep
+/// writing to it — the "between tasks" / "before a slow step's finalizing
+/// writes" re-check every stop-worthy pause in this walk performs. Factored
+/// out once [`process_one_task`]'s pre-existing T-513 check and
+/// [`run_test_gate_loop`]'s T-522 checks both needed the identical query.
+///
+/// T-551 generalizes this from "is the epic InProgress" to "is *the
+/// container* InProgress": for an epic-owned task (`epic_id: Some`) the
+/// container is the epic, exactly as before; for a standalone task
+/// (`epic_id: None`) there is no epic to ask — the task **is** its own
+/// claimable container (see [`FailureContext`]'s doc for the same
+/// epic/standalone duality), so this checks `task_id`'s own row instead. A
+/// standalone task's own status is what a Cancel (were one ever wired up for
+/// tasks — see the module doc's T-551 section on why that's out of scope
+/// here) or an external mutation would move off `InProgress`, so re-reading
+/// it here catches exactly the same class of race the epic branch already
+/// guarded against.
+async fn container_still_in_progress(conn: &Connection, epic_id: Option<&str>, task_id: &str) -> bool {
+    match epic_id {
+        Some(epic_id) => matches!(fetch_epic(conn, epic_id).await, Ok(Some(e)) if e.status == "InProgress"),
+        None => matches!(crate::tasks::fetch_task(conn, task_id).await, Ok(Some(t)) if t.status == "InProgress"),
+    }
 }
 
 /// What [`run_test_gate_loop`] tells [`process_one_task`] to do next. See the
@@ -2426,7 +2748,7 @@ enum GateOutcome {
 /// ----` section) into Dearborn's stage/evidence machinery.
 async fn run_test_gate_loop(
     state: &AppState,
-    epic_id: &str,
+    epic_id: Option<&str>,
     task_id: &str,
     workspace: &ProvisionedWorkspace,
     pat: Option<&str>,
@@ -2444,9 +2766,9 @@ async fn run_test_gate_loop(
         // in this walk — a fix round runs a whole agent turn, long enough
         // for a lease to expire or the epic to be cancelled out from under
         // it.
-        if lease.is_lost() || !epic_still_in_progress(conn, epic_id).await {
+        if lease.is_lost() || !container_still_in_progress(conn, epic_id, task_id).await {
             tracing::warn!(
-                epic = %epic_id,
+                epic = ?epic_id,
                 task = %task_id,
                 "pipeline: epic cancelled or lease lost mid-test-gate; stopping without finalizing"
             );
@@ -2462,7 +2784,7 @@ async fn run_test_gate_loop(
             conn,
             StageCommand {
                 task_id: Some(task_id),
-                epic_id: Some(epic_id),
+                epic_id,
                 stage: Stage::TestGate.as_str(),
                 attempt,
                 cwd: &workspace.workspace_path,
@@ -2503,7 +2825,7 @@ async fn run_test_gate_loop(
         // Red. Out of attempts?
         if attempt >= max_attempts {
             tracing::warn!(
-                epic = %epic_id,
+                epic = ?epic_id,
                 task = %task_id,
                 attempt,
                 "test gate still red after the configured fix attempts; task -> Failed(test_gate_exhausted)"
@@ -2526,9 +2848,9 @@ async fn run_test_gate_loop(
 
         attempt += 1;
 
-        if lease.is_lost() || !epic_still_in_progress(conn, epic_id).await {
+        if lease.is_lost() || !container_still_in_progress(conn, epic_id, task_id).await {
             tracing::warn!(
-                epic = %epic_id,
+                epic = ?epic_id,
                 task = %task_id,
                 "pipeline: epic cancelled or lease lost before the fix round; stopping without finalizing"
             );
@@ -2545,7 +2867,7 @@ async fn run_test_gate_loop(
             &*state.task_agent,
             AgentStageParams {
                 task_id,
-                epic_id: Some(epic_id),
+                epic_id,
                 attempt,
             },
             TaskRunRequest {
@@ -2671,7 +2993,7 @@ enum VerdictOutcome {
 #[allow(clippy::too_many_arguments)]
 async fn run_verdict_stage(
     state: &AppState,
-    epic_id: &str,
+    epic_id: Option<&str>,
     task_id: &str,
     workspace: &ProvisionedWorkspace,
     stage: Stage,
@@ -2695,9 +3017,9 @@ async fn run_verdict_stage(
     loop {
         // Same belt-and-suspenders re-check every long stretch of this walk
         // performs before spending a whole agent turn.
-        if lease.is_lost() || !epic_still_in_progress(conn, epic_id).await {
+        if lease.is_lost() || !container_still_in_progress(conn, epic_id, task_id).await {
             tracing::warn!(
-                epic = %epic_id,
+                epic = ?epic_id,
                 task = %task_id,
                 stage = stage_label,
                 "pipeline: epic cancelled or lease lost before the verdict stage; stopping without finalizing"
@@ -2717,7 +3039,7 @@ async fn run_verdict_stage(
             &*state.task_agent,
             AgentStageParams {
                 task_id,
-                epic_id: Some(epic_id),
+                epic_id,
                 attempt,
             },
             TaskRunRequest {
@@ -2769,7 +3091,7 @@ async fn run_verdict_stage(
                 publish_stage_changed(
                     state,
                     task_id,
-                    Some(epic_id),
+                    epic_id,
                     stage,
                     attempt,
                     "ok",
@@ -2787,7 +3109,7 @@ async fn run_verdict_stage(
         // Contract miss: out of retries for *this call*?
         if try_index >= max_tries {
             tracing::warn!(
-                epic = %epic_id,
+                epic = ?epic_id,
                 task = %task_id,
                 stage = stage_label,
                 attempt,
@@ -2847,7 +3169,7 @@ enum ConvergenceOutcome {
 #[allow(clippy::too_many_arguments)]
 async fn run_review_fix_converge(
     state: &AppState,
-    epic_id: &str,
+    epic_id: Option<&str>,
     task_id: &str,
     task_title: &str,
     workspace: &ProvisionedWorkspace,
@@ -2870,9 +3192,9 @@ async fn run_review_fix_converge(
     let mut round: u32 = 0;
 
     loop {
-        if lease.is_lost() || !epic_still_in_progress(conn, epic_id).await {
+        if lease.is_lost() || !container_still_in_progress(conn, epic_id, task_id).await {
             tracing::warn!(
-                epic = %epic_id,
+                epic = ?epic_id,
                 task = %task_id,
                 "pipeline: epic cancelled or lease lost before a review round; stopping without finalizing"
             );
@@ -2921,7 +3243,7 @@ async fn run_review_fix_converge(
                 round += 1;
                 if round > max_fix_rounds {
                     tracing::warn!(
-                        epic = %epic_id,
+                        epic = ?epic_id,
                         task = %task_id,
                         max_fix_rounds,
                         "review did not converge after the configured fix rounds; task -> Failed(review_not_converged)"
@@ -2944,9 +3266,9 @@ async fn run_review_fix_converge(
                     return ConvergenceOutcome::Stop;
                 }
 
-                if lease.is_lost() || !epic_still_in_progress(conn, epic_id).await {
+                if lease.is_lost() || !container_still_in_progress(conn, epic_id, task_id).await {
                     tracing::warn!(
-                        epic = %epic_id,
+                        epic = ?epic_id,
                         task = %task_id,
                         "pipeline: epic cancelled or lease lost before the review-round fix; stopping without finalizing"
                     );
@@ -2969,7 +3291,7 @@ async fn run_review_fix_converge(
                     &*state.task_agent,
                     AgentStageParams {
                         task_id,
-                        epic_id: Some(epic_id),
+                        epic_id,
                         attempt: fix_attempt,
                     },
                     TaskRunRequest {
@@ -3014,9 +3336,9 @@ async fn run_review_fix_converge(
                     }
                 }
 
-                if lease.is_lost() || !epic_still_in_progress(conn, epic_id).await {
+                if lease.is_lost() || !container_still_in_progress(conn, epic_id, task_id).await {
                     tracing::warn!(
-                        epic = %epic_id,
+                        epic = ?epic_id,
                         task = %task_id,
                         "pipeline: epic cancelled or lease lost before the post-fix test gate; stopping without finalizing"
                     );
@@ -3037,9 +3359,9 @@ async fn run_review_fix_converge(
                     GateOutcome::Stop => return ConvergenceOutcome::Stop,
                 }
 
-                if lease.is_lost() || !epic_still_in_progress(conn, epic_id).await {
+                if lease.is_lost() || !container_still_in_progress(conn, epic_id, task_id).await {
                     tracing::warn!(
-                        epic = %epic_id,
+                        epic = ?epic_id,
                         task = %task_id,
                         "pipeline: epic cancelled or lease lost before the review-round commit; stopping without finalizing"
                     );
@@ -3125,7 +3447,7 @@ async fn run_review_fix_converge(
 #[allow(clippy::too_many_arguments)]
 async fn run_verify_complete(
     state: &AppState,
-    epic_id: &str,
+    epic_id: Option<&str>,
     task_id: &str,
     task_title: &str,
     workspace: &ProvisionedWorkspace,
@@ -3184,9 +3506,9 @@ async fn run_verify_complete(
             TaskStepOutcome::Stop
         }
         spec::Verdict::NeedsChanges => {
-            if lease.is_lost() || !epic_still_in_progress(conn, epic_id).await {
+            if lease.is_lost() || !container_still_in_progress(conn, epic_id, task_id).await {
                 tracing::warn!(
-                    epic = %epic_id,
+                    epic = ?epic_id,
                     task = %task_id,
                     "pipeline: epic cancelled or lease lost before the verify-complete fix; stopping without finalizing"
                 );
@@ -3208,7 +3530,7 @@ async fn run_verify_complete(
                 &*state.task_agent,
                 AgentStageParams {
                     task_id,
-                    epic_id: Some(epic_id),
+                    epic_id,
                     attempt: fix_attempt,
                 },
                 TaskRunRequest {
@@ -3253,9 +3575,9 @@ async fn run_verify_complete(
                 }
             }
 
-            if lease.is_lost() || !epic_still_in_progress(conn, epic_id).await {
+            if lease.is_lost() || !container_still_in_progress(conn, epic_id, task_id).await {
                 tracing::warn!(
-                    epic = %epic_id,
+                    epic = ?epic_id,
                     task = %task_id,
                     "pipeline: epic cancelled or lease lost before the post-verify-complete test gate; stopping without finalizing"
                 );
@@ -3270,9 +3592,9 @@ async fn run_verify_complete(
                 GateOutcome::Stop => return TaskStepOutcome::Stop,
             }
 
-            if lease.is_lost() || !epic_still_in_progress(conn, epic_id).await {
+            if lease.is_lost() || !container_still_in_progress(conn, epic_id, task_id).await {
                 tracing::warn!(
-                    epic = %epic_id,
+                    epic = ?epic_id,
                     task = %task_id,
                     "pipeline: epic cancelled or lease lost before the verify-complete-driven commit; stopping without finalizing"
                 );
@@ -3348,9 +3670,9 @@ async fn run_verify_complete(
                 return TaskStepOutcome::Stop;
             };
 
-            if lease.is_lost() || !epic_still_in_progress(conn, epic_id).await {
+            if lease.is_lost() || !container_still_in_progress(conn, epic_id, task_id).await {
                 tracing::warn!(
-                    epic = %epic_id,
+                    epic = ?epic_id,
                     task = %task_id,
                     "pipeline: epic cancelled or lease lost before the post-verify-complete review; stopping without finalizing"
                 );
@@ -3571,8 +3893,23 @@ enum PushIntent<'a> {
 /// (`agent_error`, `test_gate_exhausted`, `review_not_converged`, `blocked`,
 /// and T-543's `timeout`) share the identical call shape — nothing else
 /// about the struct varies by failure kind.
+///
+/// `epic_id: Option<&'a str>` (widened by T-551 from a bare `&'a str`) is the
+/// other half of the same duality, one level up: `Some(epic_id)` is every
+/// pre-T-551 call site, unchanged — an epic-scoped failure always has an
+/// epic to `Block`. `None` is new: a standalone task (D17) has no epic at
+/// all, so there is nothing to `Block` — see [`fail_item`]'s own doc,
+/// "One container to fail, not two," for what that means for the rest of the
+/// function. The two `Option`s are **not** independent in practice: a
+/// standalone failure (`epic_id: None`) always carries `task_id: Some(_)` —
+/// unlike an epic, where `setup_failed`/`workspace_error`/`preflight_red`/
+/// `pr_failed` genuinely have no task at fault yet, a standalone task *is*
+/// the item that fails, for every §2.3 reason including those four. Nothing
+/// enforces that invariant at the type level (it would cost more clarity than
+/// it buys for two call sites total — [`run_standalone_pipeline_inner`] and
+/// the functions it calls); every standalone call site simply follows it.
 struct FailureContext<'a> {
-    epic_id: &'a str,
+    epic_id: Option<&'a str>,
     task_id: Option<&'a str>,
     reason: FailureReason,
     /// Human-readable detail for the `tracing::warn!` line only — §2.3's
@@ -3614,14 +3951,30 @@ struct FailureContext<'a> {
 ///    point in this walk already follows — if something else already moved
 ///    the epic on, pushing on its behalf here would be guessing at intent
 ///    that belongs to whatever actually won the race.
+///
+/// ## One container to fail, not two (T-551)
+///
+/// Everything above describes the `ctx.epic_id: Some(epic_id)` path,
+/// unchanged since T-540. `ctx.epic_id: None` (a standalone task, D17) skips
+/// steps 2-4 entirely — there is no epic row to fence a `Blocked` write
+/// against, no `dag_updated` (a standalone task has no DAG), and no
+/// `epic_updated`. What survives is: the task's own `Failed` write (step 1,
+/// identical), and — in its place — a direct fetch of the task (for
+/// `project_id`, since there is no epic to fetch it from) so `board_updated`
+/// still fires (the AC: "`board_updated` published on every transition") and
+/// [`push_on_failure`] still runs per `ctx.push`. There is no "did this call
+/// win a race" gate the way `took_epic` gates the epic branch's push: a
+/// standalone task has no sibling ever concurrently touching the same row
+/// (the identical invariant step 1's doc already leans on), so every
+/// standalone failure call that reaches this point pushes unconditionally.
 async fn fail_item(state: &AppState, ctx: FailureContext<'_>) {
     let reason = ctx.reason.as_str();
     tracing::warn!(
-        epic = %ctx.epic_id,
+        epic = ?ctx.epic_id,
         task = ?ctx.task_id,
         reason,
         error = %ctx.message,
-        "structured failure (T-540): task -> Failed (if any), epic -> Blocked"
+        "structured failure (T-540/T-551): task -> Failed (if any), epic -> Blocked (if any)"
     );
 
     let conn = state.db.conn();
@@ -3635,24 +3988,44 @@ async fn fail_item(state: &AppState, ctx: FailureContext<'_>) {
             )
             .await;
     }
-    mcp::publish_dag(state, ctx.epic_id).await;
+
+    let Some(epic_id) = ctx.epic_id else {
+        // T-551: no epic to Block — the standalone-task branch. `task_id` is
+        // always `Some` here (see `FailureContext`'s own doc on the
+        // invariant); fetch the task directly (there is no epic row to pull
+        // `project_id` from) so the board still refreshes and a real push
+        // can still run.
+        let Some(task_id) = ctx.task_id else {
+            tracing::error!("fail_item: epic_id is None but task_id is also None — nothing to fail");
+            return;
+        };
+        if let Ok(Some(task)) = crate::tasks::fetch_task(conn, task_id).await {
+            board::publish_board(state, &task.project_id).await;
+            if let PushIntent::Attempt(workspace) = ctx.push {
+                push_on_failure(state, None, Some(task_id), &task.project_id, workspace).await;
+            }
+        }
+        return;
+    };
+
+    mcp::publish_dag(state, epic_id).await;
 
     let took_epic = conn
         .execute(
             "UPDATE epic SET status = 'Blocked', blocked_reason = ?1, updated_at = ?2 \
              WHERE id = ?3 AND status = 'InProgress'",
-            params![reason, now, ctx.epic_id],
+            params![reason, now, epic_id],
         )
         .await
         .map(|n| n > 0)
         .unwrap_or(false);
 
-    let project_id = match fetch_epic(conn, ctx.epic_id).await {
+    let project_id = match fetch_epic(conn, epic_id).await {
         Ok(Some(updated)) => {
             let payload = serde_json::to_value(&updated).unwrap_or(serde_json::Value::Null);
             state
                 .hub
-                .publish(&format!("epic:{}", ctx.epic_id), "epic_updated", payload);
+                .publish(&format!("epic:{epic_id}"), "epic_updated", payload);
             board::publish_board(state, &updated.project_id).await;
             Some(updated.project_id)
         }
@@ -3661,7 +4034,7 @@ async fn fail_item(state: &AppState, ctx: FailureContext<'_>) {
 
     if took_epic {
         if let (PushIntent::Attempt(workspace), Some(project_id)) = (ctx.push, project_id) {
-            push_on_failure(state, ctx.epic_id, &project_id, workspace).await;
+            push_on_failure(state, Some(epic_id), None, &project_id, workspace).await;
         }
     }
 }
@@ -3687,7 +4060,8 @@ async fn fail_item(state: &AppState, ctx: FailureContext<'_>) {
 /// check this function has to perform.
 async fn push_on_failure(
     state: &AppState,
-    epic_id: &str,
+    epic_id: Option<&str>,
+    task_id: Option<&str>,
     project_id: &str,
     workspace: &ProvisionedWorkspace,
 ) {
@@ -3695,12 +4069,13 @@ async fn push_on_failure(
     let project = match load_project_for_finalize(conn, project_id).await {
         Ok(Some(project)) => project,
         Ok(None) => {
-            tracing::warn!(epic = %epic_id, "failure push: project vanished; skipping push");
+            tracing::warn!(epic = ?epic_id, task = ?task_id, "failure push: project vanished; skipping push");
             return;
         }
         Err(err) => {
             tracing::warn!(
-                epic = %epic_id,
+                epic = ?epic_id,
+                task = ?task_id,
                 error = %err,
                 "failure push: failed to load project; skipping push"
             );
@@ -3713,8 +4088,8 @@ async fn push_on_failure(
         .flatten();
 
     let open = OpenStage {
-        task_id: None,
-        epic_id: Some(epic_id),
+        task_id,
+        epic_id,
         stage: Stage::Push.as_str(),
         attempt: 1,
     };
@@ -3746,7 +4121,8 @@ async fn push_on_failure(
         Err(err) => {
             let message = git::redact(&err.message, pat.as_deref());
             tracing::warn!(
-                epic = %epic_id,
+                epic = ?epic_id,
+                task = ?task_id,
                 error = %message,
                 "failure push: push failed; non-fatal — the task/epic already reached their Failed/Blocked states"
             );
@@ -3798,7 +4174,7 @@ async fn push_on_failure(
 /// it.
 async fn route_stage_failure(
     state: &AppState,
-    epic_id: &str,
+    epic_id: Option<&str>,
     task_id: &str,
     outcome: &task_agent::AgentStageOutcome,
     message: &str,
@@ -3876,9 +4252,23 @@ async fn route_stage_failure(
 ///   upstream of it once a cancel is observed) deletes anything — the same
 ///   "never clean up on a stop path" property `fail_item` and every
 ///   between-stage cancel check already have.
-async fn handle_cancelled_task(state: &AppState, epic_id: &str, task_id: &str) {
+///
+/// T-551 widens `epic_id` to `Option<&str>` for the same reason every other
+/// failure-adjacent function in this module was widened, but cancellation
+/// itself stays out of that task's scope (see the module doc's own T-551
+/// section): nothing today ever issues a `RunControl::cancel()` against a
+/// standalone task's registry entry (there is no `POST /tasks/{id}/lane` or
+/// equivalent cancel surface for a task — only `lanes::set_epic_lane`
+/// cancels, and only epics), so `epic_id: None` reaching this function is not
+/// a path any current caller can actually exercise. It is still handled
+/// correctly rather than left to panic or silently do the wrong thing: the
+/// task still resets to `Todo`, and the publish becomes `board_updated`
+/// (there is no DAG to re-render for a standalone task) instead of
+/// `dag_updated` — whichever surface a future standalone-cancel task adds
+/// would need this same branch anyway.
+async fn handle_cancelled_task(state: &AppState, epic_id: Option<&str>, task_id: &str) {
     tracing::info!(
-        epic = %epic_id,
+        epic = ?epic_id,
         task = %task_id,
         "T-542: agent stage was cancelled; resetting task -> Todo"
     );
@@ -3890,7 +4280,14 @@ async fn handle_cancelled_task(state: &AppState, epic_id: &str, task_id: &str) {
             params![now, task_id],
         )
         .await;
-    mcp::publish_dag(state, epic_id).await;
+    match epic_id {
+        Some(epic_id) => mcp::publish_dag(state, epic_id).await,
+        None => {
+            if let Ok(Some(task)) = crate::tasks::fetch_task(conn, task_id).await {
+                board::publish_board(state, &task.project_id).await;
+            }
+        }
+    }
 }
 
 /// What [`run_preflight`] tells its caller to do next. See the module doc's
@@ -3929,9 +4326,20 @@ enum PreflightOutcome {
 /// call still records the precise `status` (`"ok"` | `"error"` | `"timeout"`)
 /// via [`cmd::run_stage_command`] — nothing about the finer-grained truth is
 /// lost, only the coarse board-facing label is collapsed to one value.
+///
+/// T-551 widens this to `epic_id: Option<&str>` / a new `task_id: Option<&str>`
+/// so a standalone task's own preflight run reaches [`fail_item`] with
+/// `epic_id: None, task_id: Some(_)` (there is no epic to Block, and unlike
+/// an epic's preflight — which has no task at fault yet, since the DAG walk
+/// hasn't started — a standalone's one task *is* the thing that fails). The
+/// evidence row's own `task_id`/`epic_id` (`StageCommand`, below) uses
+/// exactly the pair the caller passes in, so a standalone's `preflight`
+/// `agent_run` row is keyed by `task_id`, not `epic_id`, mirroring every
+/// other stage this module runs for a standalone task.
 async fn run_preflight(
     state: &AppState,
-    epic_id: &str,
+    epic_id: Option<&str>,
+    task_id: Option<&str>,
     workspace: &ProvisionedWorkspace,
     pat: Option<&str>,
 ) -> PreflightOutcome {
@@ -3951,8 +4359,8 @@ async fn run_preflight(
     let outcome = Box::pin(cmd::run_stage_command(
         conn,
         StageCommand {
-            task_id: None,
-            epic_id: Some(epic_id),
+            task_id,
+            epic_id,
             stage: Stage::Preflight.as_str(),
             attempt: 1,
             cwd: &workspace.workspace_path,
@@ -3975,16 +4383,17 @@ async fn run_preflight(
         Ok(StageOutcome::Ran(ran)) if ran.status == "ok" => PreflightOutcome::Proceed,
         Ok(StageOutcome::Ran(ran)) => {
             tracing::warn!(
-                epic = %epic_id,
+                epic = ?epic_id,
+                task = ?task_id,
                 status = ran.status,
                 exit_code = ?ran.exit_code,
-                "preflight: test_cmd is not green on the untouched tree; epic -> Blocked(preflight_red)"
+                "preflight: test_cmd is not green on the untouched tree; -> Blocked/Failed(preflight_red)"
             );
             fail_item(
                 state,
                 FailureContext {
                     epic_id,
-                    task_id: None,
+                    task_id,
                     reason: FailureReason::PreflightRed,
                     message: &format!("test_cmd not green (status={}, exit_code={:?})", ran.status, ran.exit_code),
                     push: PushIntent::Attempt(workspace),
@@ -3995,15 +4404,16 @@ async fn run_preflight(
         }
         Err(err) => {
             tracing::warn!(
-                epic = %epic_id,
+                epic = ?epic_id,
+                task = ?task_id,
                 error = %err,
-                "preflight: failed to record test_cmd evidence; epic -> Blocked(preflight_red)"
+                "preflight: failed to record test_cmd evidence; -> Blocked/Failed(preflight_red)"
             );
             fail_item(
                 state,
                 FailureContext {
                     epic_id,
-                    task_id: None,
+                    task_id,
                     reason: FailureReason::PreflightRed,
                     message: &format!("failed to record test_cmd evidence: {err}"),
                     push: PushIntent::Attempt(workspace),
@@ -4041,6 +4451,17 @@ async fn run_preflight(
 /// stayed `InProgress` with its lease released, so the pool would re-claim
 /// and re-walk it in a tight loop forever. Now every path out of a
 /// fully-`Done` DAG ends in a terminal-for-the-queue status.
+///
+/// ## Shared with [`finalize_task`] (T-551): [`push_and_open_pr`]
+///
+/// The project/PAT load, the single `Stage::Push` evidence row, the push
+/// itself, and the `open_pr` call — every step through "the PR now exists on
+/// GitHub" — is factored into [`push_and_open_pr`], the one place that
+/// sequence is written. This function (and [`finalize_task`], the standalone
+/// mirror) calls it once with its own title/body and `epic_id`/`task_id`
+/// pair, then does only what's left that genuinely differs: which row's
+/// checklist to build the body from, and which row's terminal write persists
+/// the opened PR.
 async fn finalize_epic(
     state: &AppState,
     epic_id: &str,
@@ -4051,157 +4472,24 @@ async fn finalize_epic(
 ) {
     let conn = state.db.conn();
 
-    // T-540: every `pr_failed` exit below passes `PushIntent::Skip` — this
-    // function *is* the push (and, on success, the open-PR call) already;
-    // routing its own failure back through `fail_item`'s own push step would
-    // either push nothing new (the project/PAT load failures below, which
-    // happen before any push is even attempted) or push a second, redundant
-    // time (the push-itself-failed and open-PR-failed cases further down,
-    // each of which already recorded its own `Stage::Push` evidence row via
-    // `close_push_stage` immediately before the call).
-    let project = match load_project_for_finalize(conn, &epic.project_id).await {
-        Ok(Some(project)) => project,
-        Ok(None) => {
-            if !lease.is_lost() {
-                fail_item(
-                    state,
-                    FailureContext {
-                        epic_id,
-                        task_id: None,
-                        reason: FailureReason::PrFailed,
-                        message: "project vanished before finalize",
-                        push: PushIntent::Skip,
-                    },
-                )
-                .await;
-            }
-            return;
-        }
-        Err(err) => {
-            if !lease.is_lost() {
-                fail_item(
-                    state,
-                    FailureContext {
-                        epic_id,
-                        task_id: None,
-                        reason: FailureReason::PrFailed,
-                        message: &format!("failed to load project for finalize: {err}"),
-                        push: PushIntent::Skip,
-                    },
-                )
-                .await;
-            }
-            return;
-        }
-    };
-    let pat = match crate::projects::load_decrypted_pat(state, &epic.project_id).await {
-        Ok(pat) => pat,
-        Err(err) => {
-            if !lease.is_lost() {
-                fail_item(
-                    state,
-                    FailureContext {
-                        epic_id,
-                        task_id: None,
-                        reason: FailureReason::PrFailed,
-                        message: &format!("failed to load project PAT for finalize: {err}"),
-                        push: PushIntent::Skip,
-                    },
-                )
-                .await;
-            }
-            return;
-        }
-    };
-
-    // One evidence row spans both the push and the open-PR call (§2.2 has a
-    // single `push` stage, no separate "open PR" entry) — opened once, here,
-    // before either network/git operation, closed exactly once below on
-    // whichever of the two paths this run takes.
-    let open = OpenStage {
-        task_id: None,
-        epic_id: Some(epic_id),
-        stage: Stage::Push.as_str(),
-        attempt: 1,
-    };
-    let stage_handle = evidence::open_stage(conn, open).await.ok();
-
-    let push_result = state
-        .git_host
-        .push(PushRequest {
-            workspace_path: &workspace.workspace_path,
-            branch: &workspace.branch_name,
-            repo_url: &project.repo_url,
-            pat: pat.as_deref(),
-        })
-        .await;
-
-    if let Err(err) = push_result {
-        let message = git::redact(&err.message, pat.as_deref());
-        close_push_stage(conn, &stage_handle, "error", &format!("push failed: {message}")).await;
-        if !lease.is_lost() {
-            fail_item(
-                state,
-                FailureContext {
-                    epic_id,
-                    task_id: None,
-                    reason: FailureReason::PrFailed,
-                    message: &message,
-                    push: PushIntent::Skip,
-                },
-            )
-            .await;
-        }
-        return;
-    }
-
     let title = pr::epic_pr_title(&epic.title);
     let items = build_task_checklist(conn, epic_id, dag).await;
     let body = pr::build_pr_body(epic.description.as_deref(), &items);
 
-    let open_result = state
-        .git_host
-        .open_pr(OpenPrRequest {
-            repo_url: &project.repo_url,
-            pat: pat.as_deref(),
-            head: &workspace.branch_name,
-            title: &title,
-            body: &body,
-        })
-        .await;
-
-    let opened = match open_result {
-        Ok(opened) => opened,
-        Err(err) => {
-            let message = git::redact(&err.message, pat.as_deref());
-            close_push_stage(conn, &stage_handle, "error", &format!("open_pr failed: {message}")).await;
-            if !lease.is_lost() {
-                fail_item(
-                    state,
-                    FailureContext {
-                        epic_id,
-                        task_id: None,
-                        reason: FailureReason::PrFailed,
-                        message: &message,
-                        push: PushIntent::Skip,
-                    },
-                )
-                .await;
-            }
-            return;
-        }
-    };
-
-    close_push_stage(
-        conn,
-        &stage_handle,
-        "ok",
-        &format!(
-            "pushed {} to origin; opened PR {} (#{})",
-            workspace.branch_name, opened.url, opened.number
-        ),
+    let Some(opened) = push_and_open_pr(
+        state,
+        Some(epic_id),
+        None,
+        &epic.project_id,
+        workspace,
+        lease,
+        &title,
+        &body,
     )
-    .await;
+    .await
+    else {
+        return;
+    };
 
     // Re-check immediately before the terminal writes: a slow push/PR racing
     // an external cancel or a stolen lease must not overwrite whatever that
@@ -4254,6 +4542,279 @@ async fn finalize_epic(
             );
         }
     }
+}
+
+/// The claimed-**standalone-task** counterpart to [`finalize_epic`] (T-551):
+/// push the branch, open the PR, persist `pr_url`/`pr_number` on the *task*
+/// row (there is no epic row for a standalone claim), publish, and delete
+/// the workspace. Shares [`push_and_open_pr`]'s push/open-PR core with
+/// `finalize_epic` — see that function's own doc — rather than duplicating
+/// it; the only things that differ are the title/body construction (one
+/// task, not a checklist over a DAG — [`build_standalone_checklist`]) and
+/// the terminal write below.
+///
+/// ## `Done`, not `Completed` (T-551 judgment call)
+///
+/// An epic's terminal success state is a status *distinct* from any of its
+/// tasks' own (`Completed` vs. each task's own `Done`) because the epic is a
+/// genuinely separate row tracking a genuinely separate thing: "has this
+/// epic's PR opened," independent of "are all its tasks Done" (the two can
+/// transiently disagree — the DAG can read fully `Done` for a heartbeat
+/// before `finalize_epic` gets to run). A standalone task has no second row:
+/// [`process_one_task`]'s own step 6 already left `task.status = 'Done'`
+/// before this function is ever called, and `task`'s status enum (`Todo |
+/// InProgress | Done | Failed | Cancelled` — `tasks.rs`'s own doc) has no
+/// `Completed` value to move to in the first place. `Done` **is** the
+/// task's terminal success state, exactly as it already is for every
+/// epic-owned task; opening the PR does not change what "done" means for a
+/// standalone task, it just adds where to find the PR. The persisting
+/// `UPDATE` below is fenced on `WHERE status = 'Done'` (mirroring
+/// `finalize_epic`'s own `WHERE status = 'InProgress'` fence) so a race with,
+/// say, a retry landing at exactly the wrong instant is a no-op rather than a
+/// clobber.
+async fn finalize_task(
+    state: &AppState,
+    task_id: &str,
+    task: &crate::tasks::Task,
+    workspace: &ProvisionedWorkspace,
+    lease: &LeaseHandle,
+) {
+    let conn = state.db.conn();
+
+    // `pr::epic_pr_title` is a pure passthrough (`title.to_string()`, D16 —
+    // "the epic's title, verbatim") with nothing epic-specific in it; reused
+    // as-is for a standalone task's title rather than adding a same-bodied
+    // twin.
+    let title = pr::epic_pr_title(&task.title);
+    let items = build_standalone_checklist(conn, task).await;
+    let body = pr::build_pr_body(task.description.as_deref(), &items);
+
+    let Some(opened) = push_and_open_pr(
+        state,
+        None,
+        Some(task_id),
+        &task.project_id,
+        workspace,
+        lease,
+        &title,
+        &body,
+    )
+    .await
+    else {
+        return;
+    };
+
+    if lease.is_lost() {
+        return;
+    }
+
+    let now = now_ms();
+    let affected = conn
+        .execute(
+            "UPDATE task SET pr_url = ?1, pr_number = ?2, updated_at = ?3 \
+             WHERE id = ?4 AND status = 'Done'",
+            params![opened.url.clone(), opened.number, now, task_id],
+        )
+        .await;
+
+    match affected {
+        Ok(n) if n > 0 => {
+            board::publish_board(state, &task.project_id).await;
+            if let Err(err) = workspace::delete_workspace(&workspace.workspace_path).await {
+                tracing::warn!(
+                    task = %task_id,
+                    error = %err,
+                    "finalize: failed to delete workspace after the PR opened (retained on disk; not fatal — the PR already opened successfully)"
+                );
+            }
+        }
+        Ok(_) => {
+            tracing::warn!(
+                task = %task_id,
+                "finalize: task was no longer Done when persisting the opened PR; \
+                 leaving DB state as-is (the PR already opened on GitHub and cannot be un-opened)"
+            );
+        }
+        Err(err) => {
+            tracing::error!(
+                task = %task_id,
+                error = %err,
+                "finalize: failed to persist the opened PR; the PR exists on GitHub but Dearborn's \
+                 record of it does not — a human needs to reconcile this"
+            );
+        }
+    }
+}
+
+/// The shared push+open_pr core [`finalize_epic`]/[`finalize_task`] (T-551)
+/// both call: load the project + PAT, open a single `Stage::Push` evidence
+/// row spanning both network operations (§2.2 has one `push` stage, no
+/// separate "open PR" entry), push `workspace`'s branch, then open a PR
+/// titled `title` with body `body`. Every failure routes through
+/// [`fail_item`] with [`FailureReason::PrFailed`] and `PushIntent::Skip` —
+/// this function *is* the push, so routing back through `fail_item`'s own
+/// push step would either push nothing new (the project/PAT load failures,
+/// which happen before any push is even attempted) or push a second,
+/// redundant time (the push-itself-failed/open-PR-failed cases, each of
+/// which already recorded its own evidence via [`close_push_stage`]
+/// immediately before the call) — see [`PushIntent::Skip`]'s own doc.
+/// `epic_id`/`task_id` are threaded straight into `FailureContext` and the
+/// evidence row exactly as the caller's own shape dictates: `Some(epic_id),
+/// None` for an epic, `None, Some(task_id)` for a standalone task. Returns
+/// the opened PR on success; `None` on any failure (already routed to
+/// `Failed`/`Blocked` by the time this returns) — the caller's only job on
+/// `None` is to `return`, exactly like every other failure exit in this
+/// module.
+#[allow(clippy::too_many_arguments)]
+async fn push_and_open_pr(
+    state: &AppState,
+    epic_id: Option<&str>,
+    task_id: Option<&str>,
+    project_id: &str,
+    workspace: &ProvisionedWorkspace,
+    lease: &LeaseHandle,
+    title: &str,
+    body: &str,
+) -> Option<crate::git_host::OpenedPr> {
+    let conn = state.db.conn();
+
+    let project = match load_project_for_finalize(conn, project_id).await {
+        Ok(Some(project)) => project,
+        Ok(None) => {
+            if !lease.is_lost() {
+                fail_item(
+                    state,
+                    FailureContext {
+                        epic_id,
+                        task_id,
+                        reason: FailureReason::PrFailed,
+                        message: "project vanished before finalize",
+                        push: PushIntent::Skip,
+                    },
+                )
+                .await;
+            }
+            return None;
+        }
+        Err(err) => {
+            if !lease.is_lost() {
+                fail_item(
+                    state,
+                    FailureContext {
+                        epic_id,
+                        task_id,
+                        reason: FailureReason::PrFailed,
+                        message: &format!("failed to load project for finalize: {err}"),
+                        push: PushIntent::Skip,
+                    },
+                )
+                .await;
+            }
+            return None;
+        }
+    };
+    let pat = match crate::projects::load_decrypted_pat(state, project_id).await {
+        Ok(pat) => pat,
+        Err(err) => {
+            if !lease.is_lost() {
+                fail_item(
+                    state,
+                    FailureContext {
+                        epic_id,
+                        task_id,
+                        reason: FailureReason::PrFailed,
+                        message: &format!("failed to load project PAT for finalize: {err}"),
+                        push: PushIntent::Skip,
+                    },
+                )
+                .await;
+            }
+            return None;
+        }
+    };
+
+    let open = OpenStage {
+        task_id,
+        epic_id,
+        stage: Stage::Push.as_str(),
+        attempt: 1,
+    };
+    let stage_handle = evidence::open_stage(conn, open).await.ok();
+
+    let push_result = state
+        .git_host
+        .push(PushRequest {
+            workspace_path: &workspace.workspace_path,
+            branch: &workspace.branch_name,
+            repo_url: &project.repo_url,
+            pat: pat.as_deref(),
+        })
+        .await;
+
+    if let Err(err) = push_result {
+        let message = git::redact(&err.message, pat.as_deref());
+        close_push_stage(conn, &stage_handle, "error", &format!("push failed: {message}")).await;
+        if !lease.is_lost() {
+            fail_item(
+                state,
+                FailureContext {
+                    epic_id,
+                    task_id,
+                    reason: FailureReason::PrFailed,
+                    message: &message,
+                    push: PushIntent::Skip,
+                },
+            )
+            .await;
+        }
+        return None;
+    }
+
+    let open_result = state
+        .git_host
+        .open_pr(OpenPrRequest {
+            repo_url: &project.repo_url,
+            pat: pat.as_deref(),
+            head: &workspace.branch_name,
+            title,
+            body,
+        })
+        .await;
+
+    let opened = match open_result {
+        Ok(opened) => opened,
+        Err(err) => {
+            let message = git::redact(&err.message, pat.as_deref());
+            close_push_stage(conn, &stage_handle, "error", &format!("open_pr failed: {message}")).await;
+            if !lease.is_lost() {
+                fail_item(
+                    state,
+                    FailureContext {
+                        epic_id,
+                        task_id,
+                        reason: FailureReason::PrFailed,
+                        message: &message,
+                        push: PushIntent::Skip,
+                    },
+                )
+                .await;
+            }
+            return None;
+        }
+    };
+
+    close_push_stage(
+        conn,
+        &stage_handle,
+        "ok",
+        &format!(
+            "pushed {} to origin; opened PR {} (#{})",
+            workspace.branch_name, opened.url, opened.number
+        ),
+    )
+    .await;
+
+    Some(opened)
 }
 
 /// Close the finalize step's single `Stage::Push` evidence row, if one was
@@ -4343,6 +4904,45 @@ async fn build_task_checklist(
             commit_sha: shas.get(&n.task.id).cloned(),
         })
         .collect()
+}
+
+/// The standalone-task mirror of [`build_task_checklist`] (T-551): a
+/// one-item PR-body checklist for the task itself, reading its own commit
+/// SHA the identical way — `agent_run.log`'s `"commit {sha}: {subject}"`
+/// format via [`pr::parse_commit_sha_from_commit_log`] — just filtered by
+/// `task_id` instead of `epic_id` (a standalone task's evidence rows carry
+/// `epic_id: None, task_id: Some(_)`, the opposite of an epic-owned task's —
+/// see `commit_if_dirty`). Ascending `created_at` order means the *last*
+/// insert into `sha` wins on a task with more than one commit (a review fix
+/// round), mirroring `build_task_checklist`'s own "later commit overwrites
+/// the map entry" behavior. Not a generalization of `build_task_checklist`
+/// itself: that function's whole shape is "walk a `Dag`'s many nodes," which
+/// a standalone task — one task, no DAG — has nothing to walk; duplicating
+/// its ~15 lines here reads clearer than threading an `Either<Dag, &Task>`
+/// through a function built around iterating many nodes.
+async fn build_standalone_checklist(conn: &Connection, task: &crate::tasks::Task) -> Vec<pr::TaskChecklistItem> {
+    let mut sha: Option<String> = None;
+    if let Ok(mut rows) = conn
+        .query(
+            "SELECT log FROM agent_run \
+             WHERE task_id = ?1 AND stage = 'commit' AND status = 'ok' \
+             ORDER BY created_at ASC",
+            params![task.id.clone()],
+        )
+        .await
+    {
+        while let Ok(Some(row)) = rows.next().await {
+            let log: String = row.get(0).unwrap_or_default();
+            if let Some(s) = pr::parse_commit_sha_from_commit_log(&log) {
+                sha = Some(s.to_string());
+            }
+        }
+    }
+    vec![pr::TaskChecklistItem {
+        title: task.title.clone(),
+        short_id: spec::short_id(&task.id).to_string(),
+        commit_sha: sha,
+    }]
 }
 
 /// Resolve the project id for an epic (best-effort, for the board publish).
@@ -5390,10 +5990,16 @@ mod tests {
     }
 
     /// `try_claim_and_run` claims and runs the standalone-task branch when
-    /// that is the only thing queued: the lease is taken, held for the
-    /// (currently no-op, T-551-pending) pipeline body, and released again —
-    /// proving `run_claimed_standalone`'s wiring end to end, not just its
-    /// pieces in isolation.
+    /// that is the only thing queued: the lease is taken, held for the real
+    /// (T-551) pipeline body, and released again — proving
+    /// `run_claimed_standalone`'s wiring end to end, not just its pieces in
+    /// isolation. `seed_project` (not `seed_project_with_workspace`) is
+    /// deliberate here: this test is about the claim/lease lifecycle, not the
+    /// pipeline's happy path (that's the dedicated T-551 tests further down),
+    /// so a project with no `clone_path` is exactly right — `run_standalone_pipeline_inner`
+    /// still runs for real now, fails provisioning immediately
+    /// (`workspace_error`, no task ever "at fault" for lacking a clone), and
+    /// the claim lifecycle must complete (lease released) regardless.
     #[tokio::test]
     async fn try_claim_and_run_claims_and_releases_a_standalone_task() {
         let (state, _app) = test_app().await;
@@ -5402,12 +6008,19 @@ mod tests {
 
         try_claim_and_run(&state, "worker").await;
 
-        // The pipeline body does no real work yet (T-551), but the claim
-        // lifecycle must still be exact: leased, then released, on the way
-        // through `run_claimed_standalone`.
+        // The claim lifecycle must be exact regardless of what the pipeline
+        // body itself does: leased, then released, on the way through
+        // `run_claimed_standalone`.
         let (owner, expires) = task_lease(&state, &task_id).await;
-        assert!(owner.is_none(), "the lease must be released once the (no-op) body returns");
+        assert!(owner.is_none(), "the lease must be released once the body returns");
         assert!(expires.is_none());
+
+        // The pipeline body is real now (T-551): a project with no
+        // `clone_path` fails provisioning, which fails the task itself (no
+        // epic to Block) — proving this isn't a no-op stub anymore.
+        let task = fetch_task_row(&state, &task_id).await;
+        assert_eq!(task.0, "Failed");
+        assert_eq!(task.1.as_deref(), Some("workspace_error"));
     }
 
     // ---- T-510: pool concurrency ----
@@ -8410,7 +9023,7 @@ mod tests {
             fail_item(
                 &state,
                 FailureContext {
-                    epic_id: &epic_id,
+                    epic_id: Some(&epic_id),
                     task_id: Some(&task_id),
                     reason,
                     message: "task-scoped test failure",
@@ -8440,7 +9053,7 @@ mod tests {
             fail_item(
                 &state,
                 FailureContext {
-                    epic_id: &epic_id_no_task,
+                    epic_id: Some(&epic_id_no_task),
                     task_id: None,
                     reason,
                     message: "no-task test failure",
@@ -9205,9 +9818,9 @@ mod tests {
     /// `state.cancel_registry` while it runs (only agent stages register a
     /// handle) — a cancel issued during that window is a pure DB no-op at
     /// the registry layer, and the walk only stops once the shell command
-    /// returns and the next `epic_still_in_progress` check (already built by
-    /// T-513/T-522, unchanged by this task) observes the epic is no longer
-    /// `InProgress`.
+    /// returns and the next `container_still_in_progress` check (already built
+    /// by T-513/T-522, renamed but not behaviorally changed by T-551) observes
+    /// the epic is no longer `InProgress`.
     #[tokio::test]
     async fn cancel_during_a_non_agent_stage_never_touches_the_registry() {
         let agent = Arc::new(ScriptedTaskAgent::new());
@@ -9457,5 +10070,354 @@ mod tests {
         // background loops wind down cleanly instead of leaking a parked
         // thread for the rest of the test binary's life.
         gate.release();
+    }
+
+    // ==== T-551: run a standalone task end-to-end ===========================
+
+    /// `POST /tasks/{id}/run` — `409` unless the task is `Todo` **and**
+    /// `epic_id IS NULL` (§2.5). An epic-scoped task fails this even while
+    /// `Todo`: the `WHERE epic_id IS NULL` clause excludes it regardless of
+    /// its own status — it is only ever run as part of its epic.
+    #[tokio::test]
+    async fn run_task_endpoint_409s_for_an_epic_scoped_task_even_when_todo() {
+        let (state, app) = test_app().await;
+        let project_id = seed_project(&state).await;
+        let epic_id = seed_epic(&state, &project_id, "Ready").await;
+        let task_id = seed_task(&state, &epic_id, &project_id, "A").await; // Todo, epic-scoped
+
+        let response = app
+            .oneshot(req("POST", &format!("/tasks/{task_id}/run"), None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        assert_eq!(single_task_status(&state, &task_id).await, "Todo", "must be untouched");
+    }
+
+    /// `409` for a standalone task in every status other than `Todo`.
+    #[tokio::test]
+    async fn run_task_endpoint_409s_for_every_non_todo_standalone_status() {
+        let (state, app) = test_app().await;
+        let project_id = seed_project(&state).await;
+
+        for status in ["InProgress", "Done", "Failed", "Cancelled"] {
+            let task_id = seed_standalone_task(&state, &project_id, "Standalone", status).await;
+            let response = app
+                .clone()
+                .oneshot(req("POST", &format!("/tasks/{task_id}/run"), None))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::CONFLICT, "status={status}");
+            assert_eq!(
+                single_task_status(&state, &task_id).await,
+                status,
+                "status={status}: must be untouched"
+            );
+        }
+    }
+
+    /// `404` for a task that doesn't exist at all.
+    #[tokio::test]
+    async fn run_task_endpoint_404s_for_unknown_task() {
+        let (_state, app) = test_app().await;
+        let response = app.oneshot(req("POST", "/tasks/nope/run", None)).await.unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// The endpoint's own happy path in isolation (no pool involved): `Todo →
+    /// InProgress`, the returned row reflects it, and `board_updated`
+    /// publishes on `project:<id>` — the AC's "enqueue, notify" plus "board
+    /// shows it" made concrete before any pipeline work happens at all.
+    #[tokio::test]
+    async fn run_task_endpoint_moves_todo_to_in_progress_and_publishes_board_updated() {
+        let (state, app) = test_app().await;
+        let project_id = seed_project(&state).await;
+        let task_id = seed_standalone_task(&state, &project_id, "Standalone", "Todo").await;
+
+        let mut proj_sub = state.hub.subscribe(&format!("project:{project_id}"));
+
+        let response = app
+            .oneshot(req("POST", &format!("/tasks/{task_id}/run"), None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let task = body_json(response).await;
+        assert_eq!(task["status"], "InProgress");
+        assert_eq!(task["epic_id"], Value::Null);
+
+        let frame = proj_sub.recv().await.unwrap();
+        let v: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(v["type"], "board_updated");
+        assert_eq!(v["payload"]["tasks"][0]["status"], "InProgress");
+    }
+
+    /// The full T-551 happy path (MILESTONE_2 §8's own AC), driven exactly the
+    /// way a human would: `POST /tasks/{id}/run` with a worker pool running.
+    /// Mirrors `enqueue_via_lane_drives_dag_to_done_and_completes_with_pr`'s
+    /// epic version one level flatter (no DAG, one task): preflight →
+    /// implement → test gate → commit → review → push → PR, all the way to
+    /// `Done` with `pr_url`/`pr_number` persisted on the *task* row (there is
+    /// no epic) and the workspace deleted.
+    #[tokio::test]
+    async fn standalone_task_happy_path_end_to_end_with_pr() {
+        let agent = Arc::new(
+            ScriptedTaskAgent::new()
+                .script(Stage::Implement, writes_file("a.txt", "a\n"))
+                .script(Stage::Review, review_pass()),
+        );
+        let (state, app) = test_app_with_task_agent(agent).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let task_id = seed_standalone_task(&state, &project_id, "Standalone A", "Todo").await;
+
+        let workspace_path = workspace::task_workspace_path(&state.config.clone_root, &task_id);
+
+        // Start the pool: the run endpoint no longer spawns anything itself
+        // (mirrors the lane handler's own contract), so a pool must be
+        // running to consume the enqueue+notify.
+        let _handles = spawn_pool(state.clone());
+
+        let response = app
+            .clone()
+            .oneshot(req("POST", &format!("/tasks/{task_id}/run"), None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["status"], "InProgress");
+
+        // Poll (bounded) until the task reaches Done.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if single_task_status(&state, &task_id).await == "Done" {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "worker pool never completed the standalone task in time: status={}",
+                    single_task_status(&state, &task_id).await
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // pr_url/pr_number persisted and returned by GET /tasks/{id} — poll a
+        // little further since finalize's push/open_pr runs strictly after
+        // the task's own `Done` write, in the same pipeline body.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        let task_body = loop {
+            let get_response = app
+                .clone()
+                .oneshot(req("GET", &format!("/tasks/{task_id}"), None))
+                .await
+                .unwrap();
+            assert_eq!(get_response.status(), StatusCode::OK);
+            let body = body_json(get_response).await;
+            if body["pr_url"].as_str().is_some() {
+                break body;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("pr_url was never persisted in time: {body:?}");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        };
+        assert_eq!(task_body["status"], "Done");
+        assert_eq!(task_body["epic_id"], Value::Null);
+        assert!(task_body["pr_url"]
+            .as_str()
+            .expect("pr_url must be persisted and returned")
+            .starts_with("https://"));
+        assert!(
+            task_body["pr_number"].as_i64().is_some(),
+            "pr_number must be persisted and returned"
+        );
+        assert!(
+            task_body["branch_name"]
+                .as_str()
+                .expect("branch_name must be persisted")
+                .starts_with("dearborn/task-"),
+            "§2.8: standalone branch names are `dearborn/task-<slug>-<id>`"
+        );
+
+        // The AC's "pr_url is ... shown on the board": `GET /projects/{id}/board`
+        // carries the same `Task` DTO (`board.rs`'s `Board.tasks: Vec<Task>`),
+        // so the completed standalone task's PR link must be visible there too
+        // — no board-side change was needed for this (see the module doc's
+        // "board_updated on every transition" section), but the AC is about
+        // what a client actually sees, so assert the board response directly
+        // rather than trusting that by inspection alone.
+        let board_response = app
+            .clone()
+            .oneshot(req("GET", &format!("/projects/{project_id}/board"), None))
+            .await
+            .unwrap();
+        assert_eq!(board_response.status(), StatusCode::OK);
+        let board = body_json(board_response).await;
+        let board_task = board["tasks"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|t| t["id"] == task_id.as_str())
+            .expect("the completed standalone task must appear on its project's board");
+        assert_eq!(board_task["status"], "Done");
+        assert_eq!(board_task["pr_url"], task_body["pr_url"]);
+        assert_eq!(board_task["pr_number"], task_body["pr_number"]);
+
+        // The workspace is deleted once the PR opens (bounded-poll: finalize
+        // commits the PR fields and only *then* awaits the delete).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if !workspace_path.exists() {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("the workspace must be deleted after a successful finalize");
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // Review ran exactly once (a first-try PASS) — the identical T-530
+        // evidence trail an epic-owned task's review leaves.
+        let rows = review_rows(&state, &task_id).await;
+        assert_eq!(rows.len(), 1, "exactly one review attempt on a first-try PASS");
+        assert_eq!(rows[0].2.as_deref(), Some("PASS"));
+
+        cleanup_clone_root(&state, &project_id, &[]);
+    }
+
+    /// A failing standalone task leaves it `Failed` with its branch pushed and
+    /// the workspace retained — and, per this task's own AC, "there is no
+    /// epic to Block": no epic row is ever seeded in this test, so there is
+    /// nothing for a `Blocked` write to even touch. `board_updated` still
+    /// publishes on the failure (there is no `epic_updated`/`dag_updated` to
+    /// publish instead — see `fail_item`'s own doc, "One container to fail,
+    /// not two").
+    #[tokio::test]
+    async fn standalone_task_failure_leaves_it_failed_with_branch_pushed_and_workspace_retained() {
+        let agent = Arc::new(
+            ScriptedTaskAgent::new()
+                .script(Stage::Implement, writes_file("a.txt", "a\n"))
+                .script(Stage::Review, review_blocked()),
+        );
+        let (state, _app) = test_app_with_task_agent(agent).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let task_id = seed_standalone_task(&state, &project_id, "Standalone A", "InProgress").await;
+
+        let mut proj_sub = state.hub.subscribe(&format!("project:{project_id}"));
+
+        run_standalone_pipeline(state.clone(), task_id.clone()).await;
+
+        let task = fetch_task_row(&state, &task_id).await;
+        assert_eq!(task.0, "Failed");
+        assert_eq!(task.1.as_deref(), Some("blocked"));
+
+        // board_updated fired for the failure.
+        let frame = proj_sub.recv().await.unwrap();
+        let v: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(v["type"], "board_updated");
+        assert_eq!(v["payload"]["tasks"][0]["status"], "Failed");
+        assert_eq!(v["payload"]["tasks"][0]["failure_reason"], "blocked");
+
+        // The workspace is retained (never deleted on a failure, D10/§7).
+        let workspace_path = workspace::task_workspace_path(&state.config.clone_root, &task_id);
+        assert!(
+            workspace_path.join(".git").exists(),
+            "the workspace must be retained on failure"
+        );
+
+        // The branch was pushed — the D10/§7 triage push, unconditional on
+        // the standalone side (no `took_epic`-style race gate; see
+        // `fail_item`'s own doc).
+        let branch = {
+            let mut rows = state
+                .db
+                .conn()
+                .query(
+                    "SELECT branch_name FROM task WHERE id = ?1",
+                    params![task_id.clone()],
+                )
+                .await
+                .unwrap();
+            rows.next()
+                .await
+                .unwrap()
+                .expect("branch_name must be set once the workspace was provisioned")
+                .get::<String>(0)
+                .unwrap()
+        };
+        let subjects = git_log_subjects_for_ref(&fixture.dir, &branch).await;
+        assert!(
+            subjects.contains(&format!("impl({}): Standalone A", spec::short_id(&task_id))),
+            "the committed impl must be on the pushed branch: {subjects:?}"
+        );
+
+        cleanup_clone_root(&state, &project_id, &[]);
+        let _ = std::fs::remove_dir_all(&workspace_path);
+    }
+
+    /// D11/T-551's revised retry contract, proven live: `POST
+    /// /tasks/{id}/retry` on a `Failed` standalone task doesn't just flip a
+    /// status the HTTP response shows — it leaves the task genuinely
+    /// re-claimable, and the same dispatch `worker_loop` itself calls
+    /// (`try_claim_and_run`) picks it up and runs it to completion. If retry
+    /// had left the task in `Todo` (T-541's original contract, unrevised),
+    /// `claim_task`'s predicate (`status = 'InProgress' AND epic_id IS NULL`)
+    /// would find nothing here and the second `try_claim_and_run` below would
+    /// be a no-op — the task would stay stuck `Todo` forever without a human
+    /// separately calling `POST /tasks/{id}/run` again.
+    #[tokio::test]
+    async fn retried_standalone_task_is_reclaimed_and_rerun() {
+        let agent = Arc::new(
+            ScriptedTaskAgent::new()
+                .script(Stage::Implement, writes_file("a.txt", "a\n"))
+                .script(Stage::Review, review_blocked()),
+        );
+        let (state, app) = test_app_with_task_agent(agent).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let task_id = seed_standalone_task(&state, &project_id, "Standalone A", "Todo").await;
+
+        // Start it, then run the (scripted-to-fail) first attempt directly —
+        // a single, bounded claim/run/release, exactly what `try_claim_and_run`
+        // itself is.
+        let response = app
+            .clone()
+            .oneshot(req("POST", &format!("/tasks/{task_id}/run"), None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        try_claim_and_run(&state, "worker-1").await;
+        let task = fetch_task_row(&state, &task_id).await;
+        assert_eq!(task.0, "Failed", "first attempt must fail on the scripted BLOCKED verdict");
+        assert_eq!(task.1.as_deref(), Some("blocked"));
+
+        // Retry: T-551's revised contract sends a standalone task straight
+        // back to InProgress (not Todo — see `retry_task`'s own doc).
+        let retry_response = app
+            .clone()
+            .oneshot(req("POST", &format!("/tasks/{task_id}/retry"), None))
+            .await
+            .unwrap();
+        assert_eq!(retry_response.status(), StatusCode::OK);
+        let retried = body_json(retry_response).await;
+        assert_eq!(retried["status"], "InProgress");
+        assert_eq!(retried["failure_reason"], Value::Null);
+
+        // The real proof: `try_claim_and_run` (the exact dispatch
+        // `worker_loop` calls, §2.4's claim query unchanged) actually claims
+        // and runs it a second time. The implement stage has nothing left
+        // scripted (`ScriptedTaskAgent`'s unscripted default: exit 0, no
+        // files), so this run produces no diff and routes through T-532's
+        // verify-complete (also unscripted -> default PASS), closing the task
+        // `Done` with zero new commits before finalize opens the PR.
+        try_claim_and_run(&state, "worker-2").await;
+
+        let task = fetch_task_row(&state, &task_id).await;
+        assert_eq!(task.0, "Done", "the retried task must have actually resumed and completed");
+        assert_eq!(task.1, None, "failure_reason must stay cleared");
+
+        let workspace_path = workspace::task_workspace_path(&state.config.clone_root, &task_id);
+        cleanup_clone_root(&state, &project_id, &[]);
+        let _ = std::fs::remove_dir_all(&workspace_path);
     }
 }

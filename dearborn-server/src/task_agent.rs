@@ -477,15 +477,17 @@ pub struct AgentStageParams<'a> {
 pub type CancelRegistry = Mutex<HashMap<String, RunHandle>>;
 
 /// The id [`AppState::cancel_registry`] keys a stage's entry under: the epic
-/// id when the stage belongs to one (every stage today — T-513's DAG walk is
-/// epic-scoped), the task id otherwise (`epic_id: None`, T-551's future
-/// standalone-task claim). This is deliberately "whatever id the claimed
-/// item has," not "task id" specifically or "epic id" specifically — it is
-/// the same id `worker::WorkItem::Epic(id) | WorkItem::Standalone(task_id)`
-/// carries via `WorkItem::id()` now that T-550 has landed that unification,
-/// so this function (and every registry lookup keyed by its result) costs
-/// nothing to adapt once T-551 actually drives an agent stage for a
-/// `Standalone` claim.
+/// id when the stage belongs to one (an epic's DAG walk), the task id
+/// otherwise (`epic_id: None` — a standalone claim, T-551). This is
+/// deliberately "whatever id the claimed item has," not "task id"
+/// specifically or "epic id" specifically — it is the same id
+/// `worker::WorkItem::Epic(id) | WorkItem::Standalone(task_id)` carries via
+/// `WorkItem::id()` (T-550). T-551 confirmed the bet this doc made before a
+/// standalone claim ever drove an agent stage: `worker::process_one_task`
+/// passes `AgentStageParams { epic_id: task.epic_id.as_deref(), .. }`
+/// unchanged for both an epic-owned and a standalone task, and this function
+/// needed no adaptation at all to key a standalone stage's registry entry by
+/// its task id.
 pub(crate) fn cancel_registry_key<'a>(params: &AgentStageParams<'a>) -> &'a str {
     params.epic_id.unwrap_or(params.task_id)
 }
@@ -1694,9 +1696,11 @@ mod tests {
         std::fs::remove_dir_all(&dir).ok();
     }
 
-    /// T-551 forward-compat: a standalone-task stage (`epic_id: None`) keys
-    /// its registry entry by `task_id` instead — [`cancel_registry_key`]'s
-    /// whole reason to exist rather than a bare `params.epic_id.unwrap()`.
+    /// T-551: a standalone-task stage (`epic_id: None`) keys its registry
+    /// entry by `task_id` instead — [`cancel_registry_key`]'s whole reason to
+    /// exist rather than a bare `params.epic_id.unwrap()`. This is the shape
+    /// `worker::process_one_task` now exercises for real for every stage of a
+    /// standalone claim, not just a forward-looking guess.
     #[tokio::test]
     async fn run_agent_stage_keys_the_registry_by_task_id_when_standalone() {
         let state = test_state().await;

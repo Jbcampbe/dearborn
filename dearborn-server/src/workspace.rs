@@ -85,6 +85,23 @@
 //! follow touch only that epic's own workspace directory and never need to
 //! serialize with anything. Provisions in *different* projects get different
 //! locks and never block each other.
+//!
+//! ## Standalone-task workspaces (T-551, D17)
+//!
+//! Everything above this note was written when an "epic workspace" was the
+//! only kind of workspace there could ever be. D17's standalone tasks need
+//! the identical sequence — refresh canonical, clone-or-reattach, run
+//! `setup_cmd`, persist a branch name once — just against
+//! `<clone_root>/tasks/<task id>` and `task.branch_name` instead of the epic
+//! table (§2.8's `dearborn/task-<slug>-<id>` branch shape). Rather than a
+//! second, hand-copied `provision_task_workspace` function, [`WorkspaceContainer`]
+//! (`Epic` | `Task`) names the one axis the two cases differ on — which table
+//! a handful of small reads/writes hit — and [`provision_workspace`] is the
+//! single body both [`provision_epic_workspace`] and [`provision_task_workspace`]
+//! call into with their own container, path, and branch-name-format function.
+//! `provision_epic_workspace` itself keeps its exact pre-T-551 signature and
+//! behavior, so every T-511+ test calling it directly still compiles and
+//! passes unchanged — the refactor moved what's *inside* it, not its shape.
 
 use std::path::{Path, PathBuf};
 use std::time::Duration;
@@ -100,6 +117,12 @@ use crate::AppState;
 /// canonical checkout stays `<clone_root>/<project id>` (T-103, unchanged).
 pub fn epic_workspace_path(clone_root: &str, epic_id: &str) -> PathBuf {
     Path::new(clone_root).join("epics").join(epic_id)
+}
+
+/// §2.8: the standalone-task workspace path — `<clone_root>/tasks/<task
+/// id>` (T-551) — the task-table mirror of [`epic_workspace_path`].
+pub fn task_workspace_path(clone_root: &str, task_id: &str) -> PathBuf {
+    Path::new(clone_root).join("tasks").join(task_id)
 }
 
 /// Cap on a slugged title's length (§2.8), applied *after* trimming stray
@@ -160,6 +183,18 @@ pub fn epic_branch_name(title: &str, epic_id: &str) -> String {
     format!("dearborn/{}-{}", slug(title), last_n_lower(epic_id, 6))
 }
 
+/// §2.8's standalone-task branch name: `dearborn/task-<slug(task.title)>-<last
+/// 6 of task id>` (T-551) — the task-table mirror of [`epic_branch_name`].
+/// The extra `task-` infix is the one naming difference §2.8 specifies
+/// between the two branch shapes; kept as a distinct format string rather
+/// than parameterizing `epic_branch_name` over an optional infix, since a
+/// third shape is never coming (D17: exactly epic and standalone) and a
+/// boolean/enum parameter for "insert this literal or don't" would read as
+/// more general than the problem actually is.
+pub fn task_branch_name(title: &str, task_id: &str) -> String {
+    format!("dearborn/task-{}-{}", slug(title), last_n_lower(task_id, 6))
+}
+
 /// The last (up to) `n` characters of `s`, lowercased.
 fn last_n_lower(s: &str, n: usize) -> String {
     let chars: Vec<char> = s.chars().collect();
@@ -203,6 +238,38 @@ pub enum ProvisionFailure {
     },
 }
 
+/// Which row backs a provisioned workspace (T-551) — the *only* axis
+/// [`provision_epic_workspace`]/[`provision_task_workspace`] differ on: where
+/// `branch_name` is read/persisted, and which evidence identity `setup_cmd`'s
+/// `agent_run` row carries. Mirrors `worker::LeaseTable`'s "enum plus one
+/// shared core" shape (T-550) rather than a generic/trait parameter — D17
+/// means there are exactly two containers to ever support, so a third
+/// implementor is never coming. Kept private: nothing outside this module
+/// needs to name a container — every caller already knows which kind of
+/// workspace it wants via which public function it calls.
+enum WorkspaceContainer<'a> {
+    Epic(&'a str),
+    Task(&'a str),
+}
+
+impl WorkspaceContainer<'_> {
+    fn id(&self) -> &str {
+        match self {
+            WorkspaceContainer::Epic(id) | WorkspaceContainer::Task(id) => id,
+        }
+    }
+
+    /// The `(epic_id, task_id)` pair `setup_cmd`'s evidence row carries —
+    /// exactly the shape `worker::AgentStageParams`/`FailureContext` already
+    /// use at this same epic/standalone boundary.
+    fn evidence_ids(&self) -> (Option<&str>, Option<&str>) {
+        match self {
+            WorkspaceContainer::Epic(id) => (Some(*id), None),
+            WorkspaceContainer::Task(id) => (None, Some(*id)),
+        }
+    }
+}
+
 /// Provision (or re-attach) `epic_id`'s workspace in `project_id`. See the
 /// module doc for the full sequence and its rationale. On success, the
 /// workspace is checked out on `branch_name` with `setup_cmd` (if any) having
@@ -213,7 +280,59 @@ pub async fn provision_epic_workspace(
     epic_id: &str,
     project_id: &str,
 ) -> Result<ProvisionedWorkspace, ProvisionFailure> {
+    let workspace_path = epic_workspace_path(&state.config.clone_root, epic_id);
+    provision_workspace(
+        state,
+        WorkspaceContainer::Epic(epic_id),
+        project_id,
+        workspace_path,
+        epic_branch_name,
+    )
+    .await
+}
+
+/// The standalone-task mirror of [`provision_epic_workspace`] (T-551, §2.8):
+/// identical sequence — refresh canonical → clone/re-attach → `setup_cmd` →
+/// persist `branch_name` on first provision — against `<clone_root>/tasks/<task
+/// id>` and `task.branch_name` instead of the epic table. See
+/// [`provision_workspace`] for the shared body; this function supplies only
+/// the two things that differ (which path, which branch-name format).
+pub async fn provision_task_workspace(
+    state: &AppState,
+    task_id: &str,
+    project_id: &str,
+) -> Result<ProvisionedWorkspace, ProvisionFailure> {
+    let workspace_path = task_workspace_path(&state.config.clone_root, task_id);
+    provision_workspace(
+        state,
+        WorkspaceContainer::Task(task_id),
+        project_id,
+        workspace_path,
+        task_branch_name,
+    )
+    .await
+}
+
+/// The shared guts of [`provision_epic_workspace`]/[`provision_task_workspace`]
+/// (T-551): every step of the module doc's sequence, parameterized on which
+/// [`WorkspaceContainer`] this claim is for, its already-computed
+/// `workspace_path` (the one thing that genuinely differs in *shape*, not
+/// just in which table a query hits — an epic's and a standalone task's
+/// workspace paths live under different subtrees of `clone_root`), and
+/// `branch_name_fn` (`epic_branch_name`/`task_branch_name`, §2.8's two branch
+/// formats). Everything else — the canonical refresh under the per-project
+/// lock, the clone-vs-reattach decision, `setup_cmd`, persisting
+/// `branch_name` once on first provision — is exactly the same code path for
+/// both containers, run here once.
+async fn provision_workspace(
+    state: &AppState,
+    container: WorkspaceContainer<'_>,
+    project_id: &str,
+    workspace_path: PathBuf,
+    branch_name_fn: impl Fn(&str, &str) -> String,
+) -> Result<ProvisionedWorkspace, ProvisionFailure> {
     let conn = state.db.conn();
+    let container_id = container.id();
 
     let project = load_project(conn, project_id)
         .await
@@ -248,18 +367,16 @@ pub async fn provision_epic_workspace(
             .map_err(|e| ProvisionFailure::Workspace(e.message))?;
     }
 
-    let epic = load_epic_for_provision(conn, epic_id)
+    let (title, existing_branch_name) = load_container_for_provision(conn, &container)
         .await
-        .map_err(|e| ProvisionFailure::Workspace(format!("failed to load epic: {e}")))?
-        .ok_or_else(|| ProvisionFailure::Workspace(format!("epic {epic_id} not found")))?;
-
-    let workspace_path = epic_workspace_path(&state.config.clone_root, epic_id);
+        .map_err(|e| ProvisionFailure::Workspace(format!("failed to load container: {e}")))?
+        .ok_or_else(|| ProvisionFailure::Workspace(format!("{container_id} not found")))?;
 
     // Read back a previously persisted branch name rather than recomputing —
     // see the module doc's "why re-attach" section.
-    let (branch_name, is_first_provision) = match epic.branch_name {
+    let (branch_name, is_first_provision) = match existing_branch_name {
         Some(existing) => (existing, false),
-        None => (epic_branch_name(&epic.title, epic_id), true),
+        None => (branch_name_fn(&title, container_id), true),
     };
 
     // 2. Clone (first provision / a workspace that vanished or drifted since
@@ -282,13 +399,13 @@ pub async fn provision_epic_workspace(
 
     // 3. `setup_cmd`, if any — re-runs on re-attach too (see module doc).
     if let Some(setup_cmd) = non_empty(project.setup_cmd.as_deref()) {
-        run_setup(state, epic_id, &workspace_path, setup_cmd, pat.as_deref()).await?;
+        run_setup(state, container.evidence_ids(), &workspace_path, setup_cmd, pat.as_deref()).await?;
     }
 
     // 4. Persist the branch name — only on first provision; thereafter it is
     //    read back, never rewritten (see module doc).
     if is_first_provision {
-        persist_branch_name(conn, epic_id, &branch_name)
+        persist_container_branch_name(conn, &container, &branch_name)
             .await
             .map_err(|e| {
                 ProvisionFailure::Workspace(format!("failed to persist branch_name: {e}"))
@@ -333,18 +450,25 @@ async fn workspace_reattachable(workspace_path: &Path, expected_branch: &str) ->
 /// it — the same defensive redaction T-511 established, now happening for
 /// free wherever [`cmd::run_stage_command`] is used with this hook, instead
 /// of only at this one call site.
+///
+/// `evidence_ids` (T-551) is the `(epic_id, task_id)` pair
+/// [`WorkspaceContainer::evidence_ids`] hands `setup_cmd`'s own `agent_run`
+/// row — `(Some(epic_id), None)` for an epic, `(None, Some(task_id))` for a
+/// standalone task, mirroring `worker::AgentStageParams`'s identical
+/// epic/standalone shape.
 async fn run_setup(
     state: &AppState,
-    epic_id: &str,
+    evidence_ids: (Option<&str>, Option<&str>),
     workspace_path: &Path,
     setup_cmd: &str,
     pat: Option<&str>,
 ) -> Result<(), ProvisionFailure> {
+    let (epic_id, task_id) = evidence_ids;
     let outcome = cmd::run_stage_command(
         state.db.conn(),
         StageCommand {
-            task_id: None,
-            epic_id: Some(epic_id),
+            task_id,
+            epic_id,
             stage: "setup",
             attempt: 1,
             cwd: workspace_path,
@@ -418,40 +542,61 @@ async fn load_project(
     }
 }
 
-struct EpicForProvision {
-    title: String,
-    branch_name: Option<String>,
-}
-
-async fn load_epic_for_provision(
+/// Just enough of a container row (epic or task) for [`provision_workspace`]:
+/// its title (to compute a branch name on first provision) and its
+/// already-persisted `branch_name` (`None` on first provision, `Some` on a
+/// re-claim — see the module doc's "why re-attach" section).
+async fn load_container_for_provision(
     conn: &Connection,
-    epic_id: &str,
-) -> Result<Option<EpicForProvision>, libsql::Error> {
-    let mut rows = conn
-        .query(
-            "SELECT title, branch_name FROM epic WHERE id = ?1",
-            params![epic_id],
-        )
-        .await?;
-    match rows.next().await? {
-        Some(row) => Ok(Some(EpicForProvision {
-            title: row.get(0)?,
-            branch_name: row.get(1)?,
-        })),
-        None => Ok(None),
+    container: &WorkspaceContainer<'_>,
+) -> Result<Option<(String, Option<String>)>, libsql::Error> {
+    match container {
+        WorkspaceContainer::Epic(epic_id) => {
+            let mut rows = conn
+                .query(
+                    "SELECT title, branch_name FROM epic WHERE id = ?1",
+                    params![*epic_id],
+                )
+                .await?;
+            match rows.next().await? {
+                Some(row) => Ok(Some((row.get(0)?, row.get(1)?))),
+                None => Ok(None),
+            }
+        }
+        WorkspaceContainer::Task(task_id) => {
+            let mut rows = conn
+                .query(
+                    "SELECT title, branch_name FROM task WHERE id = ?1",
+                    params![*task_id],
+                )
+                .await?;
+            match rows.next().await? {
+                Some(row) => Ok(Some((row.get(0)?, row.get(1)?))),
+                None => Ok(None),
+            }
+        }
     }
 }
 
-async fn persist_branch_name(
+/// Persist `branch_name` on the container's own row (T-551) — the
+/// epic/task-table mirror pair `provision_workspace`'s first-provision step
+/// calls into. See the module doc's "why re-attach" section for why this
+/// only ever runs once per container, never on a re-attach.
+async fn persist_container_branch_name(
     conn: &Connection,
-    epic_id: &str,
+    container: &WorkspaceContainer<'_>,
     branch_name: &str,
 ) -> Result<(), libsql::Error> {
-    conn.execute(
-        "UPDATE epic SET branch_name = ?1, updated_at = ?2 WHERE id = ?3",
-        params![branch_name, now_ms(), epic_id],
-    )
-    .await?;
+    let (table, id) = match container {
+        WorkspaceContainer::Epic(epic_id) => ("epic", *epic_id),
+        WorkspaceContainer::Task(task_id) => ("task", *task_id),
+    };
+    // `table` is one of two compile-time string literals chosen just above by
+    // `WorkspaceContainer`'s own match, never caller-supplied data — the same
+    // pattern `worker::claim_row`'s doc already establishes for interpolating
+    // a table name safely.
+    let sql = format!("UPDATE {table} SET branch_name = ?1, updated_at = ?2 WHERE id = ?3");
+    conn.execute(&sql, params![branch_name, now_ms(), id]).await?;
     Ok(())
 }
 
@@ -1040,7 +1185,7 @@ mod tests {
         let pat = "s3cr3t-pat-value";
         let setup_cmd = format!("echo {pat} && exit 1");
 
-        let err = run_setup(&state, &epic_id, &workspace, &setup_cmd, Some(pat))
+        let err = run_setup(&state, (Some(&epic_id), None), &workspace, &setup_cmd, Some(pat))
             .await
             .expect_err("exit 1 must surface as a Setup failure");
         let (message, exit_code) = match err {

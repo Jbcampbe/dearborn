@@ -196,21 +196,96 @@ timeouts (T-543)" below): a stage that exceeds its deadline is, from
 precise reason string — the task fails and the epic blocks exactly as they
 do for `agent_error`.
 
-#### Recovery: retry a failed task (T-541)
+#### Recovery: retry a failed task (T-541, standalone contract revised by T-551)
 
 | Action | Method + path | Success status |
 | ------ | ------------- | --------------- |
 | retry a failed task | `POST /tasks/{id}/retry` | `200` (the updated task); `409` unless `Failed` |
 
-D11's one-shot recovery transition: `Failed → Todo` (clearing
-`failure_reason`), and — **iff** the task's parent epic is currently
-`Blocked` — that epic also moves `Blocked → InProgress`, clearing
-`blocked_reason` and its lease (`lease_owner`/`lease_expires_at`), so the
-worker pool's claim query (§2.4) can pick it up again. `404` if the task does
-not exist; `409 conflict` if it exists but is not currently `Failed` (no
-body is required). A standalone task (`epic_id IS NULL`) has no epic to
-unblock — it still returns to `Todo`; nothing currently claims it (that's
-T-551's `POST /tasks/{id}/run`).
+D11's one-shot recovery transition. For an **epic-scoped** task:
+`Failed → Todo` (clearing `failure_reason`), and — **iff** the task's parent
+epic is currently `Blocked` — that epic also moves `Blocked → InProgress`,
+clearing `blocked_reason` and its lease (`lease_owner`/`lease_expires_at`), so
+the worker pool's claim query (§2.4) can pick it up again. `404` if the task
+does not exist; `409 conflict` if it exists but is not currently `Failed` (no
+body is required).
+
+For a **standalone** task (`epic_id IS NULL`), the transition is
+`Failed → InProgress` directly — **not** `Todo`. T-541 originally sent every
+retried task to `Todo` and left resuming a standalone one for T-551; taken
+literally that's a dead end, since the worker's claim query (§2.4) only ever
+selects `status = 'InProgress' AND epic_id IS NULL` — a task sitting in
+`Todo` is never picked up by anything, so "retry" would silently not resume
+work. The fix follows from what a standalone task actually is: unlike an
+epic-scoped task, where the claimable item (the epic) and the unit of work
+(the task) are two different rows, a standalone task is both at once, so
+restoring its claimability *is* resetting its work — one write, not two. The
+lease columns are cleared defensively (normally already `NULL` — a task's
+lease is released on every pipeline exit path before it ever reaches
+`Failed`). `POST /tasks/{id}/run` is the endpoint that puts a task into this
+loop the *first* time (see below); retry is what puts it back in after a
+failure.
+
+Editing the task's spec via `PATCH /tasks/{id}` before calling `retry` needs
+no special support here: the next `implement`/`fix` stage simply re-renders
+whatever `description`/`acceptance` are on the row at claim time, so an
+edited spec reaches the re-run for free. This applies identically to both the
+epic-scoped and standalone cases.
+
+On success: `dag_updated` + `epic_updated` on `epic:<id>` (only when the task
+has an epic) and `board_updated` on `project:<id>` (always) — the same frames
+`POST /epics/{id}/lane` publishes for a lane move — followed by
+`state.notify.notify_waiters()` so an idle worker loop wakes immediately
+instead of waiting out `DEARBORN_POLL_INTERVAL_MS`.
+
+Once a worker re-claims an unblocked epic, provisioning re-attaches its
+retained workspace (T-511: `git reset --hard HEAD` + `git clean -fd`), which
+is what actually drops the failed attempt's dirty tree before the walk
+re-enters at the now-`Todo` task. A retried standalone task re-attaches its
+own workspace (`workspace::provision_task_workspace`) the identical way.
+
+#### Run a standalone task end-to-end (T-551, §2.5, §8)
+
+| Action | Method + path | Success status |
+| ------ | ------------- | --------------- |
+| run a standalone task | `POST /tasks/{id}/run` | `200` (the updated task); `409` unless `Todo` **and** `epic_id IS NULL` |
+
+The standalone-task counterpart to an epic's `Ready → InProgress` lane move:
+`Todo → InProgress`, so the worker pool's claim query (`epic` claims tried
+first, standalone `task` claims as the fallback, §2.4) picks the task up on
+its own leased run. `404` if the task does not exist; `409` unless the task
+is currently `Todo` **and** `epic_id IS NULL` — an epic-scoped task always
+`409`s here regardless of its own status; it is only ever run as part of its
+epic's own `InProgress` transition.
+
+Once claimed, the task runs the **identical** pipeline an epic-owned task's
+DAG walk runs for one of its own tasks — preflight (if `test_cmd` is
+configured) → implement → test gate/fix loop → commit → review/fix-converge
+(or T-532's already-complete verification, if implement produced no diff) →
+`Done` — against its own workspace (`<clone_root>/tasks/{id}`, §2.8) on its
+own branch (`dearborn/task-<slug(title)>-<last 6 of id>`, §2.8). On success,
+finalize pushes the branch and opens the task's own PR, persisting
+`pr_url`/`pr_number` directly on the `Task` row (there is no epic to carry
+them instead) — the task's terminal status stays `Done` (the `task` table has
+no `Completed` value; opening the PR doesn't change what "done" means, only
+where to find the PR). A failure routes through the same structured-failure
+router every epic-scoped failure uses (`worker::fail_item`), with one
+difference: **there is no epic to `Block`** — every §2.3 reason, including
+`preflight_red`/`setup_failed`/`workspace_error` (which for an epic have no
+task at fault yet), names the task itself, which lands `Failed` with its
+branch pushed (the identical D10/§7 triage push) and its workspace retained.
+`POST /tasks/{id}/retry` (above) is how it resumes.
+
+`board_updated` on `project:<id>` publishes on every standalone-task
+transition this endpoint and the pipeline body cause: `Todo → InProgress`
+(this endpoint), `→ Failed` (the failure router), `→ Done` (the pipeline's
+own close-out) and once more when `pr_url`/`pr_number` land (finalize) —
+`Task` already serializes `pr_url`/`failure_reason`/`branch_name` (T-500), so
+the project board (`GET /projects/{id}/board`) shows a standalone task's PR
+link and failure reason with no board-side change required.
+
+There is **no cancellation surface for a standalone task** — see
+"Cancellation as a kill (T-542)" below, unchanged by this task.
 
 #### Cancellation as a kill (T-542)
 
@@ -241,25 +316,10 @@ stop. The epic needs no further write at that point (already `Cancelled`,
 set synchronously by this same endpoint before the kill was even issued).
 No PR is ever opened on a cancelled epic; the workspace is retained on disk
 exactly as it is on every other stop path (`Blocked`, a lost lease). There is
-currently no equivalent for a standalone task (T-551) or a task-scoped
-cancel independent of its epic — cancellation today is epic-scoped, issued
-only through this one endpoint.
-
-Editing the task's spec via `PATCH /tasks/{id}` before calling `retry` needs
-no special support here: the next `implement`/`fix` stage simply re-renders
-whatever `description`/`acceptance` are on the row at claim time, so an
-edited spec reaches the re-run for free.
-
-On success: `dag_updated` + `epic_updated` on `epic:<id>` (only when the task
-has an epic) and `board_updated` on `project:<id>` — the same frames
-`POST /epics/{id}/lane` publishes for a lane move — followed by
-`state.notify.notify_waiters()` so an idle worker loop wakes immediately
-instead of waiting out `DEARBORN_POLL_INTERVAL_MS`.
-
-Once a worker re-claims the unblocked epic, provisioning re-attaches its
-retained workspace (T-511: `git reset --hard HEAD` + `git clean -fd`), which
-is what actually drops the failed attempt's dirty tree before the walk
-re-enters at the now-`Todo` task.
+still no equivalent for a standalone task after T-551 landed — see that
+task's own section above ("no cancellation surface for a standalone task")
+— or a task-scoped cancel independent of its epic; cancellation today is
+epic-scoped, issued only through this one endpoint.
 
 #### Agent stage timeouts (T-543)
 

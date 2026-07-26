@@ -413,7 +413,7 @@ with `agent_error` and gets thickened in later phases.
   standalone work never starves an epic; no duplicated
   lease/heartbeat/workspace/finalize code.
 
-- [ ] **T-551 — Run a standalone task end-to-end.** *deps: T-514, T-550*
+- [x] **T-551 — Run a standalone task end-to-end.** *deps: T-514, T-550*
   `POST /tasks/{id}/run` (`Todo → InProgress`, enqueue, notify), workspace at
   `<clone_root>/tasks/<id>`, branch per §2.8, full pipeline, its own PR. **AC:**
   `409` unless the task is `Todo` **and** `epic_id IS NULL`; the whole pipeline

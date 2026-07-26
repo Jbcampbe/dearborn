@@ -172,18 +172,23 @@ pub struct AppState {
     /// assumption is ever violated.
     ///
     /// **Shaped for T-550/T-551.** The key is "whatever id the claimed item
-    /// has" — the epic id for every stage today (T-513's DAG walk is
-    /// epic-scoped), the task id for a future standalone-task claim
-    /// (`epic_id: None`, T-551). T-550 has since landed
+    /// has" — the epic id for an epic's DAG walk, the task id for a
+    /// standalone claim (`epic_id: None`). T-550 landed
     /// `worker::WorkItem::Epic(id) | WorkItem::Standalone(task_id)` as
     /// exactly this id (`WorkItem::id()`), confirming the bet this doc made
     /// before that unification existed: neither this field nor
     /// `task_agent::cancel_registry_key` needed to change shape when it did.
-    /// What's still missing is T-551 actually populating a `Standalone`
-    /// claim's agent stages through this registry in practice — T-550's own
-    /// standalone pipeline seam (`worker::run_standalone_pipeline_inner`)
-    /// runs no agent stage yet, so no `Standalone`-keyed entry exists here
-    /// until that lands.
+    /// T-551 landed the rest of the bet: `worker::run_standalone_pipeline_inner`
+    /// now drives a standalone task through the identical `process_one_task`
+    /// sequence an epic-owned task runs, so a `Standalone`-keyed entry *does*
+    /// populate here for the duration of each of its agent stages, exactly
+    /// like an `Epic`-keyed one. What's still missing is any HTTP surface
+    /// that would ever look one up to call `RunControl::cancel()` on it — T-551
+    /// deliberately did not add a `POST /tasks/{id}/lane`-style cancel
+    /// endpoint (MILESTONE_2 §8 names no such AC, and T-561's own client AC
+    /// only lists "Cancel on in-flight **epics**") — so a standalone task's
+    /// entry here is populated and correctly shaped, just never read by
+    /// anything today.
     pub cancel_registry: Arc<task_agent::CancelRegistry>,
     /// Test-only seam (T-510) letting a test observe/gate the claimed-epic
     /// pipeline body without sleeps: if set, [`worker::run_epic_pipeline`]
@@ -451,6 +456,7 @@ pub fn app(state: AppState) -> Router {
                 .delete(tasks::remove_task),
         )
         .route("/tasks/:id/retry", axum::routing::post(tasks::retry_task))
+        .route("/tasks/:id/run", axum::routing::post(tasks::run_task))
         .route("/tasks/:id/runs", get(evidence::list_task_runs))
         .route("/runs/:id", get(evidence::get_run))
         .route_layer(middleware::from_fn_with_state(
