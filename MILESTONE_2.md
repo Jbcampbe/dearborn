@@ -376,7 +376,12 @@ with `agent_error` and gets thickened in later phases.
 - [x] **T-541 — `POST /tasks/{id}/retry`.** *deps: T-540*
   One atomic transition: `Failed → Todo`, clear `failure_reason`, and if the
   parent epic is `Blocked` → `InProgress` + clear `blocked_reason` + clear lease
-  + notify. **AC:** `409` unless the task is `Failed`; after retry a worker
+  + notify. *Revised by T-551: a **standalone** task retries to `InProgress`,
+  not `Todo`. The epic case has two rows — the claimable item (the epic) and
+  the unit of work (the task) — and restores each separately; a standalone task
+  is one row playing both roles, and `claim_task` only ever selects
+  `InProgress`, so retrying it to `Todo` would clear the failure without
+  resuming anything.* **AC:** `409` unless the task is `Failed`; after retry a worker
   re-claims, re-attaches (`reset --hard` + `clean -fd` drops the failed
   attempt), and re-runs the task; the epic returns to the In Progress lane;
   editing the spec with `PATCH /tasks/{id}` before retrying feeds the new spec
