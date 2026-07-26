@@ -183,6 +183,38 @@ A failure is epic-scoped, not fatal to the worker: the same worker loop that
 just blocked one epic claims its next item (a different epic, or the same
 project's next one) immediately, with no extra delay.
 
+#### Recovery: retry a failed task (T-541)
+
+| Action | Method + path | Success status |
+| ------ | ------------- | --------------- |
+| retry a failed task | `POST /tasks/{id}/retry` | `200` (the updated task); `409` unless `Failed` |
+
+D11's one-shot recovery transition: `Failed → Todo` (clearing
+`failure_reason`), and — **iff** the task's parent epic is currently
+`Blocked` — that epic also moves `Blocked → InProgress`, clearing
+`blocked_reason` and its lease (`lease_owner`/`lease_expires_at`), so the
+worker pool's claim query (§2.4) can pick it up again. `404` if the task does
+not exist; `409 conflict` if it exists but is not currently `Failed` (no
+body is required). A standalone task (`epic_id IS NULL`) has no epic to
+unblock — it still returns to `Todo`; nothing currently claims it (that's
+T-551's `POST /tasks/{id}/run`).
+
+Editing the task's spec via `PATCH /tasks/{id}` before calling `retry` needs
+no special support here: the next `implement`/`fix` stage simply re-renders
+whatever `description`/`acceptance` are on the row at claim time, so an
+edited spec reaches the re-run for free.
+
+On success: `dag_updated` + `epic_updated` on `epic:<id>` (only when the task
+has an epic) and `board_updated` on `project:<id>` — the same frames
+`POST /epics/{id}/lane` publishes for a lane move — followed by
+`state.notify.notify_waiters()` so an idle worker loop wakes immediately
+instead of waiting out `DEARBORN_POLL_INTERVAL_MS`.
+
+Once a worker re-claims the unblocked epic, provisioning re-attaches its
+retained workspace (T-511: `git reset --hard HEAD` + `git clean -fd`), which
+is what actually drops the failed attempt's dirty tree before the walk
+re-enters at the now-`Todo` task.
+
 #### Enqueue on In Progress + the executor (T-403, superseded by T-510–T-514)
 
 > The rest of this subsection describes Milestone 1's **stub** worker,

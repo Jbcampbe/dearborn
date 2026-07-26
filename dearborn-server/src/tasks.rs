@@ -642,6 +642,122 @@ pub async fn patch_task(
     Ok(Json(task))
 }
 
+/// `POST /tasks/{id}/retry` — D11's human-in-the-loop recovery transition
+/// (MILESTONE_2 §1 D11, §7 T-541): `Failed → Todo`
+/// (clearing `failure_reason`), and — iff the parent epic is currently
+/// `Blocked` — `Blocked → InProgress` too (clearing `blocked_reason` and the
+/// lease), so the worker pool's claim query (`worker::claim_epic`, §2.4)
+/// picks the epic back up and re-attaches its retained workspace: T-511's
+/// `git reset --hard HEAD` + `git clean -fd` drop exactly the failed
+/// attempt's dirty tree, and the DAG walk re-enters at the now-`Todo` task.
+/// `404` if the task does not exist; `409 conflict` unless it is currently
+/// `Failed` (§2.5's endpoint table). Editing the task's spec via
+/// `PATCH /tasks/{id}` before calling this endpoint needs no special
+/// handling here — the next `implement`/`fix` stage simply re-renders
+/// whatever `description`/`acceptance` are on the row at claim time (T-502),
+/// so an edited spec is what the re-run sees "for free".
+///
+/// A standalone task (`epic_id IS NULL`) has no epic to unblock — it still
+/// returns to `Todo` and is left there; picking it back up is T-551's job
+/// (`POST /tasks/{id}/run`), not this endpoint's.
+///
+/// ## Making the transition atomic (D11) without a new transaction idiom
+///
+/// "One atomic transition" here does not mean wrapping these writes in a
+/// `BEGIN`/`COMMIT` — nothing else in this codebase does that; libSQL's
+/// single shared writer connection (`db.rs`'s module doc) is the concurrency
+/// primitive every other multi-statement flow in this crate already relies
+/// on (`lanes::set_epic_lane`, `worker::fail_item`). What actually needs
+/// guaranteeing is that **no concurrent observer — specifically a worker's
+/// claim query — can ever see a state this handler produced that is unsafe
+/// to act on**, even though the task and epic rows are necessarily two
+/// separate `UPDATE`s. Two choices make that true:
+///
+/// 1. **The task write is itself a single fenced `UPDATE ... RETURNING`**,
+///    the identical idiom `worker::claim_epic` uses for its own atomic
+///    check-and-claim: the `WHERE status = 'Failed'` is evaluated by SQLite
+///    at the instant of the write, not against a stale value read moments
+///    earlier by a separate `SELECT`. Two concurrent retries of the same
+///    task can therefore never both "win" — the loser's `UPDATE` affects
+///    zero rows and reports `409`, exactly as if it had arrived a moment
+///    later and observed the already-`Todo` task directly.
+/// 2. **The task `UPDATE` runs strictly before the epic `UPDATE`.** A
+///    worker's claim query only ever selects epics with
+///    `status = 'InProgress'` (§2.4) — so the epic cannot become claimable
+///    until *after* this function has already committed the task's
+///    `Todo` write. There is consequently no window in which a worker could
+///    claim the epic and find the DAG's just-retried task still `Failed`
+///    (which would leave it stuck — not ready, and no longer being retried).
+///    Ordering it the other way (epic first) would open exactly that
+///    window. This mirrors `worker::fail_item`'s own ordering discipline
+///    (task `Failed` is written, then the epic is fenced to `Blocked`) in
+///    the opposite direction.
+///
+/// The epic `UPDATE` is itself fenced on `status = 'Blocked'` (matching
+/// D11's "iff Blocked" — an epic in any other state, e.g. manually
+/// `Cancelled` mid-triage, is left untouched) so it is a no-op rather than a
+/// clobber if something else already moved the epic on.
+///
+/// On success: `dag_updated` + `epic_updated` on `epic:<id>` (only when the
+/// task has an epic) and `board_updated` on `project:<id>` — mirroring what
+/// `lanes::set_epic_lane` publishes for a lane move — then
+/// `state.notify.notify_waiters()` so an idle worker loop wakes immediately
+/// instead of waiting out the poll interval.
+pub async fn retry_task(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> AppResult<Json<Task>> {
+    let conn = state.db.conn();
+    let now = now_ms();
+
+    let sql = format!(
+        "UPDATE task SET status = 'Todo', failure_reason = NULL, updated_at = ?1 \
+         WHERE id = ?2 AND status = 'Failed' \
+         RETURNING {TASK_COLUMNS}"
+    );
+    let mut rows = conn.query(&sql, params![now, id.clone()]).await?;
+    let task = match rows.next().await? {
+        Some(row) => row_to_task(&row)?,
+        None => {
+            // The fenced UPDATE affected nothing: either the task doesn't
+            // exist (404) or it exists but isn't Failed (409) — a cheap
+            // extra lookup only on this (already-erroring) path tells them
+            // apart, same precision `update_task`/`delete_task` give every
+            // other task endpoint.
+            return Err(match fetch_task(conn, &id).await? {
+                Some(_) => AppError::Conflict(format!("task {id} is not Failed")),
+                None => AppError::NotFound(format!("task {id} not found")),
+            });
+        }
+    };
+
+    if let Some(epic_id) = task.epic_id.as_ref() {
+        conn.execute(
+            "UPDATE epic SET status = 'InProgress', blocked_reason = NULL, \
+                 lease_owner = NULL, lease_expires_at = NULL, updated_at = ?1 \
+             WHERE id = ?2 AND status = 'Blocked'",
+            params![now, epic_id.clone()],
+        )
+        .await?;
+
+        crate::mcp::publish_dag(&state, epic_id).await;
+        if let Some(updated_epic) = fetch_epic(conn, epic_id).await? {
+            let payload = serde_json::to_value(&updated_epic).unwrap_or(serde_json::Value::Null);
+            state
+                .hub
+                .publish(&format!("epic:{epic_id}"), "epic_updated", payload);
+        }
+    }
+    // Always refresh the project board: a standalone task's retry is the
+    // only visible change for it; an epic-scoped retry also moves the
+    // epic's card back into the In Progress lane.
+    crate::board::publish_board(&state, &task.project_id).await;
+
+    state.notify.notify_waiters();
+
+    Ok(Json(task))
+}
+
 /// `DELETE /tasks/{id}` — remove a task and its dependency edges. `204`;
 /// `404` if it does not exist. Publishes `dag_updated` on the task's epic
 /// (or `board_updated` on its project when the task is standalone — a NULL
@@ -1584,5 +1700,240 @@ mod tests {
         let v: Value = serde_json::from_str(&frame).unwrap();
         assert_eq!(v["type"], "board_updated");
         assert!(v["payload"]["tasks"].as_array().unwrap().is_empty());
+    }
+
+    // ---- T-541: POST /tasks/{id}/retry ----
+    //
+    // These exercise the HTTP-level contract (status codes, response shape,
+    // WS frames, notify) against directly-seeded rows — the full worker
+    // recovery loop (a real failure via the test-gate, `retry`, a worker
+    // re-claiming and re-attaching, editing the spec first) is covered in
+    // `worker.rs`'s own `mod tests`, which has the fixture repos and scripted
+    // agent this module intentionally does not depend on.
+
+    /// Set a task's `status`/`failure_reason` directly (bypassing `PATCH`,
+    /// which doesn't allow clearing `failure_reason` on its own) — mirrors
+    /// `worker.rs`'s own `set_task_status` test helper.
+    async fn set_task_status_and_reason(
+        state: &AppState,
+        task_id: &str,
+        status: &str,
+        reason: Option<&str>,
+    ) {
+        state
+            .db
+            .conn()
+            .execute(
+                "UPDATE task SET status = ?1, failure_reason = ?2 WHERE id = ?3",
+                params![status, reason, task_id],
+            )
+            .await
+            .unwrap();
+    }
+
+    /// Seed the epic `Blocked` with `reason` and a held (stale) lease, so a
+    /// retry test can assert the unblock clears both the lane and the lease.
+    async fn set_epic_blocked_with_stale_lease(state: &AppState, epic_id: &str, reason: &str) {
+        state
+            .db
+            .conn()
+            .execute(
+                "UPDATE epic SET status = 'Blocked', blocked_reason = ?1, \
+                     lease_owner = 'stale-worker', lease_expires_at = 9999999999999 \
+                 WHERE id = ?2",
+                params![reason, epic_id],
+            )
+            .await
+            .unwrap();
+    }
+
+    /// `(status, blocked_reason, lease_owner, lease_expires_at)` read directly
+    /// off the epic row (the lease columns are deliberately not on the `Epic`
+    /// DTO — see `epics::EPIC_COLUMNS` — so a retry test needs raw SQL here).
+    async fn epic_row(
+        state: &AppState,
+        epic_id: &str,
+    ) -> (String, Option<String>, Option<String>, Option<i64>) {
+        let mut rows = state
+            .db
+            .conn()
+            .query(
+                "SELECT status, blocked_reason, lease_owner, lease_expires_at FROM epic WHERE id = ?1",
+                params![epic_id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        (
+            row.get(0).unwrap(),
+            row.get(1).unwrap(),
+            row.get(2).unwrap(),
+            row.get(3).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn retry_task_endpoint_404s_for_unknown_task() {
+        let (_state, app, _p, _e) = seed_app().await;
+        let response = app
+            .oneshot(req("POST", "/tasks/nope/retry", None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        assert_eq!(body_json(response).await["error"]["code"], "not_found");
+    }
+
+    /// AC: `409` for every status other than `Failed`.
+    #[tokio::test]
+    async fn retry_task_endpoint_409s_for_every_non_failed_status() {
+        let (state, app, project_id, epic_id) = seed_app().await;
+        let conn = state.db.conn();
+
+        for status in ["Todo", "InProgress", "Done", "Cancelled"] {
+            let t = create_task(conn, &epic_id, &project_id, status, None, None)
+                .await
+                .unwrap();
+            set_task_status_and_reason(&state, &t.id, status, None).await;
+
+            let response = app
+                .clone()
+                .oneshot(req("POST", &format!("/tasks/{}/retry", t.id), None))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::CONFLICT,
+                "status {status} must not be retryable"
+            );
+            assert_eq!(body_json(response).await["error"]["code"], "conflict");
+
+            // Untouched — a rejected retry must not itself write anything.
+            let fetched = fetch_task(conn, &t.id).await.unwrap().unwrap();
+            assert_eq!(fetched.status, status);
+        }
+    }
+
+    /// The headline AC: a `Failed` task under a `Blocked` epic — `200` +
+    /// `Todo` + cleared `failure_reason`; the epic unblocks to `InProgress`
+    /// with `blocked_reason` and the lease both cleared; `dag_updated` +
+    /// `epic_updated` fire on `epic:<id>`, `board_updated` on `project:<id>`,
+    /// and an idle worker's `notify` wakes.
+    #[tokio::test]
+    async fn retry_task_endpoint_moves_failed_task_to_todo_and_unblocks_blocked_epic() {
+        let (state, app, project_id, epic_id) = seed_app().await;
+        let conn = state.db.conn();
+        let t = create_task(conn, &epic_id, &project_id, "A", None, None)
+            .await
+            .unwrap();
+        set_task_status_and_reason(&state, &t.id, "Failed", Some("test_gate_exhausted")).await;
+        set_epic_blocked_with_stale_lease(&state, &epic_id, "test_gate_exhausted").await;
+
+        let mut epic_sub = state.hub.subscribe(&format!("epic:{epic_id}"));
+        let mut proj_sub = state.hub.subscribe(&format!("project:{project_id}"));
+        // Registered before the request, per the standard `Notify` proof
+        // pattern (`lanes.rs`'s `ready_to_in_progress_clears_lease_...`):
+        // a `notify_waiters()` call with no waiter registered yet is not
+        // queued, so this only resolves if the handler itself calls it.
+        let notified = state.notify.notified();
+
+        let response = app
+            .clone()
+            .oneshot(req("POST", &format!("/tasks/{}/retry", t.id), None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let task = body_json(response).await;
+        assert_eq!(task["status"], "Todo");
+        assert_eq!(task["failure_reason"], Value::Null);
+        assert_eq!(task["id"], t.id);
+
+        tokio::time::timeout(std::time::Duration::from_millis(500), notified)
+            .await
+            .expect("retry must call state.notify.notify_waiters()");
+
+        let (status, blocked_reason, lease_owner, lease_expires_at) =
+            epic_row(&state, &epic_id).await;
+        assert_eq!(status, "InProgress", "the epic must return to the In Progress lane");
+        assert!(blocked_reason.is_none());
+        assert!(lease_owner.is_none(), "the stale lease must be cleared");
+        assert!(lease_expires_at.is_none());
+
+        // dag_updated then epic_updated on epic:<id> ...
+        let frame = epic_sub.recv().await.unwrap();
+        assert_eq!(serde_json::from_str::<Value>(&frame).unwrap()["type"], "dag_updated");
+        let frame = epic_sub.recv().await.unwrap();
+        let v: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(v["type"], "epic_updated");
+        assert_eq!(v["payload"]["status"], "InProgress");
+        assert_eq!(v["payload"]["blocked_reason"], Value::Null);
+
+        // ... and board_updated on project:<id>, reflecting the lane move.
+        let frame = proj_sub.recv().await.unwrap();
+        let v: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(v["type"], "board_updated");
+        assert_eq!(v["payload"]["epics"][0]["status"], "InProgress");
+    }
+
+    /// A standalone (`epic_id IS NULL`) task has no epic to unblock, but
+    /// still returns to `Todo` and publishes `board_updated` (never
+    /// `dag_updated`, matching every other standalone-task mutation).
+    #[tokio::test]
+    async fn retry_task_endpoint_standalone_task_has_no_epic_to_unblock() {
+        let (state, app, project_id, _e) = seed_app().await;
+        let conn = state.db.conn();
+        let t = create_standalone_task(conn, &project_id, "Small fix", None, None)
+            .await
+            .unwrap();
+        set_task_status_and_reason(&state, &t.id, "Failed", Some("agent_error")).await;
+
+        let mut proj_sub = state.hub.subscribe(&format!("project:{project_id}"));
+
+        let response = app
+            .oneshot(req("POST", &format!("/tasks/{}/retry", t.id), None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let task = body_json(response).await;
+        assert_eq!(task["status"], "Todo");
+        assert_eq!(task["failure_reason"], Value::Null);
+        assert_eq!(task["epic_id"], Value::Null);
+
+        let frame = proj_sub.recv().await.unwrap();
+        let v: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(v["type"], "board_updated");
+        assert_eq!(v["payload"]["tasks"][0]["status"], "Todo");
+    }
+
+    /// D11's "iff Blocked": a `Failed` task whose epic is in some other
+    /// state (here, `Cancelled` mid-triage) still returns to `Todo`, but the
+    /// epic itself is left completely untouched — retry must never resurrect
+    /// an epic the user deliberately moved on from.
+    #[tokio::test]
+    async fn retry_task_endpoint_leaves_a_non_blocked_epic_untouched() {
+        let (state, app, project_id, epic_id) = seed_app().await;
+        let conn = state.db.conn();
+        let t = create_task(conn, &epic_id, &project_id, "A", None, None)
+            .await
+            .unwrap();
+        set_task_status_and_reason(&state, &t.id, "Failed", Some("cancelled")).await;
+        state
+            .db
+            .conn()
+            .execute(
+                "UPDATE epic SET status = 'Cancelled' WHERE id = ?1",
+                params![epic_id.clone()],
+            )
+            .await
+            .unwrap();
+
+        let response = app
+            .oneshot(req("POST", &format!("/tasks/{}/retry", t.id), None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["status"], "Todo");
+
+        let (status, _, _, _) = epic_row(&state, &epic_id).await;
+        assert_eq!(status, "Cancelled", "a non-Blocked epic must not be resurrected by retry");
     }
 }

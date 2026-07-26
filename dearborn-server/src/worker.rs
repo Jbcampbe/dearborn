@@ -7731,4 +7731,193 @@ mod tests {
 
         cleanup_clone_root(&state, &project_id, &[&epic_a, &epic_b]);
     }
+
+    // ---- T-541: POST /tasks/{id}/retry — the full worker-side recovery loop ----
+    //
+    // `tasks.rs`'s own `mod tests` covers the HTTP-level contract (404/409/200,
+    // WS frames, notify) against directly-seeded rows. What only this module
+    // can prove is the AC that actually matters end to end: a real failure
+    // driven through the walk, `retry`, and a **second** real walk that a
+    // worker re-claims, re-attaches (dropping the failed attempt's dirty
+    // tree per T-511), and runs to `Completed` — with an edited spec (T-541's
+    // `PATCH`-then-retry AC) reaching the re-run's own prompt. Per this
+    // module's own T-522 note (`test_app`'s doc + the module-level guidance
+    // that shipped with T-522), a two-walk test like this drives the pool via
+    // `spawn_pool` + HTTP, never `run_epic_pipeline(...)` called directly —
+    // this module's async frames are large enough that a second inline await
+    // risks the stack overflow flagged after T-522 landed.
+
+    /// `git ls-tree -r --name-only <ref>` in `dir` — the set of file paths
+    /// actually committed at `ref`, used (once the workspace itself is
+    /// deleted by a successful finalize, same reasoning as
+    /// `git_log_subjects_for_ref`) to prove a file was **never** committed,
+    /// not just that it isn't in some particular commit's diff.
+    async fn git_ls_tree(dir: &std::path::Path, git_ref: &str) -> Vec<String> {
+        let output = tokio::process::Command::new("git")
+            .args(["ls-tree", "-r", "--name-only", git_ref])
+            .current_dir(dir)
+            .output()
+            .await
+            .unwrap();
+        assert!(output.status.success(), "git ls-tree {git_ref} failed: {output:?}");
+        String::from_utf8_lossy(&output.stdout)
+            .lines()
+            .map(|s| s.to_string())
+            .collect()
+    }
+
+    /// The full recovery loop (MILESTONE_2 §7 T-541's AC, essentially
+    /// verbatim): a task fails via test-gate exhaustion (mirrors
+    /// `exhausting_attempts_fails_the_task_blocks_the_epic_and_commits_nothing`
+    /// above), the spec is edited via `PATCH /tasks/{id}`, `POST
+    /// /tasks/{id}/retry` moves the task back to `Todo` and the epic back to
+    /// `InProgress`, a worker re-claims and re-attaches (T-511's `reset
+    /// --hard` + `clean -fd` drop the first attempt's dirty file), and the
+    /// re-run — scripted to behave differently the second time, as a real
+    /// agent acting on the edited spec would — completes the epic. Asserts,
+    /// in order: the first failure lands exactly as T-540 promises; the PATCH
+    /// + retry round-trip; the epic returns to the In Progress lane
+    /// immediately (before the worker even wakes) and the board reflects it;
+    /// the second walk reaches `Completed`; the failed attempt's file was
+    /// never committed while the second attempt's file was; and the retried
+    /// implement run's prompt carried the edited spec, not the original.
+    #[tokio::test]
+    async fn retry_recovers_a_failed_task_end_to_end_with_edited_spec_and_dropped_dirty_tree() {
+        let agent = Arc::new(
+            ScriptedTaskAgent::new()
+                // First attempt: writes the file that keeps the gate red
+                // forever (the default Fix stage is a no-op) until re-attach
+                // drops it.
+                .script(Stage::Implement, writes_file("broken.txt", "dirty\n"))
+                // Second attempt (after retry): doesn't recreate it, so the
+                // gate is green on the first try.
+                .script(Stage::Implement, writes_file("good.txt", "clean\n")),
+        );
+        let recorded = agent.recorded();
+        let (state, app) = test_app_with_task_agent(agent).await;
+        let fixture = GitFixture::new().await;
+        // Green on the untouched tree (preflight passes); red for as long as
+        // broken.txt exists — identical fixture to the plain exhaustion test.
+        let project_id =
+            seed_project_with_test_cmd(&state, &fixture, "! test -f broken.txt").await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let task_id = seed_task(&state, &epic_id, &project_id, "A").await;
+        set_task_spec(&state, &task_id, "ORIGINAL_SPEC_MARKER", "original acceptance").await;
+
+        let _handles = spawn_pool(state.clone());
+        state.notify.notify_waiters();
+
+        // ---- first walk: fails and blocks, exactly like T-540's own test ----
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if epic_status(&state, &epic_id).await == "Blocked" {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "epic never blocked: status={}, tasks={:?}",
+                    epic_status(&state, &epic_id).await,
+                    task_statuses(&state, &epic_id).await
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        let failed = fetch_task_row(&state, &task_id).await;
+        assert_eq!(failed.0, "Failed");
+        assert_eq!(failed.1.as_deref(), Some("test_gate_exhausted"));
+        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        assert_eq!(epic.blocked_reason.as_deref(), Some("test_gate_exhausted"));
+
+        // ---- edit the spec before retrying (T-541's PATCH-then-retry AC) ----
+        let patch_response = app
+            .clone()
+            .oneshot(req(
+                "PATCH",
+                &format!("/tasks/{task_id}"),
+                Some(json!({
+                    "description": "EDITED_SPEC_MARKER",
+                    "acceptance": "edited acceptance"
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(patch_response.status(), StatusCode::OK);
+
+        // ---- retry: 200, Todo, and the epic is back In Progress immediately ----
+        let retry_response = app
+            .clone()
+            .oneshot(req("POST", &format!("/tasks/{task_id}/retry"), None))
+            .await
+            .unwrap();
+        assert_eq!(retry_response.status(), StatusCode::OK);
+        let retried = body_json(retry_response).await;
+        assert_eq!(retried["status"], "Todo");
+        assert_eq!(retried["failure_reason"], Value::Null);
+        assert_eq!(
+            epic_status(&state, &epic_id).await,
+            "InProgress",
+            "the epic must return to the In Progress lane synchronously with the retry response, \
+             before the worker even wakes"
+        );
+
+        // The board reflects the lane move (T-541's AC), independent of
+        // whatever the worker does next.
+        let board_response = app
+            .clone()
+            .oneshot(req("GET", &format!("/projects/{project_id}/board"), None))
+            .await
+            .unwrap();
+        let board = body_json(board_response).await;
+        assert_eq!(board["epics"][0]["status"], "InProgress");
+
+        // ---- the pool re-claims, re-attaches, and completes the walk ----
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if epic_status(&state, &epic_id).await == "Completed" {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "epic never completed after retry: status={}, task={:?}",
+                    epic_status(&state, &epic_id).await,
+                    fetch_task_row(&state, &task_id).await
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert_eq!(fetch_task_row(&state, &task_id).await.0, "Done");
+
+        // ---- the re-attach dropped the failed attempt's dirty tree ----
+        //
+        // The workspace is deleted post-finalize (T-511/T-514), so read the
+        // final committed tree back from the fixture (the project's origin)
+        // on the epic's own branch.
+        let branch = epic_branch_name_column(&state, &epic_id).await;
+        let files = git_ls_tree(&fixture.dir, &branch).await;
+        assert!(
+            !files.contains(&"broken.txt".to_string()),
+            "the failed attempt's dirty file must never have been committed: {files:?}"
+        );
+        assert!(
+            files.contains(&"good.txt".to_string()),
+            "the retried attempt's own file must be committed: {files:?}"
+        );
+
+        // ---- the retried run's prompt carried the edited spec ----
+        let runs = recorded.lock().unwrap();
+        let implement_runs: Vec<_> = runs.iter().filter(|r| r.stage == Stage::Implement).collect();
+        assert_eq!(implement_runs.len(), 2, "implement must run once per attempt");
+        assert!(implement_runs[0].prompt.contains("ORIGINAL_SPEC_MARKER"));
+        assert!(
+            implement_runs[1].prompt.contains("EDITED_SPEC_MARKER"),
+            "the retried run must see the spec edited before the retry: {}",
+            implement_runs[1].prompt
+        );
+        assert!(
+            !implement_runs[1].prompt.contains("ORIGINAL_SPEC_MARKER"),
+            "the retried run must not still see the pre-edit spec"
+        );
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
 }

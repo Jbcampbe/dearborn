@@ -373,7 +373,7 @@ with `agent_error` and gets thickened in later phases.
   immediately claims a different epic (a failure is epic-scoped, not fatal); a
   second epic in the same project is unaffected.
 
-- [ ] **T-541 — `POST /tasks/{id}/retry`.** *deps: T-540*
+- [x] **T-541 — `POST /tasks/{id}/retry`.** *deps: T-540*
   One atomic transition: `Failed → Todo`, clear `failure_reason`, and if the
   parent epic is `Blocked` → `InProgress` + clear `blocked_reason` + clear lease
   + notify. **AC:** `409` unless the task is `Failed`; after retry a worker

@@ -397,6 +397,7 @@ pub fn app(state: AppState) -> Router {
                 .patch(tasks::patch_task)
                 .delete(tasks::remove_task),
         )
+        .route("/tasks/:id/retry", axum::routing::post(tasks::retry_task))
         .route("/tasks/:id/runs", get(evidence::list_task_runs))
         .route("/runs/:id", get(evidence::get_run))
         .route_layer(middleware::from_fn_with_state(
