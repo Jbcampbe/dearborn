@@ -265,10 +265,12 @@ pub fn assemble_prompt(stage: Stage, context: &crate::spec::TaskContext) -> Opti
 /// this is a real gap relative to what `references/prompts/fix-task-v2.md`
 /// (ralph's own fix prompt, whose bash caller passed only a feedback file
 /// path too, but ralph never had a sibling-manifest concept to omit) assumed
-/// its agent would have. Worth revisiting — most naturally when T-531 wires
-/// this same function up for review findings, since a NEEDS_CHANGES verdict
-/// is even more likely to hinge on acceptance criteria the fix agent can't
-/// see under the current contract.
+/// its agent would have. **Still unresolved as of T-531** (`worker.rs`'s
+/// `run_review_fix_converge`), which wires this same function up for review
+/// findings exactly as anticipated here, unchanged — a `NEEDS_CHANGES`
+/// verdict is, if anything, more likely than a failing test to hinge on
+/// acceptance criteria the fix agent still can't see under this contract.
+/// Worth revisiting, but out of scope for the task that confirmed the gap.
 pub fn assemble_fix_prompt(feedback: &str) -> String {
     let base = crate::spec::prompt_for(Stage::Fix).expect("Stage::Fix always has a prompt");
     format!("{base}\n\n---\n\n## Feedback\n\n{feedback}")

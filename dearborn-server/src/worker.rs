@@ -473,40 +473,163 @@
 //! `Bash` — the real backstop is the test gate plus this very
 //! cumulative-diff review, not the permission flag.
 //!
-//! ### `NEEDS_CHANGES` and `BLOCKED` are placeholders here, deliberately
+//! ### `PASS`, `NEEDS_CHANGES`, and `BLOCKED` each get their real treatment
 //!
-//! [`process_one_task`] routes a `PASS` verdict straight to `Done`, exactly
-//! as an epic with no review stage at all would have before this task. A
-//! `NEEDS_CHANGES` or `BLOCKED` verdict, though, does **not** get the real
-//! ralph-equivalent treatment yet (`references/ralph-v2.sh`'s
-//! `# ---- review / judge / fix loop ----`: `NEEDS_CHANGES` re-enters
-//! `Stage::Fix` and re-reviews against the same `base_sha`, capped by
-//! `MAX_FIX_ROUNDS`) — that loop is T-531's job by name (MILESTONE_2 §6).
-//! This task deliberately does the minimum that keeps the walk a real
-//! vertical slice rather than dead code: both verdicts route through
-//! [`fail_task_and_block_epic`] exactly like any other T-522-shaped failure —
-//! `NEEDS_CHANGES` as `Failed(review_not_converged)` (the §2.3 reason T-531's
-//! real loop will also use once fix-round exhaustion is the actual cause, not
-//! "there was no loop at all"), `BLOCKED` as `Failed(blocked)` (§2.3's own
-//! reason for "the agent returned BLOCKED", already exact for this verdict
-//! with no T-531 dependency at all). Building any part of T-531's
-//! fix/re-test/re-review loop ahead of that task landing — even as a TODO
-//! stub with real control flow — is exactly the kind of "quietly pre-build
-//! the next task" MILESTONE_2's own discipline (§1's "How to use this
-//! document") warns against; the comment at the call site says so, so nobody
-//! mistakes the placeholder for the finished behavior.
+//! [`process_one_task`] hands every verdict to
+//! [`run_review_fix_converge`] (T-531, next section): `PASS` proceeds
+//! straight to `Done`, exactly as an epic with no review stage at all would
+//! have; `BLOCKED` routes through [`fail_task_and_block_epic`] as
+//! `Failed(blocked)` (§2.3's reason for "the agent returned BLOCKED"); and
+//! `NEEDS_CHANGES` re-enters `Stage::Fix` and re-reviews against the same
+//! `base_sha`, capped by `MAX_FIX_ROUNDS` — the real ralph-equivalent
+//! treatment (`references/ralph-v2.sh`'s `# ---- review / judge / fix loop
+//! ----`) this section originally deferred to T-531. See the next section for
+//! the full loop.
 //!
 //! ### No review for a no-diff task (T-532's territory)
 //!
-//! [`process_one_task`] only reaches the review stage inside the "there is
-//! something to commit" branch — a task whose implement stage produced no
-//! diff (the agent judged the task already satisfied) never runs
+//! [`process_one_task`] only reaches the review/convergence loop inside the
+//! "there is something to commit" branch — a task whose implement stage
+//! produced no diff (the agent judged the task already satisfied) never runs
 //! `Stage::Review` at all, exactly as it never ran `Stage::Commit` either.
 //! MILESTONE_2 §6 names that gap `Stage::VerifyComplete`'s job (T-532): a
 //! no-diff task needs its own verdict-bearing check ("is this genuinely
 //! already done?") before either closing with zero commits or routing into
 //! the ordinary pipeline — a check this task does not attempt to build any
 //! part of.
+//!
+//! ## Review → fix → re-test → re-commit (T-531, §6)
+//!
+//! [`run_review_fix_converge`] is the loop `references/ralph-v2.sh`'s
+//! `# ---- review / judge / fix loop ----` reimplements: a `NEEDS_CHANGES`
+//! verdict is not a terminal failure by itself — it means "one more round of
+//! `Stage::Fix`, driven by the reviewer's own findings, then re-test, then
+//! re-commit, then ask the reviewer again against the identical `base_sha`."
+//! `PASS` on any round closes the task exactly as a first-try `PASS` always
+//! did; `BLOCKED` on any round fails immediately (a human must resolve it, no
+//! amount of re-fixing helps); only exhausting `MAX_FIX_ROUNDS` while still
+//! `NEEDS_CHANGES` is a real failure, `Failed(review_not_converged)`.
+//!
+//! ### Two independent counters, not one — and why
+//!
+//! This loop tracks **two** numbers, deliberately kept separate rather than
+//! collapsed into a single "round" integer:
+//!
+//! - **`round`** — the business-facing counter ralph's own script names
+//!   (`round=$(( round + 1 ))`, its log lines, its `fix(...) review round
+//!   N` commit subject). It increments exactly once per `NEEDS_CHANGES` —
+//!   never on the loop's first, baseline review — and is what
+//!   `MAX_FIX_ROUNDS` bounds: `round > max_fix_rounds` is the exhaustion
+//!   check.
+//! - **`review_attempt`** — the `agent_run.attempt` value threaded into
+//!   [`run_review_stage`]'s new `start_attempt` parameter. The baseline
+//!   review opens at `0` — not a retry or a re-review of anything, exactly
+//!   mirroring T-522's `test_gate@0` convention above. Every fix opens its
+//!   own row at `used_attempt + 1` (the review call's own returned
+//!   `attempt`, which may itself have advanced past `start_attempt` if that
+//!   review needed a contract-miss retry — see below), and the re-review
+//!   that follows a fix reuses that **same** value as its own
+//!   `start_attempt`. A red→red→green shape (two `NEEDS_CHANGES` rounds
+//!   then `PASS`, no contract misses) reads: `review@0(NEEDS_CHANGES) →
+//!   fix@1(ok) → review@1(NEEDS_CHANGES) → fix@2(ok) → review@2(PASS)` —
+//!   the exact same "a fix and the [stage] that follows it share a number"
+//!   shape T-522's module doc section above documents for `test_gate`/`fix`,
+//!   with `review` standing in for `test_gate`.
+//!
+//!   Why not just use `round` as the attempt value directly (the simplest
+//!   possible reading of "mirror T-522")? Because `run_review_stage`'s own
+//!   contract-miss retry (T-530, unchanged by this task) can consume more
+//!   than one attempt value within a single round — if round *R*'s review
+//!   needs one retry, that call alone spans attempts `[start, start+1]`. If
+//!   `round` itself were the attempt number, round *R+1*'s baseline review
+//!   would then collide with round *R*'s own contract-miss retry (both
+//!   `stage='review'` rows claiming the identical `attempt`), which breaks
+//!   the very property MILESTONE_2 §2.6 wants `attempt` for — a client
+//!   subscribed to `stage_changed` frames driving a task card's "2nd review
+//!   round" sub-label (the module doc's T-530 section already flags this as
+//!   the payload's future consumer) needs `attempt` to identify a round
+//!   *unambiguously*, not just "usually." Deriving each round's starting
+//!   attempt from the *previous* round's actual last-used attempt (rather
+//!   than from a fixed stride or the round number itself) is the simplest
+//!   scheme that guarantees no two different rounds' `review` rows ever
+//!   share an `attempt`, while still keeping the common (no-contract-miss)
+//!   case read exactly like T-522's `gate@N`/`fix@N` pairing.
+//!
+//!   One known, accepted imprecision: `run_test_gate_loop` (reused
+//!   unmodified — see below) always restarts its **own** internal
+//!   `test_gate`/`fix` attempt counter at `0` on every call, independently
+//!   of `review_attempt`/`round`. A review round's own `Stage::Fix` row and
+//!   a *nested* test-driven `Stage::Fix` row (from that same round's
+//!   post-fix `run_test_gate_loop` call, if the review-driven fix happened
+//!   to also break the tests) can therefore legitimately share an
+//!   `attempt` value while being two different events — distinguishable by
+//!   `created_at` order and by `log` content (review findings vs. test
+//!   output), just not by `attempt` alone. Avoiding this fully would mean
+//!   threading a starting offset into `run_test_gate_loop` too, which this
+//!   task does not do — the instruction to reuse that loop **unmodified**
+//!   (not extend its own numbering scheme) is more important than closing
+//!   this narrow, already-legible ambiguity.
+//!
+//! ### Why `review_prompt` is never rebuilt between rounds
+//!
+//! Unlike a test-driven fix round (whose prompt embeds the specific failing
+//! `test_cmd` output, different every retry), the review prompt never
+//! embeds a diff at all — `prompts/review.md` tells the agent to run `git
+//! diff <base_sha>..HEAD` itself. Reusing the exact same `review_prompt`
+//! string on every round (built once by [`process_one_task`], passed down
+//! unchanged) is therefore not a shortcut, it *is* "each round re-reviews
+//! the cumulative diff": `base_sha` never advances (T-531's AC line, and D9)
+//! and the instruction to diff against it never changes; only `HEAD` moves
+//! (via each round's own fix commit), so the same `git diff` command the
+//! agent runs turns up more content each round for free.
+//!
+//! ### A fix round with no diff: skip the commit, keep the round counter
+//!
+//! A review-driven `Stage::Fix` can legitimately produce no changes at all
+//! (the agent judged the reviewer's own findings already addressed, or
+//! disagreed and made no edit). [`commit_if_dirty`] — the exact same "no
+//! diff is committed as nothing" helper T-513's original `impl(...)` commit
+//! step now also goes through — makes this a silent no-op rather than an
+//! error: no `fix(...) review round N` commit lands, `HEAD` doesn't move,
+//! and the loop proceeds straight to the re-review. Crucially, **`round`
+//! already advanced** the moment the `NEEDS_CHANGES` verdict was seen,
+//! before the fix even ran — so a reviewer that keeps returning
+//! `NEEDS_CHANGES` against a fix agent that keeps producing no diff still
+//! terminates in exactly `MAX_FIX_ROUNDS` rounds (`Failed(review_not_
+//! converged)`), not an infinite loop. This is deliberately the *only*
+//! guard against a stuck no-op fix — there is no separate "N consecutive
+//! no-diff rounds" counter, because the round bound already covers it for
+//! free.
+//!
+//! ### Reusing `run_test_gate_loop` unmodified — a fix that breaks the
+//! ### tests never gets committed
+//!
+//! After each review-driven `Stage::Fix`, the loop calls
+//! [`run_test_gate_loop`] — the identical T-522 function, no new parameter,
+//! no forked copy — before ever staging or committing anything. This is the
+//! same "commit only at known-green" discipline T-522's module doc section
+//! above explains at length, just invoked a second (and third, …) time per
+//! task: if the review-driven fix broke the tests, `run_test_gate_loop`
+//! tries its own bounded test-driven fix retries and, failing to recover,
+//! fails the *task* itself (`Failed(test_gate_exhausted)`) and blocks the
+//! epic from **inside that call** — `run_review_fix_converge`'s only job on
+//! `GateOutcome::Stop` is to stop, exactly like every other reused-helper
+//! call site in this module. The task never reaches
+//! `Failed(review_not_converged)` in this scenario; `test_gate_exhausted` is
+//! the more precise reason (the tests, not the reviewer, are why the task
+//! failed), and reusing the existing helper is what makes that the natural
+//! outcome rather than something this task has to special-case.
+//!
+//! ### Belt-and-suspenders checks, same discipline, more of them
+//!
+//! A full round (fix → test-gate-with-its-own-retries → commit → re-review)
+//! is easily the longest stretch of agent turns anywhere in this walk.
+//! [`run_review_fix_converge`] re-checks `lease.is_lost()` and
+//! `epic_still_in_progress` at the top of every round, immediately before
+//! the fix stage, immediately before the post-fix test gate, and
+//! immediately before the commit — the same pattern T-522's fix loop and
+//! T-530's review call already established, just applied at every one of
+//! this loop's several pause points instead of one or two.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -1050,14 +1173,81 @@ enum TaskStepOutcome {
     Stop,
 }
 
-/// Process exactly one ready task through the full T-513/T-522/T-530
+/// `git add -A` + commit **iff** there is something to commit, opening the
+/// §2.2 `Stage::Commit` evidence row only when a commit actually happens
+/// (D13: every stage that *runs* gets a row, not every stage that could
+/// have). This is T-513's original "no diff is committed as nothing"
+/// contract for the initial `impl(...)` commit, factored out here so T-531's
+/// `fix(...) review round N` commits reuse the *identical* check rather than
+/// growing a second, subtly different "is there anything to commit"
+/// implementation — see the module doc's T-531 section, "a fix round with no
+/// diff", for why that reuse matters (it's what makes the round counter the
+/// sole thing guaranteeing termination, not "did this round happen to
+/// produce a commit").
+///
+/// `commit_attempt` is only the `Stage::Commit` row's own `attempt` value
+/// (never read back by anything in this module — [`build_task_checklist`]
+/// keys its SHA lookup on `task_id` and `created_at`, not `attempt`); it
+/// exists purely so a task with more than one commit (any task that goes
+/// through a fix round) doesn't leave several `commit` rows all claiming
+/// `attempt = 1`, keeping `GET /tasks/{id}/runs` legible for a human. T-513's
+/// call passes `1` (unchanged); T-531's fix-round call passes `1 + round` so
+/// it never collides with the initial commit's `1`.
+///
+/// Returns `Ok(None)` for "nothing to commit" (not an error — the caller
+/// decides what that means for its own step), `Ok(Some(sha))` for a real
+/// commit, `Err` for any git-level failure (`add`, `status`, or `commit`
+/// itself).
+async fn commit_if_dirty(
+    conn: &Connection,
+    task_id: &str,
+    epic_id: &str,
+    workspace_path: &std::path::Path,
+    subject: &str,
+    commit_attempt: i64,
+) -> Result<Option<String>, git::GitError> {
+    git::add_all(workspace_path).await?;
+    let status = git::status_porcelain(workspace_path).await?;
+    if status.trim().is_empty() {
+        return Ok(None);
+    }
+    let sha = git::commit_all(workspace_path, subject, COMMITTER_NAME, COMMITTER_EMAIL).await?;
+    // §2.2: the Commit stage "records the SHA in log". Opened only now that
+    // a commit actually happened (D13, see this function's own doc).
+    let open = OpenStage {
+        task_id: Some(task_id),
+        epic_id: Some(epic_id),
+        stage: Stage::Commit.as_str(),
+        attempt: commit_attempt,
+    };
+    if let Ok(handle) = evidence::open_stage(conn, open).await {
+        let _ = evidence::close_stage(
+            conn,
+            &handle,
+            CloseStage {
+                status: "ok",
+                session_id: None,
+                verdict: None,
+                exit_code: Some(0),
+                log: format!("commit {sha}: {subject}"),
+            },
+        )
+        .await;
+    }
+    Ok(Some(sha))
+}
+
+/// Process exactly one ready task through the full T-513/T-522/T-530/T-531
 /// sequence: record `base_sha`, `Todo → InProgress`, assemble the D8 prompt,
 /// run `Stage::Implement`, the T-522 test-gate/fix loop, `git add -A` +
-/// commit-if-dirty, the T-530 review stage (only when a commit happened —
-/// see the module doc's "No review for a no-diff task" section), `Done`. See
-/// the module doc's "The real implement walk" and "Review, verdict, and
-/// convergence" sections for the rationale behind each step; this function
-/// is the literal implementation of that sequence.
+/// commit-if-dirty ([`commit_if_dirty`]), the T-530/T-531 review → fix →
+/// re-test → re-commit → re-review convergence loop
+/// ([`run_review_fix_converge`], only when a commit happened — see the
+/// module doc's "No review for a no-diff task" section), `Done`. See the
+/// module doc's "The real implement walk", "Review, verdict, and
+/// convergence", and "Review → fix → re-test → re-commit" sections for the
+/// rationale behind each step; this function is the literal implementation
+/// of that sequence.
 async fn process_one_task(
     state: &AppState,
     epic_id: &str,
@@ -1226,30 +1416,20 @@ async fn process_one_task(
         GateOutcome::Stop => return TaskStepOutcome::Stop,
     }
 
-    // 5. git add -A, then commit iff there is something to commit. An agent
-    //    that made no changes is committed as *nothing* — see the module doc
-    //    for why (T-532 owns verifying that "no diff" really means done).
-    if let Err(err) = git::add_all(&workspace.workspace_path).await {
-        if !lease.is_lost() {
-            block_epic_on_agent_error(
-                state,
-                epic_id,
-                &task_id,
-                &format!("git add -A failed: {err}"),
-            )
-            .await;
-        }
-        return TaskStepOutcome::Stop;
-    }
-    let status = match git::status_porcelain(&workspace.workspace_path).await {
-        Ok(status) => status,
+    // 5. git add -A, then commit iff there is something to commit
+    //    ([`commit_if_dirty`]). An agent that made no changes is committed as
+    //    *nothing* — see the module doc for why (T-532 owns verifying that
+    //    "no diff" really means done).
+    let subject = format!("impl({}): {}", spec::short_id(&task_id), task_title);
+    let committed = match commit_if_dirty(conn, &task_id, epic_id, &workspace.workspace_path, &subject, 1).await {
+        Ok(committed) => committed,
         Err(err) => {
             if !lease.is_lost() {
                 block_epic_on_agent_error(
                     state,
                     epic_id,
                     &task_id,
-                    &format!("git status failed: {err}"),
+                    &format!("git commit failed: {err}"),
                 )
                 .await;
             }
@@ -1257,61 +1437,14 @@ async fn process_one_task(
         }
     };
 
-    if !status.trim().is_empty() {
-        // §2.8's frozen commit subject, reusing spec::short_id rather than
-        // re-deriving the "last 6 of id" convention.
-        let subject = format!("impl({}): {}", spec::short_id(&task_id), task_title);
-        match git::commit_all(
-            &workspace.workspace_path,
-            &subject,
-            COMMITTER_NAME,
-            COMMITTER_EMAIL,
-        )
-        .await
-        {
-            Ok(sha) => {
-                // §2.2: the Commit stage "records the SHA in log". Opened
-                // only now that a commit actually happened (D13: every stage
-                // that *runs* gets a row, not every stage that could have).
-                let open = OpenStage {
-                    task_id: Some(&task_id),
-                    epic_id: Some(epic_id),
-                    stage: Stage::Commit.as_str(),
-                    attempt: 1,
-                };
-                if let Ok(handle) = evidence::open_stage(conn, open).await {
-                    let _ = evidence::close_stage(
-                        conn,
-                        &handle,
-                        CloseStage {
-                            status: "ok",
-                            session_id: None,
-                            verdict: None,
-                            exit_code: Some(0),
-                            log: format!("commit {sha}: {subject}"),
-                        },
-                    )
-                    .await;
-                }
-            }
-            Err(err) => {
-                if !lease.is_lost() {
-                    block_epic_on_agent_error(
-                        state,
-                        epic_id,
-                        &task_id,
-                        &format!("git commit failed: {err}"),
-                    )
-                    .await;
-                }
-                return TaskStepOutcome::Stop;
-            }
-        }
-
-        // 5b. T-530: review the cumulative diff now that there's a commit to
-        //     review. A no-diff task never reaches this branch at all — see
-        //     the module doc's "No review for a no-diff task" section;
-        //     T-532 owns that case (`Stage::VerifyComplete`).
+    if committed.is_some() {
+        // 5b. T-530/T-531: review the cumulative diff now that there's a
+        //     commit to review, converging on a verdict via the review ->
+        //     fix -> re-test -> re-commit -> re-review loop
+        //     ([`run_review_fix_converge`]). A no-diff task never reaches
+        //     this branch at all — see the module doc's "No review for a
+        //     no-diff task" section; T-532 owns that case
+        //     (`Stage::VerifyComplete`).
         if lease.is_lost() || !epic_still_in_progress(conn, epic_id).await {
             tracing::warn!(
                 epic = %epic_id,
@@ -1328,48 +1461,23 @@ async fn process_one_task(
         let review_prompt = task_agent::assemble_prompt(Stage::Review, &review_ctx)
             .expect("Stage::Review always has a prompt (spec::prompt_for)");
 
-        match run_review_stage(state, epic_id, &task_id, workspace, &review_prompt, lease).await {
-            ReviewOutcome::Verdict(spec::Verdict::Pass) => {
+        match run_review_fix_converge(
+            state,
+            epic_id,
+            &task_id,
+            &task_title,
+            workspace,
+            &review_prompt,
+            pat.as_deref(),
+            lease,
+        )
+        .await
+        {
+            ConvergenceOutcome::Done => {
                 // Proceed to Done below, exactly as if there were no review
                 // stage at all.
             }
-            ReviewOutcome::Verdict(spec::Verdict::NeedsChanges) => {
-                // PLACEHOLDER (T-530): T-531 replaces this branch with the
-                // real review -> fix -> re-test -> re-commit -> re-review
-                // loop (`references/ralph-v2.sh`'s `# ---- review / judge /
-                // fix loop ----`, capped by MAX_FIX_ROUNDS). This task
-                // deliberately does not pre-build any part of that loop —
-                // see the module doc's "NEEDS_CHANGES and BLOCKED are
-                // placeholders here" section — it only keeps this walk a
-                // real vertical slice, not dead code, by failing the task
-                // and blocking the epic exactly like any other
-                // T-522-shaped failure.
-                if !lease.is_lost() {
-                    fail_task_and_block_epic(
-                        state,
-                        epic_id,
-                        &task_id,
-                        "review_not_converged",
-                        "review returned NEEDS_CHANGES; T-531 builds the fix/re-test/re-review loop this slice does not",
-                    )
-                    .await;
-                }
-                return TaskStepOutcome::Stop;
-            }
-            ReviewOutcome::Verdict(spec::Verdict::Blocked) => {
-                if !lease.is_lost() {
-                    fail_task_and_block_epic(
-                        state,
-                        epic_id,
-                        &task_id,
-                        "blocked",
-                        "reviewer returned BLOCKED — needs a human to resolve",
-                    )
-                    .await;
-                }
-                return TaskStepOutcome::Stop;
-            }
-            ReviewOutcome::Stop => return TaskStepOutcome::Stop,
+            ConvergenceOutcome::Stop => return TaskStepOutcome::Stop,
         }
     }
 
@@ -1605,13 +1713,24 @@ Write your findings, then finish your **final** message with exactly one such \
 line — alone, as the very last line, nothing before or after it on that line, \
 uppercase, exact spelling.";
 
-/// What [`run_review_stage`] tells [`process_one_task`] to do next.
+/// What [`run_review_stage`] tells its caller ([`run_review_fix_converge`])
+/// to do next.
 enum ReviewOutcome {
-    /// A verdict parsed (on the first attempt or the one bounded re-run) and
-    /// has already been recorded on its `agent_run` row and published as
-    /// `stage_changed`. The caller decides what each verdict means for the
-    /// task/epic.
-    Verdict(spec::Verdict),
+    /// A verdict parsed (on the first try or the one bounded contract-miss
+    /// re-run) and has already been recorded on its `agent_run` row and
+    /// published as `stage_changed`. `attempt` is the `agent_run.attempt`
+    /// value the *winning* (parseable) call landed on — T-531's
+    /// [`run_review_fix_converge`] needs it to number the next round's
+    /// `Stage::Fix` (see that function's doc, "a fix and the review that
+    /// follows it share a number"). `findings` is that same call's raw
+    /// [`task_agent::AgentStageOutcome::text`] — the reviewer's own prose —
+    /// exactly what [`task_agent::assemble_fix_prompt`] expects as feedback
+    /// for a `NEEDS_CHANGES` verdict.
+    Verdict {
+        verdict: spec::Verdict,
+        attempt: i64,
+        findings: String,
+    },
     /// The review stage failed to start, errored, or never produced a
     /// parseable verdict after the bounded retry — already routed to
     /// `Failed(agent_error)`/`Blocked` (or the lease was already lost/the
@@ -1621,15 +1740,25 @@ enum ReviewOutcome {
     Stop,
 }
 
-/// T-530: run `Stage::Review` against `review_prompt` (the D8 context,
+/// T-530/T-531: run `Stage::Review` against `review_prompt` (the D8 context,
 /// including `base_sha`, already assembled by the caller — see
 /// [`task_agent::assemble_prompt`]), parse the D9 verdict out of the
 /// transcript, and on a parse miss re-run **once** (bounded by
 /// `config.executor.verdict_retries`) with [`VERDICT_CONTRACT_REMINDER`]
 /// appended. See the module doc's "Review, verdict, and convergence" section
-/// for the full rationale — this function is the literal translation of that
-/// section's contract-miss/attempt-numbering/verdict-storage description into
-/// code.
+/// for the full contract-miss/verdict-storage rationale — this function is
+/// still the literal translation of that section into code.
+///
+/// `start_attempt` is new in T-531: the `agent_run.attempt` value this
+/// call's first try opens its row at. T-530 originally hardcoded this to the
+/// literal `1` (there was only ever one review call per task, since
+/// `NEEDS_CHANGES` immediately failed the task); that module doc explicitly
+/// left "how round and contract-miss attempt compose" to this task. See the
+/// module doc's "Review → fix → re-test → re-commit (T-531)" section for
+/// [`run_review_fix_converge`]'s numbering scheme — this function's own
+/// behavior is otherwise unchanged: every contract-miss retry *within* this
+/// one call still increments from wherever it started, exactly as it always
+/// did.
 async fn run_review_stage(
     state: &AppState,
     epic_id: &str,
@@ -1637,14 +1766,20 @@ async fn run_review_stage(
     workspace: &ProvisionedWorkspace,
     review_prompt: &str,
     lease: &LeaseHandle,
+    start_attempt: i64,
 ) -> ReviewOutcome {
     let conn = state.db.conn();
-    // Total attempts = the first try + the bounded number of contract-miss
-    // re-runs (default 1, never hardcoded — see the module doc).
-    let max_attempts = 1 + state.config.executor.verdict_retries as i64;
+    // Total *tries this call may make* = the first try + the bounded number
+    // of contract-miss re-runs (default 1, never hardcoded — see the module
+    // doc). Deliberately a separate counter from `attempt` below — `attempt`
+    // is the absolute, task-wide `agent_run.attempt` T-531 threads in via
+    // `start_attempt`; `try_index` only ever counts 1, 2, … within *this*
+    // call, which is what actually bounds the contract-miss retry.
+    let max_tries = 1 + state.config.executor.verdict_retries as i64;
     let reminded_prompt = format!("{review_prompt}\n\n---\n\n{VERDICT_CONTRACT_REMINDER}");
 
-    let mut attempt: i64 = 1;
+    let mut attempt: i64 = start_attempt;
+    let mut try_index: i64 = 1;
     loop {
         // Same belt-and-suspenders re-check every long stretch of this walk
         // performs before spending a whole agent turn.
@@ -1657,7 +1792,7 @@ async fn run_review_stage(
             return ReviewOutcome::Stop;
         }
 
-        let prompt = if attempt == 1 {
+        let prompt = if try_index == 1 {
             review_prompt.to_string()
         } else {
             reminded_prompt.clone()
@@ -1726,11 +1861,15 @@ async fn run_review_stage(
                 )
                 .await;
             }
-            return ReviewOutcome::Verdict(verdict);
+            return ReviewOutcome::Verdict {
+                verdict,
+                attempt,
+                findings: outcome.text,
+            };
         }
 
-        // Contract miss: out of retries?
-        if attempt >= max_attempts {
+        // Contract miss: out of retries for *this call*?
+        if try_index >= max_tries {
             tracing::warn!(
                 epic = %epic_id,
                 task = %task_id,
@@ -1744,7 +1883,7 @@ async fn run_review_stage(
                     task_id,
                     "agent_error",
                     &format!(
-                        "review stage produced no parseable VERDICT: line after {max_attempts} attempt(s)"
+                        "review stage produced no parseable VERDICT: line after {max_tries} attempt(s)"
                     ),
                 )
                 .await;
@@ -1753,6 +1892,272 @@ async fn run_review_stage(
         }
 
         attempt += 1;
+        try_index += 1;
+    }
+}
+
+/// What [`run_review_fix_converge`] tells [`process_one_task`] to do next.
+enum ConvergenceOutcome {
+    /// `PASS` on some round — proceed to `Done` below exactly as if there
+    /// were no review stage at all.
+    Done,
+    /// Terminal: already routed to `Failed`/`Blocked` (a `BLOCKED` verdict, a
+    /// `MAX_FIX_ROUNDS` exhaustion, a review-round fix/test-gate/commit
+    /// failure, or the lease/epic was already lost) — the caller's only job
+    /// is to stop, with no further writes, exactly like every other failure
+    /// exit in this module.
+    Stop,
+}
+
+/// T-531: the review → fix → re-test → re-commit → re-review convergence
+/// loop `references/ralph-v2.sh`'s `# ---- review / judge / fix loop ----`
+/// reimplements. See the module doc's "Review → fix → re-test → re-commit
+/// (T-531)" section for the full numbering/no-diff/reuse rationale — this
+/// function is that section's literal implementation, called once per task
+/// ([`process_one_task`], only once a commit exists to review — see "No
+/// review for a no-diff task" above it in the module doc).
+///
+/// `review_prompt` is built **once** by the caller and reused, byte-for-byte,
+/// on every round: it never embeds a diff itself (the D8/D9 context tells
+/// the agent to run `git diff <base_sha>..HEAD` itself), so replaying the
+/// exact same prompt against a tree whose `HEAD` has moved (via a fix
+/// round's commit) is what "each round re-reviews the cumulative diff"
+/// actually means here — `base_sha` and the prompt text never change between
+/// rounds; only what `git diff` returns when the agent runs it does.
+#[allow(clippy::too_many_arguments)]
+async fn run_review_fix_converge(
+    state: &AppState,
+    epic_id: &str,
+    task_id: &str,
+    task_title: &str,
+    workspace: &ProvisionedWorkspace,
+    review_prompt: &str,
+    pat: Option<&str>,
+    lease: &LeaseHandle,
+) -> ConvergenceOutcome {
+    let conn = state.db.conn();
+    let max_fix_rounds = state.config.executor.max_fix_rounds;
+
+    // `review_attempt` is the `agent_run.attempt` value fed to the *next*
+    // `run_review_stage` call — 0 for the very first review (mirroring
+    // T-522's `test_gate@0`: it isn't a retry or a re-review of anything).
+    // `round` is a *separate* counter: the business "review round N" ralph's
+    // own script names in its log lines and commit subjects, bounded by
+    // `max_fix_rounds`, incrementing only on a `NEEDS_CHANGES` that earns a
+    // fix — never on the baseline review. See the module doc for why these
+    // two numbers are deliberately not the same counter.
+    let mut review_attempt: i64 = 0;
+    let mut round: u32 = 0;
+
+    loop {
+        if lease.is_lost() || !epic_still_in_progress(conn, epic_id).await {
+            tracing::warn!(
+                epic = %epic_id,
+                task = %task_id,
+                "pipeline: epic cancelled or lease lost before a review round; stopping without finalizing"
+            );
+            return ConvergenceOutcome::Stop;
+        }
+
+        let (verdict, used_attempt, findings) = match run_review_stage(
+            state,
+            epic_id,
+            task_id,
+            workspace,
+            review_prompt,
+            lease,
+            review_attempt,
+        )
+        .await
+        {
+            ReviewOutcome::Stop => return ConvergenceOutcome::Stop,
+            ReviewOutcome::Verdict {
+                verdict,
+                attempt,
+                findings,
+            } => (verdict, attempt, findings),
+        };
+
+        match verdict {
+            spec::Verdict::Pass => return ConvergenceOutcome::Done,
+            spec::Verdict::Blocked => {
+                if !lease.is_lost() {
+                    fail_task_and_block_epic(
+                        state,
+                        epic_id,
+                        task_id,
+                        "blocked",
+                        "reviewer returned BLOCKED — needs a human to resolve",
+                    )
+                    .await;
+                }
+                return ConvergenceOutcome::Stop;
+            }
+            spec::Verdict::NeedsChanges => {
+                round += 1;
+                if round > max_fix_rounds {
+                    tracing::warn!(
+                        epic = %epic_id,
+                        task = %task_id,
+                        max_fix_rounds,
+                        "review did not converge after the configured fix rounds; task -> Failed(review_not_converged)"
+                    );
+                    if !lease.is_lost() {
+                        fail_task_and_block_epic(
+                            state,
+                            epic_id,
+                            task_id,
+                            "review_not_converged",
+                            &format!(
+                                "review still NEEDS_CHANGES after {max_fix_rounds} fix round(s)"
+                            ),
+                        )
+                        .await;
+                    }
+                    return ConvergenceOutcome::Stop;
+                }
+
+                if lease.is_lost() || !epic_still_in_progress(conn, epic_id).await {
+                    tracing::warn!(
+                        epic = %epic_id,
+                        task = %task_id,
+                        "pipeline: epic cancelled or lease lost before the review-round fix; stopping without finalizing"
+                    );
+                    return ConvergenceOutcome::Stop;
+                }
+
+                // The fix shares its attempt number with the review that
+                // produced its feedback — T-522's "a fix and the gate that
+                // follows it share a number", with review standing in for
+                // gate. D19: the fix agent's only context is
+                // `prompts/fix.md` + this round's findings — never the
+                // spec/epic/sibling context Implement gets; see
+                // `assemble_fix_prompt`'s doc (shared with T-522) for the
+                // full rationale and its open concern.
+                let fix_attempt = used_attempt + 1;
+                let fix_prompt = task_agent::assemble_fix_prompt(&findings);
+                let run_id = ulid::Ulid::new().to_string();
+                let fix_outcome = task_agent::run_agent_stage(
+                    state,
+                    &*state.task_agent,
+                    AgentStageParams {
+                        task_id,
+                        epic_id: Some(epic_id),
+                        attempt: fix_attempt,
+                    },
+                    TaskRunRequest {
+                        run_id,
+                        stage: Stage::Fix,
+                        prompt: fix_prompt,
+                        cwd: workspace.workspace_path.clone(),
+                    },
+                )
+                .await;
+
+                match fix_outcome {
+                    Ok(outcome) if outcome.is_ok() => {}
+                    Ok(_) => {
+                        if !lease.is_lost() {
+                            fail_task_and_block_epic(
+                                state,
+                                epic_id,
+                                task_id,
+                                "agent_error",
+                                "review-round fix stage did not complete successfully",
+                            )
+                            .await;
+                        }
+                        return ConvergenceOutcome::Stop;
+                    }
+                    Err(err) => {
+                        if !lease.is_lost() {
+                            fail_task_and_block_epic(
+                                state,
+                                epic_id,
+                                task_id,
+                                "agent_error",
+                                &format!("review-round fix stage failed to start: {err}"),
+                            )
+                            .await;
+                        }
+                        return ConvergenceOutcome::Stop;
+                    }
+                }
+
+                if lease.is_lost() || !epic_still_in_progress(conn, epic_id).await {
+                    tracing::warn!(
+                        epic = %epic_id,
+                        task = %task_id,
+                        "pipeline: epic cancelled or lease lost before the post-fix test gate; stopping without finalizing"
+                    );
+                    return ConvergenceOutcome::Stop;
+                }
+
+                // Re-run the test gate (T-522, reused unmodified — see the
+                // module doc for why this is deliberately not duplicated): a
+                // review-driven fix that breaks the tests must never reach
+                // the commit below. `run_test_gate_loop` performs its own
+                // belt-and-suspenders lease/epic checks and its own bounded
+                // test-driven fix retries; a red gate that never recovers
+                // already routes the task to `Failed(test_gate_exhausted)`
+                // and the epic to `Blocked` from inside that call — this
+                // loop's only job on `GateOutcome::Stop` is to stop.
+                match run_test_gate_loop(state, epic_id, task_id, workspace, pat, lease).await {
+                    GateOutcome::Proceed => {}
+                    GateOutcome::Stop => return ConvergenceOutcome::Stop,
+                }
+
+                if lease.is_lost() || !epic_still_in_progress(conn, epic_id).await {
+                    tracing::warn!(
+                        epic = %epic_id,
+                        task = %task_id,
+                        "pipeline: epic cancelled or lease lost before the review-round commit; stopping without finalizing"
+                    );
+                    return ConvergenceOutcome::Stop;
+                }
+
+                // §2.8's frozen commit subject. A round whose fix produced no
+                // diff at all commits nothing ([`commit_if_dirty`] — see the
+                // module doc's "a fix round with no diff" section); `round`
+                // has already advanced above regardless, which is what
+                // actually guarantees this loop terminates within
+                // `max_fix_rounds` even when every fix round is a no-op.
+                let subject = format!(
+                    "fix({}) review round {}: {}",
+                    spec::short_id(task_id),
+                    round,
+                    task_title
+                );
+                if let Err(err) = commit_if_dirty(
+                    conn,
+                    task_id,
+                    epic_id,
+                    &workspace.workspace_path,
+                    &subject,
+                    1 + round as i64,
+                )
+                .await
+                {
+                    if !lease.is_lost() {
+                        fail_task_and_block_epic(
+                            state,
+                            epic_id,
+                            task_id,
+                            "agent_error",
+                            &format!("git commit failed (review round {round}): {err}"),
+                        )
+                        .await;
+                    }
+                    return ConvergenceOutcome::Stop;
+                }
+
+                // Loop back: re-review against the SAME base_sha (the prompt
+                // never changes — see this function's own doc) at the
+                // attempt the fix just used, so the fix and the review that
+                // follows it read as a pair in `GET /tasks/{id}/runs`.
+                review_attempt = fix_attempt;
+            }
+        }
     }
 }
 
@@ -4912,6 +5317,23 @@ mod tests {
         }
     }
 
+    /// Like [`review_needs_changes`] but with `marker` baked into the
+    /// findings text — the T-531 counterpart to [`unparseable_review`]: lets
+    /// a test tell several different rounds' `NEEDS_CHANGES` findings apart
+    /// in the retained `agent_run` evidence.
+    fn review_needs_changes_marked(marker: &str) -> ScriptedRun {
+        ScriptedRun {
+            text: vec![review_text(
+                &format!(
+                    "[BLOCKING] marker={marker} — distinct findings for this round, so a test \
+                     can tell rounds apart in the retained evidence."
+                ),
+                "NEEDS_CHANGES",
+            )],
+            ..ScriptedRun::default()
+        }
+    }
+
     fn review_blocked() -> ScriptedRun {
         ScriptedRun {
             text: vec![review_text(
@@ -5019,69 +5441,21 @@ mod tests {
 
         let rows = review_rows(&state, &a).await;
         assert_eq!(rows.len(), 1, "exactly one review attempt on a first-try PASS");
-        assert_eq!(rows[0].0, 1, "attempt");
+        assert_eq!(rows[0].0, 0, "attempt (T-531: the baseline review opens at 0, not 1 — see the module doc's T-531 numbering section)");
         assert_eq!(rows[0].1, "ok", "status");
         assert_eq!(rows[0].2.as_deref(), Some("PASS"), "verdict");
 
         cleanup_clone_root(&state, &project_id, &[&epic_id]);
     }
 
-    /// All three D9 verdicts parse from realistic, preamble-laden reviewer
-    /// output at the unit level ([`crate::spec::parse_verdict`]'s own tests
-    /// cover PASS/NEEDS_CHANGES/BLOCKED with prose findings, severity tags,
-    /// and a fenced code block that itself mentions "VERDICT:"). This test
-    /// is the integration half: each verdict, still wrapped in the same
-    /// preamble shape, drives the walk to the right outcome end-to-end.
-    #[tokio::test]
-    async fn needs_changes_review_fails_the_task_review_not_converged_and_blocks_the_epic() {
-        let agent = Arc::new(
-            ScriptedTaskAgent::new()
-                .script(Stage::Implement, writes_file("a.txt", "a\n"))
-                .script(Stage::Review, review_needs_changes()),
-        );
-        let (state, _app) = test_app_with_task_agent(agent).await;
-        let fixture = GitFixture::new().await;
-        let project_id = seed_project_with_workspace(&state, &fixture).await;
-        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
-        let a = seed_task(&state, &epic_id, &project_id, "A").await;
-
-        run_epic_pipeline(state.clone(), epic_id.clone()).await;
-
-        let task = fetch_task_row(&state, &a).await;
-        assert_eq!(task.0, "Failed", "NEEDS_CHANGES fails the task (T-531 builds the real loop)");
-        assert_eq!(task.1.as_deref(), Some("review_not_converged"));
-
-        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
-        assert_eq!(epic.status, "Blocked");
-        assert_eq!(
-            epic.blocked_reason.as_deref(),
-            Some("review_not_converged"),
-            "the epic must carry the identical reason string as the task"
-        );
-
-        // The commit that triggered the review already landed — review runs
-        // strictly after commit, and this placeholder path never rolls it
-        // back (T-531 builds on top of it, it doesn't undo it). A
-        // `Failed`/`Blocked` walk never reaches finalize/push (only a
-        // `Completed` epic does — see `git_log_subjects_for_ref`'s own doc),
-        // so the workspace is retained rather than deleted; read the commit
-        // back from there, exactly like `set_epic_blocked`'s other retained-
-        // workspace tests (e.g. `test_gate_exhausted`,
-        // `cancel_mid_walk_stops_cleanly_without_further_writes`) do, rather
-        // than from the fixture/origin the walk never pushed to.
-        let workspace_path = workspace::epic_workspace_path(&state.config.clone_root, &epic_id);
-        let subjects = git_log_subjects(&workspace_path).await;
-        assert_eq!(
-            subjects,
-            vec!["init".to_string(), format!("impl({}): A", spec::short_id(&a))]
-        );
-
-        let rows = review_rows(&state, &a).await;
-        assert_eq!(rows.len(), 1);
-        assert_eq!(rows[0].2.as_deref(), Some("NEEDS_CHANGES"));
-
-        cleanup_clone_root(&state, &project_id, &[&epic_id]);
-    }
+    /// A `BLOCKED` verdict on the D9 unit-parser side is covered by
+    /// [`crate::spec::parse_verdict`]'s own tests (preamble, severity tags, a
+    /// fenced code block that itself mentions "VERDICT:"); the tests below
+    /// are the integration half for `NEEDS_CHANGES`, driving the whole
+    /// T-531 convergence loop end-to-end. `BLOCKED`'s own integration test
+    /// ([`blocked_review_fails_the_task_with_the_blocked_reason`], next)
+    /// predates this task and needs no change — a `BLOCKED` verdict fails
+    /// immediately regardless of which round it lands on.
 
     #[tokio::test]
     async fn blocked_review_fails_the_task_with_the_blocked_reason() {
@@ -5109,6 +5483,267 @@ mod tests {
         let rows = review_rows(&state, &a).await;
         assert_eq!(rows.len(), 1);
         assert_eq!(rows[0].2.as_deref(), Some("BLOCKED"));
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    // ==== T-531: review -> fix -> re-test -> re-commit loop ================
+
+    /// The headline AC: a `NEEDS_CHANGES` → fix → `PASS` sequence produces
+    /// **exactly two** commits on the branch (the initial `impl(...)` and the
+    /// one `fix(...) review round 1`, with the frozen §2.8 subjects) and
+    /// closes the task `Done`.
+    #[tokio::test]
+    async fn needs_changes_then_pass_converges_with_two_commits_and_closes_the_task() {
+        let agent = Arc::new(
+            ScriptedTaskAgent::new()
+                .script(Stage::Implement, writes_file("a.txt", "a\n"))
+                .script(Stage::Review, review_needs_changes())
+                .script(Stage::Fix, writes_file("b.txt", "b\n"))
+                .script(Stage::Review, review_pass()),
+        );
+        let (state, _app) = test_app_with_task_agent(agent).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let a = seed_task(&state, &epic_id, &project_id, "A").await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        let task = fetch_task_row(&state, &a).await;
+        assert_eq!(task.0, "Done");
+        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+
+        let branch = epic_branch_name_column(&state, &epic_id).await;
+        let subjects = git_log_subjects_for_ref(&fixture.dir, &branch).await;
+        assert_eq!(
+            subjects,
+            vec![
+                "init".to_string(),
+                format!("impl({}): A", spec::short_id(&a)),
+                format!("fix({}) review round 1: A", spec::short_id(&a)),
+            ],
+            "exactly two Dearborn commits: the initial impl and the one fix round"
+        );
+
+        // Baseline review (NEEDS_CHANGES) + the re-review after the fix round
+        // (PASS) — both retained as separate rows.
+        let rows = review_rows(&state, &a).await;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].2.as_deref(), Some("NEEDS_CHANGES"));
+        assert_eq!(rows[1].2.as_deref(), Some("PASS"));
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// Exceeding `MAX_FIX_ROUNDS` (3 in `Config::for_test`) while the
+    /// reviewer keeps returning `NEEDS_CHANGES` fails the task
+    /// `Failed(review_not_converged)`, blocks the epic with the identical
+    /// reason, and — the headline retained-evidence AC — every one of the
+    /// four review rounds' own distinct findings text is still readable in
+    /// `agent_run`, none overwritten or dropped. Round 0 (the baseline, no
+    /// fix behind it) plus a re-review after each of the 3 permitted fix
+    /// rounds is exactly 4 review calls; the 4th's `NEEDS_CHANGES` is what
+    /// exceeds the bound (see the module doc's T-531 section for why this
+    /// loop always re-reviews the final permitted fix, unlike
+    /// `references/ralph-v2.sh`'s own script).
+    #[tokio::test]
+    async fn exceeding_max_fix_rounds_fails_review_not_converged_with_every_rounds_findings_retained(
+    ) {
+        let agent = Arc::new(
+            ScriptedTaskAgent::new()
+                .script(Stage::Implement, writes_file("a.txt", "a\n"))
+                .script(Stage::Review, review_needs_changes_marked("round-0"))
+                .script(Stage::Review, review_needs_changes_marked("round-1"))
+                .script(Stage::Review, review_needs_changes_marked("round-2"))
+                .script(Stage::Review, review_needs_changes_marked("round-3")),
+        );
+        let (state, _app) = test_app_with_task_agent(agent).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let a = seed_task(&state, &epic_id, &project_id, "A").await;
+
+        assert_eq!(
+            state.config.executor.max_fix_rounds, 3,
+            "this test's marker count assumes Config::for_test's default"
+        );
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        let task = fetch_task_row(&state, &a).await;
+        assert_eq!(task.0, "Failed");
+        assert_eq!(task.1.as_deref(), Some("review_not_converged"));
+
+        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        assert_eq!(epic.status, "Blocked");
+        assert_eq!(
+            epic.blocked_reason.as_deref(),
+            Some("review_not_converged"),
+            "the epic must carry the identical reason string as the task"
+        );
+
+        let rows = review_rows(&state, &a).await;
+        assert_eq!(
+            rows.len(),
+            4,
+            "the baseline review plus one re-review per fix round (3 rounds)"
+        );
+        for (i, marker) in ["round-0", "round-1", "round-2", "round-3"].iter().enumerate() {
+            assert_eq!(rows[i].2.as_deref(), Some("NEEDS_CHANGES"));
+            assert!(
+                rows[i].3.contains(marker),
+                "round {i}'s own findings text must survive verbatim, unoverwritten by later rounds"
+            );
+        }
+
+        // Only 3 fix rounds actually ran — the 4th review's NEEDS_CHANGES is
+        // what exceeds MAX_FIX_ROUNDS; there is no 4th fix.
+        let fix_calls = evidence::list_runs_for_task(state.db.conn(), &a)
+            .await
+            .unwrap()
+            .into_iter()
+            .filter(|r| r.stage == "fix")
+            .count();
+        assert_eq!(fix_calls, 3);
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// A review-driven fix that breaks the tests fails the task rather than
+    /// committing red: the fix writes `broken.txt`, which flips the seeded
+    /// `test_cmd` red; the unscripted (default, no-op) nested `Stage::Fix`
+    /// inside `run_test_gate_loop` never resolves it, so the gate exhausts
+    /// `MAX_TEST_FIX_ATTEMPTS` and fails the task `Failed(test_gate_exhausted)`
+    /// — reusing T-522's existing exhaustion path unmodified (see the module
+    /// doc's "Reusing `run_test_gate_loop` unmodified" section). The
+    /// headline negative assertion: the `fix(...) review round 1` commit
+    /// never lands — the branch's commit log stops at the initial
+    /// `impl(...)` commit.
+    #[tokio::test]
+    async fn review_driven_fix_that_breaks_tests_fails_the_task_without_committing_red() {
+        let agent = Arc::new(
+            ScriptedTaskAgent::new()
+                .script(Stage::Implement, writes_file("work.txt", "work\n"))
+                .script(Stage::Review, review_needs_changes())
+                .script(Stage::Fix, writes_file("broken.txt", "oops\n")),
+        );
+        let (state, _app) = test_app_with_task_agent(agent).await;
+        let fixture = GitFixture::new().await;
+        // Green on the untouched tree and once `work.txt` (the implement
+        // stage's own diff) exists, red forever once `broken.txt` (the
+        // review-driven fix's diff) exists — the nested, unscripted
+        // test-driven fix never removes it.
+        let project_id = seed_project_with_test_cmd(&state, &fixture, "! test -f broken.txt").await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let a = seed_task(&state, &epic_id, &project_id, "A").await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        let task = fetch_task_row(&state, &a).await;
+        assert_eq!(task.0, "Failed", "the task itself must be Failed");
+        assert_eq!(task.1.as_deref(), Some("test_gate_exhausted"));
+
+        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        assert_eq!(epic.status, "Blocked");
+        assert_eq!(epic.blocked_reason.as_deref(), Some("test_gate_exhausted"));
+
+        // Workspace retained (a Failed/Blocked walk never pushes); the
+        // review-round fix's diff was never staged or committed.
+        let workspace_path = workspace::epic_workspace_path(&state.config.clone_root, &epic_id);
+        let subjects = git_log_subjects(&workspace_path).await;
+        assert_eq!(
+            subjects,
+            vec!["init".to_string(), format!("impl({}): A", spec::short_id(&a))],
+            "the review-round fix's broken diff must never be committed"
+        );
+        assert!(
+            !subjects.iter().any(|s| s.contains("review round")),
+            "no fix(...) review round commit must land when the fix broke the tests"
+        );
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// Each round re-reviews the **cumulative** diff, against the same
+    /// `base_sha` every time (the AC's own wording, and D9): the recorded
+    /// review prompt for both the baseline round and the re-review after the
+    /// one fix round instructs the agent to `git diff <base_sha>..HEAD`
+    /// against the identical SHA — `base_sha` never advances mid-task.
+    #[tokio::test]
+    async fn every_review_round_prompt_carries_the_identical_base_sha() {
+        let agent = Arc::new(
+            ScriptedTaskAgent::new()
+                .script(Stage::Implement, writes_file("a.txt", "a\n"))
+                .script(Stage::Review, review_needs_changes())
+                .script(Stage::Fix, writes_file("b.txt", "b\n"))
+                .script(Stage::Review, review_pass()),
+        );
+        let recorded = agent.recorded();
+        let (state, _app) = test_app_with_task_agent(agent).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let a = seed_task(&state, &epic_id, &project_id, "A").await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        let base_sha = task_base_sha(&state, &a)
+            .await
+            .expect("base_sha must have been recorded before the implement stage ran");
+
+        let review_runs: Vec<_> = recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.stage == Stage::Review)
+            .cloned()
+            .collect();
+        assert_eq!(review_runs.len(), 2, "baseline review + the re-review after the one fix round");
+        for run in &review_runs {
+            assert!(
+                run.prompt.contains(&format!("git diff {base_sha}..HEAD")),
+                "every round must instruct the agent to diff against the SAME base_sha"
+            );
+        }
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// §2.6's `stage_changed` frame keeps publishing across rounds, with the
+    /// T-531 numbering scheme visible in `attempt`: the baseline review
+    /// publishes `attempt=0`/`verdict=NEEDS_CHANGES`, and the re-review after
+    /// the one fix round publishes `attempt=1`/`verdict=PASS` (sharing its
+    /// number with the fix that produced it — see the module doc).
+    #[tokio::test]
+    async fn stage_changed_publishes_for_every_review_round_with_the_scheme_numbering() {
+        let agent = Arc::new(
+            ScriptedTaskAgent::new()
+                .script(Stage::Implement, writes_file("a.txt", "a\n"))
+                .script(Stage::Review, review_needs_changes())
+                .script(Stage::Fix, writes_file("b.txt", "b\n"))
+                .script(Stage::Review, review_pass()),
+        );
+        let (state, _app) = test_app_with_task_agent(agent).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let a = seed_task(&state, &epic_id, &project_id, "A").await;
+
+        let mut task_sub = state.hub.subscribe(&format!("task:{a}"));
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+
+        let first = recv_stage_changed(&mut task_sub).await;
+        assert_eq!(first["payload"]["stage"], "review");
+        assert_eq!(first["payload"]["attempt"], 0);
+        assert_eq!(first["payload"]["verdict"], "NEEDS_CHANGES");
+
+        let second = recv_stage_changed(&mut task_sub).await;
+        assert_eq!(second["payload"]["stage"], "review");
+        assert_eq!(second["payload"]["attempt"], 1);
+        assert_eq!(second["payload"]["verdict"], "PASS");
 
         cleanup_clone_root(&state, &project_id, &[&epic_id]);
     }
@@ -5169,11 +5804,14 @@ mod tests {
         // ever parsed).
         let rows = review_rows(&state, &a).await;
         assert_eq!(rows.len(), 2);
-        assert_eq!(rows[0].0, 1, "first attempt");
+        assert_eq!(
+            rows[0].0, 0,
+            "first attempt (T-531: the baseline review opens at 0 — see the module doc's T-531 numbering section)"
+        );
         assert_eq!(rows[0].1, "ok", "the agent itself exited cleanly, just with no verdict line");
         assert_eq!(rows[0].2, None);
         assert!(rows[0].3.contains("first-miss"));
-        assert_eq!(rows[1].0, 2, "second attempt (the bounded re-run)");
+        assert_eq!(rows[1].0, 1, "second attempt (the bounded re-run)");
         assert_eq!(rows[1].2, None);
         assert!(rows[1].3.contains("second-miss"));
 
@@ -5206,7 +5844,10 @@ mod tests {
         assert_eq!(task_frame["topic"], format!("task:{a}"));
         assert_eq!(task_frame["payload"]["task_id"], a);
         assert_eq!(task_frame["payload"]["stage"], "review");
-        assert_eq!(task_frame["payload"]["attempt"], 1);
+        assert_eq!(
+            task_frame["payload"]["attempt"], 0,
+            "T-531: the baseline review opens at attempt 0 — see the module doc's T-531 numbering section"
+        );
         assert_eq!(task_frame["payload"]["status"], "ok");
         assert_eq!(task_frame["payload"]["verdict"], "PASS");
 
@@ -5252,7 +5893,10 @@ mod tests {
             .expect("a review run must be listed");
         assert_eq!(review_item["verdict"], "PASS");
         assert_eq!(review_item["status"], "ok");
-        assert_eq!(review_item["attempt"], 1);
+        assert_eq!(
+            review_item["attempt"], 0,
+            "T-531: the baseline review opens at attempt 0 — see the module doc's T-531 numbering section"
+        );
 
         cleanup_clone_root(&state, &project_id, &[&epic_id]);
     }

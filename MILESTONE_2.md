@@ -341,7 +341,7 @@ with `agent_error` and gets thickened in later phases.
   the `agent_run` row and published as `stage_changed`; the reviewer cannot edit
   files (denied edit tools).
 
-- [ ] **T-531 — Review → fix → re-test → re-commit loop.** *deps: T-522, T-530*
+- [x] **T-531 — Review → fix → re-test → re-commit loop.** *deps: T-522, T-530*
   `NEEDS_CHANGES` ⇒ `Stage::Fix` on the findings → re-run the test gate → commit
   `fix(...) review round N` → re-review against the **same** `base_sha`. `PASS`
   ⇒ task `Done`. `BLOCKED` ⇒ `Failed(blocked)`. **AC:** a scripted
