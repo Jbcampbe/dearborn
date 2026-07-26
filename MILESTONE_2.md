@@ -332,7 +332,7 @@ with `agent_error` and gets thickened in later phases.
 
 ## 6. Phase 3 — Review, verdict, and convergence
 
-- [ ] **T-530 — Review stage + verdict contract.** *deps: T-502, T-512*
+- [x] **T-530 — Review stage + verdict contract.** *deps: T-502, T-512*
   `Stage::Review` sees the cumulative diff from `base_sha` plus the D8 context
   and must emit the `VERDICT:` line. Parse per D9; on a miss, one re-run with a
   terse contract reminder. **AC:** all three verdicts parse from realistic

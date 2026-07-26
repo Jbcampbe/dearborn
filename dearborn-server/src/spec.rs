@@ -55,6 +55,7 @@
 /// than `&Task`, so tests (and any future caller) can render a spec without
 /// touching `crate::tasks` at all; [`render_task_spec`] is the convenience
 /// wrapper for callers that already hold a `Task` row.
+#[derive(Clone, Copy)]
 pub struct SpecFields<'a> {
     /// The task's title, rendered as the `# <title>` heading.
     pub title: &'a str,
@@ -148,6 +149,7 @@ pub struct SiblingTask<'a> {
 /// The parent epic's background, when the task being rendered belongs to
 /// one. `None` for a standalone task (D17) — [`build_context`] then omits the
 /// epic-context section entirely rather than rendering an empty one.
+#[derive(Clone, Copy)]
 pub struct EpicContext<'a> {
     /// The epic's title.
     pub title: &'a str,
@@ -161,10 +163,18 @@ pub struct EpicContext<'a> {
 
 /// Everything [`build_context`] needs to render the D8 prompt-context block:
 /// this task's own spec fields, its epic's background (`None` for a
-/// standalone task), and the sibling manifest (empty for a standalone task,
-/// or for an epic with no other tasks yet). Plain borrowed data assembled by
-/// the caller — the worker (a later task) builds this from the DB; this
-/// struct and [`build_context`] do no I/O of their own.
+/// standalone task), the sibling manifest (empty for a standalone task, or
+/// for an epic with no other tasks yet), and — T-530 — the task's `base_sha`,
+/// when the caller wants the context to tell the agent where to diff from.
+/// Plain borrowed data assembled by the caller — the worker builds this from
+/// the DB; this struct and [`build_context`] do no I/O of their own.
+///
+/// Every field here is `Copy` (borrows and `Option`s of borrows only), so
+/// `TaskContext` itself derives `Copy`: a caller that already built one for
+/// `Stage::Implement` can cheaply produce a second, `base_sha`-bearing copy
+/// for `Stage::Review` via struct-update syntax (`TaskContext { base_sha:
+/// Some(sha), ..implement_ctx }`) instead of re-borrowing every field by hand.
+#[derive(Clone, Copy)]
 pub struct TaskContext<'a> {
     /// This task's own rendered-spec fields.
     pub spec: SpecFields<'a>,
@@ -172,6 +182,14 @@ pub struct TaskContext<'a> {
     pub epic: Option<EpicContext<'a>>,
     /// Every other task in the same epic (empty for a standalone task).
     pub siblings: &'a [SiblingTask<'a>],
+    /// The task's `base_sha` — the commit this task branched from — when the
+    /// caller wants [`build_context`] to tell the agent where to diff from
+    /// (T-530's review stage: "run `git diff <base_sha>..HEAD` yourself to
+    /// see the cumulative diff"). `None` renders **exactly** as this module
+    /// did before this field existed (MILESTONE_2 T-530's AC): every other
+    /// stage (`Implement`, `Fix`'s prompt doesn't even use `TaskContext`) has
+    /// no cumulative-diff concept and simply omits this field's section.
+    pub base_sha: Option<&'a str>,
 }
 
 /// The literal "don't touch this" framing for sibling tasks a later task
@@ -185,21 +203,35 @@ its territory here will cause conflicts and duplicate work. Implement only what 
 own spec requires.";
 
 /// Build the D8 prompt-context block a task-stage agent sees: the rendered
-/// spec, then (if present) the epic's background, then (if any siblings
-/// exist) the sibling manifest partitioned into "Already built" (done) and
-/// "Owned by later tasks" (not done, with the explicit do-not-implement
-/// framing).
+/// spec, then (if present, T-530) the task's base-commit note, then (if
+/// present) the epic's background, then (if any siblings exist) the sibling
+/// manifest partitioned into "Already built" (done) and "Owned by later
+/// tasks" (not done, with the explicit do-not-implement framing).
 ///
-/// A standalone task with no epic and no siblings renders to just the
-/// rendered spec — no dangling empty headings. An epic with no recorded
-/// product/technical context still gets an "Epic Context" section (title +
-/// description if any) but skips the context sub-headings that would
-/// otherwise be empty. An epic whose siblings are *all* done still emits the
-/// "Owned by later tasks" heading with an explicit "(none — ...)" rather than
-/// silently dropping it, so the section's absence is never ambiguous with "no
-/// siblings at all".
+/// A standalone task with no epic, no siblings, and no `base_sha` renders to
+/// just the rendered spec — no dangling empty headings. An epic with no
+/// recorded product/technical context still gets an "Epic Context" section
+/// (title + description if any) but skips the context sub-headings that
+/// would otherwise be empty. An epic whose siblings are *all* done still
+/// emits the "Owned by later tasks" heading with an explicit "(none — ...)"
+/// rather than silently dropping it, so the section's absence is never
+/// ambiguous with "no siblings at all". `base_sha`'s section is the newest
+/// addition (T-530, closing the gap `prompts/review.md` already assumed was
+/// closed): `ctx.base_sha` is `None` for every stage but `Review` today, and
+/// `None` renders nothing at all — the byte-for-byte output for the implement
+/// path (§2.1's frozen renderer output) is unchanged from before this field
+/// existed.
 pub fn build_context(ctx: &TaskContext) -> String {
     let mut out = render_spec(&ctx.spec);
+
+    if let Some(sha) = ctx.base_sha {
+        out.push_str("\n\n---\n\n## Base Commit\n\n");
+        out.push_str(&format!(
+            "This task branched from commit `{sha}`. Run `git diff {sha}..HEAD` yourself to \
+             see the cumulative diff for this task — it may span several commits across review \
+             rounds, so review the whole diff, not just the latest commit.\n"
+        ));
+    }
 
     if let Some(epic) = &ctx.epic {
         out.push_str("\n\n---\n\n## Epic Context\n\n");
@@ -282,6 +314,20 @@ pub enum Verdict {
     NeedsChanges,
     /// The task cannot proceed via a code fix; a human must intervene.
     Blocked,
+}
+
+impl Verdict {
+    /// The exact `VERDICT:` token (and the exact string stored in
+    /// `agent_run.verdict` / published in a `stage_changed` frame) for this
+    /// verdict — the inverse of [`parse_verdict`]'s token matching, kept next
+    /// to it so the two can never drift apart.
+    pub fn as_str(self) -> &'static str {
+        match self {
+            Verdict::Pass => "PASS",
+            Verdict::NeedsChanges => "NEEDS_CHANGES",
+            Verdict::Blocked => "BLOCKED",
+        }
+    }
 }
 
 /// Parse an agent's raw output for the D9 verdict line: the **last** line
@@ -444,11 +490,13 @@ mod tests {
             spec: spec("Standalone task"),
             epic: None,
             siblings: &[],
+            base_sha: None,
         };
         let rendered = build_context(&ctx);
         assert_eq!(rendered, render_spec(&ctx.spec));
         assert!(!rendered.contains("Epic Context"));
         assert!(!rendered.contains("Sibling Tasks"));
+        assert!(!rendered.contains("Base Commit"));
     }
 
     #[test]
@@ -462,6 +510,7 @@ mod tests {
                 technical_context: Some("Stripe, webhook-driven confirmation."),
             }),
             siblings: &[],
+            base_sha: None,
         };
         let rendered = build_context(&ctx);
         assert!(rendered.contains("## Epic Context"));
@@ -484,6 +533,7 @@ mod tests {
                 technical_context: None,
             }),
             siblings: &[],
+            base_sha: None,
         };
         let rendered = build_context(&ctx);
         assert!(rendered.contains("## Epic Context"));
@@ -510,6 +560,7 @@ mod tests {
             spec: spec("Middle task"),
             epic: None,
             siblings: &siblings,
+            base_sha: None,
         };
         let rendered = build_context(&ctx);
 
@@ -544,6 +595,7 @@ mod tests {
             spec: spec("Last task"),
             epic: None,
             siblings: &siblings,
+            base_sha: None,
         };
         let rendered = build_context(&ctx);
         assert!(rendered.contains("### Owned by later tasks"));
@@ -556,6 +608,38 @@ mod tests {
     fn short_id_takes_the_last_six_characters() {
         assert_eq!(short_id("01HXYZ9ABCDE"), "9ABCDE");
         assert_eq!(short_id("abc"), "abc");
+    }
+
+    // ---- base_sha (T-530) ------------------------------------------------
+
+    #[test]
+    fn present_base_sha_renders_a_diff_instruction() {
+        let ctx = TaskContext {
+            spec: spec("Reviewed task"),
+            epic: None,
+            siblings: &[],
+            base_sha: Some("deadbeef1234"),
+        };
+        let rendered = build_context(&ctx);
+        assert!(rendered.contains("## Base Commit"));
+        assert!(rendered.contains("deadbeef1234"));
+        assert!(rendered.contains("git diff deadbeef1234..HEAD"));
+    }
+
+    #[test]
+    fn absent_base_sha_renders_identically_to_before_the_field_existed() {
+        // T-530's AC: an absent base SHA must render exactly as it did before
+        // this field existed — no "Base Commit" section, no byte-for-byte
+        // change to the implement-path output.
+        let with_none = TaskContext {
+            spec: spec("Implement task"),
+            epic: None,
+            siblings: &[],
+            base_sha: None,
+        };
+        let rendered = build_context(&with_none);
+        assert!(!rendered.contains("Base Commit"));
+        assert_eq!(rendered, render_spec(&with_none.spec));
     }
 
     // ---- parse_verdict ---------------------------------------------------
@@ -611,6 +695,52 @@ VERDICT: PASS";
     fn garbage_after_the_token_does_not_match() {
         let output = "VERDICT: PASS because reasons";
         assert_eq!(parse_verdict(output), None);
+    }
+
+    #[test]
+    fn realistic_preamble_laden_output_parses_all_three_verdicts() {
+        // T-530's AC: all three verdicts parse from realistic, preamble-laden
+        // reviewer output — prose findings with severity tags, a fenced code
+        // block that itself mentions "VERDICT:", then the real trailing
+        // verdict line.
+        let pass = "\
+I reviewed the cumulative diff against the task's acceptance criteria.\n\n\
+[NIT] `foo.rs:12` — consider a shorter variable name, purely stylistic.\n\n\
+Here's the relevant snippet for reference:\n\
+```\n\
+// VERDICT: NEEDS_CHANGES  <- this is just example text in a code fence\n\
+fn foo() {}\n\
+```\n\n\
+Everything the acceptance criteria require is met; no in-scope defects.\n\n\
+VERDICT: PASS";
+        assert_eq!(parse_verdict(pass), Some(Verdict::Pass));
+
+        let needs_changes = "\
+Findings:\n\n\
+[BLOCKING] `worker.rs:42` — the fenced UPDATE never checks the affected-row \
+count, so a lost lease silently proceeds. Add an `if affected == 0 { return }` \
+guard before the next write.\n\n\
+[IMPORTANT] `worker.rs:80` — missing a doc comment explaining why this branch \
+exists.\n\n\
+VERDICT: NEEDS_CHANGES";
+        assert_eq!(parse_verdict(needs_changes), Some(Verdict::NeedsChanges));
+
+        let blocked = "\
+[SPEC-CONFLICT] The acceptance criteria ask for a column this migration never \
+adds — `blocked_reason` on `task`, not `epic`. This needs a human to resolve \
+the spec before any code change can proceed.\n\n\
+VERDICT: BLOCKED";
+        assert_eq!(parse_verdict(blocked), Some(Verdict::Blocked));
+    }
+
+    // ---- Verdict::as_str ---------------------------------------------------
+
+    #[test]
+    fn verdict_as_str_round_trips_through_parse_verdict() {
+        for verdict in [Verdict::Pass, Verdict::NeedsChanges, Verdict::Blocked] {
+            let line = format!("VERDICT: {}", verdict.as_str());
+            assert_eq!(parse_verdict(&line), Some(verdict));
+        }
     }
 
     // ---- prompts -----------------------------------------------------

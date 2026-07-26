@@ -353,6 +353,160 @@
 //! above describes for the rest of the walk, just applied at finer grain
 //! because this loop's body is where a lost lease or a cancelled epic is
 //! most likely to be sitting unnoticed the longest.
+//!
+//! ## Review, verdict, and convergence (T-530)
+//!
+//! [`run_review_stage`] slots into "The real implement walk" above between
+//! step 5 (commit-if-dirty) and step 6 (`Done`, T-513's numbering): once a
+//! task's changes are committed, [`process_one_task`] asks a fresh `Ask`-mode
+//! agent to review the **cumulative** diff since `base_sha` — the *entire*
+//! diff this task has produced across however many commits, not just the
+//! latest one — against the task's own rendered spec (its Acceptance
+//! Criteria), and to end its reply with exactly one D9 `VERDICT:` line.
+//!
+//! ### Why the reviewer needs `base_sha` in its own context
+//!
+//! `prompts/review.md` (T-502) already promised the agent "the base commit
+//! SHA this task branched from" and told it to run `git diff <base
+//! sha>..HEAD` itself — a promise [`crate::spec::build_context`] could not
+//! keep until this task, because nothing populated `TaskContext::base_sha`
+//! before now. `process_one_task` already captures `base_sha` at the top of
+//! its walk (step 1, before anything could move `HEAD`) for exactly this
+//! reason; this task's only new wiring is threading that same string into a
+//! second, `Copy`-cloned `TaskContext` (`TaskContext { base_sha:
+//! Some(&base_sha), ..task_ctx }`) built right before the review stage runs,
+//! never re-derived.
+//!
+//! ### One reviewer, not ralph's reviewer+judge split
+//!
+//! `references/ralph-v2.sh` splits this into two agents: a free-form
+//! `review` agent that writes findings with no verdict, and a separate
+//! `judge` agent (`judge_verdict`, its `# ---- judge ----` section) that
+//! reads those findings plus a fresh copy of the spec and *only* emits the
+//! machine-readable `VERDICT: ...` line, retried up to `VERDICT_RETRIES`
+//! times on a parse miss. `prompts/review.md`'s own doc explains why
+//! Dearborn collapses both jobs into one stage instead: the same agent turn
+//! writes the findings *and* the verdict, with the verdict required to be
+//! the *last* matching line (D9) specifically so a reviewer can front-load
+//! its findings and commit to a verdict once it has finished reasoning,
+//! instead of a second agent re-deriving the same judgment from a findings
+//! transcript it didn't write. [`run_review_stage`] is Dearborn's
+//! `judge_verdict` equivalent, just driving one stage instead of two.
+//!
+//! ### The bounded contract-miss retry
+//!
+//! `Stage::Review` is `Ask`-mode free text — nothing forces the model to
+//! actually end its reply with a parseable `VERDICT:` line, so
+//! [`spec::parse_verdict`] returning `None` is a real, expected outcome, not
+//! a bug. [`run_review_stage`] handles it exactly like ralph's
+//! `judge_verdict` loop: one bounded re-run (`1 +
+//! config.executor.verdict_retries` attempts total — **never** a hardcoded
+//! `1`, so the config knob is never re-derived at this call site) of the
+//! **same** review prompt with [`VERDICT_CONTRACT_REMINDER`] appended — a
+//! short, literal restatement of the exact required line, not a second
+//! review request. If the re-run still doesn't parse, the contract is
+//! considered broken: [`fail_task_and_block_epic`] routes the task to
+//! `Failed(agent_error)` and the epic to `Blocked` — the same helper T-522's
+//! exhausted test-gate loop uses, reused rather than duplicated, because both
+//! are "this stage could not produce a usable result after its bounded
+//! retries" in the same shape.
+//!
+//! ### Both raw outputs survive, by construction
+//!
+//! The miss and the re-run are **two separate calls** into
+//! [`task_agent::run_agent_stage`], each opening its own `agent_run` row
+//! (D13: every stage that runs gets a row) at successive `attempt` values —
+//! nothing here overwrites or discards the first attempt's transcript before
+//! trying again, so a human looking at `GET /tasks/{id}/runs` after a
+//! contract-miss failure sees both the agent's original (unparseable) reply
+//! and the reminder-prompted re-run's reply, in order. Attempt numbering for
+//! this stage starts at `1` for the reviewer's first try at *this task's*
+//! verdict and increments once per contract-miss retry — a much shallower
+//! counter than T-522's fix-loop `attempt` (which also counts *test*
+//! re-runs), because there is nothing to retry here except the parse itself;
+//! T-531 introduces the review-*round* concept (re-reviewing after a
+//! `NEEDS_CHANGES` fix) and will need to decide how round and contract-miss
+//! attempt compose — deliberately left to that task, not pre-built here.
+//!
+//! ### Storing the verdict after the row is already closed
+//!
+//! [`task_agent::run_agent_stage`] closes its `agent_run` row with
+//! `verdict: None` unconditionally (T-512 has no idea whether a given stage
+//! even emits a verdict) — by the time [`run_review_stage`] has parsed
+//! [`task_agent::AgentStageOutcome::text`] for a `VERDICT:` line, the row is
+//! already closed and its `StageHandle` is gone.
+//! [`task_agent::AgentStageOutcome`] now carries the row's own id
+//! (`agent_run_id`, stamped by `run_agent_stage` right after the drain
+//! finishes) precisely so a caller in this position can go back and set the
+//! column with [`evidence::set_verdict`] — a plain, independent `UPDATE ...
+//! WHERE id = ?` — instead of `CloseStage` growing a second "verdict, but
+//! only sometimes" field every non-review caller would have to remember to
+//! pass `None` for.
+//!
+//! ### `stage_changed`, and why it's a shared helper
+//!
+//! Once a verdict is known and recorded, [`publish_stage_changed`] fans out
+//! MILESTONE_2 §2.6's `{ task_id, stage, attempt, status, verdict? }` frame
+//! on **two** topics: `task:<id>` (a task detail view already subscribed to
+//! the stage's `RunEvent` firehose gets the same summary a `dag_updated`-
+//! style consumer would want) and, coarse, `epic:<id>` (so a project board or
+//! epic detail view can drive a task card's sub-label — "reviewing", "2nd
+//! review round" — without subscribing to every task's token stream, exactly
+//! the concern CONVENTIONS.md's `task:<id>` section already explains for the
+//! `RunEvent` firehose itself). One small function rather than two inlined
+//! `state.hub.publish(...)` calls at the one call site this task adds,
+//! because "publish the same payload on two topics" is exactly the kind of
+//! thing a second call site (T-531's re-review rounds, or a future non-review
+//! stage transition) would otherwise be tempted to copy-paste instead of
+//! reuse.
+//!
+//! ### The reviewer cannot edit files
+//!
+//! `Stage::Review.run_mode()` is `RunMode::Ask` and
+//! `Stage::Review.denies_edit_tools()` is `true` (both decided in T-512,
+//! `task_agent.rs`) — this task adds no new enforcement, only a test in this
+//! module's own `mod tests` asserting it directly via
+//! [`task_agent::build_extra_args`], per this task's own AC line ("the
+//! reviewer cannot edit files"). See `task_agent.rs`'s "soft read-only
+//! enforcement" doc section for the caveat MILESTONE_2 §11 risk 2 already
+//! names: `--disallowedTools` narrows Edit/Write/MultiEdit/NotebookEdit, not
+//! `Bash` — the real backstop is the test gate plus this very
+//! cumulative-diff review, not the permission flag.
+//!
+//! ### `NEEDS_CHANGES` and `BLOCKED` are placeholders here, deliberately
+//!
+//! [`process_one_task`] routes a `PASS` verdict straight to `Done`, exactly
+//! as an epic with no review stage at all would have before this task. A
+//! `NEEDS_CHANGES` or `BLOCKED` verdict, though, does **not** get the real
+//! ralph-equivalent treatment yet (`references/ralph-v2.sh`'s
+//! `# ---- review / judge / fix loop ----`: `NEEDS_CHANGES` re-enters
+//! `Stage::Fix` and re-reviews against the same `base_sha`, capped by
+//! `MAX_FIX_ROUNDS`) — that loop is T-531's job by name (MILESTONE_2 §6).
+//! This task deliberately does the minimum that keeps the walk a real
+//! vertical slice rather than dead code: both verdicts route through
+//! [`fail_task_and_block_epic`] exactly like any other T-522-shaped failure —
+//! `NEEDS_CHANGES` as `Failed(review_not_converged)` (the §2.3 reason T-531's
+//! real loop will also use once fix-round exhaustion is the actual cause, not
+//! "there was no loop at all"), `BLOCKED` as `Failed(blocked)` (§2.3's own
+//! reason for "the agent returned BLOCKED", already exact for this verdict
+//! with no T-531 dependency at all). Building any part of T-531's
+//! fix/re-test/re-review loop ahead of that task landing — even as a TODO
+//! stub with real control flow — is exactly the kind of "quietly pre-build
+//! the next task" MILESTONE_2's own discipline (§1's "How to use this
+//! document") warns against; the comment at the call site says so, so nobody
+//! mistakes the placeholder for the finished behavior.
+//!
+//! ### No review for a no-diff task (T-532's territory)
+//!
+//! [`process_one_task`] only reaches the review stage inside the "there is
+//! something to commit" branch — a task whose implement stage produced no
+//! diff (the agent judged the task already satisfied) never runs
+//! `Stage::Review` at all, exactly as it never ran `Stage::Commit` either.
+//! MILESTONE_2 §6 names that gap `Stage::VerifyComplete`'s job (T-532): a
+//! no-diff task needs its own verdict-bearing check ("is this genuinely
+//! already done?") before either closing with zero commits or routing into
+//! the ordinary pipeline — a check this task does not attempt to build any
+//! part of.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -896,11 +1050,14 @@ enum TaskStepOutcome {
     Stop,
 }
 
-/// Process exactly one ready task through the full T-513 sequence: record
-/// `base_sha`, `Todo → InProgress`, assemble the D8 prompt, run
-/// `Stage::Implement`, `git add -A` + commit-if-dirty, `Done`. See the module
-/// doc's "The real implement walk" section for the rationale behind each
-/// step; this function is the literal implementation of that sequence.
+/// Process exactly one ready task through the full T-513/T-522/T-530
+/// sequence: record `base_sha`, `Todo → InProgress`, assemble the D8 prompt,
+/// run `Stage::Implement`, the T-522 test-gate/fix loop, `git add -A` +
+/// commit-if-dirty, the T-530 review stage (only when a commit happened —
+/// see the module doc's "No review for a no-diff task" section), `Done`. See
+/// the module doc's "The real implement walk" and "Review, verdict, and
+/// convergence" sections for the rationale behind each step; this function
+/// is the literal implementation of that sequence.
 async fn process_one_task(
     state: &AppState,
     epic_id: &str,
@@ -951,7 +1108,9 @@ async fn process_one_task(
     let _ = conn
         .execute(
             "UPDATE task SET status = 'InProgress', base_sha = ?1, updated_at = ?2 WHERE id = ?3",
-            params![base_sha, now, task_id.clone()],
+            // Cloned, not moved: T-530's review stage (step 5b below) needs
+            // `base_sha` again, well after this write.
+            params![base_sha.clone(), now, task_id.clone()],
         )
         .await;
     mcp::publish_dag(state, epic_id).await;
@@ -979,6 +1138,9 @@ async fn process_one_task(
         },
         epic: Some(epic_ctx),
         siblings: &sibling_refs,
+        // No cumulative-diff concept for Implement — only Review (T-530)
+        // populates this. See spec::TaskContext's doc.
+        base_sha: None,
     };
     let prompt = task_agent::assemble_prompt(Stage::Implement, &task_ctx)
         .expect("Stage::Implement always has a prompt (spec::prompt_for)");
@@ -1144,6 +1306,70 @@ async fn process_one_task(
                 }
                 return TaskStepOutcome::Stop;
             }
+        }
+
+        // 5b. T-530: review the cumulative diff now that there's a commit to
+        //     review. A no-diff task never reaches this branch at all — see
+        //     the module doc's "No review for a no-diff task" section;
+        //     T-532 owns that case (`Stage::VerifyComplete`).
+        if lease.is_lost() || !epic_still_in_progress(conn, epic_id).await {
+            tracing::warn!(
+                epic = %epic_id,
+                task = %task_id,
+                "pipeline: epic cancelled or lease lost before the review stage; stopping without finalizing"
+            );
+            return TaskStepOutcome::Stop;
+        }
+
+        let review_ctx = TaskContext {
+            base_sha: Some(base_sha.as_str()),
+            ..task_ctx
+        };
+        let review_prompt = task_agent::assemble_prompt(Stage::Review, &review_ctx)
+            .expect("Stage::Review always has a prompt (spec::prompt_for)");
+
+        match run_review_stage(state, epic_id, &task_id, workspace, &review_prompt, lease).await {
+            ReviewOutcome::Verdict(spec::Verdict::Pass) => {
+                // Proceed to Done below, exactly as if there were no review
+                // stage at all.
+            }
+            ReviewOutcome::Verdict(spec::Verdict::NeedsChanges) => {
+                // PLACEHOLDER (T-530): T-531 replaces this branch with the
+                // real review -> fix -> re-test -> re-commit -> re-review
+                // loop (`references/ralph-v2.sh`'s `# ---- review / judge /
+                // fix loop ----`, capped by MAX_FIX_ROUNDS). This task
+                // deliberately does not pre-build any part of that loop —
+                // see the module doc's "NEEDS_CHANGES and BLOCKED are
+                // placeholders here" section — it only keeps this walk a
+                // real vertical slice, not dead code, by failing the task
+                // and blocking the epic exactly like any other
+                // T-522-shaped failure.
+                if !lease.is_lost() {
+                    fail_task_and_block_epic(
+                        state,
+                        epic_id,
+                        &task_id,
+                        "review_not_converged",
+                        "review returned NEEDS_CHANGES; T-531 builds the fix/re-test/re-review loop this slice does not",
+                    )
+                    .await;
+                }
+                return TaskStepOutcome::Stop;
+            }
+            ReviewOutcome::Verdict(spec::Verdict::Blocked) => {
+                if !lease.is_lost() {
+                    fail_task_and_block_epic(
+                        state,
+                        epic_id,
+                        &task_id,
+                        "blocked",
+                        "reviewer returned BLOCKED — needs a human to resolve",
+                    )
+                    .await;
+                }
+                return TaskStepOutcome::Stop;
+            }
+            ReviewOutcome::Stop => return TaskStepOutcome::Stop,
         }
     }
 
@@ -1355,6 +1581,210 @@ async fn run_test_gate_loop(
                 return GateOutcome::Stop;
             }
         }
+    }
+}
+
+// ---- Review, verdict, and convergence (T-530) ------------------------------
+
+/// The terse contract reminder [`run_review_stage`] appends to the **same**
+/// review prompt on its single bounded re-run, when [`spec::parse_verdict`]
+/// found no `VERDICT:` line in the first attempt's output. Named so a test
+/// can assert on it directly (this task's AC: "a terse contract reminder").
+/// Deliberately short — the agent already has the full review prompt and
+/// context from the first attempt's prompt (repeated verbatim, this text
+/// appended after it); the goal is a nudge back to the exact output shape,
+/// not a second explanation of the review's job.
+const VERDICT_CONTRACT_REMINDER: &str = "## Contract reminder\n\n\
+Your previous response did not end with a line matching exactly one of:\n\n\
+```\n\
+VERDICT: PASS\n\
+VERDICT: NEEDS_CHANGES\n\
+VERDICT: BLOCKED\n\
+```\n\n\
+Write your findings, then finish your **final** message with exactly one such \
+line — alone, as the very last line, nothing before or after it on that line, \
+uppercase, exact spelling.";
+
+/// What [`run_review_stage`] tells [`process_one_task`] to do next.
+enum ReviewOutcome {
+    /// A verdict parsed (on the first attempt or the one bounded re-run) and
+    /// has already been recorded on its `agent_run` row and published as
+    /// `stage_changed`. The caller decides what each verdict means for the
+    /// task/epic.
+    Verdict(spec::Verdict),
+    /// The review stage failed to start, errored, or never produced a
+    /// parseable verdict after the bounded retry — already routed to
+    /// `Failed(agent_error)`/`Blocked` (or the lease was already lost/the
+    /// epic already left `InProgress`) — the caller's only job is to stop,
+    /// with no further writes, exactly like every other failure exit in this
+    /// module.
+    Stop,
+}
+
+/// T-530: run `Stage::Review` against `review_prompt` (the D8 context,
+/// including `base_sha`, already assembled by the caller — see
+/// [`task_agent::assemble_prompt`]), parse the D9 verdict out of the
+/// transcript, and on a parse miss re-run **once** (bounded by
+/// `config.executor.verdict_retries`) with [`VERDICT_CONTRACT_REMINDER`]
+/// appended. See the module doc's "Review, verdict, and convergence" section
+/// for the full rationale — this function is the literal translation of that
+/// section's contract-miss/attempt-numbering/verdict-storage description into
+/// code.
+async fn run_review_stage(
+    state: &AppState,
+    epic_id: &str,
+    task_id: &str,
+    workspace: &ProvisionedWorkspace,
+    review_prompt: &str,
+    lease: &LeaseHandle,
+) -> ReviewOutcome {
+    let conn = state.db.conn();
+    // Total attempts = the first try + the bounded number of contract-miss
+    // re-runs (default 1, never hardcoded — see the module doc).
+    let max_attempts = 1 + state.config.executor.verdict_retries as i64;
+    let reminded_prompt = format!("{review_prompt}\n\n---\n\n{VERDICT_CONTRACT_REMINDER}");
+
+    let mut attempt: i64 = 1;
+    loop {
+        // Same belt-and-suspenders re-check every long stretch of this walk
+        // performs before spending a whole agent turn.
+        if lease.is_lost() || !epic_still_in_progress(conn, epic_id).await {
+            tracing::warn!(
+                epic = %epic_id,
+                task = %task_id,
+                "pipeline: epic cancelled or lease lost before the review stage; stopping without finalizing"
+            );
+            return ReviewOutcome::Stop;
+        }
+
+        let prompt = if attempt == 1 {
+            review_prompt.to_string()
+        } else {
+            reminded_prompt.clone()
+        };
+
+        let run_id = ulid::Ulid::new().to_string();
+        let outcome = task_agent::run_agent_stage(
+            state,
+            &*state.task_agent,
+            AgentStageParams {
+                task_id,
+                epic_id: Some(epic_id),
+                attempt,
+            },
+            TaskRunRequest {
+                run_id,
+                stage: Stage::Review,
+                prompt,
+                cwd: workspace.workspace_path.clone(),
+            },
+        )
+        .await;
+
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                if !lease.is_lost() {
+                    fail_task_and_block_epic(
+                        state,
+                        epic_id,
+                        task_id,
+                        "agent_error",
+                        &format!("review stage failed to start: {err}"),
+                    )
+                    .await;
+                }
+                return ReviewOutcome::Stop;
+            }
+        };
+
+        if !outcome.is_ok() {
+            if !lease.is_lost() {
+                fail_task_and_block_epic(
+                    state,
+                    epic_id,
+                    task_id,
+                    "agent_error",
+                    "review stage did not complete successfully",
+                )
+                .await;
+            }
+            return ReviewOutcome::Stop;
+        }
+
+        if let Some(verdict) = spec::parse_verdict(&outcome.text) {
+            if !lease.is_lost() {
+                let _ = evidence::set_verdict(conn, &outcome.agent_run_id, verdict.as_str()).await;
+                publish_stage_changed(
+                    state,
+                    task_id,
+                    Some(epic_id),
+                    Stage::Review,
+                    attempt,
+                    "ok",
+                    Some(verdict.as_str()),
+                )
+                .await;
+            }
+            return ReviewOutcome::Verdict(verdict);
+        }
+
+        // Contract miss: out of retries?
+        if attempt >= max_attempts {
+            tracing::warn!(
+                epic = %epic_id,
+                task = %task_id,
+                attempt,
+                "review stage did not emit a parseable VERDICT: line after the configured retries; task -> Failed(agent_error)"
+            );
+            if !lease.is_lost() {
+                fail_task_and_block_epic(
+                    state,
+                    epic_id,
+                    task_id,
+                    "agent_error",
+                    &format!(
+                        "review stage produced no parseable VERDICT: line after {max_attempts} attempt(s)"
+                    ),
+                )
+                .await;
+            }
+            return ReviewOutcome::Stop;
+        }
+
+        attempt += 1;
+    }
+}
+
+/// The §2.6 `stage_changed` frame: `{ task_id, stage, attempt, status,
+/// verdict? }`, published on `task:<id>` and — coarse, same payload — on
+/// `epic:<id>` when the task belongs to one. See the module doc's
+/// "`stage_changed`, and why it's a shared helper" section for why this is
+/// one function rather than two inlined `hub.publish` calls at each call
+/// site.
+async fn publish_stage_changed(
+    state: &AppState,
+    task_id: &str,
+    epic_id: Option<&str>,
+    stage: Stage,
+    attempt: i64,
+    status: &str,
+    verdict: Option<&str>,
+) {
+    let payload = serde_json::json!({
+        "task_id": task_id,
+        "stage": stage.as_str(),
+        "attempt": attempt,
+        "status": status,
+        "verdict": verdict,
+    });
+    state
+        .hub
+        .publish(&format!("task:{task_id}"), "stage_changed", payload.clone());
+    if let Some(epic_id) = epic_id {
+        state
+            .hub
+            .publish(&format!("epic:{epic_id}"), "stage_changed", payload);
     }
 }
 
@@ -1888,13 +2318,14 @@ mod tests {
         header::{AUTHORIZATION, CONTENT_TYPE},
         Request, StatusCode,
     };
-    use harness::{HarnessError, RunEvent, RunHandle};
+    use harness::{HarnessError, RunEvent, RunHandle, RunMode};
     use libsql::params;
     use serde_json::{json, Value};
+    use std::collections::HashMap;
     use std::path::PathBuf;
     use std::sync::atomic::{AtomicUsize, Ordering as AtomicOrdering};
     use std::sync::mpsc::Receiver;
-    use std::sync::Arc;
+    use std::sync::{Arc, Mutex};
     use std::time::Duration;
     use tower::ServiceExt;
 
@@ -3582,12 +4013,27 @@ mod tests {
             .conn()
             .query(
                 "SELECT COUNT(*) FROM agent_run WHERE task_id = ?1 AND stage = 'commit'",
-                params![task_id],
+                params![task_id.clone()],
             )
             .await
             .unwrap();
         let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
         assert_eq!(count, 0, "the commit stage never runs when there is nothing to commit");
+
+        // T-530: no commit means no review either — that's Stage::VerifyComplete's
+        // territory (T-532), not built here (see the module doc's "No review
+        // for a no-diff task" section).
+        let mut review_rows = state
+            .db
+            .conn()
+            .query(
+                "SELECT COUNT(*) FROM agent_run WHERE task_id = ?1 AND stage = 'review'",
+                params![task_id],
+            )
+            .await
+            .unwrap();
+        let review_count: i64 = review_rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(review_count, 0, "the review stage never runs for a no-diff task (T-532's job)");
 
         cleanup_clone_root(&state, &project_id, &[&epic_id]);
     }
@@ -3881,23 +4327,49 @@ mod tests {
         cleanup_clone_root(&state, &project_id, &[&epic_id]);
     }
 
-    /// A `TaskAgent` wrapper that gates only the *Nth* call's `Exited` event
-    /// (0-indexed) behind a [`Gate`], letting every other call through
-    /// untouched — unlike `ScriptedTaskAgent::with_gate`, which gates *every*
-    /// call uniformly. Needed so an earlier task can finish completely while
-    /// a later one is deliberately held in flight (the "cancel mid-walk"
-    /// test below).
+    /// A `TaskAgent` wrapper that gates only the *Nth call of one specific
+    /// stage's* `Exited` event (0-indexed, per-`gate_stage`) behind a
+    /// [`Gate`], letting every other call — including every call of any
+    /// *other* stage — through untouched. Unlike `ScriptedTaskAgent::with_gate`
+    /// (gates every call uniformly), needed so an earlier task can finish
+    /// completely while a later one is deliberately held in flight (the
+    /// "cancel mid-walk" test below).
+    ///
+    /// Indexing is per-stage, not per overall call (T-530): a walk now makes
+    /// more than one agent call per task (`Implement` then `Review`), and
+    /// T-531/T-532 add still more, so "the Nth agent call overall" silently
+    /// points at a different stage every time a new stage lands upstream of
+    /// the one a test actually cares about gating. Counting "the Nth call of
+    /// `gate_stage`" instead stays pinned to the call the test names, no
+    /// matter how many other-stage calls happen around it.
     struct SelectiveGateAgent {
         inner: ScriptedTaskAgent,
-        call_index: AtomicUsize,
+        /// Per-stage call counters, keyed by [`Stage`] — bumped once per
+        /// call to `run` for that stage, independent of every other stage's
+        /// count.
+        call_index: Mutex<HashMap<Stage, usize>>,
+        /// Which stage's calls to count at all; calls of any other stage
+        /// always pass through ungated.
+        gate_stage: Stage,
+        /// Gate the `gate_stage` call at this index (0-indexed, counting
+        /// only `gate_stage` calls).
         gate_at_index: usize,
         gate: Arc<Gate>,
     }
 
     impl TaskAgent for SelectiveGateAgent {
         fn run(&self, req: TaskRunRequest) -> Result<(RunHandle, Receiver<RunEvent>), HarnessError> {
-            let idx = self.call_index.fetch_add(1, AtomicOrdering::SeqCst);
+            let stage = req.stage;
             let (handle, inner_rx) = self.inner.run(req)?;
+            if stage != self.gate_stage {
+                return Ok((handle, inner_rx));
+            }
+            let idx = {
+                let mut counts = self.call_index.lock().unwrap();
+                let idx = *counts.get(&stage).unwrap_or(&0);
+                counts.insert(stage, idx + 1);
+                idx
+            };
             if idx != self.gate_at_index {
                 return Ok((handle, inner_rx));
             }
@@ -3933,7 +4405,8 @@ mod tests {
                 .script(Stage::Implement, writes_file("a.txt", "a"))
                 .script(Stage::Implement, writes_file("b.txt", "b"))
                 .script(Stage::Implement, writes_file("c.txt", "c")),
-            call_index: AtomicUsize::new(0),
+            call_index: Mutex::new(HashMap::new()),
+            gate_stage: Stage::Implement,
             gate_at_index: 1, // gate task B's implement call
             gate: gate.clone(),
         });
@@ -4402,6 +4875,428 @@ mod tests {
 
         let rows = gate_and_fix_rows(&state, &a).await;
         assert_eq!(rows, vec![("test_gate".to_string(), 0, "ok".to_string())]);
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    // ==== T-530: Review stage + verdict contract ===========================
+
+    /// Realistic, preamble-laden reviewer output ending in a real `VERDICT:`
+    /// line — prose findings with severity tags first, the machine-readable
+    /// verdict last (D9), exactly the shape a real Claude Code review turn
+    /// produces and `prompts/review.md` asks for.
+    fn review_text(preamble: &str, verdict: &str) -> String {
+        format!("{preamble}\n\nVERDICT: {verdict}")
+    }
+
+    fn review_pass() -> ScriptedRun {
+        ScriptedRun {
+            text: vec![review_text(
+                "Reviewed the cumulative diff against this task's acceptance criteria. \
+                 [NIT] `a.txt` — trivial, purely stylistic. Everything the acceptance \
+                 criteria require is met; no in-scope correctness/security/data bug remains.",
+                "PASS",
+            )],
+            ..ScriptedRun::default()
+        }
+    }
+
+    fn review_needs_changes() -> ScriptedRun {
+        ScriptedRun {
+            text: vec![review_text(
+                "[BLOCKING] `a.txt:1` — this violates the stated acceptance criterion; a fix \
+                 agent should address it before this slice can ship.",
+                "NEEDS_CHANGES",
+            )],
+            ..ScriptedRun::default()
+        }
+    }
+
+    fn review_blocked() -> ScriptedRun {
+        ScriptedRun {
+            text: vec![review_text(
+                "[SPEC-CONFLICT] the acceptance criteria contradict a stated convention; this \
+                 needs a human to resolve the spec, not a code fix.",
+                "BLOCKED",
+            )],
+            ..ScriptedRun::default()
+        }
+    }
+
+    /// A review reply with **no** parseable `VERDICT:` line at all — a
+    /// contract miss — carrying `marker` in its text so a test can tell two
+    /// separate miss attempts apart in the retained evidence.
+    fn unparseable_review(marker: &str) -> ScriptedRun {
+        ScriptedRun {
+            text: vec![format!(
+                "Some findings here, but this reply never ends with a parseable verdict line. \
+                 marker={marker}"
+            )],
+            ..ScriptedRun::default()
+        }
+    }
+
+    /// `review` `agent_run` rows for `task_id`, oldest first, as `(attempt,
+    /// status, verdict, log)` — the T-530 counterpart to
+    /// [`gate_and_fix_rows`], reading `log`/`verdict` too (which
+    /// `list_runs_for_task` omits) since several tests below need to inspect
+    /// both raw retained outputs directly.
+    async fn review_rows(state: &AppState, task_id: &str) -> Vec<(i64, String, Option<String>, String)> {
+        let mut rows = state
+            .db
+            .conn()
+            .query(
+                "SELECT attempt, status, verdict, log FROM agent_run \
+                 WHERE task_id = ?1 AND stage = 'review' ORDER BY created_at ASC, rowid ASC",
+                params![task_id],
+            )
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            out.push((
+                row.get(0).unwrap(),
+                row.get(1).unwrap(),
+                row.get(2).unwrap(),
+                row.get(3).unwrap(),
+            ));
+        }
+        out
+    }
+
+    /// Await the next `stage_changed` frame on `sub`, skipping any other
+    /// frame type the topic also carries (`dag_updated`/`epic_updated` on
+    /// `epic:<id>`, the `RunEvent` firehose on `task:<id>`).
+    async fn recv_stage_changed(
+        sub: &mut tokio::sync::broadcast::Receiver<crate::hub::Envelope>,
+    ) -> Value {
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let remaining = deadline.saturating_duration_since(tokio::time::Instant::now());
+            let frame = tokio::time::timeout(remaining, sub.recv())
+                .await
+                .expect("never saw a stage_changed frame")
+                .unwrap();
+            let v: Value = serde_json::from_str(&frame).unwrap();
+            if v["type"] == "stage_changed" {
+                return v;
+            }
+        }
+    }
+
+    /// `Stage::Review` runs `Ask`-mode with edit tools denied — decided in
+    /// T-512 (`task_agent.rs`'s `Stage::run_mode`/`denies_edit_tools`, and
+    /// `build_extra_args`'s own tests), asserted again here at the call site
+    /// this task wires up, per this task's own AC line ("the reviewer cannot
+    /// edit files").
+    #[test]
+    fn review_stage_runs_ask_mode_with_edit_tools_denied() {
+        assert_eq!(Stage::Review.run_mode(), Some(RunMode::Ask));
+        assert!(Stage::Review.denies_edit_tools());
+    }
+
+    /// The headline AC: a `PASS` review closes the task `Done` end-to-end
+    /// through the scripted walk, exactly like a walk with no review stage
+    /// at all.
+    #[tokio::test]
+    async fn pass_review_closes_the_task_done_end_to_end() {
+        let agent = Arc::new(
+            ScriptedTaskAgent::new()
+                .script(Stage::Implement, writes_file("a.txt", "a\n"))
+                .script(Stage::Review, review_pass()),
+        );
+        let (state, _app) = test_app_with_task_agent(agent).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let a = seed_task(&state, &epic_id, &project_id, "A").await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        let task = fetch_task_row(&state, &a).await;
+        assert_eq!(task.0, "Done");
+        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+
+        let rows = review_rows(&state, &a).await;
+        assert_eq!(rows.len(), 1, "exactly one review attempt on a first-try PASS");
+        assert_eq!(rows[0].0, 1, "attempt");
+        assert_eq!(rows[0].1, "ok", "status");
+        assert_eq!(rows[0].2.as_deref(), Some("PASS"), "verdict");
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// All three D9 verdicts parse from realistic, preamble-laden reviewer
+    /// output at the unit level ([`crate::spec::parse_verdict`]'s own tests
+    /// cover PASS/NEEDS_CHANGES/BLOCKED with prose findings, severity tags,
+    /// and a fenced code block that itself mentions "VERDICT:"). This test
+    /// is the integration half: each verdict, still wrapped in the same
+    /// preamble shape, drives the walk to the right outcome end-to-end.
+    #[tokio::test]
+    async fn needs_changes_review_fails_the_task_review_not_converged_and_blocks_the_epic() {
+        let agent = Arc::new(
+            ScriptedTaskAgent::new()
+                .script(Stage::Implement, writes_file("a.txt", "a\n"))
+                .script(Stage::Review, review_needs_changes()),
+        );
+        let (state, _app) = test_app_with_task_agent(agent).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let a = seed_task(&state, &epic_id, &project_id, "A").await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        let task = fetch_task_row(&state, &a).await;
+        assert_eq!(task.0, "Failed", "NEEDS_CHANGES fails the task (T-531 builds the real loop)");
+        assert_eq!(task.1.as_deref(), Some("review_not_converged"));
+
+        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        assert_eq!(epic.status, "Blocked");
+        assert_eq!(
+            epic.blocked_reason.as_deref(),
+            Some("review_not_converged"),
+            "the epic must carry the identical reason string as the task"
+        );
+
+        // The commit that triggered the review already landed — review runs
+        // strictly after commit, and this placeholder path never rolls it
+        // back (T-531 builds on top of it, it doesn't undo it). A
+        // `Failed`/`Blocked` walk never reaches finalize/push (only a
+        // `Completed` epic does — see `git_log_subjects_for_ref`'s own doc),
+        // so the workspace is retained rather than deleted; read the commit
+        // back from there, exactly like `set_epic_blocked`'s other retained-
+        // workspace tests (e.g. `test_gate_exhausted`,
+        // `cancel_mid_walk_stops_cleanly_without_further_writes`) do, rather
+        // than from the fixture/origin the walk never pushed to.
+        let workspace_path = workspace::epic_workspace_path(&state.config.clone_root, &epic_id);
+        let subjects = git_log_subjects(&workspace_path).await;
+        assert_eq!(
+            subjects,
+            vec!["init".to_string(), format!("impl({}): A", spec::short_id(&a))]
+        );
+
+        let rows = review_rows(&state, &a).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].2.as_deref(), Some("NEEDS_CHANGES"));
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    #[tokio::test]
+    async fn blocked_review_fails_the_task_with_the_blocked_reason() {
+        let agent = Arc::new(
+            ScriptedTaskAgent::new()
+                .script(Stage::Implement, writes_file("a.txt", "a\n"))
+                .script(Stage::Review, review_blocked()),
+        );
+        let (state, _app) = test_app_with_task_agent(agent).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let a = seed_task(&state, &epic_id, &project_id, "A").await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        let task = fetch_task_row(&state, &a).await;
+        assert_eq!(task.0, "Failed");
+        assert_eq!(task.1.as_deref(), Some("blocked"));
+
+        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        assert_eq!(epic.status, "Blocked");
+        assert_eq!(epic.blocked_reason.as_deref(), Some("blocked"));
+
+        let rows = review_rows(&state, &a).await;
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].2.as_deref(), Some("BLOCKED"));
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// The headline negative-path AC: a contract miss (no parseable
+    /// `VERDICT:` line at all) triggers **exactly one** re-run — bounded by
+    /// `config.executor.verdict_retries` (1 in `Config::for_test`, matching
+    /// the §2.7 default) — and, still unparseable after that, the task fails
+    /// `Failed(agent_error)` with the epic `Blocked(agent_error)`. Both raw
+    /// outputs (the miss and the re-run) survive as separate `agent_run`
+    /// rows, and the re-run's recorded prompt carries
+    /// `VERDICT_CONTRACT_REMINDER`.
+    #[tokio::test]
+    async fn contract_miss_triggers_exactly_one_rerun_then_fails_with_both_outputs_retained() {
+        let agent = Arc::new(
+            ScriptedTaskAgent::new()
+                .script(Stage::Implement, writes_file("a.txt", "a\n"))
+                .script(Stage::Review, unparseable_review("first-miss"))
+                .script(Stage::Review, unparseable_review("second-miss")),
+        );
+        let recorded = agent.recorded();
+        let (state, _app) = test_app_with_task_agent(agent).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let a = seed_task(&state, &epic_id, &project_id, "A").await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        let task = fetch_task_row(&state, &a).await;
+        assert_eq!(task.0, "Failed");
+        assert_eq!(task.1.as_deref(), Some("agent_error"));
+
+        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        assert_eq!(epic.status, "Blocked");
+        assert_eq!(epic.blocked_reason.as_deref(), Some("agent_error"));
+
+        // Exactly one re-run: two review attempts total, never a third.
+        let review_calls: Vec<_> = recorded
+            .lock()
+            .unwrap()
+            .iter()
+            .filter(|r| r.stage == Stage::Review)
+            .cloned()
+            .collect();
+        assert_eq!(review_calls.len(), 2, "exactly one re-run after the first contract miss");
+        assert!(
+            !review_calls[0].prompt.contains("Contract reminder"),
+            "the first attempt's prompt must not carry the reminder"
+        );
+        assert!(
+            review_calls[1].prompt.contains(VERDICT_CONTRACT_REMINDER),
+            "the re-run's prompt must carry the named contract-reminder constant"
+        );
+
+        // Both raw outputs retained as two separate agent_run rows, in order,
+        // each with the terminal status recorded and no verdict (neither
+        // ever parsed).
+        let rows = review_rows(&state, &a).await;
+        assert_eq!(rows.len(), 2);
+        assert_eq!(rows[0].0, 1, "first attempt");
+        assert_eq!(rows[0].1, "ok", "the agent itself exited cleanly, just with no verdict line");
+        assert_eq!(rows[0].2, None);
+        assert!(rows[0].3.contains("first-miss"));
+        assert_eq!(rows[1].0, 2, "second attempt (the bounded re-run)");
+        assert_eq!(rows[1].2, None);
+        assert!(rows[1].3.contains("second-miss"));
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// §2.6: `stage_changed` publishes on **both** `task:<id>` (fine-grained)
+    /// and `epic:<id>` (coarse) with the identical `{ task_id, stage,
+    /// attempt, status, verdict }` payload once the review verdict is known.
+    #[tokio::test]
+    async fn review_verdict_publishes_stage_changed_on_task_and_epic_topics() {
+        let agent = Arc::new(
+            ScriptedTaskAgent::new()
+                .script(Stage::Implement, writes_file("a.txt", "a\n"))
+                .script(Stage::Review, review_pass()),
+        );
+        let (state, _app) = test_app_with_task_agent(agent).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let a = seed_task(&state, &epic_id, &project_id, "A").await;
+
+        let mut task_sub = state.hub.subscribe(&format!("task:{a}"));
+        let mut epic_sub = state.hub.subscribe(&format!("epic:{epic_id}"));
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+
+        let task_frame = recv_stage_changed(&mut task_sub).await;
+        assert_eq!(task_frame["topic"], format!("task:{a}"));
+        assert_eq!(task_frame["payload"]["task_id"], a);
+        assert_eq!(task_frame["payload"]["stage"], "review");
+        assert_eq!(task_frame["payload"]["attempt"], 1);
+        assert_eq!(task_frame["payload"]["status"], "ok");
+        assert_eq!(task_frame["payload"]["verdict"], "PASS");
+
+        let epic_frame = recv_stage_changed(&mut epic_sub).await;
+        assert_eq!(epic_frame["topic"], format!("epic:{epic_id}"));
+        assert_eq!(
+            epic_frame["payload"], task_frame["payload"],
+            "the epic topic carries the identical payload, just coarse"
+        );
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// The verdict lands on the `agent_run` row and is visible through `GET
+    /// /tasks/{id}/runs` — the read path a human (or the client) actually
+    /// uses to see *why* a task closed the way it did.
+    #[tokio::test]
+    async fn review_verdict_is_visible_through_the_task_runs_endpoint() {
+        let agent = Arc::new(
+            ScriptedTaskAgent::new()
+                .script(Stage::Implement, writes_file("a.txt", "a\n"))
+                .script(Stage::Review, review_pass()),
+        );
+        let (state, app) = test_app_with_task_agent(agent).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let a = seed_task(&state, &epic_id, &project_id, "A").await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+
+        let response = app
+            .oneshot(req("GET", &format!("/tasks/{a}/runs"), None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        let items = body["items"].as_array().unwrap();
+        let review_item = items
+            .iter()
+            .find(|r| r["stage"] == "review")
+            .expect("a review run must be listed");
+        assert_eq!(review_item["verdict"], "PASS");
+        assert_eq!(review_item["status"], "ok");
+        assert_eq!(review_item["attempt"], 1);
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// The base-SHA context extension (item 1 of this task): the review
+    /// stage's prompt carries the exact task `base_sha` and the `git diff
+    /// <sha>..HEAD` instruction, closing the gap `prompts/review.md`
+    /// promised but `spec::build_context` didn't yet deliver.
+    #[tokio::test]
+    async fn review_prompt_includes_the_recorded_base_sha_diff_instruction() {
+        let agent = Arc::new(
+            ScriptedTaskAgent::new()
+                .script(Stage::Implement, writes_file("a.txt", "a\n"))
+                .script(Stage::Review, review_pass()),
+        );
+        let recorded = agent.recorded();
+        let (state, _app) = test_app_with_task_agent(agent).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let a = seed_task(&state, &epic_id, &project_id, "A").await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        let base_sha = task_base_sha(&state, &a)
+            .await
+            .expect("base_sha must have been recorded before the implement stage ran");
+
+        let runs = recorded.lock().unwrap();
+        let review_run = runs
+            .iter()
+            .find(|r| r.stage == Stage::Review)
+            .expect("the review stage must have run");
+        assert!(review_run.prompt.contains("## Base Commit"));
+        assert!(review_run.prompt.contains(&base_sha));
+        assert!(review_run.prompt.contains(&format!("git diff {base_sha}..HEAD")));
+
+        // The implement stage's own prompt never mentions base_sha — only
+        // Review's context does (spec::TaskContext::base_sha is None there).
+        let implement_run = runs
+            .iter()
+            .find(|r| r.stage == Stage::Implement)
+            .expect("the implement stage must have run");
+        assert!(!implement_run.prompt.contains("## Base Commit"));
 
         cleanup_clone_root(&state, &project_id, &[&epic_id]);
     }

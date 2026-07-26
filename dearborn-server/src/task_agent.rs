@@ -385,6 +385,17 @@ pub struct AgentStageOutcome {
     pub cancelled: bool,
     /// Whether an `Error` event was seen anywhere in the stream.
     pub errored: bool,
+    /// The `agent_run.id` this outcome's row was opened/closed under (T-530).
+    /// [`run_agent_stage`] has already closed the row (with `verdict: None`)
+    /// by the time it returns this outcome — a review/verify-complete
+    /// caller that parses [`Self::text`] for a `VERDICT:` line only learns
+    /// the verdict *after* the row is closed, so it needs this id to go back
+    /// and set the column via [`crate::evidence::set_verdict`] rather than
+    /// threading the answer through `CloseStage` (there is no open
+    /// `StageHandle` left by then). Empty for the zero-value
+    /// [`Default::default`] used only inside the drain closure before this
+    /// field is populated.
+    pub agent_run_id: String,
 }
 
 impl AgentStageOutcome {
@@ -570,7 +581,12 @@ pub async fn run_agent_stage(
     flush_handle.abort();
 
     let outcome = match drained {
-        Ok(outcome) => outcome,
+        Ok(mut outcome) => {
+            // Stamp the row id now that we have it — see the field's own doc
+            // for why this can't ride through `CloseStage` instead (T-530).
+            outcome.agent_run_id = stage_row.id.clone();
+            outcome
+        }
         Err(join_err) => {
             // The blocking drain thread panicked. Close the row so it never
             // sticks `running`, then surface the panic message as the
@@ -672,6 +688,31 @@ pub(crate) mod testing {
         }
     }
 
+    /// The unscripted fallback for `stage` — [`ScriptedRun::default`] for
+    /// every stage except the two verdict-emitting ones,
+    /// [`Stage::Review`] and [`Stage::VerifyComplete`] (T-530): a bare "ok"
+    /// text has no `VERDICT:` line, so a `worker.rs` test that doesn't care
+    /// about a verdict stage's own behavior (the overwhelming majority —
+    /// every T-513/T-522 test predates T-530 and asserts nothing about
+    /// review) would otherwise hit a contract-miss retry and then
+    /// `Failed(agent_error)` on every single walk that reaches that stage,
+    /// purely as a side effect of the stage existing. Defaulting an
+    /// unscripted verdict-stage run to a clean `VERDICT: PASS` keeps "a
+    /// stage nobody scripted is a no-op success" true in the sense that
+    /// actually matters for these stages — the walk proceeds — while a test
+    /// that *does* care (this module's own T-530 tests, or T-532's
+    /// `VerifyComplete` tests once they land) still overrides it with
+    /// `.script(stage, ...)` exactly like any other stage.
+    fn default_script_for(stage: Stage) -> ScriptedRun {
+        match stage {
+            Stage::Review | Stage::VerifyComplete => ScriptedRun {
+                text: vec!["Reviewed; nothing outstanding.\n\nVERDICT: PASS".to_string()],
+                ..ScriptedRun::default()
+            },
+            _ => ScriptedRun::default(),
+        }
+    }
+
     /// A [`RunControl`] whose `cancel()` is actually observable — unlike a
     /// no-op stub, `was_cancelled()` reflects a real `cancel()` call, so a
     /// test can prove the handle [`ScriptedTaskAgent::run`] hands back is a
@@ -760,7 +801,7 @@ pub(crate) mod testing {
                 .unwrap()
                 .get_mut(req.stage.as_str())
                 .and_then(|q| q.pop_front())
-                .unwrap_or_default();
+                .unwrap_or_else(|| default_script_for(req.stage));
 
             let (tx, rx) = std::sync::mpsc::channel();
             let run_id = req.run_id;
@@ -905,6 +946,7 @@ mod tests {
             },
             epic: None,
             siblings: &[],
+            base_sha: None,
         };
         let assembled = assemble_prompt(Stage::Implement, &ctx).expect("implement has a prompt");
         let prompt_only = crate::spec::prompt_for(Stage::Implement).unwrap();

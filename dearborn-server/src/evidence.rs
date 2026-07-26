@@ -218,6 +218,26 @@ pub async fn close_stage(
     Ok(())
 }
 
+/// Set `agent_run.verdict` on an **already-closed** row (T-530). A review (or
+/// future verify-complete) stage's caller only learns the D9 verdict by
+/// parsing [`crate::task_agent::AgentStageOutcome::text`] *after*
+/// [`crate::task_agent::run_agent_stage`] has already called [`close_stage`]
+/// with `verdict: None` (T-512 closes every row before its caller has had a
+/// chance to look at the text) — by the time the verdict is known, the
+/// `StageHandle` that `close_stage` needs is gone, so this is a plain,
+/// independent `UPDATE` by row id rather than a second field on [`CloseStage`].
+/// `verdict` is the exact [`crate::spec::Verdict::as_str`] token (`"PASS"` |
+/// `"NEEDS_CHANGES"` | `"BLOCKED"`), matching what `GET /tasks/{id}/runs` and
+/// the `stage_changed` WS frame both surface.
+pub async fn set_verdict(conn: &Connection, run_id: &str, verdict: &str) -> Result<(), libsql::Error> {
+    conn.execute(
+        "UPDATE agent_run SET verdict = ?1 WHERE id = ?2",
+        params![verdict, run_id],
+    )
+    .await?;
+    Ok(())
+}
+
 /// Run `body` against an already-[`open_stage`]d stage, guaranteeing
 /// [`close_stage`] is called **exactly once** no matter how `body` exits: it
 /// completes, it returns `Err`, or it panics. This is the AC's "a stage that
@@ -573,6 +593,44 @@ mod tests {
         assert_eq!(row.summary.exit_code, Some(0));
         assert_eq!(row.log, "final output");
         assert!(row.summary.ended_at.is_some());
+    }
+
+    // ---- set_verdict (T-530) ----------------------------------------------
+
+    #[tokio::test]
+    async fn set_verdict_updates_an_already_closed_row() {
+        let db = seeded_db().await;
+        let conn = db.conn();
+        let handle = open_stage(
+            conn,
+            OpenStage { task_id: Some("task-1"), epic_id: Some("epic-1"), stage: "review", attempt: 1 },
+        )
+        .await
+        .unwrap();
+        close_stage(
+            conn,
+            &handle,
+            CloseStage {
+                status: "ok",
+                session_id: None,
+                verdict: None,
+                exit_code: Some(0),
+                log: "findings...\nVERDICT: PASS".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let before = fetch_run_detail(conn, &handle.id).await.unwrap().unwrap();
+        assert_eq!(before.summary.verdict, None);
+
+        set_verdict(conn, &handle.id, "PASS").await.unwrap();
+
+        let after = fetch_run_detail(conn, &handle.id).await.unwrap().unwrap();
+        assert_eq!(after.summary.verdict.as_deref(), Some("PASS"));
+        // Nothing else about the already-closed row changed.
+        assert_eq!(after.summary.status, "ok");
+        assert_eq!(after.log, "findings...\nVERDICT: PASS");
     }
 
     // ---- guard_stage_close: the finally guarantee -------------------------
