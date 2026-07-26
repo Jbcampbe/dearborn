@@ -17,6 +17,13 @@ export type EpicStatus = "Planning" | string;
  * `technical_context` are `null` until the planning agent fills them in via its
  * `update_epic` tool (surfaced live as `epic_updated` WS frames). `description`
  * is an optional user-facing short blurb shown on kanban cards.
+ *
+ * `pr_url` / `pr_number` (MILESTONE_2 §2.1) are populated together, exactly
+ * once, by the executor's finalize step the moment `status` becomes
+ * `Completed` — `null` until then. `blocked_reason` is one of the
+ * MILESTONE_2 §2.3 reason strings whenever `status === "Blocked"` (T-540)
+ * and `null` on every other transition, including a manual recovery via
+ * `POST /tasks/{id}/retry` (T-541), which clears it.
  */
 export interface Epic {
   id: string;
@@ -26,6 +33,9 @@ export interface Epic {
   product_context: string | null;
   technical_context: string | null;
   status: EpicStatus;
+  pr_url: string | null;
+  pr_number: number | null;
+  blocked_reason: string | null;
   created_at: number;
   updated_at: number;
 }

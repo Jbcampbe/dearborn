@@ -14,8 +14,16 @@ import { apiFetch } from "./client";
 export type TaskStatus = "Todo" | "InProgress" | "Done" | "Failed" | "Cancelled";
 
 /**
- * A task as returned by the API (`tasks.rs` `Task`). The Half-2 columns
- * (`failure_reason`, `agent_session_id`) round-trip as `null` in Half 1.
+ * A task as returned by the API (`tasks.rs` `Task`). `failure_reason` is one
+ * of the MILESTONE_2 §2.3 reason strings, set alongside `status: "Failed"`
+ * (T-540) and cleared by `POST /tasks/{id}/retry` (T-541). `branch_name` /
+ * `pr_url` / `pr_number` are populated only for a task that has actually run
+ * the executor pipeline (an epic-scoped task claimed as part of its epic's
+ * walk, or a standalone task via `POST /tasks/{id}/run`, T-551) — `null`
+ * until then, and for `branch_name` also for the lifetime of a task that
+ * never reaches that pipeline (e.g. one still `Todo`/epic-scoped-and-not-yet-
+ * claimed). `pr_url`/`pr_number` land together, once, on a standalone task's
+ * own successful finalize (there is no epic to carry them instead).
  */
 export interface Task {
   id: string;
@@ -28,6 +36,9 @@ export interface Task {
   failure_reason: string | null;
   agent_session_id: string | null;
   position: number | null;
+  branch_name: string | null;
+  pr_url: string | null;
+  pr_number: number | null;
   created_at: number;
   updated_at: number;
 }
@@ -130,6 +141,28 @@ export function patchTask(token: string, id: string, input: PatchTaskInput): Pro
 /** `DELETE /tasks/{id}` → 204 (resolves to `undefined`). */
 export function deleteTask(token: string, id: string): Promise<void> {
   return apiFetch<void>(`/tasks/${encodeURIComponent(id)}`, token, { method: "DELETE" });
+}
+
+/**
+ * `POST /tasks/{id}/retry` → the updated task (200). T-541/T-551: a
+ * `Failed` task only — `409` (`ApiError`) otherwise. An epic-scoped task
+ * returns to `Todo` and un-blocks its epic; a standalone task returns
+ * directly to `InProgress` and is re-claimed on its own. Either way the
+ * resulting `dag_updated`/`epic_updated`/`board_updated` WS frame(s) drive
+ * the re-render — this call has no other visible effect to wait on.
+ */
+export function retryTask(token: string, id: string): Promise<Task> {
+  return apiFetch<Task>(`/tasks/${encodeURIComponent(id)}/retry`, token, { method: "POST" });
+}
+
+/**
+ * `POST /tasks/{id}/run` → the updated task (200). T-551 §2.5: a standalone
+ * (`epic_id: null`) `Todo` task only — `409` (`ApiError`) otherwise,
+ * including for any epic-scoped task regardless of its own status. The
+ * resulting `board_updated` WS frame drives the re-render.
+ */
+export function runTask(token: string, id: string): Promise<Task> {
+  return apiFetch<Task>(`/tasks/${encodeURIComponent(id)}/run`, token, { method: "POST" });
 }
 
 /** `POST /epics/{id}/dependencies` → the created edge (201). */

@@ -7,7 +7,7 @@ import { ApiError } from "../api/client";
 import { getEpic } from "../api/epics";
 import { getProject } from "../api/projects";
 import type { DagNode, Task, TaskStatus } from "../api/tasks";
-import { getDag, patchTask } from "../api/tasks";
+import { getDag, patchTask, retryTask } from "../api/tasks";
 import {
   hydrateDag,
   initialDagState,
@@ -21,6 +21,7 @@ import {
   TASK_LANES,
 } from "../board/epicLanes";
 import { canDropOnTaskLane } from "../board/dnd";
+import { canRetryTask, describeControlError, describeFailureReason } from "../board/controls";
 import AppIcon from "./AppIcon.vue";
 import EpicTabs from "./EpicTabs.vue";
 import StatusIcon from "./StatusIcon.vue";
@@ -36,6 +37,13 @@ import TaskModal from "./TaskModal.vue";
 // clickable (opening the shared TaskModal editor, like the project board's
 // standalone tasks) and draggable between lanes to change status — except
 // cards in In Progress, whose transitions the worker owns (`board/dnd.ts`).
+//
+// T-561 control surface: a Failed card here (an epic-scoped task) shows its
+// failure_reason and a Retry button (POST /tasks/{id}/retry, T-541) -- the
+// identical endpoint the project board's standalone Failed cards use, since
+// retry is the same one-shot recovery transition either way. There is no Run
+// or Cancel control on this view: Run is standalone-only (T-551) and Cancel
+// is issued against the epic itself, not a task (ProjectKanbanView.vue).
 const props = defineProps<{ id: string }>();
 
 const auth = useAuthStore();
@@ -156,6 +164,32 @@ function bounceIfAuth(err: unknown): boolean {
   return false;
 }
 
+/* --- T-561 control surface: Retry ------------------------------------------
+ * `busyIds` only disables the button while its own request is in flight; the
+ * actual state change always arrives over the `dag_updated`/`epic_updated`
+ * frame this endpoint publishes, never from local mutation here.
+ */
+const busyIds = reactive(new Set<string>());
+
+async function retryCard(node: DagNode) {
+  const token = auth.token;
+  if (token === null || busyIds.has(node.id)) {
+    return;
+  }
+  busyIds.add(node.id);
+  error.value = null;
+  try {
+    await retryTask(token, node.id);
+  } catch (err) {
+    if (bounceIfAuth(err)) {
+      return;
+    }
+    error.value = describeControlError("retry", err);
+  } finally {
+    busyIds.delete(node.id);
+  }
+}
+
 async function load() {
   const token = auth.token;
   if (token === null) {
@@ -272,6 +306,19 @@ onMounted(load);
               <div v-if="n.status === 'Todo' && n.blocked_by.length" class="card-blockers">
                 <span class="blockers-label">Blocked by</span>
                 <span v-for="title in blockerTitles(n)" :key="title" class="chip">{{ title }}</span>
+              </div>
+              <p v-if="n.status === 'Failed' && describeFailureReason(n.failure_reason)" class="card-reason">
+                {{ describeFailureReason(n.failure_reason) }}
+              </p>
+              <div v-if="canRetryTask(n)" class="card-foot">
+                <button
+                  class="btn btn-sm btn-ghost control-btn"
+                  type="button"
+                  :disabled="busyIds.has(n.id)"
+                  @click.stop="retryCard(n)"
+                >
+                  Retry
+                </button>
               </div>
             </div>
             <p v-if="!byLane[lane.key]?.length" class="empty-lane">No tasks</p>
@@ -416,6 +463,19 @@ onMounted(load);
   color: var(--text-faint);
   text-transform: uppercase;
   letter-spacing: 0.04em;
+}
+
+/* --- T-561 control surface: Retry + failure reason -------------------------*/
+
+.card-reason {
+  font-size: var(--text-label);
+  color: var(--color-coral-red);
+  line-height: 1.4;
+}
+
+.card-foot {
+  display: flex;
+  justify-content: flex-end;
 }
 
 .empty-lane {

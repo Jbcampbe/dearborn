@@ -439,7 +439,7 @@ with `agent_error` and gets thickened in later phases.
   or timed-out summary run still opens the PR with the template alone (the PR is
   **never** blocked on the summary); the summary is stored as an `agent_run` row.
 
-- [ ] **T-561 — Client: control surface.** *deps: T-541, T-551*
+- [x] **T-561 — Client: control surface.** *deps: T-541, T-551*
   Retry button on `Failed` cards, Run button on standalone `Todo` cards, Cancel
   on in-flight epics, failure/blocked reasons on cards, PR link on `Completed`
   epics and finished standalone tasks. **AC:** each control calls its endpoint

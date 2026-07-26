@@ -6,7 +6,7 @@ import { useAuthStore } from "../stores/auth";
 import { ApiError } from "../api/client";
 import { getBoard, setEpicLane, type EpicLane, type EpicProgress } from "../api/board";
 import type { Epic } from "../api/epics";
-import { patchTask, type Task, type TaskStatus } from "../api/tasks";
+import { patchTask, retryTask, runTask, type Task, type TaskStatus } from "../api/tasks";
 import { hydrateBoard, initialBoardState, type BoardState } from "../board/stream";
 import { useBoardStream, type StreamStatus } from "../board/useBoardStream";
 import {
@@ -15,6 +15,15 @@ import {
   taskStatusForLane,
   type DragKind,
 } from "../board/dnd";
+import {
+  canCancelEpic,
+  canRetryTask,
+  canRunTask,
+  describeControlError,
+  describeFailureReason,
+  prLabel,
+} from "../board/controls";
+import AppIcon from "./AppIcon.vue";
 import StatusIcon from "./StatusIcon.vue";
 import TaskModal from "./TaskModal.vue";
 
@@ -25,6 +34,18 @@ import TaskModal from "./TaskModal.vue";
 // Standalone tasks map to lanes by status; they have no lane-move control,
 // but are created (via the page header's `+ New` menu, through the exposed
 // `openCreateTask`) and edited (click a card) through the TaskModal.
+//
+// T-561 control surface: a `Failed` task card (standalone here, or an
+// epic-scoped one on `EpicKanbanView.vue`) gets a Retry button
+// (`POST /tasks/{id}/retry`); a standalone `Todo` card gets a Run button
+// (`POST /tasks/{id}/run`); an `InProgress` epic card gets a Cancel button
+// (the existing `POST /epics/{id}/lane` → `Cancelled`, which T-542 wires to
+// an actual kill server-side — nothing new to call here). `Completed` epics
+// and `Done` standalone tasks with a `pr_url` get a PR link. Every control
+// only fires the request and reports a `409`/other failure via
+// `board/controls.ts`'s `describeControlError` — it never mutates local
+// state or refetches the board; the existing `board_updated`/`epic_updated`
+// WS frame these endpoints already publish is what drives the re-render.
 const props = defineProps<{ id: string }>();
 
 const auth = useAuthStore();
@@ -269,6 +290,74 @@ async function moveLane(epic: Epic, target: EpicLane) {
   }
 }
 
+/* --- T-561 control surface: Retry / Run / Cancel --------------------------
+ * `busyIds` tracks in-flight control calls by card id so a button disables
+ * itself rather than allowing a double-click to fire two requests; it is not
+ * used to predict the outcome — the actual state change always arrives over
+ * the WS frame the endpoint publishes, never from this local set.
+ */
+const busyIds = reactive(new Set<string>());
+
+async function retryCard(task: Task) {
+  const token = auth.token;
+  if (token === null || busyIds.has(task.id)) {
+    return;
+  }
+  busyIds.add(task.id);
+  error.value = null;
+  try {
+    await retryTask(token, task.id);
+    // dag_updated/epic_updated/board_updated (T-541) drive the re-render.
+  } catch (err) {
+    if (bounceIfAuth(err)) {
+      return;
+    }
+    error.value = describeControlError("retry", err);
+  } finally {
+    busyIds.delete(task.id);
+  }
+}
+
+async function runCard(task: Task) {
+  const token = auth.token;
+  if (token === null || busyIds.has(task.id)) {
+    return;
+  }
+  busyIds.add(task.id);
+  error.value = null;
+  try {
+    await runTask(token, task.id);
+    // board_updated (T-551) drives the re-render.
+  } catch (err) {
+    if (bounceIfAuth(err)) {
+      return;
+    }
+    error.value = describeControlError("run", err);
+  } finally {
+    busyIds.delete(task.id);
+  }
+}
+
+async function cancelEpic(epic: Epic) {
+  const token = auth.token;
+  if (token === null || busyIds.has(epic.id)) {
+    return;
+  }
+  busyIds.add(epic.id);
+  error.value = null;
+  try {
+    await setEpicLane(token, epic.id, "Cancelled");
+    // epic_updated/board_updated drive the re-render; T-542 handles the kill.
+  } catch (err) {
+    if (bounceIfAuth(err)) {
+      return;
+    }
+    error.value = describeControlError("cancel", err);
+  } finally {
+    busyIds.delete(epic.id);
+  }
+}
+
 onMounted(load);
 </script>
 
@@ -320,6 +409,9 @@ onMounted(load);
               {{ epic.title }}
             </RouterLink>
             <p v-if="snippet(epic.description)" class="card-desc">{{ snippet(epic.description) }}</p>
+            <p v-if="epic.status === 'Blocked' && describeFailureReason(epic.blocked_reason)" class="card-reason">
+              {{ describeFailureReason(epic.blocked_reason) }}
+            </p>
             <div v-if="progressOf(epic.id)" class="card-progress">
               <span class="progress-track">
                 <span
@@ -342,6 +434,26 @@ onMounted(load);
               >
                 Board
               </RouterLink>
+              <a
+                v-if="epic.status === 'Completed' && epic.pr_url"
+                class="card-open pr-link"
+                :href="epic.pr_url"
+                target="_blank"
+                rel="noopener noreferrer"
+                @click.stop
+              >
+                <AppIcon name="link" :size="11" />
+                {{ prLabel(epic.pr_number) }}
+              </a>
+              <button
+                v-if="canCancelEpic(epic)"
+                class="btn btn-sm btn-danger control-btn"
+                type="button"
+                :disabled="busyIds.has(epic.id)"
+                @click.stop="cancelEpic(epic)"
+              >
+                Cancel
+              </button>
               <select
                 v-if="permittedTargets(epic.status).length"
                 class="lane-move select"
@@ -371,11 +483,43 @@ onMounted(load);
             @keydown.enter="openEditTask(task)"
           >
             <span class="card-title">{{ task.title }}</span>
+            <p v-if="task.status === 'Failed' && describeFailureReason(task.failure_reason)" class="card-reason">
+              {{ describeFailureReason(task.failure_reason) }}
+            </p>
             <div class="card-foot">
               <span class="badge">
                 <StatusIcon :status="task.status" :size="11" />
                 Task
               </span>
+              <a
+                v-if="task.status === 'Done' && task.pr_url"
+                class="card-open pr-link"
+                :href="task.pr_url"
+                target="_blank"
+                rel="noopener noreferrer"
+                @click.stop
+              >
+                <AppIcon name="link" :size="11" />
+                {{ prLabel(task.pr_number) }}
+              </a>
+              <button
+                v-if="canRunTask(task)"
+                class="btn btn-sm btn-ghost control-btn"
+                type="button"
+                :disabled="busyIds.has(task.id)"
+                @click.stop="runCard(task)"
+              >
+                Run
+              </button>
+              <button
+                v-if="canRetryTask(task)"
+                class="btn btn-sm btn-ghost control-btn"
+                type="button"
+                :disabled="busyIds.has(task.id)"
+                @click.stop="retryCard(task)"
+              >
+                Retry
+              </button>
             </div>
           </div>
 
@@ -510,6 +654,28 @@ onMounted(load);
 .epic-card:hover .card-open,
 .lane-move:focus,
 .card-open:focus {
+  opacity: 1;
+}
+
+/* --- T-561 control surface ---------------------------------------------- *
+ * Unlike `.lane-move`/`.card-open` (revealed on hover — secondary), a
+ * failure reason and the Retry/Run/Cancel controls are the point of looking
+ * at a Failed/Todo/InProgress card, so they render at full opacity always. */
+
+.card-reason {
+  font-size: var(--text-label);
+  color: var(--color-coral-red);
+  line-height: 1.4;
+}
+
+.control-btn {
+  flex-shrink: 0;
+}
+
+.pr-link {
+  display: inline-flex;
+  align-items: center;
+  gap: 4px;
   opacity: 1;
 }
 
