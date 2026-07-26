@@ -431,7 +431,7 @@ with `agent_error` and gets thickened in later phases.
 
 ## 9. Phase 6 — PR polish & client
 
-- [ ] **T-560 — PR body: template + agent summary.** *deps: T-512, T-514*
+- [x] **T-560 — PR body: template + agent summary.** *deps: T-512, T-514*
   Deterministic scaffold (epic description, task checklist with commit SHAs,
   review-round counts, verified-already-complete slices, Dearborn footer) plus a
   `Stage::Summarize` "Summary of changes" section over the epic diff. **AC:**

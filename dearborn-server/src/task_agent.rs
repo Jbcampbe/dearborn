@@ -455,14 +455,51 @@ fn build_extra_args(stage: Stage) -> Vec<String> {
 /// writer.
 pub const PARTIAL_FLUSH_INTERVAL: Duration = Duration::from_secs(2);
 
-/// Identifies the stage row to open + the `task:<id>` topic to relay on.
+/// Identifies the stage row to open + the WS topic to relay on.
 pub struct AgentStageParams<'a> {
-    pub task_id: &'a str,
-    /// `None` for a standalone task (D17).
+    /// `None` for a stage that has no task to attach to — as of T-560, this
+    /// is exactly one case: an epic-scoped `Stage::Summarize` run over the
+    /// epic's whole cumulative diff (`worker::finalize_epic`), which
+    /// describes the epic as a whole rather than any single task. Every
+    /// other agent stage (`implement`/`fix`/`review`/`verify_complete`, and a
+    /// *standalone* task's own `Stage::Summarize` run — see
+    /// `worker::finalize_task`) is `Some(_)`, exactly as this field always
+    /// was before T-560 widened it from a bare `&'a str`. See
+    /// [`run_agent_stage`]'s own doc for how a `None` here changes the
+    /// `agent_run.task_id` column and the streamed WS topic.
+    pub task_id: Option<&'a str>,
+    /// `None` for a standalone task (D17), or for an epic-scoped
+    /// `Stage::Summarize` run's task-less counterpart above — `epic_id` and
+    /// `task_id` are never *both* `None` (see [`cancel_registry_key`]'s own
+    /// doc, which leans on that same invariant).
     pub epic_id: Option<&'a str>,
     /// `agent_run.attempt` — 1 for the first try at this stage, bumped by
     /// the caller on a retry/fix round.
     pub attempt: i64,
+}
+
+impl AgentStageParams<'_> {
+    /// The WS topic [`run_agent_stage`] relays this stage's `RunEvent`s on
+    /// (D14): `task:<task_id>` when there is a task, the same as every stage
+    /// before T-560. An epic-scoped `Stage::Summarize` run has no task, so it
+    /// falls back to `epic:<epic_id>` — the same topic
+    /// [`crate::planning::ClaudePlanningAgent`]'s own epic-chat `RunEvent`
+    /// stream already uses (T-202) for the identical reason: a run that
+    /// belongs to the epic as a whole, not one task, streams on the epic's
+    /// own coarse topic rather than inventing a task-shaped one for a
+    /// non-existent task. Panics if both ids are `None` — see
+    /// [`cancel_registry_key`]'s doc for why that combination is a caller bug,
+    /// not a case to handle quietly.
+    fn stream_topic(&self) -> String {
+        match self.task_id {
+            Some(task_id) => format!("task:{task_id}"),
+            None => format!(
+                "epic:{}",
+                self.epic_id
+                    .expect("AgentStageParams must set at least one of epic_id/task_id")
+            ),
+        }
+    }
 }
 
 // ---- T-542: the cancel registry (D12) --------------------------------------
@@ -488,8 +525,22 @@ pub type CancelRegistry = Mutex<HashMap<String, RunHandle>>;
 /// unchanged for both an epic-owned and a standalone task, and this function
 /// needed no adaptation at all to key a standalone stage's registry entry by
 /// its task id.
+///
+/// T-560 widened `task_id` itself to `Option<&str>` (an epic-scoped
+/// `Stage::Summarize` run has no task at all — see [`AgentStageParams::task_id`]'s
+/// own doc) but changed nothing about the *key* this function picks: an
+/// epic-scoped summarize run still has `epic_id: Some(_)`, so it keys under
+/// the epic id exactly like every other stage in that epic's walk, and a
+/// standalone task's own summarize run still has `epic_id: None, task_id:
+/// Some(_)`, keying under the task id exactly like every other standalone
+/// stage. The `.expect` below is the one new thing: it encodes "at least one
+/// of the two is always `Some`" as a panic on the bug it would otherwise
+/// paper over, rather than silently keying on an empty string.
 pub(crate) fn cancel_registry_key<'a>(params: &AgentStageParams<'a>) -> &'a str {
-    params.epic_id.unwrap_or(params.task_id)
+    params
+        .epic_id
+        .or(params.task_id)
+        .expect("AgentStageParams must set at least one of epic_id/task_id")
 }
 
 /// RAII guard for one entry in [`AppState::cancel_registry`] (T-542, D12).
@@ -680,12 +731,14 @@ impl std::fmt::Display for AgentStageError {
 impl std::error::Error for AgentStageError {}
 
 /// Drive one agent stage to completion: open its `agent_run` row, start the
-/// run through `agent`, relay every `RunEvent` live on `task:<task_id>`
-/// (D14, reusing [`crate::planning::ws_type`]), flush the accumulating log
-/// to the row roughly every [`PARTIAL_FLUSH_INTERVAL`] while it streams, then
-/// close the row with the terminal status/session id/exit code/log (D13
-/// capped). Returns the assembled [`AgentStageOutcome`] so a caller decides
-/// what happens next.
+/// run through `agent`, relay every `RunEvent` live on `task:<task_id>` — or,
+/// T-560, `epic:<epic_id>` when `params.task_id` is `None` (see
+/// [`Self::stream_topic`]'s own doc for why) — (D14, reusing
+/// [`crate::planning::ws_type`]), flush the accumulating log to the row
+/// roughly every [`PARTIAL_FLUSH_INTERVAL`] while it streams, then close the
+/// row with the terminal status/session id/exit code/log (D13 capped).
+/// Returns the assembled [`AgentStageOutcome`] so a caller decides what
+/// happens next.
 ///
 /// The [`RunHandle`] `agent.run` returns is held for the **entire** drain via
 /// a [`CancelGuard`] (T-542, D12): it lives inside
@@ -704,7 +757,7 @@ pub async fn run_agent_stage(
     let conn = state.db.conn();
     let stage_str = req.stage.as_str();
     let open = OpenStage {
-        task_id: Some(params.task_id),
+        task_id: params.task_id,
         epic_id: params.epic_id,
         stage: stage_str,
         attempt: params.attempt,
@@ -743,7 +796,7 @@ pub async fn run_agent_stage(
     );
 
     let hub = state.hub.clone();
-    let topic = format!("task:{}", params.task_id);
+    let topic = params.stream_topic();
 
     // Shared with the periodic-flush task below AND (T-543) with the
     // deadline-timeout path a few lines down: the blocking drain thread
@@ -821,7 +874,8 @@ pub async fn run_agent_stage(
         Err(_elapsed) => {
             deadline_fired = true;
             tracing::warn!(
-                task = %params.task_id,
+                epic = ?params.epic_id,
+                task = ?params.task_id,
                 stage = stage_str,
                 timeout_secs = state.config.executor.agent_stage_timeout_secs,
                 "agent stage exceeded DEARBORN_AGENT_STAGE_TIMEOUT_SECS; cancelling"
@@ -834,7 +888,8 @@ pub async fn run_agent_stage(
                 .map(|h| h.cancel());
             if let Some(Err(err)) = cancel_result {
                 tracing::warn!(
-                    task = %params.task_id,
+                    epic = ?params.epic_id,
+                    task = ?params.task_id,
                     stage = stage_str,
                     error = %err,
                     "agent stage timeout: cancel() itself returned an error"
@@ -857,7 +912,8 @@ pub async fn run_agent_stage(
                     // wins over holding out for a terminal event that may
                     // never come from a stuck handle.
                     tracing::warn!(
-                        task = %params.task_id,
+                        epic = ?params.epic_id,
+                        task = ?params.task_id,
                         stage = stage_str,
                         grace_period_secs = AGENT_TIMEOUT_KILL_GRACE_PERIOD.as_secs(),
                         "agent stage timeout: cancel() did not produce Exited within the grace \
@@ -1507,7 +1563,7 @@ mod tests {
             &state,
             &agent,
             AgentStageParams {
-                task_id: "task-1",
+                task_id: Some("task-1"),
                 epic_id: Some("epic-1"),
                 attempt: 1,
             },
@@ -1577,7 +1633,7 @@ mod tests {
             &state,
             &FailingAgent,
             AgentStageParams {
-                task_id: "task-1",
+                task_id: Some("task-1"),
                 epic_id: Some("epic-1"),
                 attempt: 1,
             },
@@ -1641,7 +1697,7 @@ mod tests {
                     &state,
                     agent.as_ref(),
                     AgentStageParams {
-                        task_id: "task-1",
+                        task_id: Some("task-1"),
                         epic_id: Some("epic-1"),
                         attempt: 1,
                     },
@@ -1719,7 +1775,7 @@ mod tests {
                     &state,
                     agent.as_ref(),
                     AgentStageParams {
-                        task_id: "task-1",
+                        task_id: Some("task-1"),
                         epic_id: None,
                         attempt: 1,
                     },
@@ -1788,7 +1844,7 @@ mod tests {
                 &state,
                 &agent,
                 AgentStageParams {
-                    task_id: "task-1",
+                    task_id: Some("task-1"),
                     epic_id: Some("epic-1"),
                     attempt: 1,
                 },
@@ -1883,7 +1939,7 @@ mod tests {
             &state,
             &agent,
             AgentStageParams {
-                task_id: "task-1",
+                task_id: Some("task-1"),
                 epic_id: Some("epic-1"),
                 attempt: 1,
             },
@@ -1934,7 +1990,7 @@ mod tests {
             &state,
             &agent,
             AgentStageParams {
-                task_id: "task-1",
+                task_id: Some("task-1"),
                 epic_id: Some("epic-1"),
                 attempt: 1,
             },
@@ -1959,7 +2015,7 @@ mod tests {
                 &state,
                 &agent,
                 AgentStageParams {
-                    task_id: "task-1",
+                    task_id: Some("task-1"),
                     epic_id: Some("epic-1"),
                     attempt: 1,
                 },

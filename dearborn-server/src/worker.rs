@@ -1291,6 +1291,158 @@
 //! the epic's lane is); [`fail_item`]'s standalone branch publishes on
 //! `Failed`; `retry_task` already published on every transition it makes
 //! (unchanged); [`finalize_task`] publishes once the PR persists.
+//!
+//! ## T-560: PR body — template + agent summary (§9, D16)
+//!
+//! `pr.rs` shipped with T-514 deliberately half-built: a pure template with a
+//! fixed [`pr::SUMMARY_MARKER`] line where the D16 agent summary belongs, its
+//! own module doc naming this task as the one that fills it in. This section
+//! is that other half, plus the two §9 scaffold elements `pr::build_pr_body`
+//! never rendered at all (review-round counts, verified-already-complete
+//! slices) — four small additions layered onto the T-551 finalize shape
+//! rather than a rewrite of it.
+//!
+//! ### The summarize run is epic-scoped, not task-scoped — widening
+//! ### `AgentStageParams`
+//!
+//! Every agent stage before this one belongs to exactly one task — even
+//! `Stage::Review`'s cumulative diff is still *that task's* diff. An epic's
+//! summary is different: it describes the epic as a whole, over every task's
+//! combined diff, so there is no single task to attach its `agent_run` row
+//! to. [`task_agent::AgentStageParams::task_id`] widens from a bare `&str` to
+//! `Option<&str>` to say so directly — `None` for [`run_epic_summary`]'s call
+//! (`epic_id: Some(_)`), `Some(_)` for every other stage exactly as before,
+//! including [`run_task_summary`]'s own call (a *standalone* task's summary
+//! **is** task-scoped — see "standalone tasks get one too" below). This
+//! ripples in exactly the two places that read `task_id` off the struct:
+//! [`task_agent::cancel_registry_key`] (unaffected in practice — it already
+//! preferred `epic_id` over `task_id`, so an epic-scoped summarize keys under
+//! the epic id like every other stage in that epic's walk) and
+//! [`task_agent::run_agent_stage`]'s own WS topic selection, which now falls
+//! back to `epic:<epic_id>` when there is no task — the same topic
+//! [`crate::planning::ClaudePlanningAgent`]'s epic-chat stream already uses
+//! (T-202) for the identical "this belongs to the epic, not a task" reason.
+//! `CONVENTIONS.md`'s T-512 section previously stated flatly that every
+//! agent stage streams on `task:<id>`; it's amended alongside this task to
+//! note the one exception.
+//!
+//! One real, flagged gap this creates: `GET /tasks/{id}/runs` lists rows by
+//! `task_id`, so an epic-scoped summarize run's `agent_run` row (`task_id:
+//! NULL`) is unreachable through that endpoint — it satisfies the AC ("the
+//! summary is stored as an `agent_run` row") but is only ever *visible*
+//! live, via the `epic:<id>` WS stream while it runs, or by `GET /runs/{id}`
+//! to someone who already has its id from a log line. There is no
+//! `GET /epics/{id}/runs` today, and adding one is client-surface work
+//! (T-562's own territory, not this task's — its deps are T-512/T-514 only).
+//! Noted here rather than quietly worked around.
+//!
+//! ### Ordering: the summary runs *before* `push_and_open_pr`, on purpose
+//!
+//! [`crate::git_host::GitHost`] (T-514) has `push`/`open_pr`/`check_auth` —
+//! no "edit an already-opened PR's body." That means the summary text has to
+//! exist **before** `open_pr` is called; there is no later point to patch it
+//! in. [`finalize_epic`]/[`finalize_task`] both call [`run_epic_summary`]/
+//! [`run_task_summary`] first, build the full body via `pr::build_pr_body`,
+//! *then* call [`push_and_open_pr`] — never the other way around.
+//!
+//! The consequence flagged in this task's own brief: a summarize run that
+//! hangs burns the full `DEARBORN_AGENT_STAGE_TIMEOUT_SECS` **before** the PR
+//! opens, where a fast/failed summary would have cost nothing. This is
+//! accepted, not engineered around with a second, tighter timeout knob, for
+//! three reasons. First, it isn't a *new* class of latency — every other
+//! agent stage in the same pipeline (`implement`, `review`, a fix round) can
+//! already take up to the identical deadline, and finalize already runs
+//! after all of them; one more stage under the same budget doesn't change
+//! the shape of "how long can this epic take," which D18 already leaves
+//! unbounded by task count (per-task/per-stage caps only, no epic-level
+//! budget). Second, D20 says new tunables are global env vars — a second
+//! timeout for one stage that's otherwise identical to five others would be
+//! a special case bought for a marginal worst-case improvement, and it would
+//! be surprising for `summarize` alone to answer to a different clock than
+//! `review`/`verify_complete`, its two `RunMode::Ask` siblings. Third, and
+//! most directly: this task's AC is "never **blocked**," not "never slow" —
+//! [`run_summarize_stage`] reusing [`task_agent::run_agent_stage`] unchanged
+//! means a hung summarize run *does* eventually time out (D18, exactly like
+//! every other stage), closes its row `status = 'timeout'`, and
+//! [`run_summarize_stage`] turns that into `None` — the PR still opens, just
+//! later than it would have with a fast summary. Structural non-blocking,
+//! not fast-by-construction, is what was actually promised.
+//!
+//! ### Never fails upward: every summary failure mode, proven
+//!
+//! [`run_summarize_stage`] returns `Option<String>`, never a `Result` — there
+//! is no error variant for a caller to mishandle. Every way the stage can go
+//! wrong collapses to the same `None`: [`task_agent::run_agent_stage`]
+//! returning `Err` (harness failed to spawn, or its drain thread panicked —
+//! the `_ => None` arm), a non-`ok` [`task_agent::AgentStageOutcome`]
+//! (`status() != "ok"` covers `error`, `timeout`, and `cancelled` alike — the
+//! same match arm), and an `ok` outcome whose `text` is empty or
+//! whitespace-only after trimming (handled explicitly, since "ran cleanly,
+//! said nothing" is not a harness-level failure at all). `finalize_epic`/
+//! `finalize_task` never branch on *which* of these happened — they always
+//! call `pr::build_pr_body(.., summary.as_deref())`, and `build_pr_body`'s own
+//! blank-is-absent filtering means even a stray whitespace-only `Some` would
+//! render identically to `None`. Each path has its own worker test using
+//! `ScriptedTaskAgent` to force it: a non-ok exit
+//! (`.script(Stage::Summarize, ScriptedRun { exit_code: Some(1), .. })`), an
+//! empty/whitespace reply (`text: vec![""]` / `vec!["   "]`), a harness spawn
+//! failure (a `TaskAgent` fake whose `run()` itself returns `Err`), and a
+//! timeout (`with_gate_on(Stage::Summarize, ..)` left ungated, driven under a
+//! test's short `agent_stage_timeout_secs` the same way T-543's own timeout
+//! tests are) — all asserting the PR still opens with the template's own
+//! content intact and no "Summary of changes" heading in the body.
+//!
+//! ### Standalone tasks get one too
+//!
+//! D16 draws no epic/standalone distinction, and `finalize_task` already
+//! mirrors `finalize_epic` in every other respect (T-551's "one core, two
+//! thin callers" shape, `push_and_open_pr` chief among them) — treating the
+//! summary as epic-only would have been the one place that symmetry broke
+//! for no stated reason. [`run_task_summary`] is the standalone mirror of
+//! [`run_epic_summary`]: the task's own [`spec::SpecFields`] stand in for the
+//! epic's title/description (exactly the ordinary spec an implement/review
+//! stage already sees for this task), no siblings (D17), `base_sha` read
+//! straight off the task row via [`task_summary_base_sha`] rather than
+//! derived from the earliest `Stage::Implement` row the way
+//! [`epic_summary_base_sha`] has to (a standalone task has only the one row —
+//! no "which task ran first" question to answer).
+//!
+//! ### Sourcing the two new §9 scaffold elements
+//!
+//! [`pr::build_pr_body`] rendered three of §9's five scaffold elements from
+//! day one (description, task checklist with commit SHAs, footer); the other
+//! two — review-round counts, verified-already-complete slices — sat unbuilt
+//! because both need data this module's DB layer, not `pr.rs`, has to
+//! gather. Both ride on [`pr::TaskChecklistItem`] as two new fields
+//! (`review_rounds: u32`, `verified_complete_reasoning: Option<String>`)
+//! rather than arriving as separate parallel collections, because both are
+//! facts about a specific task, exactly like `commit_sha` already is.
+//!
+//! [`fetch_review_round_counts`] counts completed `Stage::Review`
+//! `agent_run` rows (`status = 'ok'`) per task — a plain `GROUP BY task_id`,
+//! one row per round, not the stage's own 0-based `attempt` value (T-531's
+//! own numbering starts a task's first review at `attempt = 0`; a human
+//! reading "0 review rounds" on a task that was in fact reviewed once would
+//! misread it as "never reviewed"). [`fetch_verified_complete_reasoning`]
+//! reads the `log` of whichever `Stage::VerifyComplete` row closed `status =
+//! 'ok', verdict = 'PASS'` — the exact T-532 evidence that already exists for
+//! "why this task closed with zero commits," now surfaced in the PR body
+//! itself rather than only in the task's own run history (T-532's AC talked
+//! about the latter; this task's own AC — "verified-already-complete
+//! slices" — is that same information one hop closer to a reviewer who never
+//! opens the task detail view). Both functions take a `scope_column`/
+//! `scope_value` pair (`"epic_id"`/epic id for [`build_task_checklist`],
+//! `"task_id"`/task id for [`build_standalone_checklist`]) rather than being
+//! written twice — the query shape is identical, only which column scopes it
+//! differs, and `scope_column` is always one of exactly two hardcoded
+//! literals, never caller-supplied text, so interpolating it into the SQL
+//! string carries no injection risk (SQLite has no bind-parameter syntax for
+//! a column/table name in the first place).
+//!
+//! `pr::build_pr_body` renders each new section only when at least one task
+//! qualifies (omitted entirely otherwise) — see that function's own doc for
+//! why that differs from `## Tasks`' "always render, with a placeholder"
+//! rule.
 
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -2481,7 +2633,7 @@ async fn process_one_task(
         state,
         &*state.task_agent,
         AgentStageParams {
-            task_id,
+            task_id: Some(task_id),
             epic_id,
             attempt: 1,
         },
@@ -2866,7 +3018,7 @@ async fn run_test_gate_loop(
             state,
             &*state.task_agent,
             AgentStageParams {
-                task_id,
+                task_id: Some(task_id),
                 epic_id,
                 attempt,
             },
@@ -3038,7 +3190,7 @@ async fn run_verdict_stage(
             state,
             &*state.task_agent,
             AgentStageParams {
-                task_id,
+                task_id: Some(task_id),
                 epic_id,
                 attempt,
             },
@@ -3290,7 +3442,7 @@ async fn run_review_fix_converge(
                     state,
                     &*state.task_agent,
                     AgentStageParams {
-                        task_id,
+                        task_id: Some(task_id),
                         epic_id,
                         attempt: fix_attempt,
                     },
@@ -3529,7 +3681,7 @@ async fn run_verify_complete(
                 state,
                 &*state.task_agent,
                 AgentStageParams {
-                    task_id,
+                    task_id: Some(task_id),
                     epic_id,
                     attempt: fix_attempt,
                 },
@@ -4474,7 +4626,11 @@ async fn finalize_epic(
 
     let title = pr::epic_pr_title(&epic.title);
     let items = build_task_checklist(conn, epic_id, dag).await;
-    let body = pr::build_pr_body(epic.description.as_deref(), &items);
+    // T-560: best-effort — see `run_epic_summary`'s own doc for why this can
+    // never fail this function, and the module doc's own T-560 section for
+    // why it runs *before* `push_and_open_pr` rather than after.
+    let summary = run_epic_summary(state, epic_id, epic, dag, workspace, lease).await;
+    let body = pr::build_pr_body(epic.description.as_deref(), &items, summary.as_deref());
 
     let Some(opened) = push_and_open_pr(
         state,
@@ -4587,7 +4743,11 @@ async fn finalize_task(
     // twin.
     let title = pr::epic_pr_title(&task.title);
     let items = build_standalone_checklist(conn, task).await;
-    let body = pr::build_pr_body(task.description.as_deref(), &items);
+    // T-560: a standalone task gets a summary too — see the module doc's own
+    // T-560 section, "standalone tasks get one too," for why this isn't
+    // epic-only.
+    let summary = run_task_summary(state, task_id, task, workspace, lease).await;
+    let body = pr::build_pr_body(task.description.as_deref(), &items, summary.as_deref());
 
     let Some(opened) = push_and_open_pr(
         state,
@@ -4817,6 +4977,223 @@ async fn push_and_open_pr(
     Some(opened)
 }
 
+// ---- T-560: the PR-body agent summary --------------------------------------
+//
+// See the module doc's own "T-560" section for the full ordering/scoping
+// design; the short version: [`run_summarize_stage`] is the one place a
+// `Stage::Summarize` run through `run_agent_stage` and its outcome is turned
+// into `Option<String>`, shared by [`run_epic_summary`] (epic-scoped) and
+// [`run_task_summary`] (standalone-task-scoped) exactly the way
+// [`push_and_open_pr`] is shared by [`finalize_epic`]/[`finalize_task`] —
+// only the [`spec::TaskContext`] fed in (and how the "what's the base commit
+// to diff from" question is answered) differs between the two.
+
+/// Run the `Stage::Summarize` agent stage once against `context`, in
+/// `workspace_path`, and hand back its prose — or `None` on *any* way the run
+/// can come up short. This is the single choke point both
+/// [`run_epic_summary`] and [`run_task_summary`] call; unlike
+/// [`build_task_checklist`]/[`build_standalone_checklist`] (kept deliberately
+/// separate — see that pair's own doc for why a DAG walk and a one-task
+/// checklist are different enough shapes to duplicate rather than share),
+/// running one agent stage and interpreting its
+/// [`task_agent::AgentStageOutcome`] is *exactly* the same operation whether
+/// the diff spans a whole epic or a single standalone task.
+///
+/// ## Never fails upward (D16, this task's AC: "the PR is never blocked on
+/// the summary")
+///
+/// Every non-happy path collapses to `None`, never a propagated error:
+/// [`task_agent::run_agent_stage`] itself erroring (the harness never
+/// spawned, or its drain thread panicked); a non-`ok`
+/// [`task_agent::AgentStageOutcome`] (`error`/`timeout`/`cancelled` — the
+/// same [`DEARBORN_AGENT_STAGE_TIMEOUT_SECS`](crate::config::ExecutorConfig::agent_stage_timeout_secs)
+/// deadline every other agent stage already runs under, D18 — see the module
+/// doc's T-560 section for why this isn't given its own, tighter budget); and
+/// a stage that exits `ok` but whose text is empty or whitespace-only (an
+/// agent that ran cleanly and simply had nothing to add — `prompts/
+/// summarize.md` asks for prose, not a verdict, so unlike `Stage::Review`/
+/// `Stage::VerifyComplete` there is no contract-miss concept here to retry).
+/// [`finalize_epic`]/[`finalize_task`] pass the result straight into
+/// [`pr::build_pr_body`]'s own `summary: Option<&str>`, which applies the
+/// identical trim-and-filter-blank treatment `epic_description` already gets
+/// — belt and suspenders, not because this function is expected to hand back
+/// untrimmed/blank text, but because keeping "blank means absent" in exactly
+/// one place ([`pr::build_pr_body`]) for every optional text field the
+/// template renders is simpler than asserting two functions agree on it
+/// independently.
+async fn run_summarize_stage(
+    state: &AppState,
+    epic_id: Option<&str>,
+    task_id: Option<&str>,
+    context: &TaskContext<'_>,
+    workspace_path: &std::path::Path,
+) -> Option<String> {
+    let prompt = task_agent::assemble_prompt(Stage::Summarize, context)
+        .expect("Stage::Summarize always has a prompt (spec::prompt_for)");
+    let run_id = ulid::Ulid::new().to_string();
+    let outcome = task_agent::run_agent_stage(
+        state,
+        &*state.task_agent,
+        AgentStageParams {
+            task_id,
+            epic_id,
+            attempt: 1,
+        },
+        TaskRunRequest {
+            run_id,
+            stage: Stage::Summarize,
+            prompt,
+            cwd: workspace_path.to_path_buf(),
+        },
+    )
+    .await;
+
+    match outcome {
+        Ok(outcome) if outcome.is_ok() => {
+            let text = outcome.text.trim();
+            if text.is_empty() {
+                None
+            } else {
+                Some(text.to_string())
+            }
+        }
+        _ => None,
+    }
+}
+
+/// The commit an epic's cumulative diff should be measured from, for
+/// [`run_epic_summary`]'s `git diff <sha>..HEAD` instruction (via
+/// [`spec::TaskContext::base_sha`]): the `base_sha` recorded by whichever
+/// task's `Stage::Implement` opened **first** (`agent_run.created_at ASC`).
+/// The DAG walk fully serializes one task at a time (T-513: one task
+/// `InProgress` at a time, run to a terminal state before the next begins),
+/// so that task's `base_sha` — "the workspace's `HEAD` right before this
+/// task's own work" (`process_one_task`'s own step 1) — is exactly the
+/// workspace's `HEAD` the instant it was provisioned, before *any* task in
+/// the epic touched anything; `position` order was deliberately not used
+/// instead, since a DAG's topological run order need not match `position` for
+/// independent branches. `None` when the epic has no `implement` rows at all
+/// (an empty DAG, or one whose every task somehow failed before reaching
+/// `Stage::Implement` — in practice this only happens for an epic with zero
+/// tasks, since every task's first pipeline step *is* recording `base_sha`
+/// and running `Stage::Implement`): nothing was ever built, so there is
+/// nothing to summarize either, and [`run_epic_summary`] skips the agent
+/// call entirely rather than running one with no diff to point at.
+async fn epic_summary_base_sha(conn: &Connection, epic_id: &str) -> Option<String> {
+    let mut rows = conn
+        .query(
+            "SELECT t.base_sha FROM agent_run a \
+             JOIN task t ON t.id = a.task_id \
+             WHERE a.epic_id = ?1 AND a.stage = 'implement' \
+             ORDER BY a.created_at ASC, a.rowid ASC LIMIT 1",
+            params![epic_id],
+        )
+        .await
+        .ok()?;
+    let row = rows.next().await.ok()??;
+    row.get::<Option<String>>(0).ok().flatten()
+}
+
+/// The standalone-task counterpart to [`epic_summary_base_sha`]: just the
+/// one task's own `base_sha` column, read directly (it is deliberately not
+/// projected onto [`crate::tasks::Task`] — see that struct's own doc — so
+/// this is its own small raw query rather than a field access).
+async fn task_summary_base_sha(conn: &Connection, task_id: &str) -> Option<String> {
+    let mut rows = conn
+        .query("SELECT base_sha FROM task WHERE id = ?1", params![task_id])
+        .await
+        .ok()?;
+    let row = rows.next().await.ok()??;
+    row.get::<Option<String>>(0).ok().flatten()
+}
+
+/// [`finalize_epic`]'s T-560 summary step: build the epic-scoped
+/// [`spec::TaskContext`] (the epic's own title/description standing in for
+/// [`spec::SpecFields`], no epic-context section since the epic *is* the
+/// context here, every task in the DAG listed as an "Already built" sibling —
+/// reusing [`spec::build_context`]'s existing sibling-manifest rendering
+/// gives the summarizer a plain-language checklist of what the epic built for
+/// free) and run it through [`run_summarize_stage`]. Re-checks `lease` first:
+/// by the time [`finalize_epic`] runs the lease was already confirmed live a
+/// moment ago (its own caller's guard), but this spends a whole agent turn,
+/// so it re-checks immediately before doing that — the same discipline every
+/// other pause point in this module follows. `None` (skipping the agent call
+/// entirely) when [`epic_summary_base_sha`] finds nothing to diff from.
+async fn run_epic_summary(
+    state: &AppState,
+    epic_id: &str,
+    epic: &crate::epics::Epic,
+    dag: &crate::tasks::Dag,
+    workspace: &ProvisionedWorkspace,
+    lease: &LeaseHandle,
+) -> Option<String> {
+    if lease.is_lost() {
+        return None;
+    }
+    let conn = state.db.conn();
+    let base_sha = epic_summary_base_sha(conn, epic_id).await?;
+
+    let siblings: Vec<SiblingTask> = dag
+        .nodes
+        .iter()
+        .map(|n| SiblingTask {
+            id: &n.task.id,
+            title: &n.task.title,
+            done: n.task.status == "Done",
+        })
+        .collect();
+    let context = TaskContext {
+        spec: SpecFields {
+            title: &epic.title,
+            description: epic.description.as_deref(),
+            acceptance: None,
+        },
+        epic: None,
+        siblings: &siblings,
+        base_sha: Some(base_sha.as_str()),
+    };
+
+    run_summarize_stage(state, Some(epic_id), None, &context, &workspace.workspace_path).await
+}
+
+/// [`finalize_task`]'s T-560 summary step — the standalone mirror of
+/// [`run_epic_summary`]: the task's own spec fields stand in for the epic's
+/// title/description (this *is* the ordinary [`spec::SpecFields`] an
+/// implement/review stage would see for this task), no siblings (a
+/// standalone task has none, D17), `base_sha` from
+/// [`task_summary_base_sha`]. `None` (skipping the agent call) when the task
+/// somehow has no recorded `base_sha` (in practice: unreachable by the time
+/// `finalize_task` runs, since every claimed task records it before
+/// `Stage::Implement`, but handled rather than `.expect()`-ed for the same
+/// "don't let a summary-step invariant miss take down finalize" reason
+/// [`run_summarize_stage`] never returns anything but `Option`).
+async fn run_task_summary(
+    state: &AppState,
+    task_id: &str,
+    task: &crate::tasks::Task,
+    workspace: &ProvisionedWorkspace,
+    lease: &LeaseHandle,
+) -> Option<String> {
+    if lease.is_lost() {
+        return None;
+    }
+    let conn = state.db.conn();
+    let base_sha = task_summary_base_sha(conn, task_id).await?;
+
+    let context = TaskContext {
+        spec: SpecFields {
+            title: &task.title,
+            description: task.description.as_deref(),
+            acceptance: task.acceptance.as_deref(),
+        },
+        epic: None,
+        siblings: &[],
+        base_sha: Some(base_sha.as_str()),
+    };
+
+    run_summarize_stage(state, None, Some(task_id), &context, &workspace.workspace_path).await
+}
+
 /// Close the finalize step's single `Stage::Push` evidence row, if one was
 /// successfully opened (best-effort: a failure to open it at the very start
 /// of [`finalize_epic`] must not additionally block finalize from
@@ -4862,11 +5239,15 @@ async fn load_project_for_finalize(
 
 /// Build the PR body's task checklist (D16's template half): every task in
 /// `dag`, in `position` order, paired with the commit SHA its `Stage::Commit`
-/// evidence row recorded (`None` for a task that produced no diff). Reads the
-/// SHA back out of `agent_run.log` via [`pr::parse_commit_sha_from_commit_log`]
-/// — the same format `process_one_task`'s commit step writes — rather than
-/// re-deriving it from `git log`, so this stays a plain DB read next to
-/// everything else finalize already does.
+/// evidence row recorded (`None` for a task that produced no diff), how many
+/// `Stage::Review` rounds it went through (T-560, §9), and — for a task
+/// closed via T-532 with zero commits — the verify-complete reasoning that
+/// justified it (T-560, §9). Reads the SHA back out of `agent_run.log` via
+/// [`pr::parse_commit_sha_from_commit_log`] — the same format
+/// `process_one_task`'s commit step writes — rather than re-deriving it from
+/// `git log`, so this stays a plain DB read next to everything else finalize
+/// already does; the two new fields are plain DB reads of the same shape,
+/// scoped by the identical `epic_id`.
 async fn build_task_checklist(
     conn: &Connection,
     epic_id: &str,
@@ -4893,6 +5274,9 @@ async fn build_task_checklist(
         }
     }
 
+    let review_rounds = fetch_review_round_counts(conn, "epic_id", epic_id).await;
+    let verified = fetch_verified_complete_reasoning(conn, "epic_id", epic_id).await;
+
     let mut nodes: Vec<&crate::tasks::DagNode> = dag.nodes.iter().collect();
     nodes.sort_by_key(|n| n.task.position.unwrap_or(i64::MAX));
 
@@ -4902,6 +5286,8 @@ async fn build_task_checklist(
             title: n.task.title.clone(),
             short_id: spec::short_id(&n.task.id).to_string(),
             commit_sha: shas.get(&n.task.id).cloned(),
+            review_rounds: review_rounds.get(&n.task.id).copied().unwrap_or(0),
+            verified_complete_reasoning: verified.get(&n.task.id).cloned(),
         })
         .collect()
 }
@@ -4919,7 +5305,13 @@ async fn build_task_checklist(
 /// itself: that function's whole shape is "walk a `Dag`'s many nodes," which
 /// a standalone task — one task, no DAG — has nothing to walk; duplicating
 /// its ~15 lines here reads clearer than threading an `Either<Dag, &Task>`
-/// through a function built around iterating many nodes.
+/// through a function built around iterating many nodes. T-560's
+/// review-round-count/verify-complete-reasoning fields reuse
+/// [`fetch_review_round_counts`]/[`fetch_verified_complete_reasoning`] scoped
+/// by `task_id` instead of `epic_id` — the same two functions
+/// [`build_task_checklist`] calls, just filtered on the other column, since a
+/// standalone task's evidence rows are `task_id`-keyed the way an epic-owned
+/// task's are `epic_id`-keyed for this same lookup.
 async fn build_standalone_checklist(conn: &Connection, task: &crate::tasks::Task) -> Vec<pr::TaskChecklistItem> {
     let mut sha: Option<String> = None;
     if let Ok(mut rows) = conn
@@ -4938,11 +5330,84 @@ async fn build_standalone_checklist(conn: &Connection, task: &crate::tasks::Task
             }
         }
     }
+
+    let review_rounds = fetch_review_round_counts(conn, "task_id", &task.id).await;
+    let verified = fetch_verified_complete_reasoning(conn, "task_id", &task.id).await;
+
     vec![pr::TaskChecklistItem {
         title: task.title.clone(),
         short_id: spec::short_id(&task.id).to_string(),
         commit_sha: sha,
+        review_rounds: review_rounds.get(&task.id).copied().unwrap_or(0),
+        verified_complete_reasoning: verified.get(&task.id).cloned(),
     }]
+}
+
+/// T-560: how many completed `Stage::Review` rounds each task under
+/// `scope_value` (an epic id when `scope_column = "epic_id"`, a task id when
+/// `scope_column = "task_id"`) went through — one `agent_run` row
+/// (`status = 'ok'`) per round (T-530/T-531's `attempt` is 0-based, but this
+/// counts *rows*, matching the plain "how many times was this reviewed"
+/// reading [`pr::build_pr_body`]'s "Review rounds" section wants). Feeds both
+/// [`build_task_checklist`] (`scope_column = "epic_id"`, one row per task in
+/// the epic) and [`build_standalone_checklist`] (`scope_column = "task_id"`,
+/// the map has at most the one entry). `scope_column` is one of exactly two
+/// known-safe literals, never caller-supplied text, so interpolating it into
+/// the SQL (rather than a bind parameter — column names can't be bound in
+/// SQLite anyway) carries no injection risk.
+async fn fetch_review_round_counts(
+    conn: &Connection,
+    scope_column: &'static str,
+    scope_value: &str,
+) -> std::collections::HashMap<String, u32> {
+    let mut counts = std::collections::HashMap::new();
+    let sql = format!(
+        "SELECT task_id, COUNT(*) FROM agent_run \
+         WHERE {scope_column} = ?1 AND stage = 'review' AND status = 'ok' \
+         GROUP BY task_id"
+    );
+    if let Ok(mut rows) = conn.query(&sql, params![scope_value]).await {
+        while let Ok(Some(row)) = rows.next().await {
+            let task_id: Option<String> = row.get(0).unwrap_or(None);
+            let count: i64 = row.get(1).unwrap_or(0);
+            if let Some(task_id) = task_id {
+                counts.insert(task_id, count.max(0) as u32);
+            }
+        }
+    }
+    counts
+}
+
+/// T-560: the T-532 verify-complete reasoning that closed a task with zero
+/// commits, per task, scoped the same way [`fetch_review_round_counts`] is
+/// (`scope_column`/`scope_value`). Only a `PASS`ing `Stage::VerifyComplete`
+/// row counts — a `NEEDS_CHANGES`/`BLOCKED` verdict does not close the task
+/// with zero commits (§6: `NEEDS_CHANGES` re-enters the ordinary pipeline and
+/// ends up committed; `BLOCKED` fails the task outright), so surfacing either
+/// here would misrepresent a task that has (or will have) a real commit as
+/// one that was "verified already complete." Feeds
+/// [`pr::TaskChecklistItem::verified_complete_reasoning`].
+async fn fetch_verified_complete_reasoning(
+    conn: &Connection,
+    scope_column: &'static str,
+    scope_value: &str,
+) -> std::collections::HashMap<String, String> {
+    let mut reasoning = std::collections::HashMap::new();
+    let sql = format!(
+        "SELECT task_id, log FROM agent_run \
+         WHERE {scope_column} = ?1 AND stage = 'verify_complete' AND status = 'ok' AND verdict = 'PASS' \
+         ORDER BY created_at ASC"
+    );
+    if let Ok(mut rows) = conn.query(&sql, params![scope_value]).await {
+        while let Ok(Some(row)) = rows.next().await {
+            let task_id: Option<String> = row.get(0).unwrap_or(None);
+            let log: String = row.get(1).unwrap_or_default();
+            if let Some(task_id) = task_id {
+                reasoning.insert(task_id, log);
+            }
+        }
+    }
+    reasoning
 }
 
 /// Resolve the project id for an epic (best-effort, for the board publish).
@@ -10415,6 +10880,479 @@ mod tests {
         let task = fetch_task_row(&state, &task_id).await;
         assert_eq!(task.0, "Done", "the retried task must have actually resumed and completed");
         assert_eq!(task.1, None, "failure_reason must stay cleared");
+
+        let workspace_path = workspace::task_workspace_path(&state.config.clone_root, &task_id);
+        cleanup_clone_root(&state, &project_id, &[]);
+        let _ = std::fs::remove_dir_all(&workspace_path);
+    }
+
+    // ---- T-560: PR body — template + agent summary ------------------------
+    //
+    // See the module doc's own "T-560" section for the full design; these
+    // tests prove, one failure mode at a time, that the PR is genuinely
+    // **never** blocked on the summarize stage, plus that the two new §9
+    // scaffold elements (review-round counts, verified-already-complete
+    // slices) actually reach the rendered body end-to-end, not just in
+    // `pr.rs`'s own unit tests.
+
+    /// A `TaskAgent` wrapper whose `run()` fails to *start* (mimics `claude`
+    /// missing from `PATH` — [`HarnessError::Other`]) for exactly one
+    /// [`Stage`], delegating to `inner` for every other stage. Used for T-560's
+    /// "the harness never spawned" fallback proof, which
+    /// [`crate::task_agent::testing::ScriptedTaskAgent`] alone cannot express
+    /// (every one of its scripted runs still starts; only its *outcome*
+    /// varies).
+    struct FailToSpawnAtStage {
+        stage: Stage,
+        inner: ScriptedTaskAgent,
+    }
+
+    impl TaskAgent for FailToSpawnAtStage {
+        fn run(&self, req: TaskRunRequest) -> Result<(RunHandle, Receiver<RunEvent>), HarnessError> {
+            if req.stage == self.stage {
+                return Err(HarnessError::Other(format!(
+                    "boom: {} failed to spawn",
+                    self.stage.as_str()
+                )));
+            }
+            self.inner.run(req)
+        }
+    }
+
+    /// The one `agent_run` row for `stage`, however many there are expected
+    /// to be (asserts exactly one) — used by this section's tests to check
+    /// the summarize row's `task_id`/`epic_id`/`status` shape directly,
+    /// rather than only inferring it from the rendered PR body.
+    async fn sole_agent_run_row(
+        state: &AppState,
+        stage: &str,
+    ) -> (Option<String>, Option<String>, String) {
+        let mut rows = state
+            .db
+            .conn()
+            .query(
+                "SELECT task_id, epic_id, status FROM agent_run WHERE stage = ?1",
+                params![stage],
+            )
+            .await
+            .unwrap();
+        let row = rows
+            .next()
+            .await
+            .unwrap()
+            .unwrap_or_else(|| panic!("expected exactly one '{stage}' agent_run row, found none"));
+        // Extract every value **before** advancing the cursor again — a
+        // `Row` is a view onto libsql's current cursor position, and calling
+        // `rows.next()` a second time invalidates it (observed directly: a
+        // deferred `row.get(..)` after the "no second row" check below
+        // returned a spurious `NullValue`, not this row's real columns).
+        let values = (
+            row.get::<Option<String>>(0).unwrap(),
+            row.get::<Option<String>>(1).unwrap(),
+            row.get::<String>(2).unwrap(),
+        );
+        assert!(
+            rows.next().await.unwrap().is_none(),
+            "expected exactly one '{stage}' agent_run row"
+        );
+        values
+    }
+
+    /// Happy path: a clean, non-blank `Stage::Summarize` reply lands under
+    /// its own "## Summary of changes" heading in the opened PR's body, and
+    /// is recorded as an **epic-scoped** `agent_run` row (`task_id: NULL`,
+    /// `epic_id: Some(_)`) — the AC's "the summary is stored as an
+    /// `agent_run` row," checked directly rather than only inferred from the
+    /// rendered body.
+    #[tokio::test]
+    async fn summarize_stage_text_appears_under_its_own_heading_in_the_pr_body() {
+        let agent = Arc::new(
+            ScriptedTaskAgent::new()
+                .script(Stage::Implement, writes_file("a.txt", "a\n"))
+                .script(Stage::Review, review_pass())
+                .script(
+                    Stage::Summarize,
+                    ScriptedRun {
+                        text: vec!["This epic adds a.txt with a short greeting.".to_string()],
+                        ..ScriptedRun::default()
+                    },
+                ),
+        );
+        let fake = Arc::new(FakeHost::new());
+        let (state, _app) = test_app_with_task_agent_and_host(agent, fake.clone()).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        seed_task(&state, &epic_id, &project_id, "A").await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        let calls = fake.open_pr_calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].body.contains("## Summary of changes"));
+        assert!(calls[0].body.contains("This epic adds a.txt with a short greeting."));
+
+        let (task_id, epic_id_col, status) = sole_agent_run_row(&state, "summarize").await;
+        assert_eq!(task_id, None, "an epic-scoped summarize run has no task_id");
+        assert_eq!(epic_id_col.as_deref(), Some(epic_id.as_str()));
+        assert_eq!(status, "ok");
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// A `Stage::Summarize` run that exits non-zero (the harness started but
+    /// the agent itself failed/errored) still opens the PR, with the
+    /// template alone — no "Summary of changes" heading at all.
+    #[tokio::test]
+    async fn summarize_stage_nonzero_exit_still_opens_pr_with_template_only() {
+        let agent = Arc::new(
+            ScriptedTaskAgent::new()
+                .script(Stage::Implement, writes_file("a.txt", "a\n"))
+                .script(Stage::Review, review_pass())
+                .script(
+                    Stage::Summarize,
+                    ScriptedRun {
+                        text: vec!["partial output before the agent errored".to_string()],
+                        exit_code: Some(1),
+                        ..ScriptedRun::default()
+                    },
+                ),
+        );
+        let fake = Arc::new(FakeHost::new());
+        let (state, _app) = test_app_with_task_agent_and_host(agent, fake.clone()).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        seed_task(&state, &epic_id, &project_id, "A").await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        assert_eq!(
+            epic_status(&state, &epic_id).await,
+            "Completed",
+            "the PR must open even though the summary run itself failed"
+        );
+        let calls = fake.open_pr_calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].body.contains("## Tasks"), "the template must still render");
+        assert!(!calls[0].body.contains("## Summary of changes"));
+
+        let (_, _, status) = sole_agent_run_row(&state, "summarize").await;
+        assert_eq!(status, "error");
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// An empty `Stage::Summarize` reply (the agent exited cleanly and said
+    /// nothing) is treated identically to an absent summary — the PR opens
+    /// with the template alone.
+    #[tokio::test]
+    async fn summarize_stage_empty_reply_still_opens_pr_with_template_only() {
+        let agent = Arc::new(
+            ScriptedTaskAgent::new()
+                .script(Stage::Implement, writes_file("a.txt", "a\n"))
+                .script(Stage::Review, review_pass())
+                .script(
+                    Stage::Summarize,
+                    ScriptedRun {
+                        text: vec![String::new()],
+                        ..ScriptedRun::default()
+                    },
+                ),
+        );
+        let fake = Arc::new(FakeHost::new());
+        let (state, _app) = test_app_with_task_agent_and_host(agent, fake.clone()).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        seed_task(&state, &epic_id, &project_id, "A").await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        let calls = fake.open_pr_calls();
+        assert_eq!(calls.len(), 1);
+        assert!(!calls[0].body.contains("## Summary of changes"));
+
+        // The stage itself still ran cleanly — this is "said nothing," not
+        // "errored" — so its own row still closes `ok`.
+        let (_, _, status) = sole_agent_run_row(&state, "summarize").await;
+        assert_eq!(status, "ok");
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// A whitespace-only `Stage::Summarize` reply is treated identically to
+    /// an empty one — [`pr::build_pr_body`]'s own trim-and-filter-blank rule
+    /// applies uniformly, but this proves the worker-side wiring doesn't
+    /// short-circuit on `is_empty()` alone and skip the trim.
+    #[tokio::test]
+    async fn summarize_stage_whitespace_only_reply_still_opens_pr_with_template_only() {
+        let agent = Arc::new(
+            ScriptedTaskAgent::new()
+                .script(Stage::Implement, writes_file("a.txt", "a\n"))
+                .script(Stage::Review, review_pass())
+                .script(
+                    Stage::Summarize,
+                    ScriptedRun {
+                        text: vec!["   \n\t  ".to_string()],
+                        ..ScriptedRun::default()
+                    },
+                ),
+        );
+        let fake = Arc::new(FakeHost::new());
+        let (state, _app) = test_app_with_task_agent_and_host(agent, fake.clone()).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        seed_task(&state, &epic_id, &project_id, "A").await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        let calls = fake.open_pr_calls();
+        assert_eq!(calls.len(), 1);
+        assert!(!calls[0].body.contains("## Summary of changes"));
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// The harness never spawning at all for `Stage::Summarize` (the T-512
+    /// `AgentStageError::Harness` path) still opens the PR with the template
+    /// alone — [`FailToSpawnAtStage`] forces exactly this, while every other
+    /// stage runs normally through the wrapped [`ScriptedTaskAgent`].
+    #[tokio::test]
+    async fn summarize_stage_harness_spawn_failure_still_opens_pr_with_template_only() {
+        let agent: Arc<dyn TaskAgent> = Arc::new(FailToSpawnAtStage {
+            stage: Stage::Summarize,
+            inner: ScriptedTaskAgent::new()
+                .script(Stage::Implement, writes_file("a.txt", "a\n"))
+                .script(Stage::Review, review_pass()),
+        });
+        let fake = Arc::new(FakeHost::new());
+        let (state, _app) = test_app_with_task_agent_and_host(agent, fake.clone()).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        seed_task(&state, &epic_id, &project_id, "A").await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        assert_eq!(
+            epic_status(&state, &epic_id).await,
+            "Completed",
+            "the PR must open even though the harness never spawned for the summary stage"
+        );
+        let calls = fake.open_pr_calls();
+        assert_eq!(calls.len(), 1);
+        assert!(!calls[0].body.contains("## Summary of changes"));
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// A `Stage::Summarize` run that never exits (gated, ungated release)
+    /// hits `DEARBORN_AGENT_STAGE_TIMEOUT_SECS` (D18) exactly like any other
+    /// agent stage, closes its own `agent_run` row `status = 'timeout'`, and
+    /// still lets the PR open with the template alone — the module doc's own
+    /// "ordering" section's whole point: non-blocking, not fast.
+    #[tokio::test]
+    async fn summarize_stage_timeout_still_opens_pr_with_template_only() {
+        let mut config = Config::for_test(TOKEN);
+        config.executor.agent_stage_timeout_secs = 1;
+
+        // Not released until teardown at the very end (see the comment
+        // there) — mirrors `implement_timeout_fails_the_task_and_blocks_the_epic_the_ordinary_way`'s
+        // own gated-timeout test exactly: releasing only after every
+        // assertion below has already passed avoids leaking a thread parked
+        // on this gate forever, which would otherwise hang this test
+        // binary's process exit waiting for `run_agent_stage`'s detached
+        // drain thread to notice the channel close (see that function's own
+        // "waiting for the kill to land, bounded" doc section for why the
+        // drain thread itself can never be force-stopped).
+        let gate = Arc::new(Gate::default());
+        let agent: Arc<dyn TaskAgent> = Arc::new(
+            ScriptedTaskAgent::new()
+                .script(Stage::Implement, writes_file("a.txt", "a\n"))
+                .script(Stage::Review, review_pass())
+                .with_gate_on(Stage::Summarize, gate.clone()),
+        );
+        let fake = Arc::new(FakeHost::new());
+        let db = Db::connect(":memory:").await.unwrap();
+        db.run_migrations().await.unwrap();
+        let state = AppState::with_all_agents_and_host(
+            config,
+            db,
+            Arc::new(SilentPlanningAgent),
+            Arc::new(SilentBreakdownAgent),
+            agent,
+            fake.clone(),
+        );
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        seed_task(&state, &epic_id, &project_id, "A").await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        assert_eq!(
+            epic_status(&state, &epic_id).await,
+            "Completed",
+            "the PR must open even though the summary run timed out"
+        );
+        let calls = fake.open_pr_calls();
+        assert_eq!(calls.len(), 1);
+        assert!(!calls[0].body.contains("## Summary of changes"));
+
+        let (_, _, status) = sole_agent_run_row(&state, "summarize").await;
+        assert_eq!(status, "timeout");
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+        // Teardown hygiene, not part of the assertions above — see the gate
+        // construction comment for why this must happen last, not be skipped.
+        gate.release();
+    }
+
+    /// §9's "review-round counts" scaffold element, end to end: a
+    /// `NEEDS_CHANGES` → fix → `PASS` convergence (mirrors
+    /// `needs_changes_then_pass_converges_with_two_commits_and_closes_the_task`)
+    /// renders "2 review rounds" for the task in the opened PR's body.
+    #[tokio::test]
+    async fn review_round_count_appears_in_the_pr_body() {
+        let agent = Arc::new(
+            ScriptedTaskAgent::new()
+                .script(Stage::Implement, writes_file("a.txt", "a\n"))
+                .script(Stage::Review, review_needs_changes())
+                .script(Stage::Fix, writes_file("b.txt", "b\n"))
+                .script(Stage::Review, review_pass()),
+        );
+        let fake = Arc::new(FakeHost::new());
+        let (state, _app) = test_app_with_task_agent_and_host(agent, fake.clone()).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let a = seed_task(&state, &epic_id, &project_id, "A").await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        let calls = fake.open_pr_calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].body.contains("## Review rounds"));
+        assert!(calls[0]
+            .body
+            .contains(&format!("A (`{}`): 2 review rounds", spec::short_id(&a))));
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// §9's "verified-already-complete slices" scaffold element, end to end:
+    /// a `PASS`ing `Stage::VerifyComplete` (mirrors
+    /// `verify_complete_pass_closes_the_task_done_with_zero_commits_and_is_visible_in_run_history`)
+    /// puts the task's own reasoning text under a "Verified already
+    /// complete" heading in the opened PR's body — the same evidence T-532's
+    /// own AC put in the task's run history, one hop closer to a reviewer.
+    #[tokio::test]
+    async fn verified_already_complete_reasoning_appears_in_the_pr_body() {
+        let agent =
+            Arc::new(ScriptedTaskAgent::new().script(Stage::VerifyComplete, verify_complete_pass()));
+        let fake = Arc::new(FakeHost::new());
+        let (state, _app) = test_app_with_task_agent_and_host(agent, fake.clone()).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let a = seed_task(&state, &epic_id, &project_id, "A").await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        let calls = fake.open_pr_calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].body.contains("## Verified already complete"));
+        assert!(calls[0]
+            .body
+            .contains(&format!("**A** (`{}`)", spec::short_id(&a))));
+        assert!(calls[0].body.contains("already built by an earlier task"));
+        // The task never committed, so it must not also show up in the
+        // "Review rounds" section (T-532's PASS-on-first-look skips review
+        // entirely).
+        assert!(!calls[0].body.contains("## Review rounds"));
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// Standalone tasks get a summary too (module doc: "standalone tasks get
+    /// one too") — happy path, and the row is **task-scoped**
+    /// (`task_id: Some(_)`, `epic_id: NULL`), the mirror image of the
+    /// epic-scoped row's shape above.
+    #[tokio::test]
+    async fn standalone_task_summary_appears_in_the_pr_body_and_is_task_scoped() {
+        let agent = Arc::new(
+            ScriptedTaskAgent::new()
+                .script(Stage::Implement, writes_file("a.txt", "a\n"))
+                .script(Stage::Review, review_pass())
+                .script(
+                    Stage::Summarize,
+                    ScriptedRun {
+                        text: vec!["This change adds a.txt.".to_string()],
+                        ..ScriptedRun::default()
+                    },
+                ),
+        );
+        let fake = Arc::new(FakeHost::new());
+        let (state, _app) = test_app_with_task_agent_and_host(agent, fake.clone()).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let task_id = seed_standalone_task(&state, &project_id, "Standalone A", "InProgress").await;
+
+        run_standalone_pipeline(state.clone(), task_id.clone()).await;
+
+        assert_eq!(single_task_status(&state, &task_id).await, "Done");
+        let calls = fake.open_pr_calls();
+        assert_eq!(calls.len(), 1);
+        assert!(calls[0].body.contains("## Summary of changes"));
+        assert!(calls[0].body.contains("This change adds a.txt."));
+
+        let (row_task_id, row_epic_id, status) = sole_agent_run_row(&state, "summarize").await;
+        assert_eq!(row_task_id.as_deref(), Some(task_id.as_str()));
+        assert_eq!(row_epic_id, None, "a standalone task's summarize run has no epic_id");
+        assert_eq!(status, "ok");
+
+        let workspace_path = workspace::task_workspace_path(&state.config.clone_root, &task_id);
+        cleanup_clone_root(&state, &project_id, &[]);
+        let _ = std::fs::remove_dir_all(&workspace_path);
+    }
+
+    /// The standalone mirror of the epic-scoped fallback proofs above: a
+    /// blank summary reply still opens the standalone task's own PR with the
+    /// template alone.
+    #[tokio::test]
+    async fn standalone_task_summary_failure_still_opens_pr_with_template_only() {
+        let agent = Arc::new(
+            ScriptedTaskAgent::new()
+                .script(Stage::Implement, writes_file("a.txt", "a\n"))
+                .script(Stage::Review, review_pass())
+                .script(
+                    Stage::Summarize,
+                    ScriptedRun {
+                        text: vec![String::new()],
+                        ..ScriptedRun::default()
+                    },
+                ),
+        );
+        let fake = Arc::new(FakeHost::new());
+        let (state, _app) = test_app_with_task_agent_and_host(agent, fake.clone()).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let task_id = seed_standalone_task(&state, &project_id, "Standalone A", "InProgress").await;
+
+        run_standalone_pipeline(state.clone(), task_id.clone()).await;
+
+        assert_eq!(single_task_status(&state, &task_id).await, "Done");
+        let calls = fake.open_pr_calls();
+        assert_eq!(calls.len(), 1);
+        assert!(!calls[0].body.contains("## Summary of changes"));
+        assert!(calls[0].body.contains("## Tasks"));
 
         let workspace_path = workspace::task_workspace_path(&state.config.clone_root, &task_id);
         cleanup_clone_root(&state, &project_id, &[]);

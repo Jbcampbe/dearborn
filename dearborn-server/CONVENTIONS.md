@@ -423,7 +423,11 @@ happened (stage/attempt/status/verdict/timing), not download every stage's
 full transcript just to render a list; `GET /runs/{id}` fetches one stage's
 full log on demand. `verdict` is only ever non-null for a `review` (T-530) or
 `verify_complete` (T-532) stage — the two stages whose prompt ends with a D9
-`VERDICT:` line; `session_id` is `null` for every non-agent stage.
+`VERDICT:` line; `session_id` is `null` for every non-agent stage. `task_id`
+is `null` for a `push` row opened during an epic's finalize (there is no
+single task at fault) and, since T-560, for an epic's own `summarize` row —
+the one *agent* stage that can be epic-scoped rather than task-scoped; see
+"Task-stage `RunEvent` stream" below for the WS-topic consequence of that.
 
 An agent stage additionally streams its `RunEvent`s live — see the new
 `task:<id>` WS topic below — and flushes its accumulated log to the row
@@ -600,6 +604,22 @@ new `GET /tasks/{id}/runs` / `GET /runs/{id}` endpoints above), which also
 receives the accumulated log every ~2 seconds while the stage streams (D14),
 so a client that opens a task mid-run can hydrate from REST and then follow
 the rest live with no gap.
+
+**Exception (T-560):** an epic's `Stage::Summarize` run — the PR-body
+"Summary of changes" section, generated once over the epic's whole
+cumulative diff during finalize, not any one task's — has no task to attach
+to (`agent_run.task_id` is `NULL`; only `epic_id` is set). It streams on
+`epic:<id>` instead, the same topic planning's own epic-chat `RunEvent`
+stream already uses, for the identical reason: a run describing the epic as
+a whole belongs on the epic's topic, not a task-shaped one invented for a
+task that doesn't exist. A **standalone** task's own `Stage::Summarize` run
+is unaffected by this exception — it has a real task, so it streams on
+`task:<id>` exactly like every other stage. Because this row's `task_id` is
+`NULL`, it is also not reachable via `GET /tasks/{id}/runs` (which lists by
+`task_id`) — there is no `GET /epics/{id}/runs` today, so an epic-scoped
+summarize run is visible only live (the WS stream above, while it runs) or
+via `GET /runs/{id}` to a caller that already has its id. Client-surface work
+to close that gap is out of scope here (T-561+'s territory).
 
 ### `stage_changed` (T-530, T-532)
 
