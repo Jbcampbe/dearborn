@@ -27,6 +27,14 @@ const MAP: Record<string, { glyph: Glyph; tone: Tone }> = {
   pending: { glyph: "dashed", tone: "neutral" },
   ready: { glyph: "check", tone: "green" },
   error: { glyph: "octagon", tone: "red" },
+  // agent_run.status (T-512/T-562 pipeline view) — lowercase, distinct from
+  // the capitalized epic/task vocabulary above so there's no collision
+  // (`error` is already shared with the clone lifecycle; same glyph/tone
+  // fits both).
+  running: { glyph: "half", tone: "teal" },
+  ok: { glyph: "check", tone: "green" },
+  timeout: { glyph: "octagon", tone: "red" },
+  cancelled: { glyph: "cancel", tone: "dim" },
 };
 
 const entry = computed(() => MAP[props.status] ?? { glyph: "hollow", tone: "neutral" as Tone });

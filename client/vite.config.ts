@@ -19,6 +19,9 @@ export default defineConfig({
       // Tasks + DAG REST surface (T-302/T-303). Singular `/tasks/:id` client
       // calls are proxied here too.
       "/tasks": "http://127.0.0.1:8787",
+      // One stage's full log (`GET /runs/{id}`, T-512/T-562) — a top-level
+      // path, not nested under `/tasks`, so it needs its own proxy entry.
+      "/runs": "http://127.0.0.1:8787",
       // WebSocket — planning `RunEvent` live stream (T-202/T-204). `ws:true`
       // makes the dev proxy forward the Upgrade handshake to the Rust server.
       "/ws": { target: "ws://127.0.0.1:8787", ws: true },

@@ -13,6 +13,7 @@ import {
 import { TASK_LANES } from "../board/epicLanes";
 import AppModal from "./AppModal.vue";
 import ConfirmModal from "./ConfirmModal.vue";
+import TaskPipelinePanel from "./TaskPipelinePanel.vue";
 
 // Task dialog (create standalone + full edit for standalone and epic tasks).
 // Create mode (`task === null`): title required, description/acceptance
@@ -22,6 +23,16 @@ import ConfirmModal from "./ConfirmModal.vue";
 // (`board_updated` on `project:<id>` for standalone tasks, `dag_updated` on
 // `epic:<id>` for epic tasks), which the kanban's stream folds in — no refetch
 // here.
+//
+// T-562: edit mode gains a second "Pipeline" tab (`TaskPipelinePanel.vue`) —
+// the stage timeline for this task's `agent_run` history. This dialog is the
+// one surface every task card already opens on click, standalone or
+// epic-scoped, on either kanban (`ProjectKanbanView.vue`/`EpicKanbanView.
+// vue`) — reusing it here means the pipeline view needs no new route and no
+// duplicated "which task is this" plumbing. The panel only mounts while its
+// tab is active (`v-if`, not `v-show`), so switching away or closing the
+// dialog actually tears it down — the mount/unmount boundary T-563's
+// subscribe-on-open/unsubscribe-on-close will use.
 const props = defineProps<{ open: boolean; projectId: string; task: Task | null }>();
 const emit = defineEmits<{ close: [] }>();
 
@@ -35,8 +46,12 @@ const busy = ref(false);
 const error = ref<string | null>(null);
 const confirmingDelete = ref(false);
 const inputEl = ref<HTMLInputElement | null>(null);
+const activeTab = ref<"edit" | "pipeline">("edit");
 
 const isEdit = computed(() => props.task !== null);
+
+/** The pipeline tab needs more room for a log than the edit form does. */
+const modalWidth = computed(() => (activeTab.value === "pipeline" ? 760 : 480));
 
 /** Epic-scoped tasks edit against the epic's board, not the project board. */
 const isEpicTask = computed(() => props.task?.epic_id != null);
@@ -67,6 +82,7 @@ watch(
       status.value = props.task?.status ?? "Todo";
       error.value = null;
       confirmingDelete.value = false;
+      activeTab.value = "edit";
       await nextTick();
       inputEl.value?.focus();
     }
@@ -149,10 +165,29 @@ async function confirmDelete() {
   <AppModal
     :open="open"
     :title="isEdit ? 'Edit task' : 'New task'"
-    :width="480"
+    :width="modalWidth"
     @close="emit('close')"
   >
-    <form class="form" @submit.prevent="submit">
+    <nav v-if="isEdit" class="task-tabs" aria-label="Task view">
+      <button
+        type="button"
+        class="task-tab"
+        :data-active="activeTab === 'edit'"
+        @click="activeTab = 'edit'"
+      >
+        Edit
+      </button>
+      <button
+        type="button"
+        class="task-tab"
+        :data-active="activeTab === 'pipeline'"
+        @click="activeTab = 'pipeline'"
+      >
+        Pipeline
+      </button>
+    </nav>
+
+    <form v-if="activeTab === 'edit'" class="form" @submit.prevent="submit">
       <p class="task-hint">{{ hint }}</p>
       <p v-if="error" class="banner banner-error" role="alert">{{ error }}</p>
       <div>
@@ -199,24 +234,33 @@ async function confirmDelete() {
         </select>
       </div>
     </form>
+
+    <TaskPipelinePanel v-else-if="task" :key="task.id" :task-id="task.id" />
+
     <template #footer>
-      <button
-        v-if="isEdit"
-        class="btn btn-danger"
-        :disabled="busy"
-        @click="confirmingDelete = true"
-      >
-        Delete
-      </button>
-      <span class="foot-spacer" />
-      <button class="btn" :disabled="busy" @click="emit('close')">Cancel</button>
-      <button
-        class="btn btn-primary"
-        :disabled="busy || title.trim().length === 0"
-        @click="submit"
-      >
-        {{ busy ? "Saving…" : isEdit ? "Save" : "Create task" }}
-      </button>
+      <template v-if="activeTab === 'edit'">
+        <button
+          v-if="isEdit"
+          class="btn btn-danger"
+          :disabled="busy"
+          @click="confirmingDelete = true"
+        >
+          Delete
+        </button>
+        <span class="foot-spacer" />
+        <button class="btn" :disabled="busy" @click="emit('close')">Cancel</button>
+        <button
+          class="btn btn-primary"
+          :disabled="busy || title.trim().length === 0"
+          @click="submit"
+        >
+          {{ busy ? "Saving…" : isEdit ? "Save" : "Create task" }}
+        </button>
+      </template>
+      <template v-else>
+        <span class="foot-spacer" />
+        <button class="btn" @click="emit('close')">Close</button>
+      </template>
     </template>
   </AppModal>
 
@@ -231,6 +275,35 @@ async function confirmDelete() {
 </template>
 
 <style scoped>
+.task-tabs {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-4);
+  border-bottom: 1px solid var(--border-hairline);
+  margin-bottom: var(--spacing-16);
+}
+
+.task-tab {
+  padding: 6px 10px 8px;
+  margin-bottom: -1px;
+  font-size: var(--text-caption);
+  color: var(--text-muted);
+  border-bottom: 2px solid transparent;
+  transition:
+    color var(--duration-fast) var(--ease-out),
+    border-color var(--duration-fast) var(--ease-out);
+}
+
+.task-tab:hover {
+  color: var(--text-primary);
+}
+
+.task-tab[data-active="true"] {
+  color: var(--text-primary);
+  font-weight: var(--weight-medium);
+  border-bottom-color: var(--text-primary);
+}
+
 .form {
   display: flex;
   flex-direction: column;

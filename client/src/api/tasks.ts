@@ -7,8 +7,15 @@
 // editor's reducer folds into its view model. This module covers only the
 // request/response REST calls (initial load + commands); the WS side lives in
 // `dag/`.
+//
+// T-562 adds the two `agent_run` evidence endpoints (`dearborn-server/src/
+// evidence.rs`, T-512) the task detail pipeline view hydrates from:
+// `getTaskRuns` (cheap — no `log`, one row per pipeline stage attempt) and
+// `getRunLog` (one row's full capped log, fetched only when a timeline row is
+// expanded). Neither is live — the pipeline view's WS follow (`task:<id>`,
+// T-563) is a separate, not-yet-built seam; see `src/task/pipeline.ts`.
 
-import { apiFetch } from "./client";
+import { apiFetch, type Collection } from "./client";
 
 /** Task lifecycle status (§2.2). Readiness is computed, not stored. */
 export type TaskStatus = "Todo" | "InProgress" | "Done" | "Failed" | "Cancelled";
@@ -163,6 +170,63 @@ export function retryTask(token: string, id: string): Promise<Task> {
  */
 export function runTask(token: string, id: string): Promise<Task> {
   return apiFetch<Task>(`/tasks/${encodeURIComponent(id)}/run`, token, { method: "POST" });
+}
+
+/**
+ * One `agent_run` row as returned by `GET /tasks/{id}/runs` (T-512 evidence,
+ * §2.1/§2.5) — every pipeline stage this task has run through, oldest first.
+ * Mirrors the server's `AgentRunSummary` (`evidence.rs`) field for field,
+ * **without** `log` — the list endpoint deliberately omits it (a busy task
+ * can carry several capped-256KB stage logs; a timeline view only needs to
+ * know what happened, not download every stage's full transcript). `verdict`
+ * is non-null only for a `review` or `verify_complete` row; `session_id` is
+ * `null` for every non-agent stage (`setup`/`preflight`/`test_gate`/`commit`/
+ * `push`). `task_id`/`epic_id` are nullable on the row in general (an epic
+ * finalize's `push` row and, since T-560, an epic's own `summarize` row can
+ * both be task-less) but every row *this* endpoint returns has `task_id`
+ * equal to the id in the URL, by construction of the underlying query.
+ */
+export interface AgentRunSummary {
+  id: string;
+  task_id: string | null;
+  epic_id: string | null;
+  stage: string;
+  attempt: number;
+  status: string; // running | ok | error | timeout | cancelled
+  verdict: string | null; // PASS | NEEDS_CHANGES | BLOCKED
+  session_id: string | null;
+  started_at: number | null;
+  ended_at: number | null;
+  exit_code: number | null;
+  created_at: number;
+}
+
+/** One `agent_run` row **with** its full (capped) log — `GET /runs/{id}`. */
+export interface AgentRunDetail extends AgentRunSummary {
+  log: string;
+}
+
+/**
+ * `GET /tasks/{id}/runs` → a task's stage history, oldest first (T-512
+ * §2.5). `404` (`ApiError`) if the task does not exist. Unwraps the
+ * `{ items }` envelope — callers get the array directly, matching how
+ * `getDag`/`getBoard` already hand back their payload's real shape rather
+ * than the transport envelope.
+ */
+export function getTaskRuns(token: string, taskId: string): Promise<AgentRunSummary[]> {
+  return apiFetch<Collection<AgentRunSummary>>(
+    `/tasks/${encodeURIComponent(taskId)}/runs`,
+    token,
+  ).then((c) => c.items);
+}
+
+/**
+ * `GET /runs/{id}` → one stage's full (capped) log. `404` (`ApiError`) if
+ * unknown. Called only on demand — once per expanded pipeline row, not as
+ * part of the initial timeline hydrate.
+ */
+export function getRunLog(token: string, runId: string): Promise<AgentRunDetail> {
+  return apiFetch<AgentRunDetail>(`/runs/${encodeURIComponent(runId)}`, token);
 }
 
 /** `POST /epics/{id}/dependencies` → the created edge (201). */

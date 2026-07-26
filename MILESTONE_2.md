@@ -448,7 +448,7 @@ with `agent_error` and gets thickened in later phases.
   kanban) and `Failed` (task kanban) lanes render the new metadata; tests follow
   the existing `client/test` pattern.
 
-- [ ] **T-562 — Client: task detail pipeline view.** *deps: T-512*
+- [x] **T-562 — Client: task detail pipeline view.** *deps: T-512*
   Stage timeline for a task (implement → test ×N → commit → review round N →
   verdict), each row expandable to its `agent_run` log, hydrated from
   `GET /tasks/{id}/runs`. **AC:** stages render in order with attempt numbers,
