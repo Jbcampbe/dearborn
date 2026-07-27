@@ -6,16 +6,22 @@ import { describe, expect, it } from "vitest";
 
 import type { AgentRunSummary } from "../src/api/tasks";
 import {
+  applyPipelineFrame,
   attemptLabel,
   ELISION_MARKER,
   durationLabel,
   humanAttempt,
   hydratePipeline,
   initialPipelineState,
+  mergeHydratedLog,
+  reconcileLiveLog,
+  resetLiveTail,
   runStatusLabel,
+  runningRun,
   splitLog,
   stageLabel,
   verdictLabel,
+  type PipelineFrame,
 } from "../src/task/pipeline";
 
 function run(overrides: Partial<AgentRunSummary> = {}): AgentRunSummary {
@@ -170,5 +176,256 @@ describe("initialPipelineState / hydratePipeline", () => {
     hydratePipeline(state, "T1", [run({ id: "R2" }), run({ id: "R3" })]);
 
     expect(state.runs.map((r) => r.id)).toEqual(["R2", "R3"]);
+  });
+
+  it("starts with an empty, un-reconciled live-tail buffer", () => {
+    const state = initialPipelineState();
+    expect(state.liveLog).toBe("");
+    expect(state.liveLogReconciled).toBe(false);
+  });
+
+  it("does NOT reset liveLog -- resetLiveTail owns that (see its own doc)", () => {
+    const state = initialPipelineState();
+    state.liveLog = "buffered while the REST call was in flight";
+    hydratePipeline(state, "T1", []);
+    expect(state.liveLog).toBe("buffered while the REST call was in flight");
+  });
+});
+
+describe("runningRun", () => {
+  it("finds the one row with status running", () => {
+    const state = initialPipelineState();
+    hydratePipeline(state, "T1", [
+      run({ id: "R1", stage: "implement", status: "ok" }),
+      run({ id: "R2", stage: "test_gate", status: "running" }),
+    ]);
+    expect(runningRun(state)?.id).toBe("R2");
+  });
+
+  it("returns null when nothing is running", () => {
+    const state = initialPipelineState();
+    hydratePipeline(state, "T1", [run({ status: "ok" })]);
+    expect(runningRun(state)).toBeNull();
+  });
+});
+
+describe("mergeHydratedLog", () => {
+  it("appends in full when there is no overlap at all", () => {
+    // The joiner's hydrate response lands before some of the already-
+    // buffered live events represent genuinely NEW text -- nothing to trim.
+    expect(mergeHydratedLog("line one\n", "line two\n")).toBe("line one\nline two\n");
+  });
+
+  it("trims the overlap when the hydrated log already contains text that then arrives again live", () => {
+    // The REST snapshot's flush caught up past (or to) the point the client
+    // started buffering: "line one\nline two\n" is common to both.
+    const restLog = "line one\nline two\n";
+    const buffered = "line two\nline three\n";
+    expect(mergeHydratedLog(restLog, buffered)).toBe("line one\nline two\nline three\n");
+  });
+
+  it("contributes nothing further when the buffer is wholly contained in the rest log's tail", () => {
+    expect(mergeHydratedLog("all of it here\n", "all of it here\n")).toBe("all of it here\n");
+    expect(mergeHydratedLog("all of it here\nand more", "and more")).toBe("all of it here\nand more");
+  });
+
+  it("an empty buffer is a no-op", () => {
+    expect(mergeHydratedLog("whatever was flushed", "")).toBe("whatever was flushed");
+  });
+
+  it("an empty rest log (no flush happened yet) just takes the whole buffer", () => {
+    expect(mergeHydratedLog("", "everything streamed live")).toBe("everything streamed live");
+  });
+});
+
+describe("resetLiveTail / reconcileLiveLog", () => {
+  it("resetLiveTail clears both fields", () => {
+    const state = initialPipelineState();
+    state.liveLog = "stale from a previous task";
+    state.liveLogReconciled = true;
+    resetLiveTail(state);
+    expect(state.liveLog).toBe("");
+    expect(state.liveLogReconciled).toBe(false);
+  });
+
+  it("reconcileLiveLog merges and marks reconciled", () => {
+    const state = initialPipelineState();
+    state.liveLog = "tail two\n";
+    reconcileLiveLog(state, "tail one\ntail two\n");
+    expect(state.liveLog).toBe("tail one\ntail two\n");
+    expect(state.liveLogReconciled).toBe(true);
+  });
+});
+
+describe("applyPipelineFrame -- the hydration boundary (T-563's hard part)", () => {
+  const TOPIC = "task:T1";
+  function frame(type: string, payload: unknown): PipelineFrame {
+    return { topic: TOPIC, type, payload };
+  }
+
+  it("text frames append verbatim to liveLog", () => {
+    const state = initialPipelineState();
+    applyPipelineFrame(state, frame("text", { runId: "r1", delta: "hello " }));
+    applyPipelineFrame(state, frame("text", { runId: "r1", delta: "world" }));
+    expect(state.liveLog).toBe("hello world");
+  });
+
+  it("error frames append the same `[error] ...` shape AgentStageOutcome::absorb writes server-side", () => {
+    const state = initialPipelineState();
+    applyPipelineFrame(state, frame("text", { runId: "r1", delta: "partial output" }));
+    applyPipelineFrame(state, frame("error", { message: "boom" }));
+    expect(state.liveLog).toBe("partial output\n[error] boom\n");
+  });
+
+  it("ignores thinking/tool/session/etc -- only Text/Error are part of agent_run.log", () => {
+    const state = initialPipelineState();
+    applyPipelineFrame(state, frame("thinking", { runId: "r1", delta: "pondering" }));
+    applyPipelineFrame(state, frame("tool_start", { runId: "r1", toolCallId: "c1", name: "bash" }));
+    applyPipelineFrame(state, frame("started", { runId: "r1" }));
+    applyPipelineFrame(state, frame("subscribed", {}));
+    expect(state.liveLog).toBe("");
+  });
+
+  it("a joiner whose hydrate lands before some buffered live events sees all of it, no gap", () => {
+    // Subscribe-first ordering: frames folded into `liveLog` BEFORE the REST
+    // hydrate resolves must survive the merge in full when they're new text.
+    const state = initialPipelineState();
+    resetLiveTail(state);
+    // Buffered while `GET /tasks/{id}/runs` + `GET /runs/{id}` were in flight:
+    applyPipelineFrame(state, frame("text", { runId: "r1", delta: "chunk A" }));
+    applyPipelineFrame(state, frame("text", { runId: "r1", delta: "chunk B" }));
+
+    hydratePipeline(state, "T1", [run({ id: "R1", stage: "test_gate", status: "running" })]);
+    // The REST snapshot's last flush predates both buffered chunks entirely.
+    reconcileLiveLog(state, "earlier flushed text\n");
+
+    expect(state.liveLog).toBe("earlier flushed text\nchunk Achunk B");
+  });
+
+  it("a joiner whose hydrate already contains text that then arrives again live does not duplicate it", () => {
+    const state = initialPipelineState();
+    resetLiveTail(state);
+    // The flush that produced the REST snapshot caught up past the client's
+    // subscribe point, so these two deltas are ALSO present in restLog.
+    applyPipelineFrame(state, frame("text", { runId: "r1", delta: "chunk A" }));
+    applyPipelineFrame(state, frame("text", { runId: "r1", delta: "chunk B" }));
+
+    hydratePipeline(state, "T1", [run({ id: "R1", stage: "test_gate", status: "running" })]);
+    reconcileLiveLog(state, "earlier flushed text\nchunk Achunk B");
+
+    // Not duplicated -- "chunk Achunk B" appears exactly once.
+    expect(state.liveLog).toBe("earlier flushed text\nchunk Achunk B");
+    expect(state.liveLog.split("chunk Achunk B")).toHaveLength(2);
+  });
+
+  it("frames received AFTER reconciliation simply keep appending (past the boundary, no more merging)", () => {
+    const state = initialPipelineState();
+    hydratePipeline(state, "T1", [run({ id: "R1", stage: "test_gate", status: "running" })]);
+    reconcileLiveLog(state, "flushed so far\n");
+    applyPipelineFrame(state, frame("text", { runId: "r1", delta: "brand new live text" }));
+    expect(state.liveLog).toBe("flushed so far\nbrand new live text");
+  });
+});
+
+describe("applyPipelineFrame -- stage_changed advances the timeline", () => {
+  const TOPIC = "task:T1";
+  function frame(type: string, payload: unknown): PipelineFrame {
+    return { topic: TOPIC, type, payload };
+  }
+
+  it("updates an existing row's status/verdict in place", () => {
+    const state = initialPipelineState();
+    hydratePipeline(state, "T1", [run({ id: "R1", stage: "review", attempt: 0, status: "running" })]);
+
+    applyPipelineFrame(
+      state,
+      frame("stage_changed", {
+        task_id: "T1",
+        stage: "review",
+        attempt: 0,
+        status: "ok",
+        verdict: "NEEDS_CHANGES",
+      }),
+    );
+
+    expect(state.runs).toHaveLength(1);
+    expect(state.runs[0].status).toBe("ok");
+    expect(state.runs[0].verdict).toBe("NEEDS_CHANGES");
+  });
+
+  it("resets the live-tail buffer when the row it closed out was the one being tailed", () => {
+    const state = initialPipelineState();
+    hydratePipeline(state, "T1", [run({ id: "R1", stage: "review", attempt: 0, status: "running" })]);
+    applyPipelineFrame(state, frame("text", { runId: "r1", delta: "reviewing..." }));
+    expect(state.liveLog).toBe("reviewing...");
+
+    applyPipelineFrame(
+      state,
+      frame("stage_changed", { task_id: "T1", stage: "review", attempt: 0, status: "ok", verdict: "PASS" }),
+    );
+
+    expect(state.liveLog).toBe("");
+    expect(state.liveLogReconciled).toBe(false);
+  });
+
+  it("inserts a synthesized row for a stage this client's hydrate never saw, rather than dropping it", () => {
+    // E.g. a review round that both started and finished between this
+    // client's one-time hydrate and now.
+    const state = initialPipelineState();
+    hydratePipeline(state, "T1", [run({ id: "R1", stage: "implement", status: "ok" })]);
+
+    applyPipelineFrame(
+      state,
+      frame("stage_changed", {
+        task_id: "T1",
+        stage: "verify_complete",
+        attempt: 0,
+        status: "ok",
+        verdict: "PASS",
+      }),
+    );
+
+    expect(state.runs).toHaveLength(2);
+    const inserted = state.runs[1];
+    expect(inserted.stage).toBe("verify_complete");
+    expect(inserted.attempt).toBe(0);
+    expect(inserted.status).toBe("ok");
+    expect(inserted.verdict).toBe("PASS");
+    expect(inserted.task_id).toBe("T1");
+  });
+
+  it("does not reset liveLog when the closed-out row was not the one running (defensive)", () => {
+    const state = initialPipelineState();
+    hydratePipeline(state, "T1", [
+      run({ id: "R1", stage: "review", attempt: 0, status: "ok", verdict: "NEEDS_CHANGES" }),
+      run({ id: "R2", stage: "test_gate", attempt: 1, status: "running" }),
+    ]);
+    applyPipelineFrame(state, frame("text", { runId: "r1", delta: "still testing" }));
+
+    // A late/duplicate stage_changed for the ALREADY-closed review row.
+    applyPipelineFrame(
+      state,
+      frame("stage_changed", {
+        task_id: "T1",
+        stage: "review",
+        attempt: 0,
+        status: "ok",
+        verdict: "NEEDS_CHANGES",
+      }),
+    );
+
+    expect(state.liveLog).toBe("still testing");
+  });
+
+  it("ignores a malformed stage_changed payload rather than throwing", () => {
+    const state = initialPipelineState();
+    hydratePipeline(state, "T1", [run({ id: "R1" })]);
+    const before = JSON.stringify(state);
+
+    applyPipelineFrame(state, frame("stage_changed", null));
+    applyPipelineFrame(state, frame("stage_changed", {}));
+    applyPipelineFrame(state, frame("stage_changed", { stage: "review" }));
+
+    expect(JSON.stringify(state)).toBe(before);
   });
 });

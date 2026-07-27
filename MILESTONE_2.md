@@ -455,7 +455,7 @@ with `agent_error` and gets thickened in later phases.
   status, duration, and verdict; logs are readable including the elision marker;
   a task with no runs renders an empty state, not an error.
 
-- [ ] **T-563 — Client: live tail.** *deps: T-562*
+- [x] **T-563 — Client: live tail.** *deps: T-562*
   Subscribe `task:<id>` on detail open, unsubscribe on close; append streamed
   `RunEvent` text to the running stage; `stage_changed` advances the timeline.
   **AC:** opening a task mid-run hydrates from REST and then follows live with

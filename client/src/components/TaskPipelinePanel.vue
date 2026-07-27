@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, reactive, ref, watch } from "vue";
+import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 
 import { useAuthStore } from "../stores/auth";
 import { ApiError } from "../api/client";
@@ -9,16 +9,20 @@ import {
   durationLabel,
   hydratePipeline,
   initialPipelineState,
+  reconcileLiveLog,
+  resetLiveTail,
   runStatusLabel,
+  runningRun,
   splitLog,
   stageLabel,
   verdictLabel,
   type PipelineState,
 } from "../task/pipeline";
+import { usePipelineStream, type PipelineStream, type StreamStatus } from "../task/usePipelineStream";
 import AppIcon from "./AppIcon.vue";
 import StatusIcon from "./StatusIcon.vue";
 
-// T-562: the task detail pipeline view — a stage timeline for one task
+// T-562/T-563: the task detail pipeline view — a stage timeline for one task
 // (implement → test ×N → commit → review round N → verdict), hydrated from
 // `GET /tasks/{id}/runs` (cheap: no `log`). Each row expands to its full
 // `agent_run` log via a separate, on-demand `GET /runs/{id}` call — the two-
@@ -26,20 +30,30 @@ import StatusIcon from "./StatusIcon.vue";
 // task's stages can each carry up to 256KB of transcript; a timeline view
 // shouldn't download all of them just to render the list).
 //
-// This component is intentionally REST-only: it loads once on mount and
-// never re-fetches or subscribes to anything live. `src/task/pipeline.ts`'s
-// doc comment names the seam T-563 fills in (subscribing `task:<id>`,
-// appending streamed `RunEvent` text to the running stage, folding
-// `stage_changed` into the matching row) — nothing here anticipates that;
-// the parent (`TaskModal.vue`) simply unmounts this component when its tab
-// isn't active, which is exactly the mount/unmount boundary T-563's
-// subscribe-on-open/unsubscribe-on-close will hang off of.
+// T-563 adds the live tail: `load()` now subscribes to `task:<id>`
+// (`usePipelineStream`) BEFORE issuing either REST call, then (if a row is
+// `running`) fetches that one row's current log and reconciles it against
+// whatever streamed in during the round trip (`reconcileLiveLog`) — see
+// `src/task/pipeline.ts`'s header comment for why that ordering and that
+// merge are what make "no gap or duplication" true, and
+// `src/task/usePipelineStream.ts`'s header for why it deliberately does NOT
+// follow `DagEditorView.vue`'s hydrate-then-subscribe order. The parent
+// (`TaskModal.vue`) mounts this component only while its tab is active
+// (`v-if`, keyed by task id) — `onBeforeUnmount` below is what actually tears
+// the subscription down when the tab switches or the modal closes (mirroring
+// `DagEditorView.vue`'s own `onBeforeUnmount(() => stream?.close())`, since
+// `useXStream`'s automatic `onScopeDispose` only fires when the composable is
+// constructed synchronously inside setup — here it's constructed inside an
+// async `load()`, after an `await`, where no effect scope is current).
 const props = defineProps<{ taskId: string }>();
 
 const auth = useAuthStore();
 const state = reactive<PipelineState>(initialPipelineState());
 const loading = ref(true);
 const error = ref<string | null>(null);
+const streamStatus = ref<StreamStatus>("connecting");
+let stream: PipelineStream | null = null;
+onBeforeUnmount(() => stream?.close());
 
 /** The one expanded row's id, or `null` when every row is collapsed. */
 const expandedId = ref<string | null>(null);
@@ -51,9 +65,26 @@ const logError = reactive(new Map<string, string>());
 const expandedDetail = computed<AgentRunDetail | null>(() =>
   expandedId.value !== null ? logCache.get(expandedId.value) ?? null : null,
 );
-const expandedSegments = computed(() =>
-  expandedDetail.value !== null ? splitLog(expandedDetail.value.log) : null,
-);
+/** The row `state.liveLog` belongs to, or `null` if nothing is running. */
+const runningRunId = computed(() => runningRun(state)?.id ?? null);
+/**
+ * The expanded row's log text: the live-tailed buffer while it's the running
+ * row (growing in real time, no `getRunLog` re-fetch needed — `load()`
+ * already seeded it once via `reconcileLiveLog`), otherwise whatever
+ * `toggle()` fetched into `logCache`. Once a row goes terminal (`stage_changed`
+ * or a fresh hydrate), it stops being `runningRunId` and this falls back to
+ * the ordinary on-demand fetch path unchanged from T-562.
+ */
+const expandedLog = computed<string | null>(() => {
+  if (expandedId.value === null) {
+    return null;
+  }
+  if (expandedId.value === runningRunId.value) {
+    return state.liveLog;
+  }
+  return expandedDetail.value?.log ?? null;
+});
+const expandedSegments = computed(() => (expandedLog.value !== null ? splitLog(expandedLog.value) : null));
 
 function bounceIfAuth(err: unknown): boolean {
   if (err instanceof ApiError && err.isAuth) {
@@ -74,9 +105,39 @@ async function load() {
   logCache.clear();
   logLoading.clear();
   logError.clear();
+
+  // Subscribe FIRST (T-563): `resetLiveTail` starts a clean buffer for this
+  // task, then `usePipelineStream` opens the socket and starts folding every
+  // `text`/`error`/`stage_changed` frame into `state` immediately — including
+  // any that arrive during the two REST calls below. Doing this before either
+  // `await` is what rules out the "subscribe after hydrate" gap; see
+  // `src/task/pipeline.ts`'s header for the full rationale.
+  stream?.close();
+  resetLiveTail(state);
+  stream = usePipelineStream(props.taskId, token, state, streamStatus);
+
   try {
     const runs = await getTaskRuns(token, props.taskId);
     hydratePipeline(state, props.taskId, runs);
+    const running = runningRun(state);
+    if (running !== null) {
+      // The one row a "live tail" needs a REST snapshot for -- `AgentRunSummary`
+      // (above) never carries `log`. Reconcile whatever streamed in during
+      // this call against the snapshot (`reconcileLiveLog`), then auto-expand
+      // it so the running stage's output is visible without a click.
+      expandedId.value = running.id;
+      try {
+        const detail = await getRunLog(token, running.id);
+        reconcileLiveLog(state, detail.log);
+      } catch (err) {
+        // Best-effort: the live tail still renders from the buffered text
+        // alone (`state.liveLog`, un-reconciled) -- just not proven gap-free
+        // from the stage's own start. Auth still bounces; anything else is
+        // silent (a banner here would compete with the main `error` banner
+        // for a fetch that succeeded).
+        bounceIfAuth(err);
+      }
+    }
   } catch (err) {
     if (bounceIfAuth(err)) {
       return;
@@ -93,6 +154,12 @@ async function toggle(run: AgentRunSummary) {
     return;
   }
   expandedId.value = run.id;
+  // The running row is already live-tailed via `state.liveLog` (seeded and
+  // kept current by `load()`/`applyPipelineFrame`) -- no fetch needed, and
+  // re-fetching here would just be a stale snapshot `expandedLog` ignores.
+  if (run.id === runningRunId.value) {
+    return;
+  }
   if (logCache.has(run.id) || logLoading.has(run.id)) {
     return;
   }
