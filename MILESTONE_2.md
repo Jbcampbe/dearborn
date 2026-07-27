@@ -463,7 +463,7 @@ with `agent_error` and gets thickened in later phases.
   closing the view unsubscribes; the project board does **not** receive the
   token firehose.
 
-- [ ] **T-564 — Documentation.** *deps: T-561, T-562, T-563*
+- [x] **T-564 — Documentation.** *deps: T-561, T-562, T-563*
   **AC:** `CONVENTIONS.md` documents §2.5/§2.6; README documents §2.7, the
   executor's operational model (leases, workspaces, recovery), and the `git` +
   `claude` host prerequisites; `ARCHITECTURE.md` §7 amended with the extended

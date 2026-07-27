@@ -359,9 +359,9 @@ behavior D10 already gives `agent_error`.
 > the real per-task implement walk, T-514 push + PR + `Completed`). The
 > WS/HTTP contract shapes named below (`dag_updated`, `epic_updated`,
 > `board_updated`, the lane `POST` itself) are unchanged; only what drives
-> them changed. A full write-up of the executor's operational model (leases,
-> workspaces, recovery) is MILESTONE_2 T-564's job; see `MILESTONE_2.md` in
-> the meantime for the authoritative design.
+> them changed. The full write-up of the executor's operational model
+> (leases, workspaces, recovery) lives in the [README](../README.md#executor-operational-model)
+> (T-564); this file stays scoped to the HTTP/WS contract.
 
 Moving an epic **Ready → In Progress** via `POST /epics/{id}/lane` does more
 than set `epic.status='InProgress'`: it writes the queue/lease shape from §2.3

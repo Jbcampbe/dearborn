@@ -13,6 +13,7 @@ dist/
 *.db
 *.db-shm
 *.db-wal
+*.db-journal
 *.sqlite
 
 # Env / secrets

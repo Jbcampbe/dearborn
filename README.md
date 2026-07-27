@@ -31,6 +31,24 @@ is documented in [`dearborn-server/CONVENTIONS.md`](./dearborn-server/CONVENTION
   - `cargo install just`
   - `brew install just`
 
+The above are build/dev-time only. The **executor** (Milestone 2) additionally
+shells out to two binaries that must be on the host's `PATH` at *run* time —
+neither is a Cargo/npm dependency, so `cargo build`/`npm install` succeed
+without them, but every epic and standalone-task run will fail immediately
+without them:
+
+- **`git`** — every workspace operation (canonical clone/refresh, per-epic and
+  per-task clone, commit, push) shells out to the system `git`, the same way
+  the T-103 canonical-clone path already does.
+- **`claude`** (the Claude Code CLI) — every agent stage (`implement`, `fix`,
+  `review`, `verify_complete`, `summarize`) runs it headless via the
+  [`agent-harness`](https://github.com/getlatentic/agent-harness) crate's
+  Claude adapter (`claude -p --permission-mode ...`). It must be logged in (or
+  `ANTHROPIC_API_KEY` set in the server's environment) — real agent stages
+  spend real tokens. `just test` never invokes it (see
+  [Testing](#testing)); `dearborn-server/tests/worker_live.rs` is the
+  `#[ignore]`d proof that exercises the real binary on demand.
+
 ## Getting started
 
 Install client dependencies once:
@@ -105,8 +123,15 @@ a `401` clears the token and returns to the entry screen with an auth error.
 ## Testing
 
 ```bash
-just test      # == cargo test  (the whole-repo gate)
+just test      # cargo test  +  cd client && npm test — the whole-repo gate
 ```
+
+Both suites are fully **hermetic** — no network, no real `claude`, no GitHub —
+so the gate runs anywhere without credentials. The two exceptions are
+deliberate, `#[ignore]`d, and excluded from `just test`/`cargo test` by
+default: `dearborn-server/tests/mcp_live.rs` (T-203) and
+`dearborn-server/tests/worker_live.rs` (T-515), each documenting its own `cargo
+test -- --ignored` run command for exercising the real path on demand.
 
 ## Building
 
@@ -144,6 +169,141 @@ The server **fails fast at boot** with a clear error (non-zero exit) if
 variables above are best-effort: an invalid or unparseable value falls back to
 its default with a logged warning rather than failing boot (see
 `dearborn-server/src/config.rs`).
+
+## Executor operational model
+
+The executor (Milestone 2) is a leased worker pool that claims an `In
+Progress` epic or a `Todo` standalone task and drives it through
+`implement → test-gate → commit → review+verdict → fix-loop → close`, opening
+one PR at the end. This section is the plain-language write-up of how that
+actually runs; `MILESTONE_2.md` §1–§8 has the full design history and
+`dearborn-server/CONVENTIONS.md` has the exact HTTP/WS contract.
+
+### Worker pool, leases, and claiming
+
+`DEARBORN_WORKER_CONCURRENCY` long-lived worker loops start at boot (default
+`2`), each with a stable identity used as its lease owner. An idle loop waits
+on an in-process notify with `DEARBORN_POLL_INTERVAL_MS` as a fallback timeout
+(the safety net for a wakeup that lands in the small window between a claim
+attempt and re-entering the wait); a successful claim skips the wait entirely
+and tries to claim again immediately, so a burst of enqueued work drains as
+fast as workers are free rather than one item per poll tick.
+
+A claim is one atomic `UPDATE ... RETURNING`, tried against epics first (any
+`InProgress` epic with no live lease) and, only if none is claimable,
+standalone tasks (any `Todo`, parentless task) as a fallback — so a flood of
+standalone work can never starve an epic. SQLite/libSQL's single-writer
+serialization **is** the mutual-exclusion lock; there is no separate
+application-level mutex. Once claimed, a **heartbeat** renews the lease every
+`DEARBORN_HEARTBEAT_SECS` with a fenced write (`WHERE lease_owner = ?`) — if
+another worker's claim has already stolen the row, the fenced write affects
+zero rows, which is the sole signal the heartbeat needs to know its own lease
+is gone; it stops renewing and the pipeline body abandons the item at its next
+check, making no further writes.
+
+A lease's expiry (`DEARBORN_LEASE_TTL_SECS`, default `300`s) is purely
+**implicit** — there is no background reaper task scanning for and clearing
+expired leases. The claim predicate itself (`lease_expires_at < now`) is what
+makes an expired lease reclaimable; the next claim attempt against that row
+simply succeeds. Because Dearborn assumes a single server process, every
+lease on `epic` and `task` is unconditionally cleared at **boot**, so a
+restart resumes in-flight work on the very first poll/notify instead of
+waiting out however much of the TTL happened to elapse. A dead worker's
+`InProgress` task (abandoned mid-flight, never finished) is reset to `Todo` as
+part of the next successful claim on its epic, so the DAG walk picks it back
+up rather than leaving it stuck.
+
+### Workspaces
+
+Every project has a canonical, read-only checkout at
+`<DEARBORN_CLONE_ROOT>/<project id>` (T-103), kept in sync with origin. An
+**epic workspace** is a full local `git clone` of that canonical checkout at
+`<DEARBORN_CLONE_ROOT>/epics/<epic id>`, with its origin repointed at the
+real remote (no token ever written to disk) and checked out on the epic's own
+branch (`dearborn/<slug(epic.title)>-<last 6 of epic id>`). A **standalone
+task** gets the identical treatment at `<DEARBORN_CLONE_ROOT>/tasks/<task
+id>`, on its own branch (`dearborn/task-<slug(task.title)>-<last 6 of task
+id>`). A real clone (not a `git worktree`) is deliberate: worktrees share
+their parent's `.git` and ref locks, which is exactly the kind of collision
+two concurrent epics (or an epic and the canonical checkout's own refresh)
+would otherwise hit; a clone gives each workspace its own `.git`, at the cost
+of a one-time local object-store copy per epic/task. Every provision first
+refreshes the shared canonical checkout under a **per-project lock**, so two
+workers provisioning in the same project never interleave their `git reset
+--hard`/`fetch` calls against the one shared mirror.
+
+A workspace **persists across re-claims** — a worker restart, a lease theft,
+or a retry — rather than being deleted and recreated. Re-provisioning an
+existing workspace **re-attaches** instead of re-cloning: `git reset --hard
+HEAD` + `git clean -fd` drop only whatever uncommitted mess the previous
+attempt left behind, while every real commit already on the branch survives.
+`setup_cmd` re-runs on every provision, including a re-attach — it is
+documented (MILESTONE_1 §5) as idempotent by contract, and re-running it is
+cheap next to trying to durably track "has setup already run here" across a
+restart.
+
+A workspace is **deleted** once its PR has actually opened (the epic reaches
+`Completed`, or the standalone task's own PR opens) — there is nothing left
+worth keeping on disk at that point. It is **retained** on every other exit
+path: `Blocked`, `Cancelled`, `Failed`, or a lost lease — so a human (or a
+subsequent retry) can inspect exactly what the last attempt left behind,
+including any uncommitted, in-progress diff a failed task never got to
+commit.
+
+### Recovery: retry, re-attach, re-run
+
+A structured failure (§2.3's reason set) sets the task `Failed` and, for an
+epic-scoped task, its epic `Blocked` — both carrying the identical reason
+string — releases the lease, retains the workspace, and (best-effort) pushes
+whatever is already committed on the branch so a human can `git clone`/`fetch`
+and triage locally without VPS access. The failure is scoped to that one
+epic or task; the same worker loop immediately claims its next item.
+
+`POST /tasks/{id}/retry` is the one-shot recovery transition, and it differs
+by shape:
+
+- An **epic-scoped** task retries `Failed → Todo`, and — iff its epic is
+  currently `Blocked` — the epic also moves `Blocked → InProgress`, clearing
+  `blocked_reason` and its lease. There are two rows to restore here (the
+  claimable item, the epic, and the unit of work, the task) and the endpoint
+  restores each.
+- A **standalone** task retries `Failed → InProgress` directly, **not**
+  `Todo` — the worker's claim query only ever selects `status = 'InProgress'
+  AND epic_id IS NULL` for a standalone task, so a task left in `Todo` would
+  never be picked up by anything. Unlike the epic case, a standalone task is
+  one row playing both roles (claimable item and unit of work), so restoring
+  its claimability *is* resetting its work.
+
+Either way, once a worker re-claims, provisioning re-attaches the retained
+workspace exactly as described above, which is what actually drops the failed
+attempt's dirty tree before the pipeline re-enters at the now-runnable task.
+Editing the spec first via `PATCH /tasks/{id}` needs no special support: the
+next `implement`/`fix` stage simply re-renders whatever `description`/
+`acceptance` are on the row at claim time, so an edited spec reaches the
+re-run for free.
+
+### Cancellation
+
+Cancelling is a **kill**, not a status flag a slow worker eventually notices.
+The server holds a live run handle for whatever agent stage is currently
+executing, keyed by epic id, in an in-process registry populated for the
+duration of exactly one agent stage (`implement`/`fix`/`review`/
+`verify_complete`/`summarize` — a non-agent stage like `setup`/`test_gate`/
+`commit`/`push` has no process to kill). `POST /epics/{id}/lane` with `{
+status: "Cancelled" }` against an `InProgress` epic sets the epic `Cancelled`
+and then looks the epic up in that registry, killing whatever it finds —
+best-effort and fire-and-forget; the HTTP response never waits on the process
+actually exiting. The worker's own stage-boundary check is the backstop for
+the (rare) case where nothing was in the registry to kill — between tasks, or
+during a non-agent stage. Once the kill is observed, the in-flight task
+resets to `Todo` (not `Failed` — a cancellation isn't a failure, the work is
+resumable), the lease releases, and the workspace is retained exactly as it
+is on any other stop path. No PR is ever opened on a cancelled epic.
+
+**There is deliberately no cancellation surface for a standalone task** — no
+`POST /tasks/{id}/cancel` exists. Cancellation today is issued only through
+the epic lane endpoint above; a standalone task in flight can only be waited
+out or, once it fails, recovered via `retry`.
 
 ## Canonical read-only clone (T-103)
 

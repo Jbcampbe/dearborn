@@ -73,11 +73,22 @@ implement → [test gate: Dearborn runs tests, fix-loop ≤N] → commit
 ## 7. Failure & human-in-the-loop
 - Failure is **epic-scoped, not fatal.** Task → **`Failed`** with a structured
   reason; epic → **`Blocked`** (new status) carrying the same reason; worker
-  continues on other epics. No PR. The reason set (MILESTONE_2 §2.3) is the
-  original four — `test_gate_exhausted | review_not_converged | blocked |
-  agent_error` — plus the conditions ralph-v2 handled by `die`ing, which
-  Dearborn must name rather than abort on: `preflight_red | setup_failed |
-  workspace_error | timeout | cancelled | pr_failed`.
+  continues on other epics. No PR. The reason set (MILESTONE_2 §2.3), as
+  actually shipped, is ten values: `preflight_red | setup_failed |
+  workspace_error | test_gate_exhausted | review_not_converged | blocked |
+  agent_error | timeout | cancelled | pr_failed`. This section's original four
+  — `test_gate_exhausted | review_not_converged | blocked | agent_error` — are
+  **preserved unchanged**; the other six are the conditions ralph-v2 handled by
+  `die`ing, which Dearborn instead names and routes through the identical
+  `Blocked`/`Failed` path rather than aborting on: `preflight_red` (a red tree
+  before any task ran), `setup_failed`/`workspace_error` (provisioning never
+  got far enough to blame a task), `timeout` (T-543's per-stage wall clock,
+  routed as an ordinary agent-stage failure — a stage that ran too long is a
+  failure of that attempt, not a signal to stop), `cancelled` (named in the
+  vocabulary for a human-initiated stop, though in practice no path routes a
+  cancellation through this same failure router — see the Cancel bullet
+  below), and `pr_failed` (push or PR-open itself failed after everything else
+  succeeded).
 - A failed task **halts its epic immediately** rather than continuing on
   independent DAG branches: a half-built epic with a hole in it yields a
   PR-shaped branch nobody can review, and later slices would be reviewed against
@@ -88,13 +99,22 @@ implement → [test gate: Dearborn runs tests, fix-loop ≤N] → commit
 - Preserve evidence: **per-stage logs + the agent session id per task** (also
   satisfies VISION §2 "tasks track the agent session that implemented them").
 - **v1 recovery actions: Retry task + Cancel epic.** Retry is one atomic
-  transition (`POST /tasks/{id}/retry`: task `Failed → Todo` + epic `Blocked →
-  InProgress` + lease clear + notify). Edit-spec-then-retry needs no new
-  surface — `PATCH /tasks/{id}` already edits the spec, so the client issues
-  the two calls back-to-back.
+  transition (`POST /tasks/{id}/retry`), but the transition it performs
+  depends on what kind of task it is: an **epic-scoped** task retries
+  `Failed → Todo` + epic `Blocked → InProgress` + lease clear + notify, exactly
+  as originally designed. A **standalone** task (no epic) instead retries
+  `Failed → InProgress` directly — not `Todo` — because the worker's claim
+  query only ever selects `InProgress` standalone tasks, so a standalone task
+  is both the claimable item and the unit of work at once; restoring its
+  claimability *is* resetting its work. Edit-spec-then-retry needs no new
+  surface either way — `PATCH /tasks/{id}` already edits the spec, so the
+  client issues the two calls back-to-back.
 - **Cancel is a kill, not a stage-boundary flag:** an in-process registry holds
   the live `RunHandle`, so `InProgress → Cancelled` terminates the agent in
-  seconds instead of after a 30-minute stage.
+  seconds instead of after a 30-minute stage. This exists only at the **epic**
+  level (`POST /epics/{id}/lane` with `status: "Cancelled"`) — there is no
+  standalone-task-level cancel endpoint; it was deliberately left out when
+  standalone tasks landed, not an oversight.
 
 ## 8. Epic → task DAG breakdown
 - **One-shot breakdown agent** (the `to-tasks` vertical-slice / tracer-bullet
