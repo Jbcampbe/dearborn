@@ -15,9 +15,9 @@ use thiserror::Error;
 /// Default bind address when `DEARBORN_BIND` is unset.
 pub const DEFAULT_BIND: &str = "127.0.0.1:8787";
 /// Default local libSQL/SQLite database path when `DEARBORN_DB` is unset.
-pub const DEFAULT_DB_PATH: &str = "./dearborn.db";
+pub const DEFAULT_DB_PATH: &str = "~/.dearborn/dearborn.db";
 /// Default per-project clone root when `DEARBORN_CLONE_ROOT` is unset.
-pub const DEFAULT_CLONE_ROOT: &str = "./clones";
+pub const DEFAULT_CLONE_ROOT: &str = "~/.dearborn/clones";
 /// Default directory of built SPA assets when `DEARBORN_STATIC_DIR` is unset.
 /// Relative to the process working directory (the workspace root under `cargo
 /// run`). If it does not exist the server serves the API only (see `lib::app`).
