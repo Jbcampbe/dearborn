@@ -1,13 +1,17 @@
 # Dearborn Scratchpad
 
 Ideas
-- Create Dearborn task from Slack or the cli?
 - Agent that watches observability system
 - Scheduled jobs
 - secrets and .env file for agent to run locally
 - Give planning agents the ability to improve their own skills?
-- How to make merging better? Would be ideal if PRs would automatically merge that latest changes from the base branch
+- How to make merging better? Would be ideal if PRs would automatically merge that latest changes from the base branch. Agent handles fixing merge conflicts
 - How to handle iteration on the PR
+- Atachments for context during planning
+- Prototypes/Diagrams during planning
+- Tradeoffs/Architecture/Code Design
+- Multi-repo support
+- Collaboration and feedback on plans
 
 Missing Features
 - Better auth model
@@ -24,12 +28,9 @@ Missing Features
     - Set a home branch (everything will branch off of and PR into this branch)
     - Configure single PR vs. PR per task (PR chain)
 - Better DAG editor
-- Task implementation
-    - Record full session onto each task in realtime. Showing progress through the process
-- Only allow title/description edits after epic is completed
+- Mobile App
+  - TTS and STT for planning
 - Agent memory
 - Feature toggles
 - Observability
 - Incident response
-- Mobile App
-  - TTS and STT for planning
