@@ -44,7 +44,8 @@ use crate::{AppError, AppResult, AppState};
 /// (T-510+), never through this DTO. `pr_url`/`pr_number`/`blocked_reason`
 /// (M2 §2.1) *are* part of the API-facing shape: they tell the user where the
 /// epic's PR landed and, if it stalled, why.
-const EPIC_COLUMNS: &str = "id, project_id, title, description, product_context, technical_context, \
+const EPIC_COLUMNS: &str =
+    "id, project_id, title, description, product_context, technical_context, \
      status, pr_url, pr_number, blocked_reason, created_at, updated_at";
 
 /// Columns projected into a [`TranscriptMessage`] DTO, in schema (§2.2) order.
@@ -176,7 +177,9 @@ pub async fn create_epic(
     // The project must exist (FK is declared but not enforced without
     // `PRAGMA foreign_keys`; check explicitly for a clean 404).
     if !project_exists(conn, &project_id).await? {
-        return Err(AppError::NotFound(format!("project {project_id} not found")));
+        return Err(AppError::NotFound(format!(
+            "project {project_id} not found"
+        )));
     }
 
     let id = ulid::Ulid::new().to_string();
@@ -219,7 +222,9 @@ pub async fn list_epics(
 ) -> AppResult<Json<serde_json::Value>> {
     let conn = state.db.conn();
     if !project_exists(conn, &project_id).await? {
-        return Err(AppError::NotFound(format!("project {project_id} not found")));
+        return Err(AppError::NotFound(format!(
+            "project {project_id} not found"
+        )));
     }
 
     let items = list_epics_by_project(conn, &project_id).await?;
@@ -490,10 +495,7 @@ pub async fn load_transcript(
 
 /// Load an epic's planning sessions, ordered by `created_at` (product before
 /// technical). The internal `harness_session_id` is not projected.
-pub async fn load_sessions(
-    conn: &Connection,
-    epic_id: &str,
-) -> AppResult<Vec<PlanningSession>> {
+pub async fn load_sessions(conn: &Connection, epic_id: &str) -> AppResult<Vec<PlanningSession>> {
     let sql = format!(
         "SELECT {SESSION_COLUMNS} FROM planning_session WHERE epic_id = ?1 \
          ORDER BY created_at ASC, phase ASC"
@@ -612,7 +614,10 @@ pub(crate) async fn get_epic_project_id(
     epic_id: &str,
 ) -> AppResult<Option<String>> {
     let mut rows = conn
-        .query("SELECT project_id FROM epic WHERE id = ?1", params![epic_id])
+        .query(
+            "SELECT project_id FROM epic WHERE id = ?1",
+            params![epic_id],
+        )
         .await?;
     match rows.next().await? {
         Some(row) => Ok(Some(row.get::<String>(0)?)),
@@ -891,7 +896,10 @@ mod tests {
         .unwrap();
 
         let epic = fetch_epic(conn, &id).await.unwrap().expect("epic exists");
-        assert_eq!(epic.pr_url.as_deref(), Some("https://github.com/acme/demo/pull/42"));
+        assert_eq!(
+            epic.pr_url.as_deref(),
+            Some("https://github.com/acme/demo/pull/42")
+        );
         assert_eq!(epic.pr_number, Some(42));
         assert_eq!(epic.blocked_reason.as_deref(), Some("test_gate_exhausted"));
 
@@ -905,7 +913,10 @@ mod tests {
         assert_eq!(body["pr_url"], "https://github.com/acme/demo/pull/42");
         assert_eq!(body["pr_number"], 42);
         assert_eq!(body["blocked_reason"], "test_gate_exhausted");
-        assert!(body.get("lease_owner").is_none(), "lease_owner must not be exposed");
+        assert!(
+            body.get("lease_owner").is_none(),
+            "lease_owner must not be exposed"
+        );
         assert!(
             body.get("lease_expires_at").is_none(),
             "lease_expires_at must not be exposed"
@@ -1097,7 +1108,10 @@ mod tests {
             .unwrap();
         assert_eq!(created.status(), StatusCode::CREATED);
         let epic = body_json(created).await;
-        assert_eq!(epic["description"], "Short blurb.", "description is trimmed");
+        assert_eq!(
+            epic["description"], "Short blurb.",
+            "description is trimmed"
+        );
 
         // Omitted or blank descriptions store NULL.
         let blank = app
@@ -1177,11 +1191,7 @@ mod tests {
 
         // Unknown epic -> 404.
         let missing = app
-            .oneshot(req(
-                "PATCH",
-                "/epics/nope",
-                Some(json!({ "title": "x" })),
-            ))
+            .oneshot(req("PATCH", "/epics/nope", Some(json!({ "title": "x" }))))
             .await
             .unwrap();
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
@@ -1221,7 +1231,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(transcript.status(), StatusCode::OK);
-        let items = body_json(transcript).await["items"].as_array().unwrap().clone();
+        let items = body_json(transcript).await["items"]
+            .as_array()
+            .unwrap()
+            .clone();
         assert_eq!(items.len(), N as usize);
         for (idx, item) in items.iter().enumerate() {
             assert_eq!(item["seq"].as_i64().unwrap(), idx as i64 + 1);
@@ -1261,7 +1274,10 @@ mod tests {
         }
         seqs.sort_unstable();
         let expected: Vec<i64> = (1..=N as i64).collect();
-        assert_eq!(seqs, expected, "seqs must be a contiguous 1..N with no dupes");
+        assert_eq!(
+            seqs, expected,
+            "seqs must be a contiguous 1..N with no dupes"
+        );
     }
 
     #[tokio::test]
@@ -1388,7 +1404,10 @@ mod tests {
                 .await
                 .unwrap();
             let row = rows.next().await.unwrap().unwrap();
-            assert_eq!(row.get::<Option<String>>(0).unwrap().as_deref(), Some("sess-abc"));
+            assert_eq!(
+                row.get::<Option<String>>(0).unwrap().as_deref(),
+                Some("sess-abc")
+            );
         }
 
         for suffix in ["", "-shm", "-wal"] {

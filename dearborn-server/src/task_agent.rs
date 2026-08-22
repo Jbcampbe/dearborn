@@ -276,9 +276,7 @@ impl Stage {
         match self {
             Stage::Implement | Stage::Fix => Some(RunMode::Edit),
             Stage::Review | Stage::VerifyComplete | Stage::Summarize => Some(RunMode::Ask),
-            Stage::Setup | Stage::Preflight | Stage::TestGate | Stage::Commit | Stage::Push => {
-                None
-            }
+            Stage::Setup | Stage::Preflight | Stage::TestGate | Stage::Commit | Stage::Push => None,
         }
     }
 
@@ -287,7 +285,10 @@ impl Stage {
     /// section). Exactly the `Ask`-mode agent trio — `Implement`/`Fix` need
     /// their edit tools; non-agent stages never reach this at all.
     pub fn denies_edit_tools(self) -> bool {
-        matches!(self, Stage::Review | Stage::VerifyComplete | Stage::Summarize)
+        matches!(
+            self,
+            Stage::Review | Stage::VerifyComplete | Stage::Summarize
+        )
     }
 }
 
@@ -840,7 +841,7 @@ pub async fn run_agent_stage(
     let flush_handle = tokio::spawn(async move {
         let mut interval = tokio::time::interval(PARTIAL_FLUSH_INTERVAL);
         interval.tick().await; // first tick fires immediately; skip so the
-                                // first *real* flush is ~PARTIAL_FLUSH_INTERVAL in.
+                               // first *real* flush is ~PARTIAL_FLUSH_INTERVAL in.
         loop {
             interval.tick().await;
             let snapshot = flush_shared
@@ -1126,7 +1127,8 @@ pub(crate) mod testing {
     /// any scripted files) → \[optional gate\] → Exited, and records every
     /// request it received.
     pub struct ScriptedTaskAgent {
-        scripts: Mutex<std::collections::HashMap<&'static str, std::collections::VecDeque<ScriptedRun>>>,
+        scripts:
+            Mutex<std::collections::HashMap<&'static str, std::collections::VecDeque<ScriptedRun>>>,
         recorded: Arc<Mutex<Vec<RecordedTaskRun>>>,
         gate: Option<Arc<Gate>>,
         /// T-543: when `Some`, `gate` (above) only pins a run whose
@@ -1198,7 +1200,10 @@ pub(crate) mod testing {
     }
 
     impl TaskAgent for ScriptedTaskAgent {
-        fn run(&self, req: TaskRunRequest) -> Result<(RunHandle, Receiver<RunEvent>), HarnessError> {
+        fn run(
+            &self,
+            req: TaskRunRequest,
+        ) -> Result<(RunHandle, Receiver<RunEvent>), HarnessError> {
             self.recorded.lock().unwrap().push(RecordedTaskRun {
                 run_id: req.run_id.clone(),
                 stage: req.stage,
@@ -1335,7 +1340,10 @@ mod tests {
     fn implement_and_fix_get_no_disallowed_tools_flag() {
         for stage in [Stage::Implement, Stage::Fix] {
             let args = build_extra_args(stage);
-            assert!(!args.iter().any(|a| a == "--disallowedTools"), "{stage:?}: {args:?}");
+            assert!(
+                !args.iter().any(|a| a == "--disallowedTools"),
+                "{stage:?}: {args:?}"
+            );
         }
     }
 
@@ -1395,7 +1403,10 @@ mod tests {
 
         assert!(!handle.was_cancelled(), "not cancelled yet");
         handle.cancel().unwrap();
-        assert!(handle.was_cancelled(), "cancel() must be observable on the returned handle");
+        assert!(
+            handle.was_cancelled(),
+            "cancel() must be observable on the returned handle"
+        );
 
         // Drain to completion so the thread doesn't outlive the test.
         for _ in rx {}
@@ -1431,16 +1442,24 @@ mod tests {
                 break;
             }
         }
-        assert!(saw_text, "must observe streamed output before the gate blocks completion");
+        assert!(
+            saw_text,
+            "must observe streamed output before the gate blocks completion"
+        );
 
         handle.cancel().unwrap();
         assert!(handle.was_cancelled());
         gate.release();
 
-        let exited = rx.into_iter().find(|e| matches!(e, RunEvent::Exited { .. }));
+        let exited = rx
+            .into_iter()
+            .find(|e| matches!(e, RunEvent::Exited { .. }));
         match exited {
             Some(RunEvent::Exited { cancelled, .. }) => {
-                assert!(cancelled, "Exited must report cancelled: true after handle.cancel()")
+                assert!(
+                    cancelled,
+                    "Exited must report cancelled: true after handle.cancel()"
+                )
             }
             other => panic!("expected an Exited event, got {other:?}"),
         }
@@ -1556,7 +1575,8 @@ mod tests {
 
         let sub = state.hub.subscribe("task:task-1");
 
-        let dir = std::env::temp_dir().join(format!("dearborn-run-agent-stage-{}", ulid::Ulid::new()));
+        let dir =
+            std::env::temp_dir().join(format!("dearborn-run-agent-stage-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&dir).unwrap();
 
         let outcome = run_agent_stage(
@@ -1596,12 +1616,18 @@ mod tests {
         let row = rows.next().await.unwrap().expect("a row was written");
         assert_eq!(row.get::<String>(0).unwrap(), "implement");
         assert_eq!(row.get::<String>(1).unwrap(), "ok");
-        assert_eq!(row.get::<Option<String>>(2).unwrap().as_deref(), Some("sess-42"));
+        assert_eq!(
+            row.get::<Option<String>>(2).unwrap().as_deref(),
+            Some("sess-42")
+        );
         assert_eq!(row.get::<String>(3).unwrap(), "Hello, world");
         assert_eq!(row.get::<Option<i64>>(4).unwrap(), Some(0));
         assert_eq!(row.get::<i64>(5).unwrap(), 1);
         assert_eq!(row.get::<String>(6).unwrap(), "task-1");
-        assert_eq!(row.get::<Option<String>>(7).unwrap().as_deref(), Some("epic-1"));
+        assert_eq!(
+            row.get::<Option<String>>(7).unwrap().as_deref(),
+            Some("epic-1")
+        );
 
         // Every RunEvent relayed live on `task:<id>` using the planning
         // ws_type mapping, ending in `exited`.
@@ -1651,7 +1677,10 @@ mod tests {
         let mut rows = state
             .db
             .conn()
-            .query("SELECT status, log FROM agent_run WHERE task_id = 'task-1'", ())
+            .query(
+                "SELECT status, log FROM agent_run WHERE task_id = 'task-1'",
+                (),
+            )
             .await
             .unwrap();
         let row = rows.next().await.unwrap().expect("row still written");
@@ -1685,7 +1714,8 @@ mod tests {
         let gate = Arc::new(Gate::default());
         let agent: Arc<dyn TaskAgent> = Arc::new(ScriptedTaskAgent::new().with_gate(gate.clone()));
 
-        let dir = std::env::temp_dir().join(format!("dearborn-cancel-registry-{}", ulid::Ulid::new()));
+        let dir =
+            std::env::temp_dir().join(format!("dearborn-cancel-registry-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&dir).unwrap();
 
         let run = {
@@ -1729,8 +1759,14 @@ mod tests {
 
         {
             let registry = state.cancel_registry.lock().unwrap();
-            assert_eq!(registry.len(), 1, "exactly one entry for the one in-flight stage");
-            let handle = registry.get("epic-1").expect("keyed by epic_id, not task_id");
+            assert_eq!(
+                registry.len(),
+                1,
+                "exactly one entry for the one in-flight stage"
+            );
+            let handle = registry
+                .get("epic-1")
+                .expect("keyed by epic_id, not task_id");
             assert!(!handle.was_cancelled(), "not cancelled yet");
             handle.cancel().unwrap();
             assert!(
@@ -1740,8 +1776,14 @@ mod tests {
         }
 
         gate.release();
-        let outcome = run.await.unwrap().expect("scripted stage must still close its row");
-        assert!(outcome.cancelled, "Exited must report cancelled: true after the registry cancel()");
+        let outcome = run
+            .await
+            .unwrap()
+            .expect("scripted stage must still close its row");
+        assert!(
+            outcome.cancelled,
+            "Exited must report cancelled: true after the registry cancel()"
+        );
         assert_eq!(outcome.status(), "cancelled");
 
         assert!(
@@ -1763,7 +1805,8 @@ mod tests {
         let gate = Arc::new(Gate::default());
         let agent: Arc<dyn TaskAgent> = Arc::new(ScriptedTaskAgent::new().with_gate(gate.clone()));
 
-        let dir = std::env::temp_dir().join(format!("dearborn-cancel-registry-{}", ulid::Ulid::new()));
+        let dir =
+            std::env::temp_dir().join(format!("dearborn-cancel-registry-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&dir).unwrap();
 
         let run = {
@@ -1803,7 +1846,9 @@ mod tests {
         }
 
         gate.release();
-        run.await.unwrap().expect("scripted stage must still close its row");
+        run.await
+            .unwrap()
+            .expect("scripted stage must still close its row");
         assert!(state.cancel_registry.lock().unwrap().is_empty());
         std::fs::remove_dir_all(&dir).ok();
     }
@@ -1863,8 +1908,14 @@ mod tests {
         )
         .expect("a deadline-killed stage still returns Ok with a terminal outcome");
 
-        assert!(outcome.timed_out, "AgentStageOutcome::timed_out must be set");
-        assert!(outcome.cancelled, "the deadline kill is a cancel too — same RunControl::cancel()");
+        assert!(
+            outcome.timed_out,
+            "AgentStageOutcome::timed_out must be set"
+        );
+        assert!(
+            outcome.cancelled,
+            "the deadline kill is a cancel too — same RunControl::cancel()"
+        );
         assert_eq!(outcome.status(), "timeout");
 
         // The row closed status='timeout' (not 'cancelled', not 'error') with
@@ -1872,7 +1923,10 @@ mod tests {
         let mut rows = state
             .db
             .conn()
-            .query("SELECT status, log FROM agent_run WHERE task_id = 'task-1'", ())
+            .query(
+                "SELECT status, log FROM agent_run WHERE task_id = 'task-1'",
+                (),
+            )
             .await
             .unwrap();
         let row = rows.next().await.unwrap().expect("a row was written");
@@ -1980,7 +2034,8 @@ mod tests {
         let gate = Arc::new(Gate::default());
         let agent = ScriptedTaskAgent::new().with_gate_on(Stage::Review, gate.clone());
 
-        let dir = std::env::temp_dir().join(format!("dearborn-timeout-review-{}", ulid::Ulid::new()));
+        let dir =
+            std::env::temp_dir().join(format!("dearborn-timeout-review-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&dir).unwrap();
 
         // Stage::Implement is not pinned by this agent's gate (`gate_stage`
@@ -2031,7 +2086,10 @@ mod tests {
         .expect("must return well within the test's own bound — Review's gate is never released")
         .expect("a deadline-killed stage still returns Ok with a terminal outcome");
 
-        assert!(review_outcome.timed_out, "Stage::Review must time out exactly like Stage::Implement does");
+        assert!(
+            review_outcome.timed_out,
+            "Stage::Review must time out exactly like Stage::Implement does"
+        );
         assert!(review_outcome.cancelled);
         assert_eq!(review_outcome.status(), "timeout");
 

@@ -87,7 +87,9 @@ pub async fn create_task(
 ) -> AppResult<Task> {
     let title = title.trim();
     if title.is_empty() {
-        return Err(AppError::BadRequest("`title` must not be empty".to_string()));
+        return Err(AppError::BadRequest(
+            "`title` must not be empty".to_string(),
+        ));
     }
 
     let id = ulid::Ulid::new().to_string();
@@ -133,7 +135,9 @@ pub async fn create_standalone_task(
 ) -> AppResult<Task> {
     let title = title.trim();
     if title.is_empty() {
-        return Err(AppError::BadRequest("`title` must not be empty".to_string()));
+        return Err(AppError::BadRequest(
+            "`title` must not be empty".to_string(),
+        ));
     }
 
     let id = ulid::Ulid::new().to_string();
@@ -347,7 +351,9 @@ pub async fn update_task(
     if let Some(title) = title {
         let title = title.trim().to_string();
         if title.is_empty() {
-            return Err(AppError::BadRequest("`title` must not be empty".to_string()));
+            return Err(AppError::BadRequest(
+                "`title` must not be empty".to_string(),
+            ));
         }
         assignments.push("title = ?");
         values.push(libsql::Value::Text(title));
@@ -536,9 +542,14 @@ pub async fn create_epic_task(
     let epic = fetch_epic(conn, &id)
         .await?
         .ok_or_else(|| AppError::NotFound(format!("epic {id} not found")))?;
-    let title = req.title.as_deref().map(str::trim).filter(|s| !s.is_empty()).ok_or_else(|| {
-        AppError::BadRequest("`title` is required and must not be empty".to_string())
-    })?;
+    let title = req
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            AppError::BadRequest("`title` is required and must not be empty".to_string())
+        })?;
 
     let task = create_task(
         conn,
@@ -583,9 +594,14 @@ pub async fn create_project_task(
     if !project_exists(conn, &id).await? {
         return Err(AppError::NotFound(format!("project {id} not found")));
     }
-    let title = req.title.as_deref().map(str::trim).filter(|s| !s.is_empty()).ok_or_else(|| {
-        AppError::BadRequest("`title` is required and must not be empty".to_string())
-    })?;
+    let title = req
+        .title
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            AppError::BadRequest("`title` is required and must not be empty".to_string())
+        })?;
 
     let task = create_standalone_task(
         conn,
@@ -902,12 +918,18 @@ pub async fn post_dependency(
     if !epic_exists(conn, &id).await? {
         return Err(AppError::NotFound(format!("epic {id} not found")));
     }
-    let blocker_id = req.blocker_id.as_deref().map(str::trim).filter(|s| !s.is_empty()).ok_or_else(|| {
-        AppError::BadRequest("`blocker_id` is required".to_string())
-    })?;
-    let blocked_id = req.blocked_id.as_deref().map(str::trim).filter(|s| !s.is_empty()).ok_or_else(|| {
-        AppError::BadRequest("`blocked_id` is required".to_string())
-    })?;
+    let blocker_id = req
+        .blocker_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::BadRequest("`blocker_id` is required".to_string()))?;
+    let blocked_id = req
+        .blocked_id
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::BadRequest("`blocked_id` is required".to_string()))?;
 
     // Both endpoints must belong to the path epic (not merely the same epic).
     for tid in [blocker_id, blocked_id] {
@@ -1082,9 +1104,16 @@ mod tests {
         let (db, project_id, epic_id) = seed().await;
         let conn = db.conn();
 
-        let a = create_task(conn, &epic_id, &project_id, "First", Some("does X"), Some("X works"))
-            .await
-            .unwrap();
+        let a = create_task(
+            conn,
+            &epic_id,
+            &project_id,
+            "First",
+            Some("does X"),
+            Some("X works"),
+        )
+        .await
+        .unwrap();
         assert_eq!(a.title, "First");
         assert_eq!(a.description.as_deref(), Some("does X"));
         assert_eq!(a.acceptance.as_deref(), Some("X works"));
@@ -1120,8 +1149,12 @@ mod tests {
     async fn link_dependency_stores_edge_and_lists_it() {
         let (db, project_id, epic_id) = seed().await;
         let conn = db.conn();
-        let a = create_task(conn, &epic_id, &project_id, "A", None, None).await.unwrap();
-        let b = create_task(conn, &epic_id, &project_id, "B", None, None).await.unwrap();
+        let a = create_task(conn, &epic_id, &project_id, "A", None, None)
+            .await
+            .unwrap();
+        let b = create_task(conn, &epic_id, &project_id, "B", None, None)
+            .await
+            .unwrap();
 
         link_dependency(conn, &a.id, &b.id).await.unwrap();
         // Duplicate link is a no-op (idempotent).
@@ -1134,14 +1167,19 @@ mod tests {
 
         // Unlink removes it.
         unlink_dependency(conn, &a.id, &b.id).await.unwrap();
-        assert!(list_dependencies_for_epic(conn, &epic_id).await.unwrap().is_empty());
+        assert!(list_dependencies_for_epic(conn, &epic_id)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
     async fn link_dependency_rejects_self_edge() {
         let (db, project_id, epic_id) = seed().await;
         let conn = db.conn();
-        let a = create_task(conn, &epic_id, &project_id, "A", None, None).await.unwrap();
+        let a = create_task(conn, &epic_id, &project_id, "A", None, None)
+            .await
+            .unwrap();
         let err = link_dependency(conn, &a.id, &a.id).await.unwrap_err();
         assert!(matches!(err, AppError::BadRequest(_)));
     }
@@ -1159,19 +1197,30 @@ mod tests {
         )
         .await
         .unwrap();
-        let a = create_task(conn, &epic_id, &project_id, "A", None, None).await.unwrap();
-        let x = create_task(conn, &other_epic, &project_id, "X", None, None).await.unwrap();
+        let a = create_task(conn, &epic_id, &project_id, "A", None, None)
+            .await
+            .unwrap();
+        let x = create_task(conn, &other_epic, &project_id, "X", None, None)
+            .await
+            .unwrap();
 
         let err = link_dependency(conn, &a.id, &x.id).await.unwrap_err();
-        assert!(matches!(err, AppError::BadRequest(_)), "cross-epic link rejected");
+        assert!(
+            matches!(err, AppError::BadRequest(_)),
+            "cross-epic link rejected"
+        );
     }
 
     #[tokio::test]
     async fn link_dependency_rejects_missing_task() {
         let (db, project_id, epic_id) = seed().await;
         let conn = db.conn();
-        let a = create_task(conn, &epic_id, &project_id, "A", None, None).await.unwrap();
-        let err = link_dependency(conn, &a.id, "does-not-exist").await.unwrap_err();
+        let a = create_task(conn, &epic_id, &project_id, "A", None, None)
+            .await
+            .unwrap();
+        let err = link_dependency(conn, &a.id, "does-not-exist")
+            .await
+            .unwrap_err();
         assert!(matches!(err, AppError::NotFound(_)));
     }
 
@@ -1179,9 +1228,15 @@ mod tests {
     async fn link_dependency_rejects_cycles() {
         let (db, project_id, epic_id) = seed().await;
         let conn = db.conn();
-        let a = create_task(conn, &epic_id, &project_id, "A", None, None).await.unwrap();
-        let b = create_task(conn, &epic_id, &project_id, "B", None, None).await.unwrap();
-        let c = create_task(conn, &epic_id, &project_id, "C", None, None).await.unwrap();
+        let a = create_task(conn, &epic_id, &project_id, "A", None, None)
+            .await
+            .unwrap();
+        let b = create_task(conn, &epic_id, &project_id, "B", None, None)
+            .await
+            .unwrap();
+        let c = create_task(conn, &epic_id, &project_id, "C", None, None)
+            .await
+            .unwrap();
 
         // A -> B -> C is a valid chain.
         link_dependency(conn, &a.id, &b.id).await.unwrap();
@@ -1189,7 +1244,10 @@ mod tests {
 
         // C -> A would close the loop A->B->C->A: rejected as a conflict.
         let err = link_dependency(conn, &c.id, &a.id).await.unwrap_err();
-        assert!(matches!(err, AppError::Conflict(_)), "cycle must be rejected, got {err:?}");
+        assert!(
+            matches!(err, AppError::Conflict(_)),
+            "cycle must be rejected, got {err:?}"
+        );
 
         // The rejected edge was not persisted.
         let edges = list_dependencies_for_epic(conn, &epic_id).await.unwrap();
@@ -1200,9 +1258,13 @@ mod tests {
     async fn task_belongs_to_epic_is_accurate() {
         let (db, project_id, epic_id) = seed().await;
         let conn = db.conn();
-        let a = create_task(conn, &epic_id, &project_id, "A", None, None).await.unwrap();
+        let a = create_task(conn, &epic_id, &project_id, "A", None, None)
+            .await
+            .unwrap();
         assert!(task_belongs_to_epic(conn, &a.id, &epic_id).await.unwrap());
-        assert!(!task_belongs_to_epic(conn, &a.id, "other-epic").await.unwrap());
+        assert!(!task_belongs_to_epic(conn, &a.id, "other-epic")
+            .await
+            .unwrap());
         assert!(!task_belongs_to_epic(conn, "nope", &epic_id).await.unwrap());
     }
 
@@ -1284,9 +1346,15 @@ mod tests {
         let conn = db.conn();
 
         // A (Todo, no blockers) -> B (Todo, blocked by A) -> C (Todo, blocked by B).
-        let a = create_task(conn, &epic_id, &project_id, "A", None, None).await.unwrap();
-        let b = create_task(conn, &epic_id, &project_id, "B", None, None).await.unwrap();
-        let c = create_task(conn, &epic_id, &project_id, "C", None, None).await.unwrap();
+        let a = create_task(conn, &epic_id, &project_id, "A", None, None)
+            .await
+            .unwrap();
+        let b = create_task(conn, &epic_id, &project_id, "B", None, None)
+            .await
+            .unwrap();
+        let c = create_task(conn, &epic_id, &project_id, "C", None, None)
+            .await
+            .unwrap();
         link_dependency(conn, &a.id, &b.id).await.unwrap();
         link_dependency(conn, &b.id, &c.id).await.unwrap();
 
@@ -1310,15 +1378,25 @@ mod tests {
         let node = |id: &str| dag.nodes.iter().find(|n| n.task.id == id).unwrap();
         assert!(!node(&a.id).ready, "A is Done -> not ready");
         assert!(node(&a.id).blocked_by.is_empty());
-        assert!(node(&b.id).ready, "B: Todo + only blocker A is Done -> ready");
+        assert!(
+            node(&b.id).ready,
+            "B: Todo + only blocker A is Done -> ready"
+        );
         assert!(node(&b.id).blocked_by.is_empty());
         assert!(!node(&c.id).ready, "C still blocked by B (Todo)");
         assert_eq!(node(&c.id).blocked_by, vec![b.id.clone()]);
 
         // Mark B InProgress -> C stays blocked (B not Done), and B is not ready.
-        update_task(conn, &b.id, None, None, None, Some("InProgress".to_string()))
-            .await
-            .unwrap();
+        update_task(
+            conn,
+            &b.id,
+            None,
+            None,
+            None,
+            Some("InProgress".to_string()),
+        )
+        .await
+        .unwrap();
         let dag = compute_dag(conn, &epic_id).await.unwrap();
         let node = |id: &str| dag.nodes.iter().find(|n| n.task.id == id).unwrap();
         assert!(!node(&b.id).ready, "B InProgress -> not ready");
@@ -1330,7 +1408,9 @@ mod tests {
     async fn get_dag_endpoint_returns_readiness_and_404s_for_unknown_epic() {
         let (state, app, _p, epic_id) = seed_app().await;
         let conn = state.db.conn();
-        create_task(conn, &epic_id, &_p, "A", None, None).await.unwrap();
+        create_task(conn, &epic_id, &_p, "A", None, None)
+            .await
+            .unwrap();
 
         let response = app
             .clone()
@@ -1358,7 +1438,9 @@ mod tests {
         let (state, app, _p, epic_id) = seed_app().await;
         let conn = state.db.conn();
         // A pre-existing task the new one will block.
-        let b = create_task(conn, &epic_id, &_p, "B", None, None).await.unwrap();
+        let b = create_task(conn, &epic_id, &_p, "B", None, None)
+            .await
+            .unwrap();
 
         let mut sub = state.hub.subscribe(&format!("epic:{epic_id}"));
 
@@ -1367,7 +1449,9 @@ mod tests {
             .oneshot(req(
                 "POST",
                 &format!("/epics/{epic_id}/tasks"),
-                Some(json!({"title":"A","description":"slice","acceptance":"works","blocks":[b.id]})),
+                Some(
+                    json!({"title":"A","description":"slice","acceptance":"works","blocks":[b.id]}),
+                ),
             ))
             .await
             .unwrap();
@@ -1389,7 +1473,11 @@ mod tests {
         // Missing title -> 400; unknown epic -> 404.
         let bad = app
             .clone()
-            .oneshot(req("POST", &format!("/epics/{epic_id}/tasks"), Some(json!({"title":"  "}))))
+            .oneshot(req(
+                "POST",
+                &format!("/epics/{epic_id}/tasks"),
+                Some(json!({"title":"  "})),
+            ))
             .await
             .unwrap();
         assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
@@ -1428,7 +1516,11 @@ mod tests {
         // Invalid status -> 400.
         let bad = app
             .clone()
-            .oneshot(req("PATCH", &format!("/tasks/{}", a.id), Some(json!({"status":"Weird"}))))
+            .oneshot(req(
+                "PATCH",
+                &format!("/tasks/{}", a.id),
+                Some(json!({"status":"Weird"})),
+            ))
             .await
             .unwrap();
         assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
@@ -1481,8 +1573,12 @@ mod tests {
     async fn remove_task_deletes_and_cleans_its_edges() {
         let (state, app, _p, epic_id) = seed_app().await;
         let conn = state.db.conn();
-        let a = create_task(conn, &epic_id, &_p, "A", None, None).await.unwrap();
-        let b = create_task(conn, &epic_id, &_p, "B", None, None).await.unwrap();
+        let a = create_task(conn, &epic_id, &_p, "A", None, None)
+            .await
+            .unwrap();
+        let b = create_task(conn, &epic_id, &_p, "B", None, None)
+            .await
+            .unwrap();
         link_dependency(conn, &a.id, &b.id).await.unwrap();
 
         let mut sub = state.hub.subscribe(&format!("epic:{epic_id}"));
@@ -1496,7 +1592,10 @@ mod tests {
 
         // The task and its edge are both gone.
         assert!(fetch_task(conn, &a.id).await.unwrap().is_none());
-        assert!(list_dependencies_for_epic(conn, &epic_id).await.unwrap().is_empty());
+        assert!(list_dependencies_for_epic(conn, &epic_id)
+            .await
+            .unwrap()
+            .is_empty());
 
         // A dag_updated frame fired.
         let frame = sub.recv().await.unwrap();
@@ -1515,9 +1614,15 @@ mod tests {
     async fn post_dependency_links_and_rejects_cycles_and_cross_epic() {
         let (state, app, _p, epic_id) = seed_app().await;
         let conn = state.db.conn();
-        let a = create_task(conn, &epic_id, &_p, "A", None, None).await.unwrap();
-        let b = create_task(conn, &epic_id, &_p, "B", None, None).await.unwrap();
-        let c = create_task(conn, &epic_id, &_p, "C", None, None).await.unwrap();
+        let a = create_task(conn, &epic_id, &_p, "A", None, None)
+            .await
+            .unwrap();
+        let b = create_task(conn, &epic_id, &_p, "B", None, None)
+            .await
+            .unwrap();
+        let c = create_task(conn, &epic_id, &_p, "C", None, None)
+            .await
+            .unwrap();
 
         // A -> B and B -> C are valid.
         for (blocker, blocked) in [(a.id.clone(), b.id.clone()), (b.id.clone(), c.id.clone())] {
@@ -1588,25 +1693,39 @@ mod tests {
     async fn remove_dependency_unlinks_and_404s_for_unknown_epic() {
         let (state, app, _p, epic_id) = seed_app().await;
         let conn = state.db.conn();
-        let a = create_task(conn, &epic_id, &_p, "A", None, None).await.unwrap();
-        let b = create_task(conn, &epic_id, &_p, "B", None, None).await.unwrap();
+        let a = create_task(conn, &epic_id, &_p, "A", None, None)
+            .await
+            .unwrap();
+        let b = create_task(conn, &epic_id, &_p, "B", None, None)
+            .await
+            .unwrap();
         link_dependency(conn, &a.id, &b.id).await.unwrap();
 
         let response = app
             .clone()
             .oneshot(req(
                 "DELETE",
-                &format!("/epics/{epic_id}/dependencies?blocker_id={}&blocked_id={}", a.id, b.id),
+                &format!(
+                    "/epics/{epic_id}/dependencies?blocker_id={}&blocked_id={}",
+                    a.id, b.id
+                ),
                 None,
             ))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
-        assert!(list_dependencies_for_epic(conn, &epic_id).await.unwrap().is_empty());
+        assert!(list_dependencies_for_epic(conn, &epic_id)
+            .await
+            .unwrap()
+            .is_empty());
 
         // Unknown epic -> 404.
         let missing = app
-            .oneshot(req("DELETE", "/epics/nope/dependencies?blocker_id=x&blocked_id=y", None))
+            .oneshot(req(
+                "DELETE",
+                "/epics/nope/dependencies?blocker_id=x&blocked_id=y",
+                None,
+            ))
             .await
             .unwrap();
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
@@ -1649,10 +1768,19 @@ mod tests {
         .unwrap();
 
         let fetched = fetch_task(conn, &t.id).await.unwrap().expect("task exists");
-        assert_eq!(fetched.branch_name.as_deref(), Some("dearborn/task-small-fix-abc123"));
-        assert_eq!(fetched.pr_url.as_deref(), Some("https://github.com/acme/demo/pull/7"));
+        assert_eq!(
+            fetched.branch_name.as_deref(),
+            Some("dearborn/task-small-fix-abc123")
+        );
+        assert_eq!(
+            fetched.pr_url.as_deref(),
+            Some("https://github.com/acme/demo/pull/7")
+        );
         assert_eq!(fetched.pr_number, Some(7));
-        assert_eq!(fetched.failure_reason.as_deref(), Some("test_gate_exhausted"));
+        assert_eq!(
+            fetched.failure_reason.as_deref(),
+            Some("test_gate_exhausted")
+        );
 
         // Same story through the HTTP response the client actually sees.
         let response = app
@@ -1665,12 +1793,18 @@ mod tests {
         assert_eq!(body["pr_url"], "https://github.com/acme/demo/pull/7");
         assert_eq!(body["pr_number"], 7);
         assert_eq!(body["failure_reason"], "test_gate_exhausted");
-        assert!(body.get("lease_owner").is_none(), "lease_owner must not be exposed");
+        assert!(
+            body.get("lease_owner").is_none(),
+            "lease_owner must not be exposed"
+        );
         assert!(
             body.get("lease_expires_at").is_none(),
             "lease_expires_at must not be exposed"
         );
-        assert!(body.get("base_sha").is_none(), "base_sha must not be exposed");
+        assert!(
+            body.get("base_sha").is_none(),
+            "base_sha must not be exposed"
+        );
     }
 
     #[tokio::test]
@@ -1704,20 +1838,35 @@ mod tests {
     async fn link_dependency_rejects_standalone_tasks() {
         let (db, project_id, epic_id) = seed().await;
         let conn = db.conn();
-        let a = create_task(conn, &epic_id, &project_id, "A", None, None).await.unwrap();
-        let s1 = create_standalone_task(conn, &project_id, "S1", None, None).await.unwrap();
-        let s2 = create_standalone_task(conn, &project_id, "S2", None, None).await.unwrap();
+        let a = create_task(conn, &epic_id, &project_id, "A", None, None)
+            .await
+            .unwrap();
+        let s1 = create_standalone_task(conn, &project_id, "S1", None, None)
+            .await
+            .unwrap();
+        let s2 = create_standalone_task(conn, &project_id, "S2", None, None)
+            .await
+            .unwrap();
 
         // standalone <-> epic-scoped: rejected 400 (not a misleading 404).
         let err = link_dependency(conn, &s1.id, &a.id).await.unwrap_err();
-        assert!(matches!(err, AppError::BadRequest(_)), "standalone blocker rejected");
+        assert!(
+            matches!(err, AppError::BadRequest(_)),
+            "standalone blocker rejected"
+        );
         let err = link_dependency(conn, &a.id, &s1.id).await.unwrap_err();
-        assert!(matches!(err, AppError::BadRequest(_)), "standalone blocked rejected");
+        assert!(
+            matches!(err, AppError::BadRequest(_)),
+            "standalone blocked rejected"
+        );
 
         // standalone <-> standalone: also rejected (and never links across
         // projects via the NULL == NULL hole).
         let err = link_dependency(conn, &s1.id, &s2.id).await.unwrap_err();
-        assert!(matches!(err, AppError::BadRequest(_)), "standalone pair rejected");
+        assert!(
+            matches!(err, AppError::BadRequest(_)),
+            "standalone pair rejected"
+        );
     }
 
     #[tokio::test]
@@ -1751,12 +1900,20 @@ mod tests {
         // Missing title -> 400; unknown project -> 404.
         let bad = app
             .clone()
-            .oneshot(req("POST", &format!("/projects/{project_id}/tasks"), Some(json!({"title":"  "}))))
+            .oneshot(req(
+                "POST",
+                &format!("/projects/{project_id}/tasks"),
+                Some(json!({"title":"  "})),
+            ))
             .await
             .unwrap();
         assert_eq!(bad.status(), StatusCode::BAD_REQUEST);
         let missing = app
-            .oneshot(req("POST", "/projects/nope/tasks", Some(json!({"title":"X"}))))
+            .oneshot(req(
+                "POST",
+                "/projects/nope/tasks",
+                Some(json!({"title":"X"})),
+            ))
             .await
             .unwrap();
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
@@ -1957,14 +2114,20 @@ mod tests {
 
         let (status, blocked_reason, lease_owner, lease_expires_at) =
             epic_row(&state, &epic_id).await;
-        assert_eq!(status, "InProgress", "the epic must return to the In Progress lane");
+        assert_eq!(
+            status, "InProgress",
+            "the epic must return to the In Progress lane"
+        );
         assert!(blocked_reason.is_none());
         assert!(lease_owner.is_none(), "the stale lease must be cleared");
         assert!(lease_expires_at.is_none());
 
         // dag_updated then epic_updated on epic:<id> ...
         let frame = epic_sub.recv().await.unwrap();
-        assert_eq!(serde_json::from_str::<Value>(&frame).unwrap()["type"], "dag_updated");
+        assert_eq!(
+            serde_json::from_str::<Value>(&frame).unwrap()["type"],
+            "dag_updated"
+        );
         let frame = epic_sub.recv().await.unwrap();
         let v: Value = serde_json::from_str(&frame).unwrap();
         assert_eq!(v["type"], "epic_updated");
@@ -2041,6 +2204,9 @@ mod tests {
         assert_eq!(body_json(response).await["status"], "Todo");
 
         let (status, _, _, _) = epic_row(&state, &epic_id).await;
-        assert_eq!(status, "Cancelled", "a non-Blocked epic must not be resurrected by retry");
+        assert_eq!(
+            status, "Cancelled",
+            "a non-Blocked epic must not be resurrected by retry"
+        );
     }
 }

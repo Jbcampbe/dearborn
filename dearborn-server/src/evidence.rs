@@ -144,7 +144,10 @@ pub struct StageHandle {
 }
 
 /// Open a `running` row for a stage starting now.
-pub async fn open_stage(conn: &Connection, open: OpenStage<'_>) -> Result<StageHandle, libsql::Error> {
+pub async fn open_stage(
+    conn: &Connection,
+    open: OpenStage<'_>,
+) -> Result<StageHandle, libsql::Error> {
     let id = ulid::Ulid::new().to_string();
     let started_at = now_ms();
     conn.execute(
@@ -152,7 +155,14 @@ pub async fn open_stage(conn: &Connection, open: OpenStage<'_>) -> Result<StageH
          (id, task_id, epic_id, stage, session_id, log, created_at, \
           attempt, status, verdict, started_at, ended_at, exit_code) \
          VALUES (?1, ?2, ?3, ?4, NULL, '', ?5, ?6, 'running', NULL, ?5, NULL, NULL)",
-        params![id.clone(), open.task_id, open.epic_id, open.stage, started_at, open.attempt],
+        params![
+            id.clone(),
+            open.task_id,
+            open.epic_id,
+            open.stage,
+            started_at,
+            open.attempt
+        ],
     )
     .await?;
     Ok(StageHandle { id, started_at })
@@ -229,7 +239,11 @@ pub async fn close_stage(
 /// `verdict` is the exact [`crate::spec::Verdict::as_str`] token (`"PASS"` |
 /// `"NEEDS_CHANGES"` | `"BLOCKED"`), matching what `GET /tasks/{id}/runs` and
 /// the `stage_changed` WS frame both surface.
-pub async fn set_verdict(conn: &Connection, run_id: &str, verdict: &str) -> Result<(), libsql::Error> {
+pub async fn set_verdict(
+    conn: &Connection,
+    run_id: &str,
+    verdict: &str,
+) -> Result<(), libsql::Error> {
     conn.execute(
         "UPDATE agent_run SET verdict = ?1 WHERE id = ?2",
         params![verdict, run_id],
@@ -482,12 +496,19 @@ mod tests {
         assert!(log.len() > LOG_CAP_BYTES, "fixture must exceed the cap");
 
         let capped = cap_log(&log);
-        assert!(capped.len() <= LOG_CAP_BYTES, "capped log must be <= {LOG_CAP_BYTES} bytes, got {}", capped.len());
+        assert!(
+            capped.len() <= LOG_CAP_BYTES,
+            "capped log must be <= {LOG_CAP_BYTES} bytes, got {}",
+            capped.len()
+        );
         assert!(capped.starts_with("HEAD-MARKER-"), "must keep the head");
         assert!(capped.ends_with("TAIL-MARKER-"), "must keep the tail");
         assert!(capped.contains("elided"), "must contain the elision marker");
         // The huge, uninformative middle is gone.
-        assert!(!capped.contains(&"x".repeat(1000)), "the elided middle must not survive");
+        assert!(
+            !capped.contains(&"x".repeat(1000)),
+            "the elided middle must not survive"
+        );
     }
 
     #[test]
@@ -495,7 +516,10 @@ mod tests {
         // Build a log whose head/tail cut points would land mid-character if
         // sliced naively: multi-byte emoji/CJK characters positioned right
         // around where the head/tail budgets fall.
-        let budget = (LOG_CAP_BYTES - "\n\n... [dearborn: log elided — exceeded 256 KB; showing head + tail] ...\n\n".len()) / 2;
+        let budget = (LOG_CAP_BYTES
+            - "\n\n... [dearborn: log elided — exceeded 256 KB; showing head + tail] ...\n\n"
+                .len())
+            / 2;
         let mut head = "a".repeat(budget - 2);
         head.push_str("💥💥💥💥💥"); // 4-byte chars straddling the head cut
         let middle = "z".repeat(300_000);
@@ -567,9 +591,14 @@ mod tests {
         assert_eq!(row.summary.attempt, 1);
 
         // A partial flush updates the log but not the status.
-        flush_stage_log(conn, &handle, "partial output so far").await.unwrap();
+        flush_stage_log(conn, &handle, "partial output so far")
+            .await
+            .unwrap();
         let row = fetch_run_detail(conn, &handle.id).await.unwrap().unwrap();
-        assert_eq!(row.summary.status, "running", "flush must not change status");
+        assert_eq!(
+            row.summary.status, "running",
+            "flush must not change status"
+        );
         assert_eq!(row.log, "partial output so far");
 
         // Closing writes the terminal fields.
@@ -603,7 +632,12 @@ mod tests {
         let conn = db.conn();
         let handle = open_stage(
             conn,
-            OpenStage { task_id: Some("task-1"), epic_id: Some("epic-1"), stage: "review", attempt: 1 },
+            OpenStage {
+                task_id: Some("task-1"),
+                epic_id: Some("epic-1"),
+                stage: "review",
+                attempt: 1,
+            },
         )
         .await
         .unwrap();
@@ -641,7 +675,12 @@ mod tests {
         let conn = db.conn();
         let handle = open_stage(
             conn,
-            OpenStage { task_id: Some("task-1"), epic_id: Some("epic-1"), stage: "commit", attempt: 1 },
+            OpenStage {
+                task_id: Some("task-1"),
+                epic_id: Some("epic-1"),
+                stage: "commit",
+                attempt: 1,
+            },
         )
         .await
         .unwrap();
@@ -672,7 +711,12 @@ mod tests {
         let conn = db.conn();
         let handle = open_stage(
             conn,
-            OpenStage { task_id: Some("task-1"), epic_id: Some("epic-1"), stage: "test_gate", attempt: 1 },
+            OpenStage {
+                task_id: Some("task-1"),
+                epic_id: Some("epic-1"),
+                stage: "test_gate",
+                attempt: 1,
+            },
         )
         .await
         .unwrap();
@@ -684,9 +728,15 @@ mod tests {
 
         assert_eq!(result.unwrap_err(), "boom: tests failed");
         let row = fetch_run_detail(conn, &handle.id).await.unwrap().unwrap();
-        assert_eq!(row.summary.status, "error", "an Err body must still close the row");
+        assert_eq!(
+            row.summary.status, "error",
+            "an Err body must still close the row"
+        );
         assert!(row.log.contains("boom: tests failed"));
-        assert!(row.summary.ended_at.is_some(), "ended_at must be stamped even on error");
+        assert!(
+            row.summary.ended_at.is_some(),
+            "ended_at must be stamped even on error"
+        );
     }
 
     #[tokio::test]
@@ -695,7 +745,12 @@ mod tests {
         let conn = db.conn().clone();
         let handle = open_stage(
             &conn,
-            OpenStage { task_id: Some("task-1"), epic_id: Some("epic-1"), stage: "implement", attempt: 1 },
+            OpenStage {
+                task_id: Some("task-1"),
+                epic_id: Some("epic-1"),
+                stage: "implement",
+                attempt: 1,
+            },
         )
         .await
         .unwrap();
@@ -711,23 +766,35 @@ mod tests {
                     panic!("stage body exploded");
                 }
                 #[allow(unreachable_code)]
-                Ok::<((), CloseStage), String>(((), CloseStage {
-                    status: "ok",
-                    session_id: None,
-                    verdict: None,
-                    exit_code: None,
-                    log: String::new(),
-                }))
+                Ok::<((), CloseStage), String>((
+                    (),
+                    CloseStage {
+                        status: "ok",
+                        session_id: None,
+                        verdict: None,
+                        exit_code: None,
+                        log: String::new(),
+                    },
+                ))
             })
             .await
         })
         .await;
-        assert!(join.is_err(), "the panic must propagate out of guard_stage_close");
+        assert!(
+            join.is_err(),
+            "the panic must propagate out of guard_stage_close"
+        );
         assert!(join.unwrap_err().is_panic());
 
         // The row still closed instead of sticking `running`.
-        let row = fetch_run_detail(db.conn(), &handle_id).await.unwrap().unwrap();
-        assert_eq!(row.summary.status, "error", "a panicking body must still close the row");
+        let row = fetch_run_detail(db.conn(), &handle_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.summary.status, "error",
+            "a panicking body must still close the row"
+        );
         assert!(row.log.contains("stage panicked"));
         assert!(row.summary.ended_at.is_some());
     }
@@ -754,7 +821,9 @@ mod tests {
     }
 
     async fn body_json(response: axum::response::Response) -> Value {
-        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX).await.unwrap();
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
         serde_json::from_slice(&bytes).unwrap()
     }
 
@@ -775,13 +844,61 @@ mod tests {
 
         // Two rows for task-1, created in order: implement (attempt 1), then
         // fix (attempt 1). created_at ties broken by insertion order (id).
-        let a = open_stage(conn, OpenStage { task_id: Some("task-1"), epic_id: Some("epic-1"), stage: "implement", attempt: 1 }).await.unwrap();
-        close_stage(conn, &a, CloseStage { status: "ok", session_id: None, verdict: None, exit_code: Some(0), log: "impl done".to_string() }).await.unwrap();
-        let b = open_stage(conn, OpenStage { task_id: Some("task-1"), epic_id: Some("epic-1"), stage: "review", attempt: 1 }).await.unwrap();
-        close_stage(conn, &b, CloseStage { status: "ok", session_id: None, verdict: Some("PASS".to_string()), exit_code: Some(0), log: "review done".to_string() }).await.unwrap();
+        let a = open_stage(
+            conn,
+            OpenStage {
+                task_id: Some("task-1"),
+                epic_id: Some("epic-1"),
+                stage: "implement",
+                attempt: 1,
+            },
+        )
+        .await
+        .unwrap();
+        close_stage(
+            conn,
+            &a,
+            CloseStage {
+                status: "ok",
+                session_id: None,
+                verdict: None,
+                exit_code: Some(0),
+                log: "impl done".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+        let b = open_stage(
+            conn,
+            OpenStage {
+                task_id: Some("task-1"),
+                epic_id: Some("epic-1"),
+                stage: "review",
+                attempt: 1,
+            },
+        )
+        .await
+        .unwrap();
+        close_stage(
+            conn,
+            &b,
+            CloseStage {
+                status: "ok",
+                session_id: None,
+                verdict: Some("PASS".to_string()),
+                exit_code: Some(0),
+                log: "review done".to_string(),
+            },
+        )
+        .await
+        .unwrap();
 
         let app = app_over(db).await;
-        let response = app.clone().oneshot(req("GET", "/tasks/task-1/runs")).await.unwrap();
+        let response = app
+            .clone()
+            .oneshot(req("GET", "/tasks/task-1/runs"))
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_json(response).await;
         let items = body["items"].as_array().unwrap();
@@ -793,7 +910,10 @@ mod tests {
         // The list endpoint omits the full log field.
         assert!(items[0].get("log").is_none());
 
-        let missing = app.oneshot(req("GET", "/tasks/does-not-exist/runs")).await.unwrap();
+        let missing = app
+            .oneshot(req("GET", "/tasks/does-not-exist/runs"))
+            .await
+            .unwrap();
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     }
 
@@ -801,18 +921,47 @@ mod tests {
     async fn get_run_returns_the_full_log_and_404s_unknown_id() {
         let db = seeded_db().await;
         let conn = db.conn();
-        let handle = open_stage(conn, OpenStage { task_id: Some("task-1"), epic_id: Some("epic-1"), stage: "implement", attempt: 1 }).await.unwrap();
-        close_stage(conn, &handle, CloseStage { status: "ok", session_id: Some("sess-1".to_string()), verdict: None, exit_code: Some(0), log: "the full transcript".to_string() }).await.unwrap();
+        let handle = open_stage(
+            conn,
+            OpenStage {
+                task_id: Some("task-1"),
+                epic_id: Some("epic-1"),
+                stage: "implement",
+                attempt: 1,
+            },
+        )
+        .await
+        .unwrap();
+        close_stage(
+            conn,
+            &handle,
+            CloseStage {
+                status: "ok",
+                session_id: Some("sess-1".to_string()),
+                verdict: None,
+                exit_code: Some(0),
+                log: "the full transcript".to_string(),
+            },
+        )
+        .await
+        .unwrap();
 
         let run_id = handle.id.clone();
         let app = app_over(db).await;
-        let response = app.clone().oneshot(req("GET", &format!("/runs/{run_id}"))).await.unwrap();
+        let response = app
+            .clone()
+            .oneshot(req("GET", &format!("/runs/{run_id}")))
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         let body = body_json(response).await;
         assert_eq!(body["log"], "the full transcript");
         assert_eq!(body["session_id"], "sess-1");
 
-        let missing = app.oneshot(req("GET", "/runs/does-not-exist")).await.unwrap();
+        let missing = app
+            .oneshot(req("GET", "/runs/does-not-exist"))
+            .await
+            .unwrap();
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     }
 }

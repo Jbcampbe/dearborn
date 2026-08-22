@@ -301,7 +301,11 @@ async fn live_implement_writes_commits_pushes_to_bare_origin_and_opens_a_fake_pr
     //    against the right (fake) repo — proving the real push handed off to
     //    the (faked) PR step rather than the walk stopping short.
     let calls = fake_host.open_pr_calls();
-    assert_eq!(calls.len(), 1, "exactly one open_pr call for one finalized epic");
+    assert_eq!(
+        calls.len(),
+        1,
+        "exactly one open_pr call for one finalized epic"
+    );
     assert_eq!(calls[0].head, branch);
     assert_eq!(calls[0].repo_url, bare_url);
 

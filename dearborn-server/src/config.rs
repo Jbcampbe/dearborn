@@ -139,12 +139,16 @@ impl Config {
             .unwrap_or_else(|| DEFAULT_BIND.to_string());
         let token = required(&file, "DEARBORN_TOKEN")?;
         let master_key = required(&file, "DEARBORN_MASTER_KEY")?;
-        let db_path = resolve(&file, "DEARBORN_DB")
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| DEFAULT_DB_PATH.to_string());
-        let clone_root = resolve(&file, "DEARBORN_CLONE_ROOT")
-            .filter(|v| !v.is_empty())
-            .unwrap_or_else(|| DEFAULT_CLONE_ROOT.to_string());
+        let db_path = expand_tilde(
+            resolve(&file, "DEARBORN_DB")
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| DEFAULT_DB_PATH.to_string()),
+        );
+        let clone_root = expand_tilde(
+            resolve(&file, "DEARBORN_CLONE_ROOT")
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| DEFAULT_CLONE_ROOT.to_string()),
+        );
         let static_dir = resolve(&file, "DEARBORN_STATIC_DIR")
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| DEFAULT_STATIC_DIR.to_string());
@@ -247,6 +251,26 @@ where
             );
             default
         }
+    }
+}
+
+/// Expand a leading `~/` (or bare `~`) to the user's home directory.
+///
+/// `~` is a shell convention: neither the OS nor libSQL interprets it, so a
+/// literal `~/.dearborn/dearborn.db` would be opened *relative to the current
+/// directory* inside a directory actually named `~`. Only a leading tilde
+/// followed by end-of-string or `/` is expanded; `~user` forms are left as-is.
+fn expand_tilde(path: String) -> String {
+    let Some(rest) = path.strip_prefix('~') else {
+        return path;
+    };
+    // Only expand a bare `~` or `~/...`; leave `~user` and `~foo/bar` alone.
+    if !(rest.is_empty() || rest.starts_with('/')) {
+        return path;
+    }
+    match std::env::var("HOME") {
+        Ok(home) if !home.is_empty() => format!("{home}{rest}"),
+        _ => path, // no HOME: leave the path untouched
     }
 }
 
@@ -365,6 +389,33 @@ mod tests {
     fn parse_keeps_equals_in_value() {
         let map = parse_config_file("DEARBORN_MASTER_KEY=aa==bb\n");
         assert_eq!(map.get("DEARBORN_MASTER_KEY"), Some(&"aa==bb".to_string()));
+    }
+
+    #[test]
+    fn expand_tilde_expands_leading_home() {
+        // SAFETY: tests run single-threaded w.r.t. this env var; restore after.
+        let old = std::env::var("HOME").ok();
+        std::env::set_var("HOME", "/home/tester");
+
+        assert_eq!(
+            expand_tilde("~/.dearborn/dearborn.db".into()),
+            "/home/tester/.dearborn/dearborn.db"
+        );
+        assert_eq!(expand_tilde("~".into()), "/home/tester");
+        // Non-leading or `~user` forms are left untouched.
+        assert_eq!(expand_tilde("/tmp/~x".into()), "/tmp/~x");
+        assert_eq!(expand_tilde("~root/db".into()), "~root/db");
+        // No/empty HOME leaves the path as-is.
+        std::env::set_var("HOME", "");
+        assert_eq!(
+            expand_tilde("~/.dearborn/dearborn.db".into()),
+            "~/.dearborn/dearborn.db"
+        );
+
+        match old {
+            Some(v) => std::env::set_var("HOME", v),
+            None => std::env::remove_var("HOME"),
+        }
     }
 
     fn map_of(pairs: &[(&str, &str)]) -> HashMap<String, String> {

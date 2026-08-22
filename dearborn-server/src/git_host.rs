@@ -166,13 +166,19 @@ pub trait GitHost: Send + Sync {
     /// Open a PR from `req.head` against the repo's default branch, titled
     /// `req.title` with body `req.body`. Returns the opened PR's `html_url`
     /// + `number`.
-    fn open_pr<'a>(&'a self, req: OpenPrRequest<'a>) -> BoxFuture<'a, Result<OpenedPr, GitHostError>>;
+    fn open_pr<'a>(
+        &'a self,
+        req: OpenPrRequest<'a>,
+    ) -> BoxFuture<'a, Result<OpenedPr, GitHostError>>;
 
     /// A cheap validity probe for a project's `repo_url`/PAT pair (not yet
     /// wired into any endpoint — a seam for later use, e.g. validating a PAT
     /// at project-create time). `Ok(())` iff the host considers the
     /// credentials valid for this repo.
-    fn check_auth<'a>(&'a self, req: CheckAuthRequest<'a>) -> BoxFuture<'a, Result<(), GitHostError>>;
+    fn check_auth<'a>(
+        &'a self,
+        req: CheckAuthRequest<'a>,
+    ) -> BoxFuture<'a, Result<(), GitHostError>>;
 }
 
 /// Parse `owner`/`repo` out of a GitHub HTTPS URL: `https://github.com/<owner>/<repo>`,
@@ -279,7 +285,11 @@ impl GithubHost {
     /// Attach the standard GitHub API headers (`User-Agent` — GitHub rejects
     /// requests without one — and `Accept: application/vnd.github+json`) and
     /// the bearer token, if any.
-    fn authed(&self, builder: reqwest::RequestBuilder, pat: Option<&str>) -> reqwest::RequestBuilder {
+    fn authed(
+        &self,
+        builder: reqwest::RequestBuilder,
+        pat: Option<&str>,
+    ) -> reqwest::RequestBuilder {
         let builder = builder
             .header(reqwest::header::USER_AGENT, "dearborn")
             .header(reqwest::header::ACCEPT, "application/vnd.github+json");
@@ -307,7 +317,10 @@ impl GithubHost {
             let text = resp.text().await.unwrap_or_default();
             return Err(map_github_error(status.as_u16(), &text, pat));
         }
-        let value: serde_json::Value = resp.json().await.map_err(|e| redacted_reqwest_err(&e, pat))?;
+        let value: serde_json::Value = resp
+            .json()
+            .await
+            .map_err(|e| redacted_reqwest_err(&e, pat))?;
         value
             .get("default_branch")
             .and_then(|v| v.as_str())
@@ -331,7 +344,10 @@ impl GitHost for GithubHost {
         })
     }
 
-    fn open_pr<'a>(&'a self, req: OpenPrRequest<'a>) -> BoxFuture<'a, Result<OpenedPr, GitHostError>> {
+    fn open_pr<'a>(
+        &'a self,
+        req: OpenPrRequest<'a>,
+    ) -> BoxFuture<'a, Result<OpenedPr, GitHostError>> {
         Box::pin(async move {
             let (owner, repo) = parse_owner_repo(req.repo_url)?;
             let base = self.fetch_default_branch(&owner, &repo, req.pat).await?;
@@ -365,7 +381,10 @@ impl GitHost for GithubHost {
         })
     }
 
-    fn check_auth<'a>(&'a self, req: CheckAuthRequest<'a>) -> BoxFuture<'a, Result<(), GitHostError>> {
+    fn check_auth<'a>(
+        &'a self,
+        req: CheckAuthRequest<'a>,
+    ) -> BoxFuture<'a, Result<(), GitHostError>> {
         Box::pin(async move {
             let (owner, repo) = parse_owner_repo(req.repo_url)?;
             let resp = self
@@ -491,7 +510,10 @@ pub mod testing {
 
         /// Every `open_pr` call this fake has received, in order.
         pub fn open_pr_calls(&self) -> Vec<RecordedOpenPr> {
-            self.open_pr_calls.lock().expect("FakeHost mutex poisoned").clone()
+            self.open_pr_calls
+                .lock()
+                .expect("FakeHost mutex poisoned")
+                .clone()
         }
     }
 
@@ -516,7 +538,10 @@ pub mod testing {
             })
         }
 
-        fn open_pr<'a>(&'a self, req: OpenPrRequest<'a>) -> BoxFuture<'a, Result<OpenedPr, GitHostError>> {
+        fn open_pr<'a>(
+            &'a self,
+            req: OpenPrRequest<'a>,
+        ) -> BoxFuture<'a, Result<OpenedPr, GitHostError>> {
             Box::pin(async move {
                 self.open_pr_calls
                     .lock()
@@ -538,7 +563,10 @@ pub mod testing {
             })
         }
 
-        fn check_auth<'a>(&'a self, req: CheckAuthRequest<'a>) -> BoxFuture<'a, Result<(), GitHostError>> {
+        fn check_auth<'a>(
+            &'a self,
+            req: CheckAuthRequest<'a>,
+        ) -> BoxFuture<'a, Result<(), GitHostError>> {
             Box::pin(async move {
                 let _ = req;
                 if let Some(message) = &self.check_auth_failure {
@@ -579,7 +607,8 @@ mod tests {
 
     #[test]
     fn parses_owner_repo_tolerating_trailing_slash_and_dot_git() {
-        let (owner, repo) = parse_owner_repo("https://github.com/octocat/Hello-World.git/").unwrap();
+        let (owner, repo) =
+            parse_owner_repo("https://github.com/octocat/Hello-World.git/").unwrap();
         assert_eq!(owner, "octocat");
         assert_eq!(repo, "Hello-World");
     }
@@ -664,7 +693,11 @@ mod tests {
         let pat = "ghp_leakedToken123";
         let body = format!(r#"{{"message": "bad token {pat}"}}"#);
         let err = map_github_error(401, &body, Some(pat));
-        assert!(!err.message.contains(pat), "token must not survive: {}", err.message);
+        assert!(
+            !err.message.contains(pat),
+            "token must not survive: {}",
+            err.message
+        );
     }
 
     #[test]

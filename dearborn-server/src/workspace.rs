@@ -399,7 +399,14 @@ async fn provision_workspace(
 
     // 3. `setup_cmd`, if any — re-runs on re-attach too (see module doc).
     if let Some(setup_cmd) = non_empty(project.setup_cmd.as_deref()) {
-        run_setup(state, container.evidence_ids(), &workspace_path, setup_cmd, pat.as_deref()).await?;
+        run_setup(
+            state,
+            container.evidence_ids(),
+            &workspace_path,
+            setup_cmd,
+            pat.as_deref(),
+        )
+        .await?;
     }
 
     // 4. Persist the branch name — only on first provision; thereafter it is
@@ -596,7 +603,8 @@ async fn persist_container_branch_name(
     // pattern `worker::claim_row`'s doc already establishes for interpolating
     // a table name safely.
     let sql = format!("UPDATE {table} SET branch_name = ?1, updated_at = ?2 WHERE id = ?3");
-    conn.execute(&sql, params![branch_name, now_ms(), id]).await?;
+    conn.execute(&sql, params![branch_name, now_ms(), id])
+        .await?;
     Ok(())
 }
 
@@ -827,7 +835,10 @@ mod tests {
         let mut rows = state
             .db
             .conn()
-            .query("SELECT branch_name FROM epic WHERE id = ?1", params![epic_id])
+            .query(
+                "SELECT branch_name FROM epic WHERE id = ?1",
+                params![epic_id],
+            )
             .await
             .unwrap();
         rows.next().await.unwrap().unwrap().get(0).unwrap()
@@ -942,7 +953,10 @@ mod tests {
             .expect("provisioning must succeed against a local fixture");
 
         assert!(outcome.workspace_path.join(".git").exists());
-        let expected_branch = format!("dearborn/ship-the-thing-{}", &epic_id[epic_id.len() - 6..].to_lowercase());
+        let expected_branch = format!(
+            "dearborn/ship-the-thing-{}",
+            &epic_id[epic_id.len() - 6..].to_lowercase()
+        );
         assert_eq!(outcome.branch_name, expected_branch);
 
         // branch_name persisted on the epic row.
@@ -993,21 +1007,37 @@ mod tests {
         assert_eq!(second.branch_name, first.branch_name);
 
         // .git survived (re-attach, not re-clone).
-        assert!(git_marker.exists(), ".git directory must not have been recreated");
+        assert!(
+            git_marker.exists(),
+            ".git directory must not have been recreated"
+        );
 
         // Dirty tracked-file edit reverted by `reset --hard HEAD`.
         let readme = std::fs::read_to_string(first.workspace_path.join("README.md")).unwrap();
-        assert_eq!(readme, "hello\n", "tracked-file edit must be reverted on re-attach");
+        assert_eq!(
+            readme, "hello\n",
+            "tracked-file edit must be reverted on re-attach"
+        );
 
         // Untracked sentinel removed by `clean -fd`.
-        assert!(!sentinel.exists(), "untracked file must be removed on re-attach");
+        assert!(
+            !sentinel.exists(),
+            "untracked file must be removed on re-attach"
+        );
     }
 
     #[tokio::test]
     async fn missing_clone_path_is_a_workspace_error() {
         let root = TempCloneRoot::new("no-clone-path");
         let state = test_state(&root.path_str()).await;
-        let project_id = seed_project(&state, "https://example.invalid/x.git", "ready", false, None).await;
+        let project_id = seed_project(
+            &state,
+            "https://example.invalid/x.git",
+            "ready",
+            false,
+            None,
+        )
+        .await;
         let epic_id = seed_epic(&state, &project_id, "No Clone Path").await;
 
         let err = provision_epic_workspace(&state, &epic_id, &project_id)
@@ -1023,7 +1053,14 @@ mod tests {
     async fn pending_clone_status_is_a_workspace_error() {
         let root = TempCloneRoot::new("pending-clone");
         let state = test_state(&root.path_str()).await;
-        let project_id = seed_project(&state, "https://example.invalid/x.git", "pending", true, None).await;
+        let project_id = seed_project(
+            &state,
+            "https://example.invalid/x.git",
+            "pending",
+            true,
+            None,
+        )
+        .await;
         let epic_id = seed_epic(&state, &project_id, "Pending Clone").await;
 
         let err = provision_epic_workspace(&state, &epic_id, &project_id)
@@ -1053,7 +1090,10 @@ mod tests {
             ProvisionFailure::Workspace(msg) => msg,
             other => panic!("expected Workspace failure, got {other:?}"),
         };
-        assert!(!message.contains(pat), "token must not leak into the error: {message}");
+        assert!(
+            !message.contains(pat),
+            "token must not leak into the error: {message}"
+        );
         assert!(!message.contains("ghp_"));
     }
 
@@ -1074,13 +1114,23 @@ mod tests {
             .await
             .unwrap();
 
-        let ws_config = std::fs::read_to_string(outcome.workspace_path.join(".git/config")).unwrap();
-        assert!(ws_config.contains(&repo_url), "origin must point at the real remote");
-        assert!(!ws_config.contains('@'), "no userinfo/credentials belong in .git/config: {ws_config}");
+        let ws_config =
+            std::fs::read_to_string(outcome.workspace_path.join(".git/config")).unwrap();
+        assert!(
+            ws_config.contains(&repo_url),
+            "origin must point at the real remote"
+        );
+        assert!(
+            !ws_config.contains('@'),
+            "no userinfo/credentials belong in .git/config: {ws_config}"
+        );
 
         let canonical_path = Path::new(&state.config.clone_root).join(&project_id);
         let canonical_config = std::fs::read_to_string(canonical_path.join(".git/config")).unwrap();
-        assert!(!canonical_config.contains('@'), "canonical .git/config must be credential-free too");
+        assert!(
+            !canonical_config.contains('@'),
+            "canonical .git/config must be credential-free too"
+        );
     }
 
     // ---- setup_cmd -----------------------------------------------------------
@@ -1113,7 +1163,10 @@ mod tests {
 
         // The workspace is retained (never deleted) on a setup failure.
         let workspace_path = epic_workspace_path(&state.config.clone_root, &epic_id);
-        assert!(workspace_path.join(".git").exists(), "workspace must be retained on setup failure");
+        assert!(
+            workspace_path.join(".git").exists(),
+            "workspace must be retained on setup failure"
+        );
 
         // Evidence landed in agent_run.
         let mut rows = state
@@ -1125,7 +1178,11 @@ mod tests {
             )
             .await
             .unwrap();
-        let row = rows.next().await.unwrap().expect("an agent_run row for setup");
+        let row = rows
+            .next()
+            .await
+            .unwrap()
+            .expect("an agent_run row for setup");
         assert_eq!(row.get::<String>(0).unwrap(), "setup");
         assert_eq!(row.get::<String>(1).unwrap(), "error");
         assert_eq!(row.get::<Option<i64>>(2).unwrap(), Some(3));
@@ -1161,7 +1218,11 @@ mod tests {
             )
             .await
             .unwrap();
-        let row = rows.next().await.unwrap().expect("an agent_run row for setup");
+        let row = rows
+            .next()
+            .await
+            .unwrap()
+            .expect("an agent_run row for setup");
         assert_eq!(row.get::<String>(0).unwrap(), "ok");
         assert_eq!(row.get::<Option<i64>>(1).unwrap(), Some(0));
     }
@@ -1177,7 +1238,14 @@ mod tests {
         let root = TempCloneRoot::new("setup-redact");
         let state = test_state(&root.path_str()).await;
         // `agent_run.epic_id` is a foreign key — seed a real project + epic.
-        let project_id = seed_project(&state, "https://example.invalid/x.git", "ready", false, None).await;
+        let project_id = seed_project(
+            &state,
+            "https://example.invalid/x.git",
+            "ready",
+            false,
+            None,
+        )
+        .await;
         let epic_id = seed_epic(&state, &project_id, "Redact Me").await;
         let workspace = root.dir.join("standalone-setup-dir");
         std::fs::create_dir_all(&workspace).unwrap();
@@ -1185,15 +1253,24 @@ mod tests {
         let pat = "s3cr3t-pat-value";
         let setup_cmd = format!("echo {pat} && exit 1");
 
-        let err = run_setup(&state, (Some(&epic_id), None), &workspace, &setup_cmd, Some(pat))
-            .await
-            .expect_err("exit 1 must surface as a Setup failure");
+        let err = run_setup(
+            &state,
+            (Some(&epic_id), None),
+            &workspace,
+            &setup_cmd,
+            Some(pat),
+        )
+        .await
+        .expect_err("exit 1 must surface as a Setup failure");
         let (message, exit_code) = match err {
             ProvisionFailure::Setup { message, exit_code } => (message, exit_code),
             other => panic!("expected Setup failure, got {other:?}"),
         };
         assert_eq!(exit_code, Some(1));
-        assert!(!message.contains(pat), "PAT must not appear in the returned message: {message}");
+        assert!(
+            !message.contains(pat),
+            "PAT must not appear in the returned message: {message}"
+        );
 
         let mut rows = state
             .db
@@ -1205,7 +1282,13 @@ mod tests {
             .await
             .unwrap();
         let log: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
-        assert!(!log.contains(pat), "PAT must not appear in the stored evidence log: {log}");
-        assert!(log.contains("***"), "redaction marker expected in place of the token: {log}");
+        assert!(
+            !log.contains(pat),
+            "PAT must not appear in the stored evidence log: {log}"
+        );
+        assert!(
+            log.contains("***"),
+            "redaction marker expected in place of the token: {log}"
+        );
     }
 }

@@ -348,7 +348,12 @@ fn spawn_clone(state: AppState, id: String, repo_url: String, pat: Option<String
 /// Write the terminal clone/refresh state to the row and publish a
 /// `project:<id>` `clone_status` WS event. `GitError` messages are already
 /// redacted of any token, so they are safe to store and log.
-async fn record_clone_outcome(state: &AppState, id: &str, dest: &FsPath, result: Result<(), GitError>) {
+async fn record_clone_outcome(
+    state: &AppState,
+    id: &str,
+    dest: &FsPath,
+    result: Result<(), GitError>,
+) {
     let (status, clone_error) = match &result {
         Ok(()) => ("ready", None),
         Err(err) => ("error", Some(err.message.clone())),
@@ -448,7 +453,10 @@ pub(crate) async fn load_decrypted_pat(state: &AppState, id: &str) -> AppResult<
     let mut rows = state
         .db
         .conn()
-        .query("SELECT pat_encrypted FROM project WHERE id = ?1", params![id])
+        .query(
+            "SELECT pat_encrypted FROM project WHERE id = ?1",
+            params![id],
+        )
         .await?;
     let row = rows.next().await?.ok_or_else(|| not_found(id))?;
     let blob: Option<Vec<u8>> = row.get(0)?;
@@ -832,7 +840,10 @@ mod tests {
         let mut rows = state
             .db
             .conn()
-            .query("SELECT pat_encrypted FROM project WHERE id = ?1", params![id.clone()])
+            .query(
+                "SELECT pat_encrypted FROM project WHERE id = ?1",
+                params![id.clone()],
+            )
             .await
             .unwrap();
         let row = rows.next().await.unwrap().unwrap();
@@ -981,7 +992,10 @@ mod tests {
         assert_eq!(status, "error");
         let error = error.expect("error status must carry a reason");
         assert!(!error.is_empty());
-        assert!(!error.contains("ghp_"), "token must not leak into clone_error: {error}");
+        assert!(
+            !error.contains("ghp_"),
+            "token must not leak into clone_error: {error}"
+        );
 
         let _ = std::fs::remove_dir_all(&root);
     }

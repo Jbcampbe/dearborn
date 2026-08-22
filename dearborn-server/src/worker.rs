@@ -1462,7 +1462,7 @@ use crate::pr;
 use crate::spec::{self, EpicContext, SiblingTask, SpecFields, TaskContext};
 use crate::task_agent::{self, AgentStageParams, Stage, TaskRunRequest};
 use crate::tasks::compute_dag;
-use crate::workspace::{self, ProvisionedWorkspace, ProvisionFailure};
+use crate::workspace::{self, ProvisionFailure, ProvisionedWorkspace};
 use crate::AppState;
 
 /// The deterministic git identity every T-513 commit is attributed to (§2.8's
@@ -1480,9 +1480,8 @@ const COMMITTER_EMAIL: &str = "dearborn@noreply.localhost";
 /// awaits once, immediately after a claim, before doing any DB work. See
 /// [`crate::AppState::test_pipeline_hook`].
 #[cfg(test)]
-pub type PipelineHook = Arc<
-    dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync,
->;
+pub type PipelineHook =
+    Arc<dyn Fn() -> std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>> + Send + Sync>;
 
 /// The row identity returned by a successful [`claim_epic`] — just enough to
 /// drive the pipeline body and resolve the project for board publishes.
@@ -1709,8 +1708,11 @@ async fn renew_lease_generic(
     let now = now_ms();
     let expires_at = now + (lease_ttl_secs as i64) * 1000;
     let table = table.as_str();
-    let sql = format!("UPDATE {table} SET lease_expires_at = ?1 WHERE id = ?2 AND lease_owner = ?3");
-    let affected = conn.execute(&sql, params![expires_at, id, worker_id]).await?;
+    let sql =
+        format!("UPDATE {table} SET lease_expires_at = ?1 WHERE id = ?2 AND lease_owner = ?3");
+    let affected = conn
+        .execute(&sql, params![expires_at, id, worker_id])
+        .await?;
     Ok(affected > 0)
 }
 
@@ -1803,7 +1805,15 @@ fn spawn_heartbeat(
     lease_ttl_secs: u64,
     lease: LeaseHandle,
 ) -> JoinHandle<()> {
-    spawn_heartbeat_generic(conn, LeaseTable::Epic, epic_id, worker_id, period, lease_ttl_secs, lease)
+    spawn_heartbeat_generic(
+        conn,
+        LeaseTable::Epic,
+        epic_id,
+        worker_id,
+        period,
+        lease_ttl_secs,
+        lease,
+    )
 }
 
 /// The `task`-table mirror of [`spawn_heartbeat`] (T-550): a claimed
@@ -1817,7 +1827,15 @@ fn spawn_task_heartbeat(
     lease_ttl_secs: u64,
     lease: LeaseHandle,
 ) -> JoinHandle<()> {
-    spawn_heartbeat_generic(conn, LeaseTable::Task, task_id, worker_id, period, lease_ttl_secs, lease)
+    spawn_heartbeat_generic(
+        conn,
+        LeaseTable::Task,
+        task_id,
+        worker_id,
+        period,
+        lease_ttl_secs,
+        lease,
+    )
 }
 
 /// The shared guts of [`release_lease`]/[`release_task_lease`]: clear
@@ -1952,7 +1970,9 @@ async fn try_claim_and_run(state: &AppState, worker_id: &str) -> ClaimOutcome {
 
     match claimed {
         WorkItem::Epic(claimed) => run_claimed_epic(state, conn, worker_id, claimed).await,
-        WorkItem::Standalone(claimed) => run_claimed_standalone(state, conn, worker_id, claimed).await,
+        WorkItem::Standalone(claimed) => {
+            run_claimed_standalone(state, conn, worker_id, claimed).await
+        }
     }
 
     ClaimOutcome::Claimed
@@ -1969,7 +1989,12 @@ async fn try_claim_and_run(state: &AppState, worker_id: &str) -> ClaimOutcome {
 /// panic there resolves the `JoinHandle` as `Err` rather than unwinding into
 /// the long-lived worker loop, so the release/heartbeat-abort below always
 /// runs.
-async fn run_claimed_epic(state: &AppState, conn: &Connection, worker_id: &str, claimed: ClaimedEpic) {
+async fn run_claimed_epic(
+    state: &AppState,
+    conn: &Connection,
+    worker_id: &str,
+    claimed: ClaimedEpic,
+) {
     if let Err(err) = reset_orphaned_tasks(conn, &claimed.id).await {
         tracing::warn!(
             epic = %claimed.id,
@@ -2028,7 +2053,12 @@ async fn run_claimed_epic(state: &AppState, conn: &Connection, worker_id: &str, 
 /// [`run_claimed_epic`] already isolates its own body against. The task just
 /// stays `InProgress` with a soon-to-expire lease and gets picked up again,
 /// same as an epic's panicking body would.
-async fn run_claimed_standalone(state: &AppState, conn: &Connection, worker_id: &str, claimed: ClaimedTask) {
+async fn run_claimed_standalone(
+    state: &AppState,
+    conn: &Connection,
+    worker_id: &str,
+    claimed: ClaimedTask,
+) {
     let lease = LeaseHandle::new();
     let heartbeat = spawn_task_heartbeat(
         conn.clone(),
@@ -2092,7 +2122,9 @@ async fn run_standalone_pipeline_inner(state: &AppState, task_id: &str, lease: &
                 // epic branch's identical belt-and-suspenders check.
                 if !lease.is_lost() {
                     let (reason, message) = match failure {
-                        ProvisionFailure::Workspace(message) => (FailureReason::WorkspaceError, message),
+                        ProvisionFailure::Workspace(message) => {
+                            (FailureReason::WorkspaceError, message)
+                        }
                         ProvisionFailure::Setup { message, exit_code } => (
                             FailureReason::SetupFailed,
                             format!("exit_code={exit_code:?}: {message}"),
@@ -2261,7 +2293,9 @@ async fn run_epic_pipeline_inner(state: AppState, epic_id: String, lease: LeaseH
                 // even construct, not a choice among alternatives.
                 if !lease.is_lost() {
                     let (reason, message) = match failure {
-                        ProvisionFailure::Workspace(message) => (FailureReason::WorkspaceError, message),
+                        ProvisionFailure::Workspace(message) => {
+                            (FailureReason::WorkspaceError, message)
+                        }
                         ProvisionFailure::Setup { message, exit_code } => (
                             FailureReason::SetupFailed,
                             format!("exit_code={exit_code:?}: {message}"),
@@ -2411,7 +2445,13 @@ async fn run_epic_pipeline_inner(state: AppState, epic_id: String, lease: LeaseH
             .nodes
             .iter()
             .filter(|n| n.task.id != ready.task.id)
-            .map(|n| (n.task.id.clone(), n.task.title.clone(), n.task.status == "Done"))
+            .map(|n| {
+                (
+                    n.task.id.clone(),
+                    n.task.title.clone(),
+                    n.task.status == "Done",
+                )
+            })
             .collect();
         let sibling_refs: Vec<SiblingTask> = siblings
             .iter()
@@ -2428,7 +2468,16 @@ async fn run_epic_pipeline_inner(state: AppState, epic_id: String, lease: LeaseH
             technical_context: epic.technical_context.as_deref(),
         };
 
-        match process_one_task(&state, &ready.task, Some(epic_ctx), &sibling_refs, &workspace, &lease).await {
+        match process_one_task(
+            &state,
+            &ready.task,
+            Some(epic_ctx),
+            &sibling_refs,
+            &workspace,
+            &lease,
+        )
+        .await
+        {
             TaskStepOutcome::Continue => continue,
             TaskStepOutcome::Stop => return,
         }
@@ -2715,7 +2764,16 @@ async fn process_one_task(
     //    *nothing* — see below (T-532) for why that's not the end of the
     //    story.
     let subject = format!("impl({}): {}", spec::short_id(task_id), task_title);
-    let committed = match commit_if_dirty(conn, task_id, epic_id, &workspace.workspace_path, &subject, 1).await {
+    let committed = match commit_if_dirty(
+        conn,
+        task_id,
+        epic_id,
+        &workspace.workspace_path,
+        &subject,
+        1,
+    )
+    .await
+    {
         Ok(committed) => committed,
         Err(err) => {
             if !lease.is_lost() {
@@ -2868,10 +2926,18 @@ async fn process_one_task(
 /// here) or an external mutation would move off `InProgress`, so re-reading
 /// it here catches exactly the same class of race the epic branch already
 /// guarded against.
-async fn container_still_in_progress(conn: &Connection, epic_id: Option<&str>, task_id: &str) -> bool {
+async fn container_still_in_progress(
+    conn: &Connection,
+    epic_id: Option<&str>,
+    task_id: &str,
+) -> bool {
     match epic_id {
-        Some(epic_id) => matches!(fetch_epic(conn, epic_id).await, Ok(Some(e)) if e.status == "InProgress"),
-        None => matches!(crate::tasks::fetch_task(conn, task_id).await, Ok(Some(t)) if t.status == "InProgress"),
+        Some(epic_id) => {
+            matches!(fetch_epic(conn, epic_id).await, Ok(Some(e)) if e.status == "InProgress")
+        }
+        None => {
+            matches!(crate::tasks::fetch_task(conn, task_id).await, Ok(Some(t)) if t.status == "InProgress")
+        }
     }
 }
 
@@ -2989,7 +3055,9 @@ async fn run_test_gate_loop(
                         epic_id,
                         task_id: Some(task_id),
                         reason: FailureReason::TestGateExhausted,
-                        message: &format!("tests still failing after {max_attempts} fix attempt(s)"),
+                        message: &format!(
+                            "tests still failing after {max_attempts} fix attempt(s)"
+                        ),
                         push: PushIntent::Attempt(workspace),
                     },
                 )
@@ -3478,7 +3546,9 @@ async fn run_review_fix_converge(
                                     epic_id,
                                     task_id: Some(task_id),
                                     reason: FailureReason::AgentError,
-                                    message: &format!("review-round fix stage failed to start: {err}"),
+                                    message: &format!(
+                                        "review-round fix stage failed to start: {err}"
+                                    ),
                                     push: PushIntent::Attempt(workspace),
                                 },
                             )
@@ -3549,7 +3619,9 @@ async fn run_review_fix_converge(
                                 epic_id,
                                 task_id: Some(task_id),
                                 reason: FailureReason::AgentError,
-                                message: &format!("git commit failed (review round {round}): {err}"),
+                                message: &format!(
+                                    "git commit failed (review round {round}): {err}"
+                                ),
                                 push: PushIntent::Attempt(workspace),
                             },
                         )
@@ -3649,7 +3721,8 @@ async fn run_verify_complete(
                         epic_id,
                         task_id: Some(task_id),
                         reason: FailureReason::Blocked,
-                        message: "verify-complete verifier returned BLOCKED — needs a human to resolve",
+                        message:
+                            "verify-complete verifier returned BLOCKED — needs a human to resolve",
                         push: PushIntent::Attempt(workspace),
                     },
                 )
@@ -3717,7 +3790,9 @@ async fn run_verify_complete(
                                 epic_id,
                                 task_id: Some(task_id),
                                 reason: FailureReason::AgentError,
-                                message: &format!("verify-complete fix stage failed to start: {err}"),
+                                message: &format!(
+                                    "verify-complete fix stage failed to start: {err}"
+                                ),
                                 push: PushIntent::Attempt(workspace),
                             },
                         )
@@ -4148,7 +4223,9 @@ async fn fail_item(state: &AppState, ctx: FailureContext<'_>) {
         // `project_id` from) so the board still refreshes and a real push
         // can still run.
         let Some(task_id) = ctx.task_id else {
-            tracing::error!("fail_item: epic_id is None but task_id is also None — nothing to fail");
+            tracing::error!(
+                "fail_item: epic_id is None but task_id is also None — nothing to fail"
+            );
             return;
         };
         if let Ok(Some(task)) = crate::tasks::fetch_task(conn, task_id).await {
@@ -4278,7 +4355,13 @@ async fn push_on_failure(
                 error = %message,
                 "failure push: push failed; non-fatal — the task/epic already reached their Failed/Blocked states"
             );
-            close_push_stage(conn, &stage_handle, "error", &format!("push failed: {message}")).await;
+            close_push_stage(
+                conn,
+                &stage_handle,
+                "error",
+                &format!("push failed: {message}"),
+            )
+            .await;
         }
     }
 }
@@ -4547,7 +4630,10 @@ async fn run_preflight(
                     epic_id,
                     task_id,
                     reason: FailureReason::PreflightRed,
-                    message: &format!("test_cmd not green (status={}, exit_code={:?})", ran.status, ran.exit_code),
+                    message: &format!(
+                        "test_cmd not green (status={}, exit_code={:?})",
+                        ran.status, ran.exit_code
+                    ),
                     push: PushIntent::Attempt(workspace),
                 },
             )
@@ -4913,7 +4999,13 @@ async fn push_and_open_pr(
 
     if let Err(err) = push_result {
         let message = git::redact(&err.message, pat.as_deref());
-        close_push_stage(conn, &stage_handle, "error", &format!("push failed: {message}")).await;
+        close_push_stage(
+            conn,
+            &stage_handle,
+            "error",
+            &format!("push failed: {message}"),
+        )
+        .await;
         if !lease.is_lost() {
             fail_item(
                 state,
@@ -4945,7 +5037,13 @@ async fn push_and_open_pr(
         Ok(opened) => opened,
         Err(err) => {
             let message = git::redact(&err.message, pat.as_deref());
-            close_push_stage(conn, &stage_handle, "error", &format!("open_pr failed: {message}")).await;
+            close_push_stage(
+                conn,
+                &stage_handle,
+                "error",
+                &format!("open_pr failed: {message}"),
+            )
+            .await;
             if !lease.is_lost() {
                 fail_item(
                     state,
@@ -5153,7 +5251,14 @@ async fn run_epic_summary(
         base_sha: Some(base_sha.as_str()),
     };
 
-    run_summarize_stage(state, Some(epic_id), None, &context, &workspace.workspace_path).await
+    run_summarize_stage(
+        state,
+        Some(epic_id),
+        None,
+        &context,
+        &workspace.workspace_path,
+    )
+    .await
 }
 
 /// [`finalize_task`]'s T-560 summary step — the standalone mirror of
@@ -5191,7 +5296,14 @@ async fn run_task_summary(
         base_sha: Some(base_sha.as_str()),
     };
 
-    run_summarize_stage(state, None, Some(task_id), &context, &workspace.workspace_path).await
+    run_summarize_stage(
+        state,
+        None,
+        Some(task_id),
+        &context,
+        &workspace.workspace_path,
+    )
+    .await
 }
 
 /// Close the finalize step's single `Stage::Push` evidence row, if one was
@@ -5229,10 +5341,15 @@ async fn load_project_for_finalize(
     project_id: &str,
 ) -> Result<Option<ProjectForFinalize>, libsql::Error> {
     let mut rows = conn
-        .query("SELECT repo_url FROM project WHERE id = ?1", params![project_id])
+        .query(
+            "SELECT repo_url FROM project WHERE id = ?1",
+            params![project_id],
+        )
         .await?;
     match rows.next().await? {
-        Some(row) => Ok(Some(ProjectForFinalize { repo_url: row.get(0)? })),
+        Some(row) => Ok(Some(ProjectForFinalize {
+            repo_url: row.get(0)?,
+        })),
         None => Ok(None),
     }
 }
@@ -5312,7 +5429,10 @@ async fn build_task_checklist(
 /// [`build_task_checklist`] calls, just filtered on the other column, since a
 /// standalone task's evidence rows are `task_id`-keyed the way an epic-owned
 /// task's are `epic_id`-keyed for this same lookup.
-async fn build_standalone_checklist(conn: &Connection, task: &crate::tasks::Task) -> Vec<pr::TaskChecklistItem> {
+async fn build_standalone_checklist(
+    conn: &Connection,
+    task: &crate::tasks::Task,
+) -> Vec<pr::TaskChecklistItem> {
     let mut sha: Option<String> = None;
     if let Ok(mut rows) = conn
         .query(
@@ -5883,7 +6003,11 @@ mod tests {
 
         let statuses = task_statuses(&state, &epic_id).await;
         assert_eq!(statuses["A"], "Todo", "task untouched");
-        assert_eq!(epic_status(&state, &epic_id).await, "Ready", "epic untouched");
+        assert_eq!(
+            epic_status(&state, &epic_id).await,
+            "Ready",
+            "epic untouched"
+        );
     }
 
     /// No sibling InProgress invariant: after a full run, the final state is
@@ -5975,7 +6099,10 @@ mod tests {
 
         reset_orphaned_tasks(conn, &epic_id).await.unwrap();
         let statuses = task_statuses(&state, &epic_id).await;
-        assert_eq!(statuses["A"], "Todo", "orphaned InProgress task reset to Todo");
+        assert_eq!(
+            statuses["A"], "Todo",
+            "orphaned InProgress task reset to Todo"
+        );
     }
 
     /// A lease that is still live (not expired) is NOT re-claimable — the
@@ -6029,7 +6156,10 @@ mod tests {
         .unwrap();
 
         let still_held = renew_lease_once(conn, &epic_id, "me", 30).await.unwrap();
-        assert!(!still_held, "renewal against a stolen lease must report 0 rows / lost");
+        assert!(
+            !still_held,
+            "renewal against a stolen lease must report 0 rows / lost"
+        );
 
         // The row still belongs to the thief — our renewal must not have
         // clobbered it.
@@ -6199,7 +6329,10 @@ mod tests {
                 winner = Some(claimed.id);
             }
         }
-        assert_eq!(successes, 1, "exactly one racer must claim the standalone task");
+        assert_eq!(
+            successes, 1,
+            "exactly one racer must claim the standalone task"
+        );
         assert_eq!(winner.as_deref(), Some(task_id.as_str()));
     }
 
@@ -6247,7 +6380,10 @@ mod tests {
         .unwrap();
 
         let claimed = claim_task(conn, "other-worker", 30).await.unwrap();
-        assert!(claimed.is_none(), "a live standalone lease must not be reclaimable");
+        assert!(
+            claimed.is_none(),
+            "a live standalone lease must not be reclaimable"
+        );
     }
 
     /// A standalone task with `epic_id` set (owned by an epic's DAG walk) is
@@ -6264,7 +6400,10 @@ mod tests {
         set_task_status(&state, &a, "InProgress").await;
 
         let claimed = claim_task(state.db.conn(), "worker", 30).await.unwrap();
-        assert!(claimed.is_none(), "an epic-owned task must never satisfy the standalone claim");
+        assert!(
+            claimed.is_none(),
+            "an epic-owned task must never satisfy the standalone claim"
+        );
     }
 
     /// A heartbeat renewal against a standalone task's lease already stolen
@@ -6290,8 +6429,13 @@ mod tests {
         .await
         .unwrap();
 
-        let still_held = renew_task_lease_once(conn, &task_id, "me", 30).await.unwrap();
-        assert!(!still_held, "renewal against a stolen standalone lease must report 0 rows / lost");
+        let still_held = renew_task_lease_once(conn, &task_id, "me", 30)
+            .await
+            .unwrap();
+        assert!(
+            !still_held,
+            "renewal against a stolen standalone lease must report 0 rows / lost"
+        );
 
         let (owner, _) = task_lease(&state, &task_id).await;
         assert_eq!(owner.as_deref(), Some("thief"));
@@ -6311,7 +6455,9 @@ mod tests {
         .await
         .unwrap();
 
-        let still_held = renew_task_lease_once(conn, &task_id, "me", 30).await.unwrap();
+        let still_held = renew_task_lease_once(conn, &task_id, "me", 30)
+            .await
+            .unwrap();
         assert!(still_held);
     }
 
@@ -6395,7 +6541,10 @@ mod tests {
         // The standalone task must still be untouched — genuinely not
         // starved, not just "not returned this one time".
         let (owner, _) = task_lease(&state, &task_id).await;
-        assert!(owner.is_none(), "the standalone task must not have been claimed at all");
+        assert!(
+            owner.is_none(),
+            "the standalone task must not have been claimed at all"
+        );
     }
 
     /// With no epic queued, `claim_next` falls back to the standalone task —
@@ -6421,7 +6570,10 @@ mod tests {
     #[tokio::test]
     async fn claim_next_returns_none_when_nothing_is_queued() {
         let (state, _app) = test_app().await;
-        assert!(claim_next(state.db.conn(), "worker", 30).await.unwrap().is_none());
+        assert!(claim_next(state.db.conn(), "worker", 30)
+            .await
+            .unwrap()
+            .is_none());
     }
 
     /// `try_claim_and_run` itself — not just `claim_next` in isolation —
@@ -6449,7 +6601,10 @@ mod tests {
         // sibling states, still exactly the `InProgress` this test seeded.
         assert_eq!(epic_status(&state, &epic_id).await, "Completed");
         let (owner, _) = task_lease(&state, &task_id).await;
-        assert!(owner.is_none(), "the standalone task must not have been claimed");
+        assert!(
+            owner.is_none(),
+            "the standalone task must not have been claimed"
+        );
         assert_eq!(single_task_status(&state, &task_id).await, "InProgress");
         cleanup_clone_root(&state, &project_id, &[&epic_id]);
     }
@@ -6477,7 +6632,10 @@ mod tests {
         // body itself does: leased, then released, on the way through
         // `run_claimed_standalone`.
         let (owner, expires) = task_lease(&state, &task_id).await;
-        assert!(owner.is_none(), "the lease must be released once the body returns");
+        assert!(
+            owner.is_none(),
+            "the lease must be released once the body returns"
+        );
         assert!(expires.is_none());
 
         // The pipeline body is real now (T-551): a project with no
@@ -6587,7 +6745,10 @@ mod tests {
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
-                panic!("pool never reached 2 concurrently-claimed epics (active={})", gate.active());
+                panic!(
+                    "pool never reached 2 concurrently-claimed epics (active={})",
+                    gate.active()
+                );
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -6756,7 +6917,10 @@ mod tests {
             "a Completed epic must not be disturbed by a fresh pool notify"
         );
         let (lease_owner, lease_expires_at) = epic_lease(&state, &epic_id).await;
-        assert!(lease_owner.is_none(), "a Completed epic must never hold a lease");
+        assert!(
+            lease_owner.is_none(),
+            "a Completed epic must never hold a lease"
+        );
         assert!(lease_expires_at.is_none());
 
         cleanup_clone_root(&state, &project_id, &[&epic_id]);
@@ -6773,7 +6937,10 @@ mod tests {
         seed_epic(&state, &project_id, "Completed").await;
 
         let claimed = claim_epic(state.db.conn(), "prober", 30).await.unwrap();
-        assert!(claimed.is_none(), "a Completed epic must never be claimable");
+        assert!(
+            claimed.is_none(),
+            "a Completed epic must never be claimable"
+        );
     }
 
     // ---- T-511: provisioning-failure wiring (workspace_error / setup_failed) ----
@@ -6900,7 +7067,10 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
 
         let blocked_frame = recv_epic_updated_with_status(&mut epic_sub, "Blocked").await;
-        assert_eq!(blocked_frame["payload"]["blocked_reason"], "workspace_error");
+        assert_eq!(
+            blocked_frame["payload"]["blocked_reason"],
+            "workspace_error"
+        );
 
         // board_updated must have landed too (either for the InProgress
         // enqueue, the Blocked transition, or both) — drain for one.
@@ -6919,7 +7089,10 @@ mod tests {
             }
         }
 
-        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        let epic = fetch_epic(state.db.conn(), &epic_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(epic.status, "Blocked");
         assert_eq!(epic.blocked_reason.as_deref(), Some("workspace_error"));
 
@@ -6966,12 +7139,16 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        let epic = fetch_epic(state.db.conn(), &epic_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(epic.blocked_reason.as_deref(), Some("setup_failed"));
 
         // Workspace retained: the provisioned directory (and its .git) is
         // still on disk, not deleted on this failure path.
-        let workspace_path = crate::workspace::epic_workspace_path(&state.config.clone_root, &epic_id);
+        let workspace_path =
+            crate::workspace::epic_workspace_path(&state.config.clone_root, &epic_id);
         assert!(
             workspace_path.join(".git").exists(),
             "workspace must be retained on setup_failed"
@@ -7019,7 +7196,10 @@ mod tests {
 
         run_epic_pipeline(state.clone(), epic_id.clone()).await;
 
-        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        let epic = fetch_epic(state.db.conn(), &epic_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(epic.status, "Blocked");
         assert_eq!(epic.blocked_reason.as_deref(), Some("preflight_red"));
 
@@ -7045,14 +7225,19 @@ mod tests {
             )
             .await
             .unwrap();
-        let row = rows.next().await.unwrap().expect("a preflight agent_run row");
+        let row = rows
+            .next()
+            .await
+            .unwrap()
+            .expect("a preflight agent_run row");
         assert_eq!(row.get::<String>(0).unwrap(), "error");
         assert_eq!(row.get::<Option<i64>>(1).unwrap(), Some(1));
         let log: String = row.get(2).unwrap();
         assert!(log.contains("tree-is-red"));
 
         // Workspace retained: the provisioned directory is still on disk.
-        let workspace_path = crate::workspace::epic_workspace_path(&state.config.clone_root, &epic_id);
+        let workspace_path =
+            crate::workspace::epic_workspace_path(&state.config.clone_root, &epic_id);
         assert!(
             workspace_path.join(".git").exists(),
             "workspace must be retained on preflight_red"
@@ -7080,7 +7265,10 @@ mod tests {
 
         run_epic_pipeline(state.clone(), epic_id.clone()).await;
 
-        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        let epic = fetch_epic(state.db.conn(), &epic_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             epic.status, "Completed",
             "a green preflight must let the rest of the pipeline run to completion"
@@ -7095,7 +7283,11 @@ mod tests {
             )
             .await
             .unwrap();
-        let row = rows.next().await.unwrap().expect("a preflight agent_run row");
+        let row = rows
+            .next()
+            .await
+            .unwrap()
+            .expect("a preflight agent_run row");
         assert_eq!(row.get::<String>(0).unwrap(), "ok");
 
         cleanup_clone_root(&state, &project_id, &[&epic_id]);
@@ -7115,7 +7307,10 @@ mod tests {
 
         run_epic_pipeline(state.clone(), epic_id.clone()).await;
 
-        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        let epic = fetch_epic(state.db.conn(), &epic_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(epic.status, "Completed");
 
         let mut rows = state
@@ -7128,7 +7323,10 @@ mod tests {
             .await
             .unwrap();
         let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
-        assert_eq!(count, 0, "an absent test_cmd must record zero preflight rows");
+        assert_eq!(
+            count, 0,
+            "an absent test_cmd must record zero preflight rows"
+        );
 
         cleanup_clone_root(&state, &project_id, &[&epic_id]);
     }
@@ -7203,7 +7401,10 @@ mod tests {
             .await
             .unwrap();
         let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
-        assert_eq!(count, 1, "preflight must run once per claim, not once per task");
+        assert_eq!(
+            count, 1,
+            "preflight must run once per claim, not once per task"
+        );
 
         cleanup_clone_root(&state, &project_id, &[&epic_id]);
     }
@@ -7262,7 +7463,10 @@ mod tests {
         let mut rows = state
             .db
             .conn()
-            .query("SELECT branch_name FROM epic WHERE id = ?1", params![epic_id])
+            .query(
+                "SELECT branch_name FROM epic WHERE id = ?1",
+                params![epic_id],
+            )
             .await
             .unwrap();
         let row = rows.next().await.unwrap().unwrap();
@@ -7416,7 +7620,10 @@ mod tests {
     }
 
     impl TaskAgent for ConcurrencyProbeAgent {
-        fn run(&self, req: TaskRunRequest) -> Result<(RunHandle, Receiver<RunEvent>), HarnessError> {
+        fn run(
+            &self,
+            req: TaskRunRequest,
+        ) -> Result<(RunHandle, Receiver<RunEvent>), HarnessError> {
             if req.stage == Stage::Implement {
                 let conn = self.conn.clone();
                 let count = std::thread::spawn(move || {
@@ -7426,10 +7633,7 @@ mod tests {
                         .unwrap();
                     rt.block_on(async move {
                         let mut rows = conn
-                            .query(
-                                "SELECT COUNT(*) FROM task WHERE status = 'InProgress'",
-                                (),
-                            )
+                            .query("SELECT COUNT(*) FROM task WHERE status = 'InProgress'", ())
                             .await
                             .unwrap();
                         let row = rows.next().await.unwrap().unwrap();
@@ -7486,7 +7690,11 @@ mod tests {
         assert_eq!(statuses["C"], "Done");
 
         let counts = observed.lock().unwrap().clone();
-        assert_eq!(counts.len(), 3, "one probe reading per task's implement call");
+        assert_eq!(
+            counts.len(),
+            3,
+            "one probe reading per task's implement call"
+        );
         assert!(
             counts.iter().all(|&n| n == 1),
             "exactly one InProgress task at every implement call: {counts:?}"
@@ -7535,7 +7743,10 @@ mod tests {
             .await
             .unwrap();
         let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
-        assert_eq!(count, 0, "the commit stage never runs when there is nothing to commit");
+        assert_eq!(
+            count, 0,
+            "the commit stage never runs when there is nothing to commit"
+        );
 
         // No commit means no review either.
         let mut review_rows = state
@@ -7548,7 +7759,10 @@ mod tests {
             .await
             .unwrap();
         let review_count: i64 = review_rows.next().await.unwrap().unwrap().get(0).unwrap();
-        assert_eq!(review_count, 0, "the review stage never runs for a no-diff task");
+        assert_eq!(
+            review_count, 0,
+            "the review stage never runs for a no-diff task"
+        );
 
         // T-532: verify-complete runs exactly once instead, and (defaulted
         // to PASS) records that verdict.
@@ -7564,7 +7778,10 @@ mod tests {
         let vc_row = vc_rows.next().await.unwrap().unwrap();
         let vc_count: i64 = vc_row.get(0).unwrap();
         let vc_verdict: Option<String> = vc_row.get(1).unwrap();
-        assert_eq!(vc_count, 1, "verify-complete runs exactly once for a no-diff task");
+        assert_eq!(
+            vc_count, 1,
+            "verify-complete runs exactly once for a no-diff task"
+        );
         assert_eq!(vc_verdict.as_deref(), Some("PASS"));
 
         cleanup_clone_root(&state, &project_id, &[&epic_id]);
@@ -7600,7 +7817,11 @@ mod tests {
             )
             .await
             .unwrap();
-        let row = rows.next().await.unwrap().expect("an implement agent_run row");
+        let row = rows
+            .next()
+            .await
+            .unwrap()
+            .expect("an implement agent_run row");
         assert_eq!(row.get::<String>(0).unwrap(), "ok");
 
         let mut rows = state
@@ -7615,7 +7836,10 @@ mod tests {
         let row = rows.next().await.unwrap().expect("a commit agent_run row");
         assert_eq!(row.get::<String>(0).unwrap(), "ok");
         let log: String = row.get(1).unwrap();
-        assert!(log.contains(&head_sha), "commit row's log must carry the SHA: {log:?}");
+        assert!(
+            log.contains(&head_sha),
+            "commit row's log must carry the SHA: {log:?}"
+        );
 
         cleanup_clone_root(&state, &project_id, &[&epic_id]);
     }
@@ -7661,7 +7885,10 @@ mod tests {
         // Stage::VerifyComplete (default-scripted PASS) — filter down to
         // just the Implement calls this test actually cares about, rather
         // than assuming `recorded` holds only those.
-        let runs: Vec<_> = all_runs.iter().filter(|r| r.stage == Stage::Implement).collect();
+        let runs: Vec<_> = all_runs
+            .iter()
+            .filter(|r| r.stage == Stage::Implement)
+            .collect();
         assert_eq!(runs.len(), 2, "one implement call per task");
 
         // A's prompt: epic context present; B listed as owned by a later task.
@@ -7728,9 +7955,18 @@ mod tests {
         let branch = epic_branch_name_column(&state, &epic_id).await;
         let calls = fake.open_pr_calls();
         assert_eq!(calls.len(), 1, "exactly one open_pr call per finalize");
-        assert_eq!(calls[0].head, branch, "PR must be opened from the epic branch");
-        assert_eq!(calls[0].base, "main", "PR must target the (fake) default branch");
-        assert_eq!(calls[0].title, "E", "PR title must be the epic's own title (seed_epic's 'E')");
+        assert_eq!(
+            calls[0].head, branch,
+            "PR must be opened from the epic branch"
+        );
+        assert_eq!(
+            calls[0].base, "main",
+            "PR must target the (fake) default branch"
+        );
+        assert_eq!(
+            calls[0].title, "E",
+            "PR title must be the epic's own title (seed_epic's 'E')"
+        );
         assert!(calls[0].body.contains("## Tasks"));
 
         cleanup_clone_root(&state, &project_id, &[&epic_id]);
@@ -7790,14 +8026,23 @@ mod tests {
             .await
             .unwrap();
 
-        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        let epic = fetch_epic(state.db.conn(), &epic_id)
+            .await
+            .unwrap()
+            .unwrap();
         let dag = compute_dag(state.db.conn(), &epic_id).await.unwrap();
         finalize_epic(&state, &epic_id, &epic, &dag, &ws, &LeaseHandle::new()).await;
 
-        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        let epic = fetch_epic(state.db.conn(), &epic_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(epic.status, "Blocked");
         assert_eq!(epic.blocked_reason.as_deref(), Some("pr_failed"));
-        assert!(epic.pr_url.is_none(), "pr_url must never be set when open_pr fails");
+        assert!(
+            epic.pr_url.is_none(),
+            "pr_url must never be set when open_pr fails"
+        );
         assert!(epic.pr_number.is_none());
 
         let (lease_owner, lease_expires_at) = epic_lease(&state, &epic_id).await;
@@ -7822,8 +8067,14 @@ mod tests {
         let row = rows.next().await.unwrap().expect("a push agent_run row");
         assert_eq!(row.get::<String>(0).unwrap(), "error");
         let log: String = row.get(1).unwrap();
-        assert!(log.contains("422"), "the failure reason must be readable: {log:?}");
-        assert!(!log.contains(pat), "the token must never leak into evidence: {log:?}");
+        assert!(
+            log.contains("422"),
+            "the failure reason must be readable: {log:?}"
+        );
+        assert!(
+            !log.contains(pat),
+            "the token must never leak into evidence: {log:?}"
+        );
         assert!(!log.contains("ghp_"));
 
         cleanup_clone_root(&state, &project_id, &[&epic_id]);
@@ -7834,11 +8085,9 @@ mod tests {
     #[tokio::test]
     async fn failed_push_blocks_epic_retains_workspace_and_never_calls_open_pr() {
         let fake = Arc::new(FakeHost::new().fail_push("simulated push failure"));
-        let (state, _app) = test_app_with_task_agent_and_host(
-            Arc::new(ScriptedTaskAgent::new()),
-            fake.clone(),
-        )
-        .await;
+        let (state, _app) =
+            test_app_with_task_agent_and_host(Arc::new(ScriptedTaskAgent::new()), fake.clone())
+                .await;
         let fixture = GitFixture::new().await;
         let project_id = seed_project_with_workspace(&state, &fixture).await;
         let epic_id = seed_epic(&state, &project_id, "InProgress").await;
@@ -7846,7 +8095,10 @@ mod tests {
 
         run_epic_pipeline(state.clone(), epic_id.clone()).await;
 
-        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        let epic = fetch_epic(state.db.conn(), &epic_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(epic.status, "Blocked");
         assert_eq!(epic.blocked_reason.as_deref(), Some("pr_failed"));
         assert!(epic.pr_url.is_none());
@@ -7896,7 +8148,10 @@ mod tests {
     }
 
     impl TaskAgent for SelectiveGateAgent {
-        fn run(&self, req: TaskRunRequest) -> Result<(RunHandle, Receiver<RunEvent>), HarnessError> {
+        fn run(
+            &self,
+            req: TaskRunRequest,
+        ) -> Result<(RunHandle, Receiver<RunEvent>), HarnessError> {
             let stage = req.stage;
             let (handle, inner_rx) = self.inner.run(req)?;
             if stage != self.gate_stage {
@@ -7971,7 +8226,11 @@ mod tests {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
             let statuses = task_statuses(&state, &epic_id).await;
-            if statuses.get("B").map(|s| s == "InProgress").unwrap_or(false) {
+            if statuses
+                .get("B")
+                .map(|s| s == "InProgress")
+                .unwrap_or(false)
+            {
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
@@ -8005,7 +8264,10 @@ mod tests {
         let subjects = git_log_subjects(&workspace_path).await;
         assert_eq!(
             subjects,
-            vec!["init".to_string(), format!("impl({}): A", spec::short_id(&a))],
+            vec![
+                "init".to_string(),
+                format!("impl({}): A", spec::short_id(&a))
+            ],
             "only A's commit may have landed before the cancel stopped the walk"
         );
 
@@ -8040,8 +8302,7 @@ mod tests {
     /// Like [`FLIPPABLE_TEST_CMD`] but the red branch also echoes a
     /// distinctive marker — used by the D19 test to prove the exact test
     /// output reached the fix agent's prompt.
-    const FLIPPABLE_TEST_CMD_WITH_MARKER: &str =
-        "if test -f .fixed; then exit 0; \
+    const FLIPPABLE_TEST_CMD_WITH_MARKER: &str = "if test -f .fixed; then exit 0; \
          elif test -f work.txt; then echo THE_TESTS_ARE_BROKEN_MARKER; exit 1; \
          else exit 0; fi";
 
@@ -8091,7 +8352,10 @@ mod tests {
             .output()
             .await
             .unwrap();
-        assert!(output.status.success(), "git show {git_ref}:{path} failed: {output:?}");
+        assert!(
+            output.status.success(),
+            "git show {git_ref}:{path} failed: {output:?}"
+        );
         String::from_utf8_lossy(&output.stdout).trim().to_string()
     }
 
@@ -8139,15 +8403,24 @@ mod tests {
         let subjects = git_log_subjects_for_ref(&fixture.dir, &branch).await;
         assert_eq!(
             subjects,
-            vec!["init".to_string(), format!("impl({}): A", spec::short_id(&a))],
+            vec![
+                "init".to_string(),
+                format!("impl({}): A", spec::short_id(&a))
+            ],
             "exactly one commit must land, after the gate went green"
         );
 
         // The single commit contains both the implement stage's file and
         // the fix stage's file — the fix really did land in the commit that
         // finally went green, not get discarded.
-        assert_eq!(git_show_file(&fixture.dir, &branch, "work.txt").await, "work");
-        assert_eq!(git_show_file(&fixture.dir, &branch, ".fixed").await, "fixed");
+        assert_eq!(
+            git_show_file(&fixture.dir, &branch, "work.txt").await,
+            "work"
+        );
+        assert_eq!(
+            git_show_file(&fixture.dir, &branch, ".fixed").await,
+            "fixed"
+        );
 
         let rows = gate_and_fix_rows(&state, &a).await;
         assert_eq!(
@@ -8220,8 +8493,7 @@ mod tests {
         // actually reaches this task's implement stage), red forever once
         // `broken.txt` exists — the scripted Fix stage (default: no files
         // written) never creates anything that would satisfy it.
-        let project_id =
-            seed_project_with_test_cmd(&state, &fixture, "! test -f broken.txt").await;
+        let project_id = seed_project_with_test_cmd(&state, &fixture, "! test -f broken.txt").await;
         let epic_id = seed_epic(&state, &project_id, "InProgress").await;
         let a = seed_task(&state, &epic_id, &project_id, "A").await;
 
@@ -8231,7 +8503,10 @@ mod tests {
         assert_eq!(task.0, "Failed", "the task itself must be Failed");
         assert_eq!(task.1.as_deref(), Some("test_gate_exhausted"));
 
-        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        let epic = fetch_epic(state.db.conn(), &epic_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(epic.status, "Blocked");
         assert_eq!(
             epic.blocked_reason.as_deref(),
@@ -8240,7 +8515,10 @@ mod tests {
         );
 
         let (lease_owner, lease_expires_at) = epic_lease(&state, &epic_id).await;
-        assert!(lease_owner.is_none(), "lease must be released on exhaustion");
+        assert!(
+            lease_owner.is_none(),
+            "lease must be released on exhaustion"
+        );
         assert!(lease_expires_at.is_none());
 
         // Attempts: test_gate@0..3 all error (4 rows), fix@1..3 all ok (3
@@ -8345,8 +8623,12 @@ mod tests {
 
         // Sanity: the markers really are in the implement stage's prompt —
         // otherwise their absence from the fix prompt would prove nothing.
-        assert!(implement_run.prompt.contains("SPEC_MARKER_ONLY_IN_IMPLEMENT_CONTEXT"));
-        assert!(implement_run.prompt.contains("ACCEPTANCE_MARKER_ONLY_IN_IMPLEMENT_CONTEXT"));
+        assert!(implement_run
+            .prompt
+            .contains("SPEC_MARKER_ONLY_IN_IMPLEMENT_CONTEXT"));
+        assert!(implement_run
+            .prompt
+            .contains("ACCEPTANCE_MARKER_ONLY_IN_IMPLEMENT_CONTEXT"));
         assert!(implement_run.prompt.contains("## Epic Context"));
 
         // The headline assertion: the fix prompt has the test output...
@@ -8356,8 +8638,12 @@ mod tests {
             fix_run.prompt
         );
         // ...and none of the implement stage's own context.
-        assert!(!fix_run.prompt.contains("SPEC_MARKER_ONLY_IN_IMPLEMENT_CONTEXT"));
-        assert!(!fix_run.prompt.contains("ACCEPTANCE_MARKER_ONLY_IN_IMPLEMENT_CONTEXT"));
+        assert!(!fix_run
+            .prompt
+            .contains("SPEC_MARKER_ONLY_IN_IMPLEMENT_CONTEXT"));
+        assert!(!fix_run
+            .prompt
+            .contains("ACCEPTANCE_MARKER_ONLY_IN_IMPLEMENT_CONTEXT"));
         assert!(!fix_run.prompt.contains("## Epic Context"));
         assert!(!fix_run.prompt.contains("D19 Task"));
 
@@ -8371,7 +8657,9 @@ mod tests {
     /// assertion rather than the no-diff-no-commit case).
     #[tokio::test]
     async fn absent_test_cmd_skips_the_gate_and_commits_immediately() {
-        let agent = Arc::new(ScriptedTaskAgent::new().script(Stage::Implement, writes_file("a.txt", "a\n")));
+        let agent = Arc::new(
+            ScriptedTaskAgent::new().script(Stage::Implement, writes_file("a.txt", "a\n")),
+        );
         let (state, _app) = test_app_with_task_agent(agent).await;
         let fixture = GitFixture::new().await;
         let project_id = seed_project_with_workspace(&state, &fixture).await; // no test_cmd
@@ -8383,13 +8671,19 @@ mod tests {
         assert_eq!(epic_status(&state, &epic_id).await, "Completed");
 
         let rows = gate_and_fix_rows(&state, &a).await;
-        assert!(rows.is_empty(), "no test_cmd must mean zero test_gate/fix rows: {rows:?}");
+        assert!(
+            rows.is_empty(),
+            "no test_cmd must mean zero test_gate/fix rows: {rows:?}"
+        );
 
         let branch = epic_branch_name_column(&state, &epic_id).await;
         let subjects = git_log_subjects_for_ref(&fixture.dir, &branch).await;
         assert_eq!(
             subjects,
-            vec!["init".to_string(), format!("impl({}): A", spec::short_id(&a))],
+            vec![
+                "init".to_string(),
+                format!("impl({}): A", spec::short_id(&a))
+            ],
             "the commit must still happen with no gate in the way"
         );
 
@@ -8400,7 +8694,9 @@ mod tests {
     /// `attempt = 0` and no `fix` row at all.
     #[tokio::test]
     async fn green_first_try_writes_one_test_gate_row_and_no_fix_row() {
-        let agent = Arc::new(ScriptedTaskAgent::new().script(Stage::Implement, writes_file("a.txt", "a\n")));
+        let agent = Arc::new(
+            ScriptedTaskAgent::new().script(Stage::Implement, writes_file("a.txt", "a\n")),
+        );
         let (state, _app) = test_app_with_task_agent(agent).await;
         let fixture = GitFixture::new().await;
         let project_id = seed_project_with_test_cmd(&state, &fixture, "true").await;
@@ -8496,7 +8792,10 @@ mod tests {
     /// [`gate_and_fix_rows`], reading `log`/`verdict` too (which
     /// `list_runs_for_task` omits) since several tests below need to inspect
     /// both raw retained outputs directly.
-    async fn review_rows(state: &AppState, task_id: &str) -> Vec<(i64, String, Option<String>, String)> {
+    async fn review_rows(
+        state: &AppState,
+        task_id: &str,
+    ) -> Vec<(i64, String, Option<String>, String)> {
         let mut rows = state
             .db
             .conn()
@@ -8573,7 +8872,11 @@ mod tests {
         assert_eq!(epic_status(&state, &epic_id).await, "Completed");
 
         let rows = review_rows(&state, &a).await;
-        assert_eq!(rows.len(), 1, "exactly one review attempt on a first-try PASS");
+        assert_eq!(
+            rows.len(),
+            1,
+            "exactly one review attempt on a first-try PASS"
+        );
         assert_eq!(rows[0].0, 0, "attempt (T-531: the baseline review opens at 0, not 1 — see the module doc's T-531 numbering section)");
         assert_eq!(rows[0].1, "ok", "status");
         assert_eq!(rows[0].2.as_deref(), Some("PASS"), "verdict");
@@ -8609,7 +8912,10 @@ mod tests {
         assert_eq!(task.0, "Failed");
         assert_eq!(task.1.as_deref(), Some("blocked"));
 
-        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        let epic = fetch_epic(state.db.conn(), &epic_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(epic.status, "Blocked");
         assert_eq!(epic.blocked_reason.as_deref(), Some("blocked"));
 
@@ -8708,7 +9014,10 @@ mod tests {
         assert_eq!(task.0, "Failed");
         assert_eq!(task.1.as_deref(), Some("review_not_converged"));
 
-        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        let epic = fetch_epic(state.db.conn(), &epic_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(epic.status, "Blocked");
         assert_eq!(
             epic.blocked_reason.as_deref(),
@@ -8722,7 +9031,10 @@ mod tests {
             4,
             "the baseline review plus one re-review per fix round (3 rounds)"
         );
-        for (i, marker) in ["round-0", "round-1", "round-2", "round-3"].iter().enumerate() {
+        for (i, marker) in ["round-0", "round-1", "round-2", "round-3"]
+            .iter()
+            .enumerate()
+        {
             assert_eq!(rows[i].2.as_deref(), Some("NEEDS_CHANGES"));
             assert!(
                 rows[i].3.contains(marker),
@@ -8777,7 +9089,10 @@ mod tests {
         assert_eq!(task.0, "Failed", "the task itself must be Failed");
         assert_eq!(task.1.as_deref(), Some("test_gate_exhausted"));
 
-        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        let epic = fetch_epic(state.db.conn(), &epic_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(epic.status, "Blocked");
         assert_eq!(epic.blocked_reason.as_deref(), Some("test_gate_exhausted"));
 
@@ -8787,7 +9102,10 @@ mod tests {
         let subjects = git_log_subjects(&workspace_path).await;
         assert_eq!(
             subjects,
-            vec!["init".to_string(), format!("impl({}): A", spec::short_id(&a))],
+            vec![
+                "init".to_string(),
+                format!("impl({}): A", spec::short_id(&a))
+            ],
             "the review-round fix's broken diff must never be committed"
         );
         assert!(
@@ -8832,7 +9150,11 @@ mod tests {
             .filter(|r| r.stage == Stage::Review)
             .cloned()
             .collect();
-        assert_eq!(review_runs.len(), 2, "baseline review + the re-review after the one fix round");
+        assert_eq!(
+            review_runs.len(),
+            2,
+            "baseline review + the re-review after the one fix round"
+        );
         for run in &review_runs {
             assert!(
                 run.prompt.contains(&format!("git diff {base_sha}..HEAD")),
@@ -8910,7 +9232,10 @@ mod tests {
         assert_eq!(task.0, "Failed");
         assert_eq!(task.1.as_deref(), Some("agent_error"));
 
-        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        let epic = fetch_epic(state.db.conn(), &epic_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(epic.status, "Blocked");
         assert_eq!(epic.blocked_reason.as_deref(), Some("agent_error"));
 
@@ -8922,7 +9247,11 @@ mod tests {
             .filter(|r| r.stage == Stage::Review)
             .cloned()
             .collect();
-        assert_eq!(review_calls.len(), 2, "exactly one re-run after the first contract miss");
+        assert_eq!(
+            review_calls.len(),
+            2,
+            "exactly one re-run after the first contract miss"
+        );
         assert!(
             !review_calls[0].prompt.contains("Contract reminder"),
             "the first attempt's prompt must not carry the reminder"
@@ -8941,7 +9270,10 @@ mod tests {
             rows[0].0, 0,
             "first attempt (T-531: the baseline review opens at 0 — see the module doc's T-531 numbering section)"
         );
-        assert_eq!(rows[0].1, "ok", "the agent itself exited cleanly, just with no verdict line");
+        assert_eq!(
+            rows[0].1, "ok",
+            "the agent itself exited cleanly, just with no verdict line"
+        );
         assert_eq!(rows[0].2, None);
         assert!(rows[0].3.contains("first-miss"));
         assert_eq!(rows[1].0, 1, "second attempt (the bounded re-run)");
@@ -9065,7 +9397,9 @@ mod tests {
             .expect("the review stage must have run");
         assert!(review_run.prompt.contains("## Base Commit"));
         assert!(review_run.prompt.contains(&base_sha));
-        assert!(review_run.prompt.contains(&format!("git diff {base_sha}..HEAD")));
+        assert!(review_run
+            .prompt
+            .contains(&format!("git diff {base_sha}..HEAD")));
 
         // The implement stage's own prompt never mentions base_sha — only
         // Review's context does (spec::TaskContext::base_sha is None there).
@@ -9280,7 +9614,10 @@ mod tests {
         let subjects = git_log_subjects_for_ref(&fixture.dir, &branch).await;
         assert_eq!(
             subjects,
-            vec!["init".to_string(), format!("impl({}): A", spec::short_id(&a))],
+            vec![
+                "init".to_string(),
+                format!("impl({}): A", spec::short_id(&a))
+            ],
             "the verify-complete-driven fix's diff must land as the task's impl(...) commit"
         );
 
@@ -9315,7 +9652,11 @@ mod tests {
         // The test gate ran (green first try) and the ordinary review loop
         // ran on top of the new commit and passed.
         let review_rows = review_rows(&state, &a).await;
-        assert_eq!(review_rows.len(), 1, "the ordinary review loop runs once more, starting fresh at attempt 0");
+        assert_eq!(
+            review_rows.len(),
+            1,
+            "the ordinary review loop runs once more, starting fresh at attempt 0"
+        );
         assert_eq!(review_rows[0].0, 0);
         assert_eq!(review_rows[0].2.as_deref(), Some("PASS"));
 
@@ -9342,7 +9683,10 @@ mod tests {
         assert_eq!(task.0, "Failed");
         assert_eq!(task.1.as_deref(), Some("blocked"));
 
-        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        let epic = fetch_epic(state.db.conn(), &epic_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(epic.status, "Blocked");
         assert_eq!(epic.blocked_reason.as_deref(), Some("blocked"));
 
@@ -9354,7 +9698,11 @@ mod tests {
         // deletes the workspace or pushes).
         let workspace_path = workspace::epic_workspace_path(&state.config.clone_root, &epic_id);
         let subjects = git_log_subjects(&workspace_path).await;
-        assert_eq!(subjects, vec!["init".to_string()], "nothing must ever be committed on a BLOCKED verdict");
+        assert_eq!(
+            subjects,
+            vec!["init".to_string()],
+            "nothing must ever be committed on a BLOCKED verdict"
+        );
 
         cleanup_clone_root(&state, &project_id, &[&epic_id]);
     }
@@ -9368,8 +9716,14 @@ mod tests {
     ) {
         let agent = Arc::new(
             ScriptedTaskAgent::new()
-                .script(Stage::VerifyComplete, unparseable_verify_complete("first-miss"))
-                .script(Stage::VerifyComplete, unparseable_verify_complete("second-miss")),
+                .script(
+                    Stage::VerifyComplete,
+                    unparseable_verify_complete("first-miss"),
+                )
+                .script(
+                    Stage::VerifyComplete,
+                    unparseable_verify_complete("second-miss"),
+                ),
         );
         let recorded = agent.recorded();
         let (state, _app) = test_app_with_task_agent(agent).await;
@@ -9384,7 +9738,10 @@ mod tests {
         assert_eq!(task.0, "Failed");
         assert_eq!(task.1.as_deref(), Some("agent_error"));
 
-        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        let epic = fetch_epic(state.db.conn(), &epic_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(epic.status, "Blocked");
         assert_eq!(epic.blocked_reason.as_deref(), Some("agent_error"));
 
@@ -9395,7 +9752,11 @@ mod tests {
             .filter(|r| r.stage == Stage::VerifyComplete)
             .cloned()
             .collect();
-        assert_eq!(vc_calls.len(), 2, "exactly one re-run after the first contract miss");
+        assert_eq!(
+            vc_calls.len(),
+            2,
+            "exactly one re-run after the first contract miss"
+        );
         assert!(!vc_calls[0].prompt.contains("Contract reminder"));
         assert!(vc_calls[1].prompt.contains(VERDICT_CONTRACT_REMINDER));
 
@@ -9432,15 +9793,25 @@ mod tests {
         run_epic_pipeline(state.clone(), epic_id.clone()).await;
 
         let task = fetch_task_row(&state, &a).await;
-        assert_eq!(task.0, "Failed", "a no-op fix must never leave the task Done");
+        assert_eq!(
+            task.0, "Failed",
+            "a no-op fix must never leave the task Done"
+        );
         assert_eq!(task.1.as_deref(), Some("agent_error"));
 
-        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        let epic = fetch_epic(state.db.conn(), &epic_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(epic.status, "Blocked");
 
         let workspace_path = workspace::epic_workspace_path(&state.config.clone_root, &epic_id);
         let subjects = git_log_subjects(&workspace_path).await;
-        assert_eq!(subjects, vec!["init".to_string()], "nothing must ever be committed");
+        assert_eq!(
+            subjects,
+            vec!["init".to_string()],
+            "nothing must ever be committed"
+        );
 
         cleanup_clone_root(&state, &project_id, &[&epic_id]);
     }
@@ -9457,8 +9828,14 @@ mod tests {
         assert_eq!(FailureReason::PreflightRed.as_str(), "preflight_red");
         assert_eq!(FailureReason::SetupFailed.as_str(), "setup_failed");
         assert_eq!(FailureReason::WorkspaceError.as_str(), "workspace_error");
-        assert_eq!(FailureReason::TestGateExhausted.as_str(), "test_gate_exhausted");
-        assert_eq!(FailureReason::ReviewNotConverged.as_str(), "review_not_converged");
+        assert_eq!(
+            FailureReason::TestGateExhausted.as_str(),
+            "test_gate_exhausted"
+        );
+        assert_eq!(
+            FailureReason::ReviewNotConverged.as_str(),
+            "review_not_converged"
+        );
         assert_eq!(FailureReason::Blocked.as_str(), "blocked");
         assert_eq!(FailureReason::AgentError.as_str(), "agent_error");
         assert_eq!(FailureReason::Timeout.as_str(), "timeout");
@@ -9505,8 +9882,14 @@ mod tests {
                 "{reason:?}: task.failure_reason must match the router's reason"
             );
 
-            let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
-            assert_eq!(epic.status, "Blocked", "{reason:?}: epic must reach Blocked");
+            let epic = fetch_epic(state.db.conn(), &epic_id)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                epic.status, "Blocked",
+                "{reason:?}: epic must reach Blocked"
+            );
             assert_eq!(
                 epic.blocked_reason.as_deref(),
                 Some(reason.as_str()),
@@ -9526,9 +9909,18 @@ mod tests {
                 },
             )
             .await;
-            let epic_no_task = fetch_epic(state.db.conn(), &epic_id_no_task).await.unwrap().unwrap();
-            assert_eq!(epic_no_task.status, "Blocked", "{reason:?}: no-task epic must reach Blocked");
-            assert_eq!(epic_no_task.blocked_reason.as_deref(), Some(reason.as_str()));
+            let epic_no_task = fetch_epic(state.db.conn(), &epic_id_no_task)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(
+                epic_no_task.status, "Blocked",
+                "{reason:?}: no-task epic must reach Blocked"
+            );
+            assert_eq!(
+                epic_no_task.blocked_reason.as_deref(),
+                Some(reason.as_str())
+            );
         }
     }
 
@@ -9549,8 +9941,7 @@ mod tests {
         );
         let (state, _app) = test_app_with_task_agent(agent).await;
         let fixture = GitFixture::new().await;
-        let project_id =
-            seed_project_with_test_cmd(&state, &fixture, "! test -f broken.txt").await;
+        let project_id = seed_project_with_test_cmd(&state, &fixture, "! test -f broken.txt").await;
         let epic_id = seed_epic(&state, &project_id, "InProgress").await;
         let a = seed_task(&state, &epic_id, &project_id, "A").await;
         let b = seed_task(&state, &epic_id, &project_id, "B").await;
@@ -9564,7 +9955,10 @@ mod tests {
         assert_eq!(task_b.0, "Failed");
         assert_eq!(task_b.1.as_deref(), Some("test_gate_exhausted"));
 
-        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        let epic = fetch_epic(state.db.conn(), &epic_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(epic.status, "Blocked");
         assert_eq!(epic.blocked_reason.as_deref(), Some("test_gate_exhausted"));
 
@@ -9574,7 +9968,10 @@ mod tests {
         let subjects = git_log_subjects_for_ref(&fixture.dir, &branch).await;
         assert_eq!(
             subjects,
-            vec!["init".to_string(), format!("impl({}): A", spec::short_id(&a))],
+            vec![
+                "init".to_string(),
+                format!("impl({}): A", spec::short_id(&a))
+            ],
             "the pushed branch must carry A's commit and nothing from B's failed attempt"
         );
 
@@ -9627,8 +10024,7 @@ mod tests {
         );
         let (state, _app) = test_app_with_task_agent_and_host(agent, fake).await;
         let fixture = GitFixture::new().await;
-        let project_id =
-            seed_project_with_test_cmd(&state, &fixture, "! test -f broken.txt").await;
+        let project_id = seed_project_with_test_cmd(&state, &fixture, "! test -f broken.txt").await;
         let epic_id = seed_epic(&state, &project_id, "InProgress").await;
         let a = seed_task(&state, &epic_id, &project_id, "A").await;
 
@@ -9638,7 +10034,10 @@ mod tests {
         assert_eq!(task.0, "Failed");
         assert_eq!(task.1.as_deref(), Some("test_gate_exhausted"));
 
-        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        let epic = fetch_epic(state.db.conn(), &epic_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(epic.status, "Blocked");
         assert_eq!(
             epic.blocked_reason.as_deref(),
@@ -9690,7 +10089,10 @@ mod tests {
             .await
             .unwrap();
         let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
-        assert_eq!(count, 0, "no ProvisionedWorkspace ever existed — there must be no push row at all");
+        assert_eq!(
+            count, 0,
+            "no ProvisionedWorkspace ever existed — there must be no push row at all"
+        );
     }
 
     /// `workspace_error` (an unreachable repo) predates any
@@ -9732,7 +10134,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        let epic = fetch_epic(state.db.conn(), &epic_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(epic.blocked_reason.as_deref(), Some("workspace_error"));
         assert_no_push_row(&state, &epic_id).await;
     }
@@ -9772,7 +10177,10 @@ mod tests {
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
-        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        let epic = fetch_epic(state.db.conn(), &epic_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(epic.blocked_reason.as_deref(), Some("setup_failed"));
         assert_no_push_row(&state, &epic_id).await;
 
@@ -9809,12 +10217,17 @@ mod tests {
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            let (s1, s2) = (epic_status(&state, &epic1).await, epic_status(&state, &epic2).await);
+            let (s1, s2) = (
+                epic_status(&state, &epic1).await,
+                epic_status(&state, &epic2).await,
+            );
             if s1 == "Blocked" && s2 == "Completed" {
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
-                panic!("epics never reached their expected terminal states: epic1={s1:?} epic2={s2:?}");
+                panic!(
+                    "epics never reached their expected terminal states: epic1={s1:?} epic2={s2:?}"
+                );
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -9856,7 +10269,10 @@ mod tests {
 
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            let (sa, sb) = (epic_status(&state, &epic_a).await, epic_status(&state, &epic_b).await);
+            let (sa, sb) = (
+                epic_status(&state, &epic_a).await,
+                epic_status(&state, &epic_b).await,
+            );
             if sa == "Blocked" && sb == "Completed" {
                 break;
             }
@@ -9869,11 +10285,17 @@ mod tests {
         let epic_a_row = fetch_epic(state.db.conn(), &epic_a).await.unwrap().unwrap();
         assert_eq!(epic_a_row.blocked_reason.as_deref(), Some("agent_error"));
         let task_a = fetch_task_row(&state, &task_a_id).await;
-        assert_eq!(task_a.0, "Failed", "the T-540 fix: a failing implement stage now fails the task too");
+        assert_eq!(
+            task_a.0, "Failed",
+            "the T-540 fix: a failing implement stage now fails the task too"
+        );
         assert_eq!(task_a.1.as_deref(), Some("agent_error"));
 
         let statuses_b = task_statuses(&state, &epic_b).await;
-        assert_eq!(statuses_b["B"], "Done", "epic B must be unaffected by epic A's failure");
+        assert_eq!(
+            statuses_b["B"], "Done",
+            "epic B must be unaffected by epic A's failure"
+        );
 
         cleanup_clone_root(&state, &project_id, &[&epic_a, &epic_b]);
     }
@@ -9905,7 +10327,10 @@ mod tests {
             .output()
             .await
             .unwrap();
-        assert!(output.status.success(), "git ls-tree {git_ref} failed: {output:?}");
+        assert!(
+            output.status.success(),
+            "git ls-tree {git_ref} failed: {output:?}"
+        );
         String::from_utf8_lossy(&output.stdout)
             .lines()
             .map(|s| s.to_string())
@@ -9944,11 +10369,16 @@ mod tests {
         let fixture = GitFixture::new().await;
         // Green on the untouched tree (preflight passes); red for as long as
         // broken.txt exists — identical fixture to the plain exhaustion test.
-        let project_id =
-            seed_project_with_test_cmd(&state, &fixture, "! test -f broken.txt").await;
+        let project_id = seed_project_with_test_cmd(&state, &fixture, "! test -f broken.txt").await;
         let epic_id = seed_epic(&state, &project_id, "InProgress").await;
         let task_id = seed_task(&state, &epic_id, &project_id, "A").await;
-        set_task_spec(&state, &task_id, "ORIGINAL_SPEC_MARKER", "original acceptance").await;
+        set_task_spec(
+            &state,
+            &task_id,
+            "ORIGINAL_SPEC_MARKER",
+            "original acceptance",
+        )
+        .await;
 
         let _handles = spawn_pool(state.clone());
         state.notify.notify_waiters();
@@ -9971,7 +10401,10 @@ mod tests {
         let failed = fetch_task_row(&state, &task_id).await;
         assert_eq!(failed.0, "Failed");
         assert_eq!(failed.1.as_deref(), Some("test_gate_exhausted"));
-        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        let epic = fetch_epic(state.db.conn(), &epic_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(epic.blocked_reason.as_deref(), Some("test_gate_exhausted"));
 
         // ---- edit the spec before retrying (T-541's PATCH-then-retry AC) ----
@@ -10051,8 +10484,15 @@ mod tests {
 
         // ---- the retried run's prompt carried the edited spec ----
         let runs = recorded.lock().unwrap();
-        let implement_runs: Vec<_> = runs.iter().filter(|r| r.stage == Stage::Implement).collect();
-        assert_eq!(implement_runs.len(), 2, "implement must run once per attempt");
+        let implement_runs: Vec<_> = runs
+            .iter()
+            .filter(|r| r.stage == Stage::Implement)
+            .collect();
+        assert_eq!(
+            implement_runs.len(),
+            2,
+            "implement must run once per attempt"
+        );
         assert!(implement_runs[0].prompt.contains("ORIGINAL_SPEC_MARKER"));
         assert!(
             implement_runs[1].prompt.contains("EDITED_SPEC_MARKER"),
@@ -10091,13 +10531,14 @@ mod tests {
     #[tokio::test]
     async fn cancel_during_implement_kills_it_in_flight_resets_task_retains_workspace_no_pr() {
         let gate = Arc::new(Gate::default());
-        let agent: Arc<dyn TaskAgent> = Arc::new(ScriptedTaskAgent::new().with_gate(gate.clone()).script(
-            Stage::Implement,
-            ScriptedRun {
-                text: vec!["partial output before the kill".to_string()],
-                ..ScriptedRun::default()
-            },
-        ));
+        let agent: Arc<dyn TaskAgent> =
+            Arc::new(ScriptedTaskAgent::new().with_gate(gate.clone()).script(
+                Stage::Implement,
+                ScriptedRun {
+                    text: vec!["partial output before the kill".to_string()],
+                    ..ScriptedRun::default()
+                },
+            ));
         let fake = Arc::new(FakeHost::new());
         let (state, app) = test_app_with_task_agent_and_host(agent, fake.clone()).await;
         let fixture = GitFixture::new().await;
@@ -10191,7 +10632,11 @@ mod tests {
             )
             .await
             .unwrap();
-        let row = rows.next().await.unwrap().expect("the implement row must exist");
+        let row = rows
+            .next()
+            .await
+            .unwrap()
+            .expect("the implement row must exist");
         assert_eq!(row.get::<String>(0).unwrap(), "cancelled");
         let log: String = row.get(1).unwrap();
         assert!(
@@ -10227,7 +10672,8 @@ mod tests {
     /// `state.cancel_registry`.
     #[tokio::test]
     async fn cancel_registry_is_empty_after_a_normal_successful_walk() {
-        let agent = Arc::new(ScriptedTaskAgent::new().script(Stage::Implement, writes_file("a.txt", "a")));
+        let agent =
+            Arc::new(ScriptedTaskAgent::new().script(Stage::Implement, writes_file("a.txt", "a")));
         let (state, _app) = test_app_with_task_agent(agent).await;
         let fixture = GitFixture::new().await;
         let project_id = seed_project_with_workspace(&state, &fixture).await;
@@ -10417,13 +10863,14 @@ mod tests {
         config.executor.agent_stage_timeout_secs = 1;
 
         let gate = Arc::new(Gate::default());
-        let agent: Arc<dyn TaskAgent> = Arc::new(ScriptedTaskAgent::new().with_gate(gate.clone()).script(
-            Stage::Implement,
-            ScriptedRun {
-                text: vec!["partial output before the deadline kill".to_string()],
-                ..ScriptedRun::default()
-            },
-        ));
+        let agent: Arc<dyn TaskAgent> =
+            Arc::new(ScriptedTaskAgent::new().with_gate(gate.clone()).script(
+                Stage::Implement,
+                ScriptedRun {
+                    text: vec!["partial output before the deadline kill".to_string()],
+                    ..ScriptedRun::default()
+                },
+            ));
         let fake = Arc::new(FakeHost::new());
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
@@ -10481,7 +10928,10 @@ mod tests {
         assert_eq!(failure_reason.as_deref(), Some("timeout"));
 
         // The epic blocked with the matching reason — never Cancelled.
-        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        let epic = fetch_epic(state.db.conn(), &epic_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(epic.status, "Blocked");
         assert_eq!(epic.blocked_reason.as_deref(), Some("timeout"));
 
@@ -10496,7 +10946,11 @@ mod tests {
             )
             .await
             .unwrap();
-        let row = rows.next().await.unwrap().expect("the implement row must exist");
+        let row = rows
+            .next()
+            .await
+            .unwrap()
+            .expect("the implement row must exist");
         assert_eq!(row.get::<String>(0).unwrap(), "timeout");
         let log: String = row.get(1).unwrap();
         assert!(
@@ -10555,7 +11009,11 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::CONFLICT);
-        assert_eq!(single_task_status(&state, &task_id).await, "Todo", "must be untouched");
+        assert_eq!(
+            single_task_status(&state, &task_id).await,
+            "Todo",
+            "must be untouched"
+        );
     }
 
     /// `409` for a standalone task in every status other than `Todo`.
@@ -10584,7 +11042,10 @@ mod tests {
     #[tokio::test]
     async fn run_task_endpoint_404s_for_unknown_task() {
         let (_state, app) = test_app().await;
-        let response = app.oneshot(req("POST", "/tasks/nope/run", None)).await.unwrap();
+        let response = app
+            .oneshot(req("POST", "/tasks/nope/run", None))
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::NOT_FOUND);
     }
 
@@ -10742,7 +11203,11 @@ mod tests {
         // Review ran exactly once (a first-try PASS) — the identical T-530
         // evidence trail an epic-owned task's review leaves.
         let rows = review_rows(&state, &task_id).await;
-        assert_eq!(rows.len(), 1, "exactly one review attempt on a first-try PASS");
+        assert_eq!(
+            rows.len(),
+            1,
+            "exactly one review attempt on a first-try PASS"
+        );
         assert_eq!(rows[0].2.as_deref(), Some("PASS"));
 
         cleanup_clone_root(&state, &project_id, &[]);
@@ -10853,7 +11318,10 @@ mod tests {
 
         try_claim_and_run(&state, "worker-1").await;
         let task = fetch_task_row(&state, &task_id).await;
-        assert_eq!(task.0, "Failed", "first attempt must fail on the scripted BLOCKED verdict");
+        assert_eq!(
+            task.0, "Failed",
+            "first attempt must fail on the scripted BLOCKED verdict"
+        );
         assert_eq!(task.1.as_deref(), Some("blocked"));
 
         // Retry: T-551's revised contract sends a standalone task straight
@@ -10878,7 +11346,10 @@ mod tests {
         try_claim_and_run(&state, "worker-2").await;
 
         let task = fetch_task_row(&state, &task_id).await;
-        assert_eq!(task.0, "Done", "the retried task must have actually resumed and completed");
+        assert_eq!(
+            task.0, "Done",
+            "the retried task must have actually resumed and completed"
+        );
         assert_eq!(task.1, None, "failure_reason must stay cleared");
 
         let workspace_path = workspace::task_workspace_path(&state.config.clone_root, &task_id);
@@ -10908,7 +11379,10 @@ mod tests {
     }
 
     impl TaskAgent for FailToSpawnAtStage {
-        fn run(&self, req: TaskRunRequest) -> Result<(RunHandle, Receiver<RunEvent>), HarnessError> {
+        fn run(
+            &self,
+            req: TaskRunRequest,
+        ) -> Result<(RunHandle, Receiver<RunEvent>), HarnessError> {
             if req.stage == self.stage {
                 return Err(HarnessError::Other(format!(
                     "boom: {} failed to spawn",
@@ -10936,11 +11410,10 @@ mod tests {
             )
             .await
             .unwrap();
-        let row = rows
-            .next()
-            .await
-            .unwrap()
-            .unwrap_or_else(|| panic!("expected exactly one '{stage}' agent_run row, found none"));
+        let row =
+            rows.next().await.unwrap().unwrap_or_else(|| {
+                panic!("expected exactly one '{stage}' agent_run row, found none")
+            });
         // Extract every value **before** advancing the cursor again — a
         // `Row` is a view onto libsql's current cursor position, and calling
         // `rows.next()` a second time invalidates it (observed directly: a
@@ -10991,7 +11464,9 @@ mod tests {
         let calls = fake.open_pr_calls();
         assert_eq!(calls.len(), 1);
         assert!(calls[0].body.contains("## Summary of changes"));
-        assert!(calls[0].body.contains("This epic adds a.txt with a short greeting."));
+        assert!(calls[0]
+            .body
+            .contains("This epic adds a.txt with a short greeting."));
 
         let (task_id, epic_id_col, status) = sole_agent_run_row(&state, "summarize").await;
         assert_eq!(task_id, None, "an epic-scoped summarize run has no task_id");
@@ -11035,7 +11510,10 @@ mod tests {
         );
         let calls = fake.open_pr_calls();
         assert_eq!(calls.len(), 1);
-        assert!(calls[0].body.contains("## Tasks"), "the template must still render");
+        assert!(
+            calls[0].body.contains("## Tasks"),
+            "the template must still render"
+        );
         assert!(!calls[0].body.contains("## Summary of changes"));
 
         let (_, _, status) = sole_agent_run_row(&state, "summarize").await;
@@ -11254,8 +11732,9 @@ mod tests {
     /// own AC put in the task's run history, one hop closer to a reviewer.
     #[tokio::test]
     async fn verified_already_complete_reasoning_appears_in_the_pr_body() {
-        let agent =
-            Arc::new(ScriptedTaskAgent::new().script(Stage::VerifyComplete, verify_complete_pass()));
+        let agent = Arc::new(
+            ScriptedTaskAgent::new().script(Stage::VerifyComplete, verify_complete_pass()),
+        );
         let fake = Arc::new(FakeHost::new());
         let (state, _app) = test_app_with_task_agent_and_host(agent, fake.clone()).await;
         let fixture = GitFixture::new().await;
@@ -11315,7 +11794,10 @@ mod tests {
 
         let (row_task_id, row_epic_id, status) = sole_agent_run_row(&state, "summarize").await;
         assert_eq!(row_task_id.as_deref(), Some(task_id.as_str()));
-        assert_eq!(row_epic_id, None, "a standalone task's summarize run has no epic_id");
+        assert_eq!(
+            row_epic_id, None,
+            "a standalone task's summarize run has no epic_id"
+        );
         assert_eq!(status, "ok");
 
         let workspace_path = workspace::task_workspace_path(&state.config.clone_root, &task_id);

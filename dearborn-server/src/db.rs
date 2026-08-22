@@ -192,10 +192,17 @@ mod tests {
             )
             .await
             .unwrap();
-        let row = rows.next().await.unwrap().expect("project row should exist");
+        let row = rows
+            .next()
+            .await
+            .unwrap()
+            .expect("project row should exist");
         assert_eq!(row.get::<String>(0).unwrap(), "proj-1");
         assert_eq!(row.get::<String>(1).unwrap(), "Demo Project");
-        assert_eq!(row.get::<String>(2).unwrap(), "https://example.com/demo.git");
+        assert_eq!(
+            row.get::<String>(2).unwrap(),
+            "https://example.com/demo.git"
+        );
         assert_eq!(row.get::<String>(3).unwrap(), "pending");
         assert!(rows.next().await.unwrap().is_none());
     }
@@ -278,7 +285,10 @@ mod tests {
                 )
                 .await
                 .unwrap();
-            assert!(rows.next().await.unwrap().is_some(), "missing index: {index}");
+            assert!(
+                rows.next().await.unwrap().is_some(),
+                "missing index: {index}"
+            );
         }
     }
 
@@ -342,7 +352,10 @@ mod tests {
                     has_pr_url = true;
                 }
             }
-            assert!(has_pr_url, "epic.pr_url present after migrating an existing db");
+            assert!(
+                has_pr_url,
+                "epic.pr_url present after migrating an existing db"
+            );
 
             // Re-running again is a no-op.
             assert_eq!(db.run_migrations().await.unwrap(), 0);

@@ -164,7 +164,11 @@ pub fn build_pr_body(
     if !reviewed.is_empty() {
         out.push_str("\n## Review rounds\n\n");
         for item in reviewed {
-            let noun = if item.review_rounds == 1 { "round" } else { "rounds" };
+            let noun = if item.review_rounds == 1 {
+                "round"
+            } else {
+                "rounds"
+            };
             out.push_str(&format!(
                 "- {} (`{}`): {} review {}\n",
                 item.title, item.short_id, item.review_rounds, noun
@@ -318,7 +322,10 @@ mod tests {
         // it must not *also* show up inside the Review rounds section itself.
         let section_start = body.find("## Review rounds").unwrap();
         let section = &body[section_start..];
-        let section_end = section[1..].find("\n## ").map(|i| i + 1).unwrap_or(section.len());
+        let section_end = section[1..]
+            .find("\n## ")
+            .map(|i| i + 1)
+            .unwrap_or(section.len());
         assert!(!section[..section_end].contains("Never reviewed"));
     }
 
@@ -351,7 +358,10 @@ mod tests {
         // The section lists exactly the one qualifying task; the committed
         // one must not spuriously match here too.
         let section = &body[body.find("## Verified already complete").unwrap()..];
-        let next_heading = section[1..].find("\n## ").map(|i| i + 1).unwrap_or(section.len());
+        let next_heading = section[1..]
+            .find("\n## ")
+            .map(|i| i + 1)
+            .unwrap_or(section.len());
         assert!(!section[..next_heading].contains("Add the form"));
     }
 
@@ -363,7 +373,10 @@ mod tests {
             ..plain_item("Add the endpoint", "ccc333", None)
         }];
         let body = build_pr_body(Some("desc"), &items, None);
-        assert!(body.contains('…'), "an over-long reasoning slice must be truncated with an ellipsis");
+        assert!(
+            body.contains('…'),
+            "an over-long reasoning slice must be truncated with an ellipsis"
+        );
         // 400-char cap plus the ellipsis character; well under the full 1000.
         assert!(body.len() < 1_000);
     }
@@ -414,7 +427,10 @@ mod tests {
 
     #[test]
     fn parse_sha_returns_none_for_an_unrecognized_format() {
-        assert_eq!(parse_commit_sha_from_commit_log("not a commit log line"), None);
+        assert_eq!(
+            parse_commit_sha_from_commit_log("not a commit log line"),
+            None
+        );
         assert_eq!(parse_commit_sha_from_commit_log(""), None);
         assert_eq!(parse_commit_sha_from_commit_log("commit : subject"), None);
     }

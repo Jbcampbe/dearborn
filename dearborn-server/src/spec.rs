@@ -777,7 +777,9 @@ VERDICT: BLOCKED";
     #[test]
     fn review_and_verify_complete_prompts_state_the_verdict_contract() {
         assert!(prompt_for(Stage::Review).unwrap().contains("VERDICT:"));
-        assert!(prompt_for(Stage::VerifyComplete).unwrap().contains("VERDICT:"));
+        assert!(prompt_for(Stage::VerifyComplete)
+            .unwrap()
+            .contains("VERDICT:"));
     }
 
     #[test]

@@ -90,7 +90,10 @@ async fn connect_subscribe_and_receive_a_server_pushed_event() {
         .unwrap();
 
     let ack = next_json(&mut socket).await;
-    assert_eq!(ack, json!({ "topic": "epic:42", "type": "subscribed", "payload": {} }));
+    assert_eq!(
+        ack,
+        json!({ "topic": "epic:42", "type": "subscribed", "payload": {} })
+    );
 
     // Server-side code publishes an event to the topic (this is the API T-202 /
     // T-401 will call).

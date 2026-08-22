@@ -329,7 +329,10 @@ impl AppState {
     /// so every caller provisioning against that project actually excludes
     /// every other. See [`AppState::refresh_locks`] for why this exists.
     pub fn project_refresh_lock(&self, project_id: &str) -> Arc<tokio::sync::Mutex<()>> {
-        let mut map = self.refresh_locks.lock().expect("refresh_locks mutex poisoned");
+        let mut map = self
+            .refresh_locks
+            .lock()
+            .expect("refresh_locks mutex poisoned");
         map.entry(project_id.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()

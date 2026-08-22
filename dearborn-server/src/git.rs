@@ -395,7 +395,8 @@ mod tests {
 
     #[test]
     fn injects_token_as_userinfo() {
-        let url = authenticated_url("https://github.com/octocat/Hello-World.git", Some(PAT)).unwrap();
+        let url =
+            authenticated_url("https://github.com/octocat/Hello-World.git", Some(PAT)).unwrap();
         assert_eq!(
             url,
             "https://x-access-token:ghp_superSecretToken123@github.com/octocat/Hello-World.git"
@@ -430,7 +431,10 @@ mod tests {
         let auth = authenticated_url("https://github.com/o/r.git", Some(PAT)).unwrap();
         let msg = format!("fatal: could not read from '{auth}'");
         let red = redact(&msg, Some(PAT));
-        assert!(!red.contains(PAT), "token must not survive redaction: {red}");
+        assert!(
+            !red.contains(PAT),
+            "token must not survive redaction: {red}"
+        );
         assert!(!red.contains("ghp_"));
         assert!(red.contains("***@github.com/o/r.git"));
     }
@@ -465,7 +469,11 @@ mod tests {
             .await
             .expect_err("clone of a bad URL must fail");
         assert!(!err.message.is_empty(), "error reason must be readable");
-        assert!(!err.message.contains(PAT), "no token in error: {}", err.message);
+        assert!(
+            !err.message.contains(PAT),
+            "no token in error: {}",
+            err.message
+        );
         assert!(!err.message.contains("ghp_"));
         let _ = std::fs::remove_dir_all(&dir);
     }
@@ -503,7 +511,11 @@ mod tests {
     }
 
     fn temp_repo_dir(name: &str) -> std::path::PathBuf {
-        std::env::temp_dir().join(format!("dearborn-git-commit-{name}-{}-{}", std::process::id(), now_nanos()))
+        std::env::temp_dir().join(format!(
+            "dearborn-git-commit-{name}-{}-{}",
+            std::process::id(),
+            now_nanos()
+        ))
     }
 
     #[tokio::test]
@@ -511,7 +523,10 @@ mod tests {
         let dir = temp_repo_dir("clean");
         init_repo(&dir).await;
         let status = status_porcelain(&dir).await.unwrap();
-        assert!(status.trim().is_empty(), "a freshly committed tree must be clean: {status:?}");
+        assert!(
+            status.trim().is_empty(),
+            "a freshly committed tree must be clean: {status:?}"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -524,7 +539,10 @@ mod tests {
 
         add_all(&dir).await.unwrap();
         let status = status_porcelain(&dir).await.unwrap();
-        assert!(!status.trim().is_empty(), "staged changes must show up: {status:?}");
+        assert!(
+            !status.trim().is_empty(),
+            "staged changes must show up: {status:?}"
+        );
         assert!(status.contains("README.md"));
         assert!(status.contains("new.txt"));
         let _ = std::fs::remove_dir_all(&dir);
@@ -549,11 +567,20 @@ mod tests {
         std::fs::write(dir.join("new.txt"), "brand new\n").unwrap();
         add_all(&dir).await.unwrap();
 
-        let sha = commit_all(&dir, "impl(abc123): Do the thing", "Dearborn", "dearborn@noreply.localhost")
-            .await
-            .unwrap();
+        let sha = commit_all(
+            &dir,
+            "impl(abc123): Do the thing",
+            "Dearborn",
+            "dearborn@noreply.localhost",
+        )
+        .await
+        .unwrap();
         assert_ne!(sha, base_sha, "a new commit must have landed");
-        assert_eq!(current_commit(&dir).await.unwrap(), sha, "commit_all must return the new HEAD");
+        assert_eq!(
+            current_commit(&dir).await.unwrap(),
+            sha,
+            "commit_all must return the new HEAD"
+        );
 
         // Subject + identity landed on the commit itself, not the workspace's
         // persistent git config.
@@ -656,7 +683,11 @@ mod tests {
         .await
         .expect_err("push to an unreachable host must fail");
         assert!(!err.message.is_empty(), "error reason must be readable");
-        assert!(!err.message.contains(pat), "no token in error: {}", err.message);
+        assert!(
+            !err.message.contains(pat),
+            "no token in error: {}",
+            err.message
+        );
         assert!(!err.message.contains("ghp_"));
 
         let _ = std::fs::remove_dir_all(&repo_dir);

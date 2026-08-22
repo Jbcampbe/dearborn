@@ -385,7 +385,11 @@ pub async fn run_stage_command(
     let ran: RanCommand = evidence::guard_stage_close(conn, &handle, move || async move {
         let (status, exit_code, raw_output) = match run_shell_timed(cmd, cwd, timeout).await {
             ShellOutcome::Exited(out) => (
-                if out.exit_code == Some(0) { "ok" } else { "error" },
+                if out.exit_code == Some(0) {
+                    "ok"
+                } else {
+                    "error"
+                },
                 out.exit_code,
                 out.output,
             ),

@@ -254,11 +254,8 @@ mod tests {
     async fn test_app() -> (AppState, axum::Router) {
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
-        let state = AppState::with_planner(
-            Config::for_test(TOKEN),
-            db,
-            Arc::new(SilentPlanningAgent),
-        );
+        let state =
+            AppState::with_planner(Config::for_test(TOKEN), db, Arc::new(SilentPlanningAgent));
         let app = app(state.clone());
         (state, app)
     }
@@ -449,7 +446,10 @@ mod tests {
             .await
             .unwrap();
         let status: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
-        assert_eq!(status, "Todo", "lane handler must not spawn a worker itself");
+        assert_eq!(
+            status, "Todo",
+            "lane handler must not spawn a worker itself"
+        );
     }
 
     #[tokio::test]
@@ -557,10 +557,15 @@ mod tests {
         );
 
         gate.release();
-        let exited = rx.into_iter().find(|e| matches!(e, RunEvent::Exited { .. }));
+        let exited = rx
+            .into_iter()
+            .find(|e| matches!(e, RunEvent::Exited { .. }));
         match exited {
             Some(RunEvent::Exited { cancelled, .. }) => {
-                assert!(cancelled, "the scripted run's own Exited must report cancelled: true")
+                assert!(
+                    cancelled,
+                    "the scripted run's own Exited must report cancelled: true"
+                )
             }
             other => panic!("expected an Exited event, got {other:?}"),
         }
