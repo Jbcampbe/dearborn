@@ -43,7 +43,7 @@ use crate::{AppError, AppResult, AppState, InflightGuard};
 
 /// The system prompt that encodes the `to-tasks` vertical-slice breakdown logic.
 /// The epic's product + technical context is appended separately (as the "PRD").
-const BREAKDOWN_PROMPT: &str = "\
+pub(crate) const BREAKDOWN_PROMPT: &str = "\
 You are Dearborn's breakdown agent. You run ONCE (non-interactively) to convert an \
 approved epic into an executable task DAG. The epic's product and technical context \
 are provided to you as the plan.

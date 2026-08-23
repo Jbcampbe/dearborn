@@ -81,7 +81,7 @@ pub const PRODUCT_PLANNING: PlanningConfig = PlanningConfig {
     tools_enabled: true,
 };
 
-const PRODUCT_PLANNING_PROMPT: &str = "\
+pub(crate) const PRODUCT_PLANNING_PROMPT: &str = "\
 You are Dearborn's product-planning partner. You help a single engineer turn a \
 rough idea for an epic into a crisp product definition through conversation.
 
@@ -117,7 +117,7 @@ pub const TECHNICAL_PLANNING: PlanningConfig = PlanningConfig {
     tools_enabled: true,
 };
 
-const TECHNICAL_PLANNING_PROMPT: &str = "\
+pub(crate) const TECHNICAL_PLANNING_PROMPT: &str = "\
 You are Dearborn's technical-planning partner. The product-planning phase has \
 already agreed WHAT to build (its outcome is provided to you as the product \
 context). Your job is to work out HOW: the technical approach, architecture, the \

@@ -73,6 +73,8 @@ export interface SlotSetting {
   harness: string | null;
   model: string | null;
   system_prompt: string | null;
+  /** The slot's compiled default instruction text (editor prefill source). */
+  default_prompt: string;
   effective: EffectiveConfig;
 }
 
@@ -145,6 +147,27 @@ export function updateProjectAgentSetting(
 export function blankClears(value: string): string | null {
   const trimmed = value.trim();
   return trimmed.length > 0 ? trimmed : null;
+}
+
+/**
+ * Prompt-editor save semantics for one slot (design §4's reset=clear rule).
+ * Returns the `system_prompt` facet to send in the PUT body:
+ * - blank draft → `""` (server trims; explicit-empty shape as before);
+ * - editing a **default-source** slot whose text is unchanged from the served
+ *   default → `null`, so an open-tweak-nothing-save pass never freezes
+ *   today's built-in text as an override (the slot keeps receiving future
+ *   built-in prompt updates);
+ * - anything else → the trimmed text as an explicit override.
+ */
+export function promptSaveValue(draft: string, slot: SlotSetting): string | null {
+  const trimmed = draft.trim();
+  if (trimmed.length === 0) {
+    return "";
+  }
+  const hadOverride = slot.system_prompt !== null;
+  const unchangedFromDefault =
+    !hadOverride && trimmed === slot.default_prompt.trim();
+  return unchangedFromDefault ? null : trimmed;
 }
 
 /**

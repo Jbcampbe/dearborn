@@ -8,6 +8,7 @@ import {
   blankClears,
   getGlobalSettings,
   listProjectAgentSettings,
+  promptSaveValue,
   updateProjectAgentSetting,
   type AgentSlot,
   type GlobalSettings,
@@ -159,7 +160,9 @@ function openPromptEditor(slot: AgentSlot) {
     return;
   }
   editingSlot.value = slot;
-  promptDraft.value = view.system_prompt ?? "";
+  // Default-source slots prefill with the built-in text so the user tweaks
+  // from it; override-source slots show the override as-is.
+  promptDraft.value = view.system_prompt ?? view.default_prompt;
   promptError.value = null;
 }
 
@@ -176,11 +179,15 @@ async function savePrompt() {
   promptBusy.value = true;
   promptError.value = null;
   try {
-    const trimmed = promptDraft.value.trim();
-    // Empty text stores as cleared (server trims too); an explicit empty
-    // string body would be ambiguous, so send the explicit shape.
+    const current = editing.value;
+    if (current === null) {
+      return;
+    }
+    // Unchanged default-source text sends null (not an override) so a casual
+    // open-save never freezes the built-in prompt (design §4 reset=clear).
+    const system_prompt = promptSaveValue(promptDraft.value, current);
     const view = await updateProjectAgentSetting(token, props.projectId, slot, {
-      system_prompt: trimmed.length > 0 ? trimmed : "",
+      system_prompt,
     });
     replaceSlot(view);
     closePromptEditor();
@@ -347,6 +354,9 @@ onMounted(load);
         <p class="hint">
           The instruction portion only. Dearborn always appends its own context blocks (rendered
           spec, epic background, sibling manifest) after this text.
+        </p>
+        <p v-if="editing.system_prompt === null" class="hint" data-testid="default-copy-note">
+          Editing a copy of the built-in default. Reset restores the built-in version.
         </p>
         <textarea
           v-model="promptDraft"

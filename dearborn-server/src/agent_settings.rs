@@ -576,6 +576,9 @@ pub struct SlotSettingView {
     pub harness: Option<String>,
     pub model: Option<String>,
     pub system_prompt: Option<String>,
+    /// The slot's compiled default instruction text (design §4), served so a
+    /// client editing a default-source slot can prefill the editor with it.
+    pub default_prompt: String,
     pub effective: EffectiveConfig,
 }
 
@@ -585,7 +588,35 @@ fn slot_view(slot: AgentSlot, setting: Option<&AgentSetting>, global: &GlobalSet
         harness: setting.and_then(|s| s.harness.clone()),
         model: setting.and_then(|s| s.model.clone()),
         system_prompt: setting.and_then(|s| s.system_prompt.clone()),
+        default_prompt: default_prompt(slot).to_string(),
         slot,
+    }
+}
+
+/// The compiled default instruction text for `slot` (design §4) — exactly the
+/// text the spawn sites serve when the slot carries no override. The settings
+/// API exposes it so a client editing a default-source slot can prefill the
+/// editor with something to tweak instead of a blank box, without this module
+/// duplicating any prompt constant (task stages come from [`crate::spec::prompt_for`];
+/// planning/breakdown from their own modules' single constants).
+pub fn default_prompt(slot: AgentSlot) -> &'static str {
+    use crate::breakdown::BREAKDOWN_PROMPT;
+    use crate::planning::{PRODUCT_PLANNING_PROMPT, TECHNICAL_PLANNING_PROMPT};
+    use crate::spec::prompt_for;
+    use crate::task_agent::Stage;
+    match slot {
+        AgentSlot::PlanningProduct => PRODUCT_PLANNING_PROMPT,
+        AgentSlot::PlanningTechnical => TECHNICAL_PLANNING_PROMPT,
+        AgentSlot::Breakdown => BREAKDOWN_PROMPT,
+        // Every agent stage has a compiled prompt (`spec.rs`'s own test
+        // asserts non-empty for each); `expect` mirrors the spawn sites.
+        AgentSlot::Implement => prompt_for(Stage::Implement).expect("Stage::Implement always has a prompt"),
+        AgentSlot::Fix => prompt_for(Stage::Fix).expect("Stage::Fix always has a prompt"),
+        AgentSlot::Review => prompt_for(Stage::Review).expect("Stage::Review always has a prompt"),
+        AgentSlot::VerifyComplete => {
+            prompt_for(Stage::VerifyComplete).expect("Stage::VerifyComplete always has a prompt")
+        }
+        AgentSlot::Summarize => prompt_for(Stage::Summarize).expect("Stage::Summarize always has a prompt"),
     }
 }
 
@@ -1420,6 +1451,58 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(disable.status(), StatusCode::OK);
+    }
+
+    /// The editor-prefill contract: `default_prompt` is non-empty for all
+    /// eight slots and byte-identical to the constant each spawn site uses
+    /// (no duplication, no drift between API and spawn path).
+    #[tokio::test]
+    async fn every_slot_serves_its_compiled_default_prompt() {
+        use crate::breakdown::BREAKDOWN_PROMPT;
+        use crate::planning::{PRODUCT_PLANNING_PROMPT, TECHNICAL_PLANNING_PROMPT};
+        use crate::spec::prompt_for;
+        use crate::task_agent::Stage;
+
+        let expected = [
+            (AgentSlot::PlanningProduct, PRODUCT_PLANNING_PROMPT),
+            (AgentSlot::PlanningTechnical, TECHNICAL_PLANNING_PROMPT),
+            (AgentSlot::Breakdown, BREAKDOWN_PROMPT),
+            (
+                AgentSlot::Implement,
+                prompt_for(Stage::Implement).unwrap(),
+            ),
+            (AgentSlot::Fix, prompt_for(Stage::Fix).unwrap()),
+            (AgentSlot::Review, prompt_for(Stage::Review).unwrap()),
+            (
+                AgentSlot::VerifyComplete,
+                prompt_for(Stage::VerifyComplete).unwrap(),
+            ),
+            (AgentSlot::Summarize, prompt_for(Stage::Summarize).unwrap()),
+        ];
+        for (slot, text) in expected {
+            assert!(!text.trim().is_empty());
+            assert_eq!(default_prompt(slot), text, "slot {}", slot);
+        }
+
+        // And the API view carries the same text per slot.
+        let (app, _state) = test_app().await;
+        let project = create_project(&app).await;
+        let got = app
+            .oneshot(req(
+                "GET",
+                &format!("/projects/{project}/agent-settings"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(got.status(), StatusCode::OK);
+        let body = body_json(got).await;
+        for item in body["items"].as_array().unwrap() {
+            let key = item["slot"].as_str().unwrap();
+            let served = item["default_prompt"].as_str().unwrap();
+            assert_eq!(served, default_prompt(AgentSlot::parse(key).unwrap()));
+            assert!(!served.is_empty(), "slot {key} must prefill the editor");
+        }
     }
 
     #[tokio::test]
