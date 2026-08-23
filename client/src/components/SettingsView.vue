@@ -31,13 +31,6 @@ const enabled = ref<Set<string>>(new Set());
 const models = ref<Record<string, string>>({});
 const defaultHarness = ref("");
 
-/**
- * Harness keys offered as toggles: the ones Dearborn has an adapter for
- * (`SUPPORTED_HARNESSES`) plus `codex`, still pre-listed so enabling it later
- * is a checkbox away once an adapter exists. Anything else already enabled on
- * the server (a custom key) joins this list when settings load.
- */
-const KNOWN_HARNESS = [...SUPPORTED_HARNESSES, "codex"];
 const customHarness = ref("");
 
 async function load() {
@@ -202,7 +195,7 @@ onMounted(load);
         <h2 class="section-title">Enabled harnesses</h2>
         <p class="hint">A harness must be enabled before it can be picked anywhere.</p>
         <div class="toggle-list">
-          <label v-for="h in KNOWN_HARNESS" :key="h" class="toggle-row">
+          <label v-for="h in SUPPORTED_HARNESSES" :key="h" class="toggle-row">
             <input
               type="checkbox"
               class="checkbox"
@@ -214,7 +207,7 @@ onMounted(load);
               installed adapter
             </span>
           </label>
-          <label v-for="h in [...enabled].filter((x) => !KNOWN_HARNESS.includes(x))" :key="h" class="toggle-row">
+          <label v-for="h in [...enabled].filter((x) => !SUPPORTED_HARNESSES.includes(x))" :key="h" class="toggle-row">
             <input
               type="checkbox"
               class="checkbox"
