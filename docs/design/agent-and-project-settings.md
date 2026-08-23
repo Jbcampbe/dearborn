@@ -207,43 +207,43 @@ Ordered by dependency; each task is one reviewable unit. `[B]` = backend,
 
 ### Phase 1 — Schema & core resolution (backend foundation)
 
-- [ ] **T-1. Migration `0005_agent_settings.sql`** — `global_settings` singleton
+- [x] **T-1. Migration `0005_agent_settings.sql`** — `global_settings` singleton
       table (seeded: `enabled_harnesses=["claude"]`, `default_harness="claude"`,
       `default_models={}`), `agent_setting` table (`(project_id, slot)` PK;
       nullable `harness`/`model`/`system_prompt`), `project.base_branch TEXT NULL`,
       `epic.base_branch TEXT NULL`. Register in `db.rs`. No data migration.
-- [ ] **T-2. Agent-slot enum** — closed Rust enum of the eight slots with stable
+- [x] **T-2. Agent-slot enum** — closed Rust enum of the eight slots with stable
       snake_case wire keys (`serde`), plus validation of arbitrary strings into
       slots (for path params / rows). New module (e.g. `agent_slot.rs`).
-- [ ] **T-3. Global-settings store** — typed read/write of the singleton row
+- [x] **T-3. Global-settings store** — typed read/write of the singleton row
       (`default_harness`, `default_models` JSON map, `enabled_harnesses` JSON
       array); seed-if-absent guard at boot for pre-migration DBs is unnecessary
       (seed lives in SQL) but the accessor must tolerate an empty table.
-- [ ] **T-4. Effective-config resolver** — pure, unit-tested function:
+- [x] **T-4. Effective-config resolver** — pure, unit-tested function:
       `(global, Option<agent_setting>) → {harness, model, system_prompt,
       prompt_source}` implementing §3's harness-scoped inheritance (model map
       keyed by *effective* harness). This is the heart of the feature — test
       every null-combination exhaustively.
-- [ ] **T-5. Agent-setting store** — CRUD for `agent_setting` rows keyed by
+- [x] **T-5. Agent-setting store** — CRUD for `agent_setting` rows keyed by
       `(project_id, slot)`; "reset" semantics = delete/NULL, never copy defaults.
 
 ### Phase 2 — Prompts & evidence wiring (backend)
 
-- [ ] **T-6. Prompt override plumbing** — `spec::prompt_for` (task stages) and
+- [x] **T-6. Prompt override plumbing** — `spec::prompt_for` (task stages) and
       the planning/breakdown system-prompt sites accept an optional override
       string; when absent, compiled defaults serve exactly as today. Compute a
       content hash of the resolved instruction text alongside it.
       `assemble_prompt` composition order unchanged (instruction → context →
       feedback).
-- [ ] **T-7. Harness/model at spawn** — thread effective `{harness, model}` into
+- [x] **T-7. Harness/model at spawn** — thread effective `{harness, model}` into
       all three spawn sites (`ClaudeTaskAgent`, `ClaudePlanningAgent`,
       `ClaudeBreakdownAgent`) so `RunTuning.model` carries the resolved model.
       v1: any non-`"claude"` key resolves to an error at spawn-validation time
       (unreachable via API until a second harness ships, but fail loudly).
-- [ ] **T-8. Evidence columns** — add `harness`, `model`, `prompt_hash` to
+- [x] **T-8. Evidence columns** — add `harness`, `model`, `prompt_hash` to
       `agent_run`; write them at stage spawn (all agent stages incl. planning
       runs). Backfill not needed (NULL = predates feature).
-- [ ] **T-9. Live-read verification** — test that a mid-epic settings change is
+- [x] **T-9. Live-read verification** — test that a mid-epic settings change is
       picked up by the *next* stage run and that the running stage is unaffected
       (spawn-time read, no caching).
 

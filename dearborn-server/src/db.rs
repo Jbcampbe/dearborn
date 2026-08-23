@@ -48,6 +48,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0005_agent_settings",
         sql: include_str!("../migrations/0005_agent_settings.sql"),
     },
+    Migration {
+        id: 6,
+        name: "0006_agent_run_evidence",
+        sql: include_str!("../migrations/0006_agent_run_evidence.sql"),
+    },
 ];
 
 /// Errors surfaced while opening the database or running migrations.

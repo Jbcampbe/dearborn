@@ -82,6 +82,16 @@ pub struct BreakdownRunRequest {
     /// MCP wiring (the breakdown tool surface). `None` disables tools (used only
     /// when the clone/base URL is unavailable — the run then no-ops usefully).
     pub mcp: Option<BreakdownMcp>,
+    /// The breakdown instruction prompt — the slot's live-resolved effective
+    /// text (T6): the project's override when set, else `BREAKDOWN_PROMPT`.
+    pub system_prompt: String,
+    /// The harness key this run was resolved to (T7). Validated against
+    /// [`crate::agent_settings::SUPPORTED_HARNESS`] by
+    /// [`ClaudeBreakdownAgent::run`]; a non-supported key surfaces as an
+    /// `Error` + `Exited` event stream (the trait has no `Result`).
+    pub harness: String,
+    /// The resolved model passed verbatim to the CLI; `None` → CLI default (T7).
+    pub model: Option<String>,
 }
 
 /// The MCP knobs [`spawn_breakdown`] hands the agent for the run.
@@ -114,9 +124,30 @@ impl BreakdownAgent for ClaudeBreakdownAgent {
     fn run(&self, req: BreakdownRunRequest) -> Receiver<RunEvent> {
         let run_id = req.run_id.clone();
 
+        // T7 spawn-validation, mirroring the planning agent's check: a
+        // non-supported harness key surfaces loudly through the same synthetic
+        // Error+Exited stream a spawn failure uses.
+        if req.harness != crate::agent_settings::SUPPORTED_HARNESS {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let _ = tx.send(RunEvent::Error {
+                run_id: run_id.clone(),
+                message: format!(
+                    "unsupported harness `{}`: only \"{}\" can be spawned in v1",
+                    req.harness,
+                    crate::agent_settings::SUPPORTED_HARNESS
+                ),
+            });
+            let _ = tx.send(RunEvent::Exited {
+                run_id,
+                exit_code: None,
+                cancelled: false,
+            });
+            return rx;
+        }
+
         let mut extra_args = vec![
             "--append-system-prompt".to_string(),
-            BREAKDOWN_PROMPT.to_string(),
+            req.system_prompt.clone(),
             // The epic's product + technical context, as the plan to break down.
             "--append-system-prompt".to_string(),
             req.plan.clone(),
@@ -139,6 +170,8 @@ impl BreakdownAgent for ClaudeBreakdownAgent {
             mode: RunMode::Ask,
             tuning: RunTuning {
                 extra_args,
+                // T7: the slot's resolved model rides through to the CLI.
+                model: req.model.clone(),
                 ..RunTuning::default()
             },
             // One-shot: never resume a prior session.
@@ -288,6 +321,25 @@ pub fn spawn_breakdown(state: AppState, epic_id: String, guard: InflightGuard) {
             .ok()
             .flatten()
             .unwrap_or_default();
+
+        // T6/T7: resolve the Breakdown slot's live config at spawn time — the
+        // project's system-prompt override when set, else `BREAKDOWN_PROMPT`,
+        // plus the effective harness/model (design §9: read fresh per run).
+        let spawn_cfg = match
+            crate::agent_settings::spawn_config(
+                &state.db,
+                &project_id,
+                crate::agent_slot::AgentSlot::Breakdown,
+                BREAKDOWN_PROMPT,
+            )
+            .await
+        {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                tracing::warn!(epic = %epic_id, error = %err, "failed to resolve breakdown agent settings; aborting run");
+                return;
+            }
+        };
         match (clone_path, state.advertised_base()) {
             (Some(clone_path), Some(base)) => {
                 let clone_pb = PathBuf::from(&clone_path);
@@ -323,6 +375,9 @@ pub fn spawn_breakdown(state: AppState, epic_id: String, guard: InflightGuard) {
             plan,
             cwd,
             mcp,
+            system_prompt: spawn_cfg.prompt,
+            harness: spawn_cfg.harness.clone(),
+            model: spawn_cfg.model.clone(),
         };
 
         let rx = state.breakdown.run(req);
@@ -353,18 +408,25 @@ pub fn spawn_breakdown(state: AppState, epic_id: String, guard: InflightGuard) {
         };
 
         // Record per-run evidence (the tasks/edges were persisted live by the
-        // MCP tools during the run).
+        // MCP tools during the run), including which agent settings produced
+        // it (T8).
         let run_id = ulid::Ulid::new().to_string();
         let _ = conn
             .execute(
-                "INSERT INTO agent_run (id, task_id, epic_id, stage, session_id, log, created_at) \
-                 VALUES (?1, NULL, ?2, 'breakdown', ?3, ?4, ?5)",
+                "INSERT INTO agent_run (id, task_id, epic_id, stage, session_id, log, created_at, \
+                 attempt, status, verdict, started_at, ended_at, exit_code, \
+                 harness, model, prompt_hash) \
+                 VALUES (?1, NULL, ?2, 'breakdown', ?3, ?4, ?5, 1, 'ok', NULL, ?5, ?5, NULL, \
+                 ?6, ?7, ?8)",
                 params![
                     run_id,
                     epic_id.clone(),
                     outcome.session_id,
                     outcome.log,
-                    now_ms()
+                    now_ms(),
+                    spawn_cfg.harness,
+                    spawn_cfg.model,
+                    spawn_cfg.prompt_hash,
                 ],
             )
             .await;
@@ -795,5 +857,33 @@ mod tests {
         let response = trigger(&app, &epic_id).await;
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         assert_eq!(wait_for_status(&state, &epic_id, "Ready").await, "Ready");
+    }
+
+    // ---- T7: unsupported-harness spawn validation -------------------------
+
+    #[test]
+    fn breakdown_agent_rejects_an_unsupported_harness_loudly() {
+        let agent = ClaudeBreakdownAgent::new();
+        let rx = agent.run(BreakdownRunRequest {
+            run_id: "run-codex".to_string(),
+            prompt: "break it down".to_string(),
+            plan: "plan".to_string(),
+            cwd: None,
+            mcp: None,
+            system_prompt: BREAKDOWN_PROMPT.to_string(),
+            harness: "codex".to_string(),
+            model: None,
+        });
+
+        let first = rx.iter().next().expect("an Error event must arrive");
+        match first {
+            RunEvent::Error { message, .. } => {
+                assert!(message.contains("codex"), "error names the harness: {message}");
+                assert!(message.contains("unsupported"), "error says why: {message}");
+            }
+            other => panic!("expected RunEvent::Error, got {other:?}"),
+        }
+        let exited = rx.iter().find(|e| matches!(e, RunEvent::Exited { .. }));
+        assert!(exited.is_some(), "stream must end with Exited");
     }
 }

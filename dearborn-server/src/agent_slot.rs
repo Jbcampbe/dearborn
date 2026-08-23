@@ -74,6 +74,24 @@ impl AgentSlot {
     pub fn parse(key: &str) -> Option<AgentSlot> {
         AgentSlot::ALL.iter().copied().find(|s| s.as_str() == key)
     }
+
+    /// The slot a pipeline [`Stage`] is configured under. A 1:1 mapping for
+    /// the five agent stages; `None` for the non-agent stages (`Setup`/
+    /// `Preflight`/`TestGate`/`Commit`/`Push`), which run shell commands or
+    /// plain git and have no agent settings to resolve.
+    pub fn from_stage(stage: crate::task_agent::Stage) -> Option<AgentSlot> {
+        use crate::task_agent::Stage;
+        match stage {
+            Stage::Implement => Some(AgentSlot::Implement),
+            Stage::Fix => Some(AgentSlot::Fix),
+            Stage::Review => Some(AgentSlot::Review),
+            Stage::VerifyComplete => Some(AgentSlot::VerifyComplete),
+            Stage::Summarize => Some(AgentSlot::Summarize),
+            Stage::Setup | Stage::Preflight | Stage::TestGate | Stage::Commit | Stage::Push => {
+                None
+            }
+        }
+    }
 }
 
 impl fmt::Display for AgentSlot {
@@ -138,5 +156,33 @@ mod tests {
             }
         }
         assert_eq!(AgentSlot::ALL.len(), 8);
+    }
+
+    #[test]
+    fn from_stage_maps_every_agent_stage_and_rejects_non_agent_stages() {
+        use crate::task_agent::Stage;
+        assert_eq!(
+            AgentSlot::from_stage(Stage::Implement),
+            Some(AgentSlot::Implement)
+        );
+        assert_eq!(AgentSlot::from_stage(Stage::Fix), Some(AgentSlot::Fix));
+        assert_eq!(AgentSlot::from_stage(Stage::Review), Some(AgentSlot::Review));
+        assert_eq!(
+            AgentSlot::from_stage(Stage::VerifyComplete),
+            Some(AgentSlot::VerifyComplete)
+        );
+        assert_eq!(
+            AgentSlot::from_stage(Stage::Summarize),
+            Some(AgentSlot::Summarize)
+        );
+        for stage in [
+            Stage::Setup,
+            Stage::Preflight,
+            Stage::TestGate,
+            Stage::Commit,
+            Stage::Push,
+        ] {
+            assert_eq!(AgentSlot::from_stage(stage), None);
+        }
     }
 }

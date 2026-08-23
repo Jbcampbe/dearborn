@@ -316,6 +316,19 @@ pub struct TaskRunRequest {
     /// directory (unlike planning's `Option<PathBuf>`, which may run
     /// tool-less): every task stage acts on a checked-out branch.
     pub cwd: PathBuf,
+    /// The harness key this run was resolved to (T7). Validated against
+    /// [`crate::agent_settings::SUPPORTED_HARNESS`] by [`run_agent_stage`]
+    /// before any spawn — a non-supported key fails loudly there instead of
+    /// silently running Claude under another harness's name.
+    pub harness: String,
+    /// The resolved model passed verbatim to the CLI (`RunTuning.model`);
+    /// `None` → the CLI's own configured default (T7).
+    pub model: Option<String>,
+    /// SHA-256 hex of the **instruction portion** of `prompt` — the stage's
+    /// effective prompt text *before* the context/feedback blocks are
+    /// appended — written to the `agent_run` evidence row (T8). See
+    /// [`crate::agent_settings::prompt_hash`].
+    pub prompt_hash: String,
 }
 
 /// Assemble the full prompt for `stage`: its static instructions
@@ -327,9 +340,21 @@ pub struct TaskRunRequest {
 /// ordering — it just builds a [`crate::spec::TaskContext`] from the DB and
 /// calls this.
 pub fn assemble_prompt(stage: Stage, context: &crate::spec::TaskContext) -> Option<String> {
-    let base = crate::spec::prompt_for(stage)?;
+    Some(assemble_prompt_text(
+        crate::spec::prompt_for(stage)?,
+        context,
+    ))
+}
+
+/// Assemble a full stage prompt from an **explicit** instruction text plus
+/// the D8 context block — the override-aware variant of [`assemble_prompt`]
+/// (T6). The caller resolves the effective instruction text via
+/// [`crate::agent_settings::spawn_config`] and passes it here; composition
+/// order is unchanged (instruction → `---` separator → context block), so a
+/// default-resolved base produces byte-for-byte today's output.
+pub fn assemble_prompt_text(base: &str, context: &crate::spec::TaskContext) -> String {
     let context_block = crate::spec::build_context(context);
-    Some(format!("{base}\n\n---\n\n{context_block}"))
+    format!("{base}\n\n---\n\n{context_block}")
 }
 
 /// Assemble the `Fix` stage's prompt for T-522's test-driven fix loop (and,
@@ -366,6 +391,14 @@ pub fn assemble_prompt(stage: Stage, context: &crate::spec::TaskContext) -> Opti
 /// Worth revisiting, but out of scope for the task that confirmed the gap.
 pub fn assemble_fix_prompt(feedback: &str) -> String {
     let base = crate::spec::prompt_for(Stage::Fix).expect("Stage::Fix always has a prompt");
+    assemble_fix_prompt_text(base, feedback)
+}
+
+/// The override-aware variant of [`assemble_fix_prompt`] (T6): an explicit
+/// instruction text plus one round of feedback. Composition order unchanged
+/// (instruction → `---` separator → Feedback heading), so a default-resolved
+/// base produces byte-for-byte today's output.
+pub fn assemble_fix_prompt_text(base: &str, feedback: &str) -> String {
     format!("{base}\n\n---\n\n## Feedback\n\n{feedback}")
 }
 
@@ -413,6 +446,10 @@ impl TaskAgent for ClaudeTaskAgent {
             mode,
             tuning: RunTuning {
                 extra_args: build_extra_args(req.stage),
+                // T7: the slot's resolved model rides through to the CLI;
+                // `None` keeps the CLI's own configured default exactly as
+                // before configurable agents existed.
+                model: req.model.clone(),
                 ..RunTuning::default()
             },
             // D19: every stage is a brand new agent context, always.
@@ -717,6 +754,12 @@ pub enum AgentStageError {
     /// closed (`status = "error"`) before this is returned — see
     /// [`run_agent_stage`]'s handling of a failed `JoinHandle`.
     DrainFailed(String),
+    /// The run's resolved harness is not spawnable in this build (T7 — only
+    /// `"claude"` exists today). Checked **before** any row is opened: an
+    /// unsupported-harness request is a configuration bug the settings API
+    /// should have made unreachable (only enabled harnesses are selectable),
+    /// so there is no stage attempt to record evidence for.
+    UnsupportedHarness(String),
 }
 
 impl std::fmt::Display for AgentStageError {
@@ -725,6 +768,11 @@ impl std::fmt::Display for AgentStageError {
             AgentStageError::Db(e) => write!(f, "agent_run row error: {e}"),
             AgentStageError::Harness(e) => write!(f, "agent stage failed to start: {e}"),
             AgentStageError::DrainFailed(msg) => write!(f, "{msg}"),
+            AgentStageError::UnsupportedHarness(key) => write!(
+                f,
+                "unsupported harness `{key}`: only \"{}\" can be spawned in v1",
+                crate::agent_settings::SUPPORTED_HARNESS
+            ),
         }
     }
 }
@@ -756,12 +804,23 @@ pub async fn run_agent_stage(
     req: TaskRunRequest,
 ) -> Result<AgentStageOutcome, AgentStageError> {
     let conn = state.db.conn();
+    // T7 spawn-validation, before anything else: a non-supported harness key
+    // means settings were hand-edited into a state the API refuses to create.
+    // Fail loudly; no `agent_run` row is opened because no run was attempted.
+    if req.harness != crate::agent_settings::SUPPORTED_HARNESS {
+        return Err(AgentStageError::UnsupportedHarness(req.harness.clone()));
+    }
     let stage_str = req.stage.as_str();
     let open = OpenStage {
         task_id: params.task_id,
         epic_id: params.epic_id,
         stage: stage_str,
         attempt: params.attempt,
+        // T8 evidence: which harness/model produced this run, and the hash of
+        // the instruction prompt it was given (before context/feedback).
+        harness: Some(req.harness.as_str()),
+        model: req.model.as_deref(),
+        prompt_hash: Some(req.prompt_hash.as_str()),
     };
     let stage_row = evidence::open_stage(conn, open)
         .await
@@ -1398,6 +1457,9 @@ mod tests {
                 stage: Stage::Implement,
                 prompt: "do it".to_string(),
                 cwd: dir.clone(),
+                harness: "claude".to_string(),
+                model: None,
+                prompt_hash: "test-prompt-hash".to_string(),
             })
             .unwrap();
 
@@ -1430,6 +1492,9 @@ mod tests {
                 stage: Stage::Implement,
                 prompt: "do it".to_string(),
                 cwd: dir.clone(),
+                harness: "claude".to_string(),
+                model: None,
+                prompt_hash: "test-prompt-hash".to_string(),
             })
             .unwrap();
 
@@ -1479,6 +1544,9 @@ mod tests {
                 stage: Stage::Review,
                 prompt: "review this".to_string(),
                 cwd: dir.clone(),
+                harness: "claude".to_string(),
+                model: None,
+                prompt_hash: "test-prompt-hash".to_string(),
             })
             .unwrap();
         for _ in rx {}
@@ -1511,6 +1579,9 @@ mod tests {
                 stage: Stage::Implement,
                 prompt: "write a file".to_string(),
                 cwd: dir.clone(),
+                harness: "claude".to_string(),
+                model: None,
+                prompt_hash: "test-prompt-hash".to_string(),
             })
             .unwrap();
         for _ in rx {}
@@ -1592,6 +1663,9 @@ mod tests {
                 stage: Stage::Implement,
                 prompt: "go".to_string(),
                 cwd: dir.clone(),
+                harness: "claude".to_string(),
+                model: None,
+                prompt_hash: "test-prompt-hash".to_string(),
             },
         )
         .await
@@ -1668,6 +1742,9 @@ mod tests {
                 stage: Stage::Implement,
                 prompt: "go".to_string(),
                 cwd: std::env::temp_dir(),
+                harness: "claude".to_string(),
+                model: None,
+                prompt_hash: "test-prompt-hash".to_string(),
             },
         )
         .await
@@ -1695,6 +1772,220 @@ mod tests {
             state.cancel_registry.lock().unwrap().is_empty(),
             "a harness spawn failure must never populate the cancel registry"
         );
+    }
+
+    // ---- T8 evidence columns ---------------------------------------------
+
+    #[tokio::test]
+    async fn run_agent_stage_writes_harness_model_and_prompt_hash_evidence() {
+        let state = test_state().await;
+        let agent = ScriptedTaskAgent::new().script(Stage::Review, ScriptedRun::default());
+        let dir =
+            std::env::temp_dir().join(format!("dearborn-evidence-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let outcome = run_agent_stage(
+            &state,
+            &agent,
+            AgentStageParams {
+                task_id: Some("task-1"),
+                epic_id: Some("epic-1"),
+                attempt: 3,
+            },
+            TaskRunRequest {
+                run_id: "run-ev".to_string(),
+                stage: Stage::Review,
+                prompt: "review prompt".to_string(),
+                cwd: dir.clone(),
+                harness: "claude".to_string(),
+                model: Some("test-model".to_string()),
+                prompt_hash: crate::agent_settings::prompt_hash("review prompt"),
+            },
+        )
+        .await
+        .expect("scripted stage must succeed");
+        assert!(outcome.is_ok());
+
+        let mut rows = state
+            .db
+            .conn()
+            .query(
+                "SELECT harness, model, prompt_hash FROM agent_run \
+                 WHERE task_id = 'task-1' AND stage = 'review'",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("a row was written");
+        assert_eq!(row.get::<String>(0).unwrap(), "claude");
+        assert_eq!(row.get::<Option<String>>(1).unwrap().as_deref(), Some("test-model"));
+        assert_eq!(
+            row.get::<Option<String>>(2).unwrap().as_deref(),
+            Some(crate::agent_settings::prompt_hash("review prompt").as_str())
+        );
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[tokio::test]
+    async fn unsupported_harness_fails_loudly_before_any_row_is_opened() {
+        let state = test_state().await;
+        let agent = ScriptedTaskAgent::new();
+        let err = run_agent_stage(
+            &state,
+            &agent,
+            AgentStageParams {
+                task_id: Some("task-1"),
+                epic_id: None,
+                attempt: 1,
+            },
+            TaskRunRequest {
+                run_id: "run-codex".to_string(),
+                stage: Stage::Implement,
+                prompt: "go".to_string(),
+                cwd: std::env::temp_dir(),
+                // Only reachable by hand-editing settings rows — the API only
+                // hands out enabled harnesses, and only "claude" is enabled.
+                harness: "codex".to_string(),
+                model: None,
+                prompt_hash: "x".to_string(),
+            },
+        )
+        .await
+        .expect_err("an unsupported harness must fail loudly at spawn-validation");
+        match &err {
+            AgentStageError::UnsupportedHarness(key) => assert_eq!(key, "codex"),
+            other => panic!("expected UnsupportedHarness, got {other:?}"),
+        }
+        assert!(err.to_string().contains("codex"));
+
+        // No run was attempted, so no evidence row exists to misread later.
+        let mut rows = state
+            .db
+            .conn()
+            .query("SELECT COUNT(*) FROM agent_run", ())
+            .await
+            .unwrap();
+        let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(count, 0);
+    }
+
+    // ---- T9: live-read across stage runs ----------------------------------
+
+    /// The exact resolution a worker spawn site performs (see worker.rs's
+    /// `stage_spawn_config`): fold globals + the project's override around the
+    /// stage's compiled default, fresh on every call.
+    async fn resolve_like_worker(state: &AppState) -> crate::agent_settings::SpawnConfig {
+        crate::agent_settings::spawn_config(
+            &state.db,
+            "proj-1",
+            crate::agent_slot::AgentSlot::Implement,
+            crate::spec::prompt_for(Stage::Implement)
+                .expect("Stage::Implement always has a prompt"),
+        )
+        .await
+        .expect("settings resolution must succeed")
+    }
+
+    #[tokio::test]
+    async fn live_read_a_mid_flight_settings_change_reaches_the_next_stage_run() {
+        // `test_state` already seeds the `proj-1` FK target.
+        let state = test_state().await;
+
+        let agent = ScriptedTaskAgent::new().script(Stage::Implement, ScriptedRun::default());
+        let dir =
+            std::env::temp_dir().join(format!("dearborn-live-read-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Stage run 1: everything at defaults.
+        let cfg1 = resolve_like_worker(&state).await;
+        let outcome1 = run_agent_stage(
+            &state,
+            &agent,
+            AgentStageParams {
+                task_id: Some("task-1"),
+                epic_id: None,
+                attempt: 1,
+            },
+            TaskRunRequest {
+                run_id: "run-1".to_string(),
+                stage: Stage::Implement,
+                prompt: cfg1.prompt.clone(),
+                cwd: dir.clone(),
+                harness: cfg1.harness.clone(),
+                model: cfg1.model.clone(),
+                prompt_hash: cfg1.prompt_hash.clone(),
+            },
+        )
+        .await
+        .expect("first stage must succeed");
+        assert!(outcome1.is_ok());
+
+        // Mid-flight edit: override implement's prompt + model *after* run 1
+        // has already started-and-finished on the old values.
+        crate::agent_settings::upsert_agent_setting(
+            &state.db,
+            "proj-1",
+            &crate::agent_settings::AgentSetting {
+                slot: crate::agent_slot::AgentSlot::Implement,
+                harness: None,
+                model: Some("haiku".to_string()),
+                system_prompt: Some("revised implement instructions".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+
+        // Stage run 2 resolves fresh — no caching — and picks up the edit.
+        let cfg2 = resolve_like_worker(&state).await;
+        assert_eq!(cfg2.prompt, "revised implement instructions");
+        assert_eq!(cfg2.model.as_deref(), Some("haiku"));
+        assert_ne!(cfg1.prompt_hash, cfg2.prompt_hash);
+        let outcome2 = run_agent_stage(
+            &state,
+            &agent,
+            AgentStageParams {
+                task_id: Some("task-1"),
+                epic_id: None,
+                attempt: 2,
+            },
+            TaskRunRequest {
+                run_id: "run-2".to_string(),
+                stage: Stage::Implement,
+                prompt: cfg2.prompt.clone(),
+                cwd: dir.clone(),
+                harness: cfg2.harness.clone(),
+                model: cfg2.model.clone(),
+                prompt_hash: cfg2.prompt_hash.clone(),
+            },
+        )
+        .await
+        .expect("second stage must succeed");
+        assert!(outcome2.is_ok());
+
+        // Evidence keeps both runs auditable against their own configs:
+        // attempt 1 carries the default hash + NULL model it actually ran
+        // with; attempt 2 carries the override's hash + model.
+        let mut rows = state
+            .db
+            .conn()
+            .query(
+                "SELECT attempt, harness, model, prompt_hash FROM agent_run \
+                 WHERE task_id = 'task-1' ORDER BY attempt",
+                (),
+            )
+            .await
+            .unwrap();
+        let row1 = rows.next().await.unwrap().unwrap();
+        assert_eq!(row1.get::<i64>(0).unwrap(), 1);
+        assert_eq!(row1.get::<String>(1).unwrap(), "claude");
+        assert_eq!(row1.get::<Option<String>>(2).unwrap(), None);
+        assert_eq!(row1.get::<String>(3).unwrap(), cfg1.prompt_hash);
+        let row2 = rows.next().await.unwrap().unwrap();
+        assert_eq!(row2.get::<i64>(0).unwrap(), 2);
+        assert_eq!(row2.get::<String>(1).unwrap(), "claude");
+        assert_eq!(row2.get::<Option<String>>(2).unwrap().as_deref(), Some("haiku"));
+        assert_eq!(row2.get::<String>(3).unwrap(), cfg2.prompt_hash);
+        std::fs::remove_dir_all(&dir).ok();
     }
 
     // ---- T-542: the cancel registry -------------------------------------
@@ -1736,6 +2027,9 @@ mod tests {
                         stage: Stage::Implement,
                         prompt: "go".to_string(),
                         cwd: dir,
+                        harness: "claude".to_string(),
+                        model: None,
+                        prompt_hash: "test-prompt-hash".to_string(),
                     },
                 )
                 .await
@@ -1827,6 +2121,9 @@ mod tests {
                         stage: Stage::Implement,
                         prompt: "go".to_string(),
                         cwd: dir,
+                        harness: "claude".to_string(),
+                        model: None,
+                        prompt_hash: "test-prompt-hash".to_string(),
                     },
                 )
                 .await
@@ -1898,6 +2195,9 @@ mod tests {
                     stage: Stage::Implement,
                     prompt: "go".to_string(),
                     cwd: dir.clone(),
+                    harness: "claude".to_string(),
+                    model: None,
+                    prompt_hash: "test-prompt-hash".to_string(),
                 },
             ),
         )
@@ -2002,6 +2302,9 @@ mod tests {
                 stage: Stage::Implement,
                 prompt: "go".to_string(),
                 cwd: dir.clone(),
+                harness: "claude".to_string(),
+                model: None,
+                prompt_hash: "test-prompt-hash".to_string(),
             },
         )
         .await
@@ -2054,6 +2357,9 @@ mod tests {
                 stage: Stage::Implement,
                 prompt: "go".to_string(),
                 cwd: dir.clone(),
+                harness: "claude".to_string(),
+                model: None,
+                prompt_hash: "test-prompt-hash".to_string(),
             },
         )
         .await
@@ -2079,6 +2385,9 @@ mod tests {
                     stage: Stage::Review,
                     prompt: "go".to_string(),
                     cwd: dir.clone(),
+                    harness: "claude".to_string(),
+                    model: None,
+                    prompt_hash: "test-prompt-hash".to_string(),
                 },
             ),
         )

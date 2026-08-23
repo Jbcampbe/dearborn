@@ -45,6 +45,7 @@ use std::sync::mpsc::Receiver;
 use harness::{Claude, Harness, RunEvent, RunMode, RunRequest, RunTuning};
 use serde_json::Value;
 
+use libsql::params;
 use libsql::Connection;
 
 use crate::epics::{
@@ -183,8 +184,17 @@ pub struct PlanningRunRequest {
     pub cwd: Option<PathBuf>,
     /// Native harness resume id, if this epic/phase already has a session.
     pub resume: Option<String>,
-    /// System prompt for the phase (stable across turns).
-    pub system_prompt: &'static str,
+    /// System prompt for the phase (stable across turns). A `String`, not
+    /// `&'static str`: it is the slot's live-resolved effective prompt (T6) —
+    /// the project's override when set, else the phase's compiled default.
+    pub system_prompt: String,
+    /// The harness key this run was resolved to (T7). Validated against
+    /// [`crate::agent_settings::SUPPORTED_HARNESS`] by
+    /// [`ClaudePlanningAgent::run`]; a non-supported key surfaces as an
+    /// `Error` + `Exited` event stream (the trait has no `Result`).
+    pub harness: String,
+    /// The resolved model passed verbatim to the CLI; `None` → CLI default (T7).
+    pub model: Option<String>,
     /// Cross-phase continuity, appended as a *second* system prompt (T-205).
     /// Because each phase is its own harness session, a later phase cannot see an
     /// earlier phase's conversation; [`spawn_run`] seeds the prior phase's outcome
@@ -235,10 +245,33 @@ impl PlanningAgent for ClaudePlanningAgent {
     fn run(&self, req: PlanningRunRequest) -> Receiver<RunEvent> {
         let run_id = req.run_id.clone();
 
+        // T7 spawn-validation, mirroring `run_agent_stage`'s task-stage check:
+        // a non-supported harness key means settings were hand-edited into a
+        // state the API refuses to create. Surface loudly through the same
+        // synthetic Error+Exited stream a spawn failure uses — the trait's
+        // return type has no room for a `Result`.
+        if req.harness != crate::agent_settings::SUPPORTED_HARNESS {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let _ = tx.send(RunEvent::Error {
+                run_id: run_id.clone(),
+                message: format!(
+                    "unsupported harness `{}`: only \"{}\" can be spawned in v1",
+                    req.harness,
+                    crate::agent_settings::SUPPORTED_HARNESS
+                ),
+            });
+            let _ = tx.send(RunEvent::Exited {
+                run_id,
+                exit_code: None,
+                cancelled: false,
+            });
+            return rx;
+        }
+
         // Base args: the phase system prompt, appended verbatim.
         let mut extra_args = vec![
             "--append-system-prompt".to_string(),
-            req.system_prompt.to_string(),
+            req.system_prompt.clone(),
         ];
         // Cross-phase continuity (T-205): the prior phase's outcome, appended as a
         // second system prompt so a later phase (e.g. technical) builds on it.
@@ -268,6 +301,8 @@ impl PlanningAgent for ClaudePlanningAgent {
             mode: RunMode::Ask,
             tuning: RunTuning {
                 extra_args,
+                // T7: the slot's resolved model rides through to the CLI.
+                model: req.model.clone(),
                 ..RunTuning::default()
             },
             resume: req.resume,
@@ -381,6 +416,32 @@ pub fn spawn_run(
             .ok()
             .flatten();
 
+        // T6/T7: resolve this phase's live slot config at spawn time — the
+        // project's system-prompt override when set, else the phase's compiled
+        // default, plus the effective harness/model (design §9: read fresh per
+        // run, never cached). The epic's project id also feeds MCP scoping
+        // below.
+        let slot = if config.phase == "product" {
+            crate::agent_slot::AgentSlot::PlanningProduct
+        } else {
+            crate::agent_slot::AgentSlot::PlanningTechnical
+        };
+        let project_id = get_epic_project_id(state.db.conn(), &epic_id)
+            .await
+            .ok()
+            .flatten()
+            .unwrap_or_default();
+        let spawn_cfg = match
+            crate::agent_settings::spawn_config(&state.db, &project_id, slot, config.system_prompt)
+                .await
+        {
+            Ok(cfg) => cfg,
+            Err(err) => {
+                tracing::warn!(epic = %epic_id, error = %err, "failed to resolve planning agent settings; skipping turn");
+                return;
+            }
+        };
+
         // For a tools-enabled phase, mint a per-run capability scoped to this
         // (epic, phase, clone) and wire the MCP config. `_cap_guard` is held for
         // the whole run so the token is revoked when the run ends; `mcp_config`
@@ -402,14 +463,18 @@ pub fn spawn_run(
                     // The scope needs the project (unused by planning's tools, but
                     // part of the shared scope shape); fall back to empty if the
                     // epic vanished, which only disables tools harmlessly.
-                    let project_id = get_epic_project_id(state.db.conn(), &epic_id)
-                        .await
-                        .ok()
-                        .flatten()
-                        .unwrap_or_default();
+                    let scope_project_id = if project_id.is_empty() {
+                        get_epic_project_id(state.db.conn(), &epic_id)
+                            .await
+                            .ok()
+                            .flatten()
+                            .unwrap_or_default()
+                    } else {
+                        project_id.clone()
+                    };
                     let guard = state.caps.mint(
                         epic_id.clone(),
-                        project_id,
+                        scope_project_id,
                         phase.clone(),
                         clone_pb.clone(),
                     );
@@ -450,9 +515,11 @@ pub fn spawn_run(
             prompt: user_content,
             cwd,
             resume,
-            system_prompt: config.system_prompt,
+            system_prompt: spawn_cfg.prompt,
             continuity,
             mcp,
+            harness: spawn_cfg.harness.clone(),
+            model: spawn_cfg.model.clone(),
         };
 
         let rx = state.planner.run(req);
@@ -500,7 +567,43 @@ pub fn spawn_run(
         if let Some(session_id) = &outcome.session_id {
             let _ = set_harness_session_id(conn, &epic_id, &phase, session_id).await;
         }
+
+        // T8 evidence: one `planning` row per turn — same shape as breakdown's
+        // post-run insert (`status` stays the schema default `running`; there
+        // is no pipeline watching planning turns), plus the configurable-agent
+        // columns so the turn is auditable against the settings that produced
+        // it. Best-effort: transcript rows above are the source of truth.
+        let _ = conn
+            .execute(
+                "INSERT INTO agent_run \
+                 (id, task_id, epic_id, stage, session_id, log, created_at, \
+                  attempt, status, verdict, started_at, ended_at, exit_code, \
+                  harness, model, prompt_hash) \
+                 VALUES (?1, NULL, ?2, 'planning', ?3, ?4, ?5, 1, 'ok', NULL, ?5, ?6, NULL, \
+                  ?7, ?8, ?9)",
+                params![
+                    ulid::Ulid::new().to_string(),
+                    epic_id,
+                    outcome.session_id,
+                    outcome.text,
+                    now_ms(),
+                    now_ms(),
+                    spawn_cfg.harness,
+                    spawn_cfg.model,
+                    spawn_cfg.prompt_hash,
+                ],
+            )
+            .await;
     });
+}
+
+/// Current unix time in milliseconds (matches the `*_at` columns). Local copy
+/// following the same per-module convention as every other store module.
+fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
 }
 
 // ---- test doubles (crate-visible so `epics` tests can inject them) --------
@@ -1249,5 +1352,65 @@ mod tests {
         );
         let items = wait_for_transcript(&state, &epic_id, 2).await;
         assert!(items.iter().any(|m| m["role"] == "agent"));
+    }
+
+    // ---- T7: unsupported-harness spawn validation -------------------------
+
+    #[test]
+    fn planning_agent_rejects_an_unsupported_harness_loudly() {
+        let agent = ClaudePlanningAgent::new();
+        let rx = agent.run(PlanningRunRequest {
+            run_id: "run-codex".to_string(),
+            prompt: "hello".to_string(),
+            cwd: None,
+            resume: None,
+            system_prompt: "system".to_string(),
+            continuity: None,
+            mcp: None,
+            harness: "codex".to_string(),
+            model: None,
+        });
+
+        let first = rx.iter().next().expect("an Error event must arrive");
+        match first {
+            RunEvent::Error { message, .. } => {
+                assert!(message.contains("codex"), "error names the harness: {message}");
+                assert!(message.contains("unsupported"), "error says why: {message}");
+            }
+            other => panic!("expected RunEvent::Error, got {other:?}"),
+        }
+        // The synthetic stream still terminates so every drainer exits.
+        let exited = rx.iter().find(|e| matches!(e, RunEvent::Exited { .. }));
+        assert!(exited.is_some(), "stream must end with Exited");
+    }
+
+    #[test]
+    fn planning_agent_accepts_the_supported_harness_request_shape() {
+        // No live spawn here — a real `claude` binary would start. Instead:
+        // build the request exactly as spawn_run does for the supported key
+        // and confirm it passes validation by checking the constant the
+        // adapter validates against, plus that a supported request reaches
+        // the spawn path (which, without `claude` on PATH in CI, surfaces as
+        // an Error stream too — so we only assert it did NOT fail with
+        // "unsupported").
+        let agent = ClaudePlanningAgent::new();
+        let rx = agent.run(PlanningRunRequest {
+            run_id: "run-claude".to_string(),
+            prompt: "hello".to_string(),
+            cwd: None,
+            resume: None,
+            system_prompt: "system".to_string(),
+            continuity: None,
+            mcp: None,
+            harness: crate::agent_settings::SUPPORTED_HARNESS.to_string(),
+            model: None,
+        });
+        let unsupported = rx
+            .iter()
+            .any(|e| matches!(&e, RunEvent::Error { message, .. } if message.contains("unsupported")));
+        assert!(
+            !unsupported,
+            "a supported-harness request must pass spawn validation"
+        );
     }
 }

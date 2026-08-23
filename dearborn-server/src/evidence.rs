@@ -131,6 +131,16 @@ pub struct OpenStage<'a> {
     /// string here, never a new enum variant wired through this module.
     pub stage: &'a str,
     pub attempt: i64,
+    /// Which harness key this run was resolved to (T8 evidence). `None` for
+    /// rows predating the column (no backfill) and for non-agent stages.
+    pub harness: Option<&'a str>,
+    /// The resolved model passed to the CLI, if any (T8). `None` = CLI default.
+    pub model: Option<&'a str>,
+    /// SHA-256 hex of the resolved instruction prompt (T8) — see
+    /// [`crate::agent_settings::prompt_hash`]. Hash, not text: prompts are
+    /// user-authored and can be large; the hash correlates a run with the
+    /// override that produced it without duplicating that text per row.
+    pub prompt_hash: Option<&'a str>,
 }
 
 /// A stage's open row: just enough to flush/close it later without a
@@ -153,15 +163,20 @@ pub async fn open_stage(
     conn.execute(
         "INSERT INTO agent_run \
          (id, task_id, epic_id, stage, session_id, log, created_at, \
-          attempt, status, verdict, started_at, ended_at, exit_code) \
-         VALUES (?1, ?2, ?3, ?4, NULL, '', ?5, ?6, 'running', NULL, ?5, NULL, NULL)",
+          attempt, status, verdict, started_at, ended_at, exit_code, \
+          harness, model, prompt_hash) \
+         VALUES (?1, ?2, ?3, ?4, NULL, '', ?5, ?6, 'running', NULL, ?5, NULL, NULL, \
+          ?7, ?8, ?9)",
         params![
             id.clone(),
             open.task_id,
             open.epic_id,
             open.stage,
             started_at,
-            open.attempt
+            open.attempt,
+            open.harness,
+            open.model,
+            open.prompt_hash
         ],
     )
     .await?;
@@ -578,6 +593,9 @@ mod tests {
                 epic_id: Some("epic-1"),
                 stage: "implement",
                 attempt: 1,
+                harness: None,
+                model: None,
+                prompt_hash: None,
             },
         )
         .await
@@ -637,6 +655,9 @@ mod tests {
                 epic_id: Some("epic-1"),
                 stage: "review",
                 attempt: 1,
+                harness: None,
+                model: None,
+                prompt_hash: None,
             },
         )
         .await
@@ -680,6 +701,9 @@ mod tests {
                 epic_id: Some("epic-1"),
                 stage: "commit",
                 attempt: 1,
+                harness: None,
+                model: None,
+                prompt_hash: None,
             },
         )
         .await
@@ -716,6 +740,9 @@ mod tests {
                 epic_id: Some("epic-1"),
                 stage: "test_gate",
                 attempt: 1,
+                harness: None,
+                model: None,
+                prompt_hash: None,
             },
         )
         .await
@@ -750,6 +777,9 @@ mod tests {
                 epic_id: Some("epic-1"),
                 stage: "implement",
                 attempt: 1,
+                harness: None,
+                model: None,
+                prompt_hash: None,
             },
         )
         .await
@@ -851,6 +881,9 @@ mod tests {
                 epic_id: Some("epic-1"),
                 stage: "implement",
                 attempt: 1,
+                harness: None,
+                model: None,
+                prompt_hash: None,
             },
         )
         .await
@@ -875,6 +908,9 @@ mod tests {
                 epic_id: Some("epic-1"),
                 stage: "review",
                 attempt: 1,
+                harness: None,
+                model: None,
+                prompt_hash: None,
             },
         )
         .await
@@ -928,6 +964,9 @@ mod tests {
                 epic_id: Some("epic-1"),
                 stage: "implement",
                 attempt: 1,
+                harness: None,
+                model: None,
+                prompt_hash: None,
             },
         )
         .await

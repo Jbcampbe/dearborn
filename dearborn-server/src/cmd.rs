@@ -375,6 +375,9 @@ pub async fn run_stage_command(
             epic_id: req.epic_id,
             stage: req.stage,
             attempt: req.attempt,
+            harness: None,
+            model: None,
+            prompt_hash: None,
         },
     )
     .await?;

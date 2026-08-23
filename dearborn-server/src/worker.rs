@@ -2541,6 +2541,9 @@ async fn commit_if_dirty(
         epic_id,
         stage: Stage::Commit.as_str(),
         attempt: commit_attempt,
+        harness: None,
+        model: None,
+        prompt_hash: None,
     };
     if let Ok(handle) = evidence::open_stage(conn, open).await {
         let _ = evidence::close_stage(
@@ -2654,7 +2657,9 @@ async fn process_one_task(
     // published.
 
     // 2. The D8 prompt: rendered spec + epic background (if any) + sibling
-    //    manifest (empty for a standalone task).
+    //    manifest (empty for a standalone task). The instruction text is the
+    //    slot's live-resolved effective prompt (T6): the project override when
+    //    set, else prompts/implement.md — read at spawn time (design §9).
     let task_ctx = TaskContext {
         spec: SpecFields {
             title: task_title,
@@ -2667,8 +2672,21 @@ async fn process_one_task(
         // populates this. See spec::TaskContext's doc.
         base_sha: None,
     };
-    let prompt = task_agent::assemble_prompt(Stage::Implement, &task_ctx)
-        .expect("Stage::Implement always has a prompt (spec::prompt_for)");
+    let implement_cfg = match resolve_or_fail(
+        state,
+        epic_id,
+        project_id,
+        task_id,
+        Stage::Implement,
+        workspace,
+        lease,
+    )
+    .await
+    {
+        Ok(cfg) => cfg,
+        Err(()) => return TaskStepOutcome::Stop,
+    };
+    let prompt = task_agent::assemble_prompt_text(&implement_cfg.prompt, &task_ctx);
 
     // 3. Run the implement stage through the TaskAgent seam.
     let run_id = ulid::Ulid::new().to_string();
@@ -2677,6 +2695,9 @@ async fn process_one_task(
         stage: Stage::Implement,
         prompt,
         cwd: workspace.workspace_path.clone(),
+        harness: implement_cfg.harness,
+        model: implement_cfg.model,
+        prompt_hash: implement_cfg.prompt_hash,
     };
     let outcome = task_agent::run_agent_stage(
         state,
@@ -2754,7 +2775,7 @@ async fn process_one_task(
         .await
         .ok()
         .flatten();
-    match run_test_gate_loop(state, epic_id, task_id, workspace, pat.as_deref(), lease).await {
+    match run_test_gate_loop(state, epic_id, project_id, task_id, workspace, pat.as_deref(), lease).await {
         GateOutcome::Proceed => {}
         GateOutcome::Stop => return TaskStepOutcome::Stop,
     }
@@ -2812,16 +2833,31 @@ async fn process_one_task(
                 base_sha: Some(base_sha.as_str()),
                 ..task_ctx
             };
-            let review_prompt = task_agent::assemble_prompt(Stage::Review, &review_ctx)
-                .expect("Stage::Review always has a prompt (spec::prompt_for)");
+            let review_cfg = match resolve_or_fail(
+                state,
+                epic_id,
+                project_id,
+                task_id,
+                Stage::Review,
+                workspace,
+                lease,
+            )
+            .await
+            {
+                Ok(cfg) => cfg,
+                Err(()) => return TaskStepOutcome::Stop,
+            };
+            let review_prompt = task_agent::assemble_prompt_text(&review_cfg.prompt, &review_ctx);
 
             match run_review_fix_converge(
                 state,
                 epic_id,
+                project_id,
                 task_id,
                 task_title,
                 workspace,
                 &review_prompt,
+                &review_cfg,
                 pat.as_deref(),
                 lease,
             )
@@ -2856,16 +2892,31 @@ async fn process_one_task(
             // read the end state of the code, not `git diff`. `task_ctx`
             // already has `base_sha: None`; reused as-is rather than cloning
             // a `base_sha`-bearing copy the way the review branch above does.
-            let verify_prompt = task_agent::assemble_prompt(Stage::VerifyComplete, &task_ctx)
-                .expect("Stage::VerifyComplete always has a prompt (spec::prompt_for)");
+            let verify_cfg = match resolve_or_fail(
+                state,
+                epic_id,
+                project_id,
+                task_id,
+                Stage::VerifyComplete,
+                workspace,
+                lease,
+            )
+            .await
+            {
+                Ok(cfg) => cfg,
+                Err(()) => return TaskStepOutcome::Stop,
+            };
+            let verify_prompt = task_agent::assemble_prompt_text(&verify_cfg.prompt, &task_ctx);
 
             match run_verify_complete(
                 state,
                 epic_id,
+                project_id,
                 task_id,
                 task_title,
                 workspace,
                 &verify_prompt,
+                &verify_cfg,
                 task_ctx,
                 &base_sha,
                 pat.as_deref(),
@@ -2964,9 +3015,85 @@ enum GateOutcome {
 /// epic, and the D19 concern) — this function is the literal translation of
 /// `references/ralph-v2.sh`'s `test_attempt` loop (its `# ---- test gate
 /// ----` section) into Dearborn's stage/evidence machinery.
+/// Resolve a pipeline stage's live [`SpawnConfig`](crate::agent_settings::SpawnConfig)
+/// for `project_id` (T6/T7): maps `stage` onto its [`AgentSlot`], then folds
+/// global settings + the project's override around the stage's compiled
+/// default prompt. Called at every spawn site **immediately before** prompt
+/// assembly — never cached — so a mid-epic settings edit is picked up by the
+/// very next stage run (design §9); only meaningful for agent stages
+/// (`Stage::is_agent_stage`), since non-agent stages have nothing to resolve.
+///
+/// Returns a boxed future on purpose: every caller sits inside the already
+/// sizeable `process_one_task`/gate/convergence futures, and inlining this
+/// resolution's state into each of them overflowed the test runtime's 2 MiB
+/// thread stack (the same hazard that boxes the `cmd::run_stage_command`
+/// calls below). Boxing keeps the callers' generator layout unchanged.
+fn stage_spawn_config<'a>(
+    state: &'a AppState,
+    project_id: &'a str,
+    stage: Stage,
+) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<crate::agent_settings::SpawnConfig,
+crate::agent_settings::SettingsError>> + Send + 'a>> {
+    Box::pin(async move {
+        // Both unwraps are guarded by the callers' agent-stage-only contract:
+        // every agent stage has a compiled default prompt and a slot mapping.
+        let default = crate::spec::prompt_for(stage)
+            .expect("stage_spawn_config is only called for agent stages");
+        let slot = crate::agent_slot::AgentSlot::from_stage(stage)
+            .expect("stage_spawn_config is only called for agent stages");
+        crate::agent_settings::spawn_config(&state.db, project_id, slot, default).await
+    })
+}
+
+/// Resolve a claimed item's slot config or route the standard `agent_error`
+/// failure (T6/T7): the resolve-or-fail preamble every agent-stage spawn site
+/// shares, in one boxed future so neither the resolution nor [`fail_item`]'s
+/// own sizeable future is inlined into the already-huge pipeline generators
+/// (the same stack-overflow hazard [`stage_spawn_config`]'s doc describes).
+/// `Ok(None)` is impossible; `Err(())` means the failure was routed — the
+/// caller must stop without further writes.
+#[allow(clippy::too_many_arguments)]
+fn resolve_or_fail<'a>(
+    state: &'a AppState,
+    epic_id: Option<&'a str>,
+    project_id: &'a str,
+    task_id: &'a str,
+    stage: Stage,
+    workspace: &'a ProvisionedWorkspace,
+    lease: &'a LeaseHandle,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<crate::agent_settings::SpawnConfig,
+()>
+> + Send + 'a>> {
+    Box::pin(async move {
+        match stage_spawn_config(state, project_id, stage).await {
+            Ok(cfg) => Ok(cfg),
+            Err(err) => {
+                if !lease.is_lost() {
+                    fail_item(
+                        state,
+                        FailureContext {
+                            epic_id,
+                            task_id: Some(task_id),
+                            reason: FailureReason::AgentError,
+                            message: &format!(
+                                "failed to resolve {} agent settings: {err}",
+                                stage.as_str()
+                            ),
+                            push: PushIntent::Attempt(workspace),
+                        },
+                    )
+                    .await;
+                }
+                Err(())
+            }
+        }
+    })
+}
+
 async fn run_test_gate_loop(
     state: &AppState,
     epic_id: Option<&str>,
+    project_id: &str,
     task_id: &str,
     workspace: &ProvisionedWorkspace,
     pat: Option<&str>,
@@ -3077,10 +3204,27 @@ async fn run_test_gate_loop(
             return GateOutcome::Stop;
         }
 
-        // D19: the fix agent's entire context is prompts/fix.md plus this
-        // one round's failing output — see `task_agent::assemble_fix_prompt`
-        // for the full rationale and an open concern about it.
-        let fix_prompt = task_agent::assemble_fix_prompt(&ran.output);
+        // D19: the fix agent's entire context is the fix instructions plus
+        // this one round's failing output — see
+        // `task_agent::assemble_fix_prompt` for the full rationale and an
+        // open concern about it. The instruction text re-resolves live each
+        // round (T6/design §9): a settings change mid-loop applies from the
+        // next fix attempt on.
+        let fix_cfg = match resolve_or_fail(
+            state,
+            epic_id,
+            project_id,
+            task_id,
+            Stage::Fix,
+            workspace,
+            lease,
+        )
+        .await
+        {
+            Ok(cfg) => cfg,
+            Err(()) => return GateOutcome::Stop,
+        };
+        let fix_prompt = task_agent::assemble_fix_prompt_text(&fix_cfg.prompt, &ran.output);
         let run_id = ulid::Ulid::new().to_string();
         let fix_outcome = task_agent::run_agent_stage(
             state,
@@ -3095,6 +3239,9 @@ async fn run_test_gate_loop(
                 stage: Stage::Fix,
                 prompt: fix_prompt,
                 cwd: workspace.workspace_path.clone(),
+                harness: fix_cfg.harness,
+                model: fix_cfg.model,
+                prompt_hash: fix_cfg.prompt_hash,
             },
         )
         .await;
@@ -3220,6 +3367,7 @@ async fn run_verdict_stage(
     prompt: &str,
     lease: &LeaseHandle,
     start_attempt: i64,
+    cfg: &crate::agent_settings::SpawnConfig,
 ) -> VerdictOutcome {
     let conn = state.db.conn();
     // Total *tries this call may make* = the first try + the bounded number
@@ -3267,6 +3415,9 @@ async fn run_verdict_stage(
                 stage,
                 prompt: this_try_prompt,
                 cwd: workspace.workspace_path.clone(),
+                harness: cfg.harness.clone(),
+                model: cfg.model.clone(),
+                prompt_hash: cfg.prompt_hash.clone(),
             },
         )
         .await;
@@ -3390,10 +3541,12 @@ enum ConvergenceOutcome {
 async fn run_review_fix_converge(
     state: &AppState,
     epic_id: Option<&str>,
+    project_id: &str,
     task_id: &str,
     task_title: &str,
     workspace: &ProvisionedWorkspace,
     review_prompt: &str,
+    review_cfg: &crate::agent_settings::SpawnConfig,
     pat: Option<&str>,
     lease: &LeaseHandle,
 ) -> ConvergenceOutcome {
@@ -3430,6 +3583,7 @@ async fn run_review_fix_converge(
             review_prompt,
             lease,
             review_attempt,
+            review_cfg,
         )
         .await
         {
@@ -3498,13 +3652,28 @@ async fn run_review_fix_converge(
                 // The fix shares its attempt number with the review that
                 // produced its feedback — T-522's "a fix and the gate that
                 // follows it share a number", with review standing in for
-                // gate. D19: the fix agent's only context is
-                // `prompts/fix.md` + this round's findings — never the
+                // gate. D19: the fix agent's only context is the fix
+                // instructions + this round's findings — never the
                 // spec/epic/sibling context Implement gets; see
                 // `assemble_fix_prompt`'s doc (shared with T-522) for the
-                // full rationale and its open concern.
+                // full rationale and its open concern. The instruction text
+                // re-resolves live each round (T6/design §9).
                 let fix_attempt = used_attempt + 1;
-                let fix_prompt = task_agent::assemble_fix_prompt(&findings);
+                let fix_cfg = match resolve_or_fail(
+                    state,
+                    epic_id,
+                    project_id,
+                    task_id,
+                    Stage::Fix,
+                    workspace,
+                    lease,
+                )
+                .await
+                {
+                    Ok(cfg) => cfg,
+                    Err(()) => return ConvergenceOutcome::Stop,
+                };
+                let fix_prompt = task_agent::assemble_fix_prompt_text(&fix_cfg.prompt, &findings);
                 let run_id = ulid::Ulid::new().to_string();
                 let fix_outcome = task_agent::run_agent_stage(
                     state,
@@ -3519,6 +3688,9 @@ async fn run_review_fix_converge(
                         stage: Stage::Fix,
                         prompt: fix_prompt,
                         cwd: workspace.workspace_path.clone(),
+                        harness: fix_cfg.harness,
+                        model: fix_cfg.model,
+                        prompt_hash: fix_cfg.prompt_hash,
                     },
                 )
                 .await;
@@ -3576,7 +3748,7 @@ async fn run_review_fix_converge(
                 // already routes the task to `Failed(test_gate_exhausted)`
                 // and the epic to `Blocked` from inside that call — this
                 // loop's only job on `GateOutcome::Stop` is to stop.
-                match run_test_gate_loop(state, epic_id, task_id, workspace, pat, lease).await {
+                match run_test_gate_loop(state, epic_id, project_id, task_id, workspace, pat, lease).await {
                     GateOutcome::Proceed => {}
                     GateOutcome::Stop => return ConvergenceOutcome::Stop,
                 }
@@ -3672,10 +3844,12 @@ async fn run_review_fix_converge(
 async fn run_verify_complete(
     state: &AppState,
     epic_id: Option<&str>,
+    project_id: &str,
     task_id: &str,
     task_title: &str,
     workspace: &ProvisionedWorkspace,
     verify_prompt: &str,
+    verify_cfg: &crate::agent_settings::SpawnConfig,
     task_ctx: TaskContext<'_>,
     base_sha: &str,
     pat: Option<&str>,
@@ -3695,6 +3869,7 @@ async fn run_verify_complete(
         verify_prompt,
         lease,
         0,
+        verify_cfg,
     )
     .await
     {
@@ -3745,10 +3920,25 @@ async fn run_verify_complete(
             // [verdict stage] that follows it share a number" convention
             // T-522/T-531 already established, with verify_complete standing
             // in for test_gate/review. D19: the fix agent's only context is
-            // `prompts/fix.md` + the verifier's findings — never the spec/
-            // epic/sibling context Implement gets.
+            // the fix instructions + the verifier's findings — never the
+            // spec/epic/sibling context Implement gets. The instruction text
+            // re-resolves live each round (T6/design §9).
             let fix_attempt = used_attempt + 1;
-            let fix_prompt = task_agent::assemble_fix_prompt(&findings);
+            let fix_cfg = match resolve_or_fail(
+                state,
+                epic_id,
+                project_id,
+                task_id,
+                Stage::Fix,
+                workspace,
+                lease,
+            )
+            .await
+            {
+                Ok(cfg) => cfg,
+                Err(()) => return TaskStepOutcome::Stop,
+            };
+            let fix_prompt = task_agent::assemble_fix_prompt_text(&fix_cfg.prompt, &findings);
             let run_id = ulid::Ulid::new().to_string();
             let fix_outcome = task_agent::run_agent_stage(
                 state,
@@ -3763,6 +3953,9 @@ async fn run_verify_complete(
                     stage: Stage::Fix,
                     prompt: fix_prompt,
                     cwd: workspace.workspace_path.clone(),
+                    harness: fix_cfg.harness,
+                    model: fix_cfg.model,
+                    prompt_hash: fix_cfg.prompt_hash,
                 },
             )
             .await;
@@ -3814,7 +4007,7 @@ async fn run_verify_complete(
             // Re-enter the normal pipeline (§6's own words): the identical
             // T-522 test gate `Stage::Implement`'s own path runs, reused
             // unmodified.
-            match run_test_gate_loop(state, epic_id, task_id, workspace, pat, lease).await {
+            match run_test_gate_loop(state, epic_id, project_id, task_id, workspace, pat, lease).await {
                 GateOutcome::Proceed => {}
                 GateOutcome::Stop => return TaskStepOutcome::Stop,
             }
@@ -3909,21 +4102,37 @@ async fn run_verify_complete(
             // From here on this is byte-for-byte "an ordinary implemented
             // task": build the Review context/prompt exactly as
             // `process_one_task`'s own step 5b does, and hand off to the
-            // unmodified T-530/T-531 convergence loop.
+            // unmodified T-530/T-531 convergence loop. The Review slot's
+            // config resolves live here too (T6).
             let review_ctx = TaskContext {
                 base_sha: Some(base_sha),
                 ..task_ctx
             };
-            let review_prompt = task_agent::assemble_prompt(Stage::Review, &review_ctx)
-                .expect("Stage::Review always has a prompt (spec::prompt_for)");
+            let review_cfg = match resolve_or_fail(
+                state,
+                epic_id,
+                project_id,
+                task_id,
+                Stage::Review,
+                workspace,
+                lease,
+            )
+            .await
+            {
+                Ok(cfg) => cfg,
+                Err(()) => return TaskStepOutcome::Stop,
+            };
+            let review_prompt = task_agent::assemble_prompt_text(&review_cfg.prompt, &review_ctx);
 
             match run_review_fix_converge(
                 state,
                 epic_id,
+                project_id,
                 task_id,
                 task_title,
                 workspace,
                 &review_prompt,
+                &review_cfg,
                 pat,
                 lease,
             )
@@ -4321,6 +4530,9 @@ async fn push_on_failure(
         epic_id,
         stage: Stage::Push.as_str(),
         attempt: 1,
+        harness: None,
+        model: None,
+        prompt_hash: None,
     };
     let stage_handle = evidence::open_stage(conn, open).await.ok();
 
@@ -4984,6 +5196,9 @@ async fn push_and_open_pr(
         epic_id,
         stage: Stage::Push.as_str(),
         attempt: 1,
+        harness: None,
+        model: None,
+        prompt_hash: None,
     };
     let stage_handle = evidence::open_stage(conn, open).await.ok();
 
@@ -5121,13 +5336,23 @@ async fn push_and_open_pr(
 /// independently.
 async fn run_summarize_stage(
     state: &AppState,
+    project_id: &str,
     epic_id: Option<&str>,
     task_id: Option<&str>,
     context: &TaskContext<'_>,
     workspace_path: &std::path::Path,
 ) -> Option<String> {
-    let prompt = task_agent::assemble_prompt(Stage::Summarize, context)
-        .expect("Stage::Summarize always has a prompt (spec::prompt_for)");
+    // Live-resolved Summarize slot config (T6): override or prompts/
+    // summarize.md, read at spawn time. Every failure path below collapses
+    // to `None` — the summary never blocks the PR (D16).
+    let cfg = match stage_spawn_config(state, project_id, Stage::Summarize).await {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            tracing::warn!(project = %project_id, error = %err, "failed to resolve summarize agent settings; skipping summary");
+            return None;
+        }
+    };
+    let prompt = task_agent::assemble_prompt_text(&cfg.prompt, context);
     let run_id = ulid::Ulid::new().to_string();
     let outcome = task_agent::run_agent_stage(
         state,
@@ -5142,6 +5367,9 @@ async fn run_summarize_stage(
             stage: Stage::Summarize,
             prompt,
             cwd: workspace_path.to_path_buf(),
+            harness: cfg.harness,
+            model: cfg.model,
+            prompt_hash: cfg.prompt_hash,
         },
     )
     .await;
@@ -5253,6 +5481,7 @@ async fn run_epic_summary(
 
     run_summarize_stage(
         state,
+        &epic.project_id,
         Some(epic_id),
         None,
         &context,
@@ -5298,6 +5527,7 @@ async fn run_task_summary(
 
     run_summarize_stage(
         state,
+        &task.project_id,
         None,
         Some(task_id),
         &context,

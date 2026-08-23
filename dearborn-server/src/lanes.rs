@@ -519,6 +519,9 @@ mod tests {
                 stage: Stage::Implement,
                 prompt: "go".to_string(),
                 cwd: std::env::temp_dir(),
+                harness: "claude".to_string(),
+                model: None,
+                prompt_hash: "test-prompt-hash".to_string(),
             })
             .unwrap();
         // Mirrors what `task_agent::CancelGuard::new` does while a real

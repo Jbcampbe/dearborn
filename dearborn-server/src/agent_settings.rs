@@ -272,6 +272,76 @@ pub async fn delete_agent_setting(
     Ok(changed > 0)
 }
 
+// ---- Per-run spawn config (T6/T7) ------------------------------------------
+
+/// The only harness whose CLI can actually be spawned in v1 (design §2). The
+/// settings schema is harness-ready, but until a second adapter is wired up a
+/// non-`"claude"` effective harness fails loudly at spawn-validation time
+/// rather than silently running Claude under another harness's name.
+pub const SUPPORTED_HARNESS: &str = "claude";
+
+/// The per-run config a spawn site needs (T6/T7): everything folds globals +
+/// overrides into one value read **at spawn time** (live-read, design §9 — no
+/// caching anywhere; every stage run re-resolves). `prompt` is the *effective
+/// instruction text* — the slot's override when set, else the caller-supplied
+/// compiled default — and `prompt_hash` is its SHA-256 hex digest, written to
+/// the `agent_run` evidence row so historical runs stay auditable after the
+/// override that produced them changes.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SpawnConfig {
+    /// Harness key validated against [`SUPPORTED_HARNESS`] by each spawn site.
+    pub harness: String,
+    /// Model passed verbatim to the CLI; `None` → the CLI's own default.
+    pub model: Option<String>,
+    /// Effective instruction text (override or compiled default).
+    pub prompt: String,
+    /// SHA-256 hex of `prompt` (evidence column `agent_run.prompt_hash`).
+    pub prompt_hash: String,
+}
+
+/// Resolve a slot's live [`SpawnConfig`] for `project_id`, falling back to
+/// `default_prompt` (the site's compiled `include_str!` text) when the slot
+/// carries no system-prompt override. Reads the DB fresh on every call — the
+/// whole point is that a mid-epic settings edit is picked up by the next
+/// stage run without any invalidation machinery (design §9).
+pub async fn spawn_config(
+    db: &Db,
+    project_id: &str,
+    slot: AgentSlot,
+    default_prompt: &str,
+) -> Result<SpawnConfig, SettingsError> {
+    let global = get_global_settings(db).await?;
+    let override_row = get_agent_setting(db, project_id, slot).await?;
+    let effective = resolve_effective(&global, override_row.as_ref());
+    // Same "empty counts as absent" rule resolve_effective applies to the
+    // prompt-source flag: an empty override must not replace the default with
+    // blank instructions just because it survived validation as `Some("")`.
+    let prompt = match override_row
+        .as_ref()
+        .and_then(|o| o.system_prompt.as_deref())
+        .filter(|p| !p.is_empty())
+    {
+        Some(override_prompt) => override_prompt.to_string(),
+        None => default_prompt.to_string(),
+    };
+    Ok(SpawnConfig {
+        harness: effective.harness,
+        model: effective.model,
+        prompt_hash: prompt_hash(&prompt),
+        prompt,
+    })
+}
+
+/// SHA-256 hex digest of an instruction prompt — the T8 evidence hash. Full
+/// digest (not truncated): prompts are user-authored text where two distinct
+/// overrides colliding on a short prefix is a real possibility, and 64 hex
+/// chars cost nothing in a TEXT column.
+pub fn prompt_hash(prompt: &str) -> String {
+    use sha2::{Digest, Sha256};
+    let digest = Sha256::digest(prompt.as_bytes());
+    digest.iter().map(|b| format!("{b:02x}")).collect()
+}
+
 // ---- Resolution (T4) --------------------------------------------------------
 
 /// Where a slot's effective instruction prompt came from. Reported by the
@@ -682,5 +752,126 @@ mod tests {
             .await
             .unwrap();
         assert!(list_agent_settings(&db, &project).await.is_err());
+    }
+
+    // ---- spawn_config (T6/T7) ----------------------------------------------
+
+    const DEFAULT_PROMPT: &str = "compiled default instructions";
+
+    #[tokio::test]
+    async fn spawn_config_without_override_serves_the_compiled_default() {
+        let db = test_db().await;
+        let project = seed_project(&db).await;
+        let cfg = spawn_config(&db, &project, AgentSlot::Implement, DEFAULT_PROMPT)
+            .await
+            .unwrap();
+        assert_eq!(cfg.harness, "claude");
+        assert_eq!(cfg.model, None, "seeded globals configure no model");
+        assert_eq!(cfg.prompt, DEFAULT_PROMPT);
+        assert_eq!(cfg.prompt_hash, prompt_hash(DEFAULT_PROMPT));
+    }
+
+    #[tokio::test]
+    async fn spawn_config_applies_the_slot_override() {
+        let db = test_db().await;
+        let project = seed_project(&db).await;
+        upsert_agent_setting(
+            &db,
+            &project,
+            &AgentSetting {
+                slot: AgentSlot::Review,
+                harness: None,
+                model: Some("haiku".to_string()),
+                system_prompt: Some("be harsh but fair".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+        let cfg = spawn_config(
+            &db,
+            &project,
+            AgentSlot::Review,
+            "compiled review prompt",
+        )
+        .await
+        .unwrap();
+        assert_eq!(cfg.harness, "claude");
+        assert_eq!(cfg.model, Some("haiku".to_string()));
+        assert_eq!(cfg.prompt, "be harsh but fair");
+        assert_eq!(cfg.prompt_hash, prompt_hash("be harsh but fair"));
+    }
+
+    #[tokio::test]
+    async fn empty_prompt_override_counts_as_absent() {
+        let db = test_db().await;
+        let project = seed_project(&db).await;
+        upsert_agent_setting(
+            &db,
+            &project,
+            &AgentSetting {
+                slot: AgentSlot::Implement,
+                harness: None,
+                model: None,
+                system_prompt: Some(String::new()),
+            },
+        )
+        .await
+        .unwrap();
+        let cfg = spawn_config(&db, &project, AgentSlot::Implement, DEFAULT_PROMPT)
+            .await
+            .unwrap();
+        assert_eq!(cfg.prompt, DEFAULT_PROMPT);
+    }
+
+    #[tokio::test]
+    async fn live_read_picks_up_a_mid_flight_settings_change_on_the_next_call() {
+        // T9's core property at the resolution seam: no caching. Two calls
+        // around an override write must observe different effective configs.
+        let db = test_db().await;
+        let project = seed_project(&db).await;
+        let before = spawn_config(&db, &project, AgentSlot::Fix, DEFAULT_PROMPT)
+            .await
+            .unwrap();
+        assert_eq!(before.prompt, DEFAULT_PROMPT);
+
+        upsert_agent_setting(
+            &db,
+            &project,
+            &AgentSetting {
+                slot: AgentSlot::Fix,
+                harness: Some("claude".to_string()),
+                model: Some("sonnet-4-5".to_string()),
+                system_prompt: Some("revised fix instructions".to_string()),
+            },
+        )
+        .await
+        .unwrap();
+
+        let after = spawn_config(&db, &project, AgentSlot::Fix, DEFAULT_PROMPT)
+            .await
+            .unwrap();
+        assert_eq!(after.prompt, "revised fix instructions");
+        assert_eq!(after.model, Some("sonnet-4-5".to_string()));
+        assert_ne!(before, after, "the next run must see the new settings");
+
+        // Reset (delete) also takes effect on the very next read.
+        delete_agent_setting(&db, &project, AgentSlot::Fix)
+            .await
+            .unwrap();
+        let reset = spawn_config(&db, &project, AgentSlot::Fix, DEFAULT_PROMPT)
+            .await
+            .unwrap();
+        assert_eq!(reset, before);
+    }
+
+    #[test]
+    fn prompt_hash_is_a_full_sha256_hex_digest_and_discriminates_inputs() {
+        let a = prompt_hash("instructions A");
+        let b = prompt_hash("instructions B");
+        assert_eq!(a.len(), 64, "full digest, not a truncated prefix");
+        assert!(a.chars().all(|c| c.is_ascii_hexdigit()));
+        assert_ne!(a, b, "distinct prompts must hash distinctly");
+        // Stability: hashing twice yields the same digest (no randomness).
+        assert_eq!(a, prompt_hash("instructions A"));
     }
 }
