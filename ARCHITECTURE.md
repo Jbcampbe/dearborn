@@ -24,6 +24,9 @@ Clients are a shared Vue/Tauri codebase, web-first.
   **[agent-harness](https://github.com/getlatentic/agent-harness)** — one
   `Harness` trait, normalized `RunEvent` stream (text, reasoning, tool calls,
   tokens, lifecycle).
+- **Prompts, harness, and model are runtime-configurable per project agent
+  slot** (global defaults + per-project overrides; evidence recorded per run).
+  See [docs/design/agent-and-project-settings.md](./docs/design/agent-and-project-settings.md).
 - Dearborn does **not** implement its own agent loop.
 
 ## 2. Concurrency & isolation
@@ -177,7 +180,10 @@ implement → [test gate: Dearborn runs tests, fix-loop ≤N] → commit
 - **`GitHost` trait** (`clone / push / open_pr / check_auth`).
 - **v1: GitHub only.** Gitea = v2 (slots into the trait).
 - **Per-project PAT, encrypted at rest**, used for git-over-HTTPS + the host API.
-- **One PR per epic**, branch `dearborn/<project key>-<id>`.
+- **One PR per epic**, branch `dearborn/<project key>-<id>`. The PR base is the
+  epic's **recorded base branch** (snapshotted at provision from an optional
+  epic/project setting; repo default when unset) — `open_pr` no longer does a
+  live default-branch lookup.
 
 ## 15. Transport & clients
 - **REST for commands/queries; WebSocket for live subscriptions** (kanban/status

@@ -294,12 +294,12 @@ Ordered by dependency; each task is one reviewable unit. `[B]` = backend,
 
 ### Phase 6 — Hardening & docs
 
-- [ ] **T-20. API/integration tests** — global PUT validation matrix (disable-
+- [x] **T-20. API/integration tests** — global PUT validation matrix (disable-
       referenced 409, default-not-enabled); slot PUT reset semantics; epic
       create with bad `base_branch` (400); provision + PR-base against a fake
       remote exercising the resolution chain (epic NULL → project NULL →
       repo default).
-- [ ] **T-21. Docs** — ARCHITECTURE.md pointer to this design doc (§14 git-host
+- [x] **T-21. Docs** — ARCHITECTURE.md pointer to this design doc (§14 git-host
       note about the retired live-default-branch lookup; §10/§11 agent runtime
       notes); SCRATCHPAD: strike the Global/Project settings bullets this
       implements, keep the deferred ones.

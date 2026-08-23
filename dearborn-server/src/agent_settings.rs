@@ -1265,20 +1265,23 @@ mod tests {
                 "PUT",
                 "/settings",
                 Some(json!({
-                    "default_harness": "codex",
+                    "default_harness": "  codex  ",
                     "default_models": {
-                        "claude": "sonnet-4-5",
+                        "claude": "  sonnet-4-5  ",
                         "codex": "gpt-5"
                     },
-                    "enabled_harnesses": ["claude", "codex"]
+                    "enabled_harnesses": ["claude", " codex "]
                 })),
             ))
             .await
             .unwrap();
         assert_eq!(put.status(), StatusCode::OK);
+        let first = body_json(put).await;
+        assert_eq!(first["default_harness"], json!("codex"));
+        // Values are trimmed on save (design §7: trimmed, non-empty only).
         assert_eq!(
-            body_json(put).await["default_harness"],
-            json!("codex")
+            first["default_models"],
+            json!({ "claude": "sonnet-4-5", "codex": "gpt-5" })
         );
 
         // Partial PUT: only the model map changes; harness + enablement stay.

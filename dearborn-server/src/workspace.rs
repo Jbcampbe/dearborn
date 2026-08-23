@@ -1097,6 +1097,119 @@ mod tests {
         assert_eq!(epic_base_branch_column(&state, &epic_id).await, Some("release".to_string()));
     }
 
+    /// §5 chain permutation (epic set, project set) at the I/O level: the
+    /// epic's own recorded base wins over the project default — provisioning
+    /// branches off `origin/<epic base>` (the release-only file exists, the
+    /// develop-only file does not) and snapshots *that* onto `epic.base_branch`.
+    /// Complements the pure [`resolve_base_branch`] unit tests by proving the
+    /// winning value actually drives git and the snapshot write.
+    #[tokio::test]
+    async fn provision_prefers_the_epics_base_over_the_project_default() {
+        let root = TempCloneRoot::new("base-branch-epic-wins");
+        let fixture = GitFixture::new().await;
+        // Two non-default branches, each carrying a file the others lack.
+        run_git_ok(fixture.path(), &["checkout", "-b", "release"]).await;
+        std::fs::write(fixture.path().join("release-only.txt"), "from release\n").unwrap();
+        run_git_ok(fixture.path(), &["add", ".", "release-only.txt"]).await;
+        run_git_ok(fixture.path(), &["commit", "-m", "release"]).await;
+        run_git_ok(fixture.path(), &["checkout", "-b", "develop", "main"]).await;
+        std::fs::write(fixture.path().join("develop-only.txt"), "from develop\n").unwrap();
+        run_git_ok(fixture.path(), &["add", ".", "develop-only.txt"]).await;
+        run_git_ok(fixture.path(), &["commit", "-m", "develop"]).await;
+        run_git_ok(fixture.path(), &["checkout", "main"]).await;
+
+        let state = test_state(&root.path_str()).await;
+        let project_id = seed_project(
+            &state,
+            &fixture.path().to_string_lossy(),
+            "ready",
+            true,
+            None,
+        )
+        .await;
+        state
+            .db
+            .conn()
+            .execute(
+                "UPDATE project SET base_branch = 'develop' WHERE id = ?1",
+                params![project_id.clone()],
+            )
+            .await
+            .unwrap();
+        let epic_id = seed_epic(&state, &project_id, "Stacked On Release").await;
+        state
+            .db
+            .conn()
+            .execute(
+                "UPDATE epic SET base_branch = 'release' WHERE id = ?1",
+                params![epic_id.clone()],
+            )
+            .await
+            .unwrap();
+
+        let outcome = provision_epic_workspace(&state, &epic_id, &project_id)
+            .await
+            .expect("provisioning must succeed against the local fixture");
+
+        // Epic's base won: branched off `release`'s graph, not `develop`'s.
+        assert!(outcome.workspace_path.join("release-only.txt").exists());
+        assert!(
+            !outcome.workspace_path.join("develop-only.txt").exists(),
+            "the project default must lose to the epic's recorded base"
+        );
+        assert_eq!(
+            epic_base_branch_column(&state, &epic_id).await,
+            Some("release".to_string()),
+            "the snapshot must record the epic's own base"
+        );
+    }
+
+    /// §5 chain permutation (epic set, project NULL) at the I/O level: with no
+    /// project default, the epic's explicit base is still used and snapshotted —
+    /// an epic-level override never silently falls back to the repo default.
+    #[tokio::test]
+    async fn provision_uses_the_epics_base_when_the_project_has_none() {
+        let root = TempCloneRoot::new("base-branch-epic-only");
+        let fixture = GitFixture::new().await;
+        run_git_ok(fixture.path(), &["checkout", "-b", "hotfix"]).await;
+        std::fs::write(fixture.path().join("hotfix-only.txt"), "from hotfix\n").unwrap();
+        run_git_ok(fixture.path(), &["add", "."]).await;
+        run_git_ok(fixture.path(), &["commit", "-m", "hotfix"]).await;
+        run_git_ok(fixture.path(), &["checkout", "main"]).await;
+
+        let state = test_state(&root.path_str()).await;
+        let project_id = seed_project(
+            &state,
+            &fixture.path().to_string_lossy(),
+            "ready",
+            true,
+            None,
+        )
+        .await;
+        let epic_id = seed_epic(&state, &project_id, "Based On Hotfix").await;
+        state
+            .db
+            .conn()
+            .execute(
+                "UPDATE epic SET base_branch = 'hotfix' WHERE id = ?1",
+                params![epic_id.clone()],
+            )
+            .await
+            .unwrap();
+
+        let outcome = provision_epic_workspace(&state, &epic_id, &project_id)
+            .await
+            .expect("provisioning must succeed against the local fixture");
+
+        // Branched off `hotfix`'s graph (its own commit is present).
+        assert!(outcome.workspace_path.join("hotfix-only.txt").exists());
+        // And the snapshot recorded it.
+        assert_eq!(
+            epic_base_branch_column(&state, &epic_id).await,
+            Some("hotfix".to_string())
+        );
+    }
+
     #[tokio::test]
     async fn first_provision_clones_checks_out_branch_and_persists_it() {
         let root = TempCloneRoot::new("first");
