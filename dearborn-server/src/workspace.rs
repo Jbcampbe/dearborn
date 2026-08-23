@@ -113,6 +113,19 @@ use crate::git;
 use crate::projects::load_decrypted_pat;
 use crate::AppState;
 
+/// Design-doc §5's base-branch resolution chain, minus its terminal: an
+/// explicit **epic**-level branch wins (set at creation, immutable), else the
+/// **project** default, else `None` — which every caller renders as "the
+/// remote's own HEAD" (`origin/HEAD` for resets, [`git::origin_default_branch`]
+/// for PR targets). Pure so the chain is unit-tested directly rather than only
+/// through full provisioning runs.
+fn resolve_base_branch<'a>(
+    epic_base: Option<&'a str>,
+    project_base: Option<&'a str>,
+) -> Option<&'a str> {
+    epic_base.or(project_base)
+}
+
 /// §2.8: the epic workspace path — `<clone_root>/epics/<epic id>`. The
 /// canonical checkout stays `<clone_root>/<project id>` (T-103, unchanged).
 pub fn epic_workspace_path(clone_root: &str, epic_id: &str) -> PathBuf {
@@ -358,19 +371,30 @@ async fn provision_workspace(
         .map_err(|e| ProvisionFailure::Workspace(format!("failed to load project PAT: {e}")))?;
 
     // 1. Refresh the canonical checkout, serialized per-project (§11 risk 3
-    //    — see module doc). Held only across this call.
+    //    — see module doc). Held only across this call. The reset target is
+    //    the §5-resolved explicit base branch when one is recorded, so the
+    //    clone below branches off exactly that commit graph.
+    let (title, existing_branch_name, existing_base_branch) =
+        load_container_for_provision(conn, &container)
+            .await
+            .map_err(|e| ProvisionFailure::Workspace(format!("failed to load container: {e}")))?
+            .ok_or_else(|| ProvisionFailure::Workspace(format!("{container_id} not found")))?;
+    let resolved_base = resolve_base_branch(
+        existing_base_branch.as_deref(),
+        project.base_branch.as_deref(),
+    );
     {
         let lock = state.project_refresh_lock(project_id);
         let _guard = lock.lock().await;
-        git::refresh_repo(&project.repo_url, pat.as_deref(), &canonical_path)
-            .await
-            .map_err(|e| ProvisionFailure::Workspace(e.message))?;
-    }
-
-    let (title, existing_branch_name) = load_container_for_provision(conn, &container)
+        git::refresh_repo(
+            &project.repo_url,
+            pat.as_deref(),
+            &canonical_path,
+            resolved_base,
+        )
         .await
-        .map_err(|e| ProvisionFailure::Workspace(format!("failed to load container: {e}")))?
-        .ok_or_else(|| ProvisionFailure::Workspace(format!("{container_id} not found")))?;
+        .map_err(|e| ProvisionFailure::Workspace(e.message))?;
+    }
 
     // Read back a previously persisted branch name rather than recomputing —
     // see the module doc's "why re-attach" section.
@@ -410,9 +434,28 @@ async fn provision_workspace(
     }
 
     // 4. Persist the branch name — only on first provision; thereafter it is
-    //    read back, never rewritten (see module doc).
+    //    read back, never rewritten (see module doc). On an epic's first
+    //    provision this same write snapshots the §5-resolved base branch onto
+    //    `epic.base_branch` when one is recorded (design doc §5: the snapshot
+    //    happens when the branch is cut, so a later project-default edit can
+    //    never retarget an already-provisioned epic's PR). An epic whose chain
+    //    resolved to "repo default" stays NULL deliberately — that *is* its
+    //    recorded base.
     if is_first_provision {
-        persist_container_branch_name(conn, &container, &branch_name)
+        // What to write to `epic.base_branch`: an epic whose base was set at
+        // creation keeps that exact value (the write below must never clobber
+        // it with NULL); one without gets the §5-resolved branch snapshotted
+        // now (`None` = repo default — which *is* its recorded state). Tasks
+        // have no per-item column, so they always write NULL there (ignored
+        // by the task arm of the SQL).
+        let base_snapshot = match container {
+            WorkspaceContainer::Epic(_) => match existing_base_branch.as_deref() {
+                Some(existing) => Some(existing),
+                None => resolved_base,
+            },
+            WorkspaceContainer::Task(_) => None,
+        };
+        persist_container_branch_name(conn, &container, &branch_name, base_snapshot)
             .await
             .map_err(|e| {
                 ProvisionFailure::Workspace(format!("failed to persist branch_name: {e}"))
@@ -525,6 +568,9 @@ struct ProjectForProvision {
     test_cmd: Option<String>,
     clone_path: Option<String>,
     clone_status: String,
+    /// §5: the project default base branch (`None` = repo default), fed into
+    /// [`resolve_base_branch`] together with the container's own override.
+    base_branch: Option<String>,
 }
 
 async fn load_project(
@@ -533,7 +579,8 @@ async fn load_project(
 ) -> Result<Option<ProjectForProvision>, libsql::Error> {
     let mut rows = conn
         .query(
-            "SELECT repo_url, setup_cmd, test_cmd, clone_path, clone_status FROM project WHERE id = ?1",
+            "SELECT repo_url, setup_cmd, test_cmd, clone_path, clone_status, base_branch \
+             FROM project WHERE id = ?1",
             params![project_id],
         )
         .await?;
@@ -544,6 +591,7 @@ async fn load_project(
             test_cmd: row.get(2)?,
             clone_path: row.get(3)?,
             clone_status: row.get(4)?,
+            base_branch: row.get(5)?,
         })),
         None => Ok(None),
     }
@@ -553,20 +601,26 @@ async fn load_project(
 /// its title (to compute a branch name on first provision) and its
 /// already-persisted `branch_name` (`None` on first provision, `Some` on a
 /// re-claim — see the module doc's "why re-attach" section).
+/// Just enough of a container row (epic or task) for [`provision_workspace`]:
+/// its title (to compute a branch name on first provision), its
+/// already-persisted `branch_name` (`None` on first provision, `Some` on a
+/// re-claim — see the module doc's "why re-attach" section), and its
+/// already-recorded `base_branch` (§5; always `None` for a standalone task —
+/// tasks have no per-item base override by design).
 async fn load_container_for_provision(
     conn: &Connection,
     container: &WorkspaceContainer<'_>,
-) -> Result<Option<(String, Option<String>)>, libsql::Error> {
+) -> Result<Option<(String, Option<String>, Option<String>)>, libsql::Error> {
     match container {
         WorkspaceContainer::Epic(epic_id) => {
             let mut rows = conn
                 .query(
-                    "SELECT title, branch_name FROM epic WHERE id = ?1",
+                    "SELECT title, branch_name, base_branch FROM epic WHERE id = ?1",
                     params![*epic_id],
                 )
                 .await?;
             match rows.next().await? {
-                Some(row) => Ok(Some((row.get(0)?, row.get(1)?))),
+                Some(row) => Ok(Some((row.get(0)?, row.get(1)?, row.get(2)?))),
                 None => Ok(None),
             }
         }
@@ -578,7 +632,7 @@ async fn load_container_for_provision(
                 )
                 .await?;
             match rows.next().await? {
-                Some(row) => Ok(Some((row.get(0)?, row.get(1)?))),
+                Some(row) => Ok(Some((row.get(0)?, row.get(1)?, None))),
                 None => Ok(None),
             }
         }
@@ -589,21 +643,43 @@ async fn load_container_for_provision(
 /// epic/task-table mirror pair `provision_workspace`'s first-provision step
 /// calls into. See the module doc's "why re-attach" section for why this
 /// only ever runs once per container, never on a re-attach.
+/// Persist `branch_name` on the container's own row (T-551) — the
+/// epic/task-table mirror pair `provision_workspace`'s first-provision step
+/// calls into. See the module doc's "why re-attach" section for why this
+/// only ever runs once per container, never on a re-attach. For an epic,
+/// `base_snapshot` (§5) rides along in the same write: the resolved explicit
+/// base branch, snapshotted exactly when the branch is cut (`None` keeps the
+/// column NULL — "repo default" — which is itself the recorded state). The
+/// task arm simply ignores it (no per-task base override exists).
 async fn persist_container_branch_name(
     conn: &Connection,
     container: &WorkspaceContainer<'_>,
     branch_name: &str,
+    base_snapshot: Option<&str>,
 ) -> Result<(), libsql::Error> {
+    let now = now_ms();
+    // Each arm names its own columns explicitly: the `task` table has no
+    // `base_branch` column (§5 is epic/project-level only), so the shared
+    // "branch_name + updated_at" shape cannot be one interpolated statement.
+    // `table` is one of two compile-time string literals chosen just below by
+    // `WorkspaceContainer`'s own match, never caller-supplied data — the same
+    // pattern `worker::claim_row`'s doc already establishes for interpolating
+    // a table name safely.
     let (table, id) = match container {
         WorkspaceContainer::Epic(epic_id) => ("epic", *epic_id),
         WorkspaceContainer::Task(task_id) => ("task", *task_id),
     };
-    // `table` is one of two compile-time string literals chosen just above by
-    // `WorkspaceContainer`'s own match, never caller-supplied data — the same
-    // pattern `worker::claim_row`'s doc already establishes for interpolating
-    // a table name safely.
-    let sql = format!("UPDATE {table} SET branch_name = ?1, updated_at = ?2 WHERE id = ?3");
-    conn.execute(&sql, params![branch_name, now_ms(), id])
+    let sql = match container {
+        WorkspaceContainer::Epic(_) => {
+            format!(
+                "UPDATE {table} SET branch_name = ?1, base_branch = ?2, updated_at = ?3 WHERE id = ?4"
+            )
+        }
+        WorkspaceContainer::Task(_) => {
+            format!("UPDATE {table} SET branch_name = ?1, updated_at = ?3 WHERE id = ?4")
+        }
+    };
+    conn.execute(&sql, params![branch_name, base_snapshot, now, id])
         .await?;
     Ok(())
 }
@@ -630,6 +706,31 @@ mod tests {
     use crate::{Config, Db};
     use std::sync::Arc;
     use std::time::Duration;
+
+    // ---- §5 base-branch resolution chain -----------------------------------
+
+    #[test]
+    fn resolve_base_branch_epic_wins_over_project() {
+        assert_eq!(
+            resolve_base_branch(Some("epic-branch"), Some("project-main")),
+            Some("epic-branch")
+        );
+    }
+
+    #[test]
+    fn resolve_base_branch_falls_back_to_project_default() {
+        assert_eq!(
+            resolve_base_branch(None, Some("release")),
+            Some("release")
+        );
+    }
+
+    #[test]
+    fn resolve_base_branch_none_means_repo_default() {
+        // The terminal of the chain: `None` renders as origin/HEAD everywhere
+        // it is consumed — never as a guessed literal branch name.
+        assert_eq!(resolve_base_branch(None, None), None);
+    }
 
     // ---- slug() ----------------------------------------------------------
 
@@ -844,6 +945,20 @@ mod tests {
         rows.next().await.unwrap().unwrap().get(0).unwrap()
     }
 
+    /// The epic row's §5 `base_branch` snapshot (`None` = repo default).
+    async fn epic_base_branch_column(state: &AppState, epic_id: &str) -> Option<String> {
+        let mut rows = state
+            .db
+            .conn()
+            .query(
+                "SELECT base_branch FROM epic WHERE id = ?1",
+                params![epic_id],
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    }
+
     // ---- per-project refresh lock serialization ---------------------------
 
     /// The load-bearing primitive itself (§11 risk 3): two holders of the
@@ -932,6 +1047,55 @@ mod tests {
     }
 
     // ---- full provisioning: first call, idempotent re-attach ---------------
+
+    /// §5 end-to-end: with a project default base branch set, provisioning
+    /// resets the canonical checkout to `origin/<base>`, the epic workspace
+    /// branches off that commit graph (the release-only file exists), and the
+    /// resolved branch is snapshotted onto `epic.base_branch` at first
+    /// provision.
+    #[tokio::test]
+    async fn provision_branches_off_the_project_base_and_snapshots_it_onto_the_epic() {
+        let root = TempCloneRoot::new("base-branch");
+        let fixture = GitFixture::new().await;
+        // A `release` branch carrying a file `main` never gets.
+        run_git_ok(fixture.path(), &["checkout", "-b", "release"]).await;
+        std::fs::write(fixture.path().join("release-only.txt"), "from release\n").unwrap();
+        run_git_ok(fixture.path(), &["add", "."]).await;
+        run_git_ok(fixture.path(), &["commit", "-m", "release"]).await;
+        run_git_ok(fixture.path(), &["checkout", "main"]).await;
+
+        let state = test_state(&root.path_str()).await;
+        let project_id = seed_project(
+            &state,
+            &fixture.path().to_string_lossy(),
+            "ready",
+            true,
+            None,
+        )
+        .await;
+        state
+            .db
+            .conn()
+            .execute(
+                "UPDATE project SET base_branch = 'release' WHERE id = ?1",
+                params![project_id.clone()],
+            )
+            .await
+            .unwrap();
+        let epic_id = seed_epic(&state, &project_id, "Based On Release").await;
+
+        let outcome = provision_epic_workspace(&state, &epic_id, &project_id)
+            .await
+            .expect("provisioning must succeed against the local fixture");
+
+        // The workspace actually branched off `release`'s commit graph.
+        assert!(outcome.workspace_path.join("release-only.txt").exists());
+        let current = git::current_branch(&outcome.workspace_path).await.unwrap();
+        assert_eq!(current, outcome.branch_name);
+
+        // The snapshot landed on the epic row in the same write as branch_name.
+        assert_eq!(epic_base_branch_column(&state, &epic_id).await, Some("release".to_string()));
+    }
 
     #[tokio::test]
     async fn first_provision_clones_checks_out_branch_and_persists_it() {

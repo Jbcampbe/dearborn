@@ -5237,12 +5237,67 @@ async fn push_and_open_pr(
         return None;
     }
 
+    // Resolve the PR's base branch (design doc §5) *before* opening the push
+    // evidence row, so a resolution failure routes through the same
+    // `pr_failed` path with its own readable evidence. Chain: the recorded
+    // explicit base (the epic's provision-time snapshot, or — standalone
+    // tasks having no per-item record by design — the project default), else
+    // the workspace clone's own `origin/HEAD` (offline; no GitHub API call).
+    let recorded_base = match recorded_base_branch(conn, epic_id, project.base_branch.as_deref())
+        .await
+    {
+        Ok(base) => base,
+        Err(err) => {
+            if !lease.is_lost() {
+                fail_item(
+                    state,
+                    FailureContext {
+                        epic_id,
+                        task_id,
+                        reason: FailureReason::PrFailed,
+                        message: &format!("failed to load recorded base branch: {err}"),
+                        push: PushIntent::Skip,
+                    },
+                )
+                .await;
+            }
+            return None;
+        }
+    };
+    let base = match recorded_base {
+        Some(base) => base,
+        None => match git::origin_default_branch(&workspace.workspace_path).await {
+            Ok(branch) => branch,
+            Err(err) => {
+                if !lease.is_lost() {
+                    fail_item(
+                        state,
+                        FailureContext {
+                            epic_id,
+                            task_id,
+                            reason: FailureReason::PrFailed,
+                            message: &format!(
+                                "could not resolve the PR's base branch from the workspace \
+                                 clone (no explicit base is recorded): {}",
+                                err.message
+                            ),
+                            push: PushIntent::Skip,
+                        },
+                    )
+                    .await;
+                }
+                return None;
+            }
+        },
+    };
+
     let open_result = state
         .git_host
         .open_pr(OpenPrRequest {
             repo_url: &project.repo_url,
             pat: pat.as_deref(),
             head: &workspace.branch_name,
+            base: &base,
             title,
             body,
         })
@@ -5564,6 +5619,37 @@ async fn close_push_stage(
 /// Just enough of a project row for [`finalize_epic`]'s push/PR step.
 struct ProjectForFinalize {
     repo_url: String,
+    /// §5 project default (`None` = repo default). Only consulted for
+    /// standalone tasks — an epic always reads its own snapshot first.
+    base_branch: Option<String>,
+}
+
+/// The §5-recorded explicit base branch for this finalize, or `None` when the
+/// chain terminates at "repo default": an **epic** reads its own
+/// `epic.base_branch` — written once at first provision and never recomputed,
+/// so a later project-default edit can never retarget an in-flight epic. A
+/// **standalone task** has no per-item record by design, so it falls straight
+/// to the project default.
+async fn recorded_base_branch(
+    conn: &Connection,
+    epic_id: Option<&str>,
+    project_base: Option<&str>,
+) -> Result<Option<String>, libsql::Error> {
+    match epic_id {
+        Some(epic_id) => {
+            let mut rows = conn
+                .query(
+                    "SELECT base_branch FROM epic WHERE id = ?1",
+                    params![epic_id],
+                )
+                .await?;
+            match rows.next().await? {
+                Some(row) => Ok(row.get::<Option<String>>(0)?),
+                None => Ok(None),
+            }
+        }
+        None => Ok(project_base.map(str::to_string)),
+    }
 }
 
 async fn load_project_for_finalize(
@@ -5572,13 +5658,14 @@ async fn load_project_for_finalize(
 ) -> Result<Option<ProjectForFinalize>, libsql::Error> {
     let mut rows = conn
         .query(
-            "SELECT repo_url FROM project WHERE id = ?1",
+            "SELECT repo_url, base_branch FROM project WHERE id = ?1",
             params![project_id],
         )
         .await?;
     match rows.next().await? {
         Some(row) => Ok(Some(ProjectForFinalize {
             repo_url: row.get(0)?,
+            base_branch: row.get(1)?,
         })),
         None => Ok(None),
     }
@@ -8200,6 +8287,85 @@ mod tests {
         assert!(calls[0].body.contains("## Tasks"));
 
         cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// §5: an epic with a recorded `base_branch` opens its PR against exactly
+    /// that branch — the provision-time snapshot wins over anything else,
+    /// including the workspace clone's own origin/HEAD (which is `main` in
+    /// this fixture).
+    #[tokio::test]
+    async fn finalize_open_pr_targets_the_epics_recorded_base_branch() {
+        let fake = Arc::new(FakeHost::new());
+        let (state, _app) =
+            test_app_with_task_agent_and_host(Arc::new(ScriptedTaskAgent::new()), fake.clone())
+                .await;
+        let fixture = GitFixture::new().await;
+        // The recorded base must actually exist on the remote, or provisioning
+        // (which resets the canonical checkout to origin/<base>) fails first.
+        git_ok(&fixture.dir, &["branch", "release/1"]).await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        state
+            .db
+            .conn()
+            .execute(
+                "UPDATE epic SET base_branch = 'release/1' WHERE id = ?1",
+                params![epic_id.clone()],
+            )
+            .await
+            .unwrap();
+        seed_task(&state, &epic_id, &project_id, "A").await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        let calls = fake.open_pr_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].base, "release/1",
+            "the recorded epic base branch must win over the clone's origin/HEAD"
+        );
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// §5: a standalone task has no per-item record by design, so its PR
+    /// targets the project default when one is set.
+    #[tokio::test]
+    async fn finalize_open_pr_standalone_task_targets_the_project_base() {
+        let fake = Arc::new(FakeHost::new());
+        let (state, _app) =
+            test_app_with_task_agent_and_host(Arc::new(ScriptedTaskAgent::new()), fake.clone())
+                .await;
+        let fixture = GitFixture::new().await;
+        // The project default must exist on the remote for provisioning.
+        git_ok(&fixture.dir, &["branch", "develop"]).await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        state
+            .db
+            .conn()
+            .execute(
+                "UPDATE project SET base_branch = 'develop' WHERE id = ?1",
+                params![project_id.clone()],
+            )
+            .await
+            .unwrap();
+        // The standalone claim predicate only ever selects `InProgress`
+        // (§2.4) — seed it claim-ready.
+        let task_id =
+            seed_standalone_task(&state, &project_id, "Solo", "InProgress").await;
+
+        run_standalone_pipeline(state.clone(), task_id.clone()).await;
+
+        assert_eq!(single_task_status(&state, &task_id).await, "Done");
+        let calls = fake.open_pr_calls();
+        assert_eq!(calls.len(), 1);
+        assert_eq!(
+            calls[0].base, "develop",
+            "a standalone task's PR must target the project default"
+        );
+
+        cleanup_clone_root(&state, &project_id, &[]);
     }
 
     /// `Completed` is set **only** after the PR opens: a `FakeHost` scripted

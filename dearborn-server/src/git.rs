@@ -187,12 +187,23 @@ pub async fn clone_repo(repo_url: &str, pat: Option<&str>, dest: &Path) -> Resul
     Ok(())
 }
 
-/// Refresh the canonical checkout at `dest`: `git fetch` then hard-reset to the
-/// origin default branch (a read-only mirror always matches origin). If `dest`
-/// is not yet a repository, this performs an initial [`clone_repo`] instead.
-pub async fn refresh_repo(repo_url: &str, pat: Option<&str>, dest: &Path) -> Result<(), GitError> {
+/// Refresh the canonical checkout at `dest`: hard-reset to `base` after a
+/// `git fetch` — either an explicit `Some(branch)` (resetting to
+/// `origin/<branch>`, the design-doc §5 base-branch seam) or `None`, the
+/// historical behavior: reset to `origin/HEAD`, i.e. whatever branch the
+/// remote's HEAD names. A read-only mirror always matches origin. If `dest`
+/// is not yet a repository, this performs an initial [`clone_repo`] first and
+/// *then* resets — so a project whose very first provisioning carries a base
+/// branch still lands its canonical checkout on that branch, not silently on
+/// the remote default.
+pub async fn refresh_repo(
+    repo_url: &str,
+    pat: Option<&str>,
+    dest: &Path,
+    base: Option<&str>,
+) -> Result<(), GitError> {
     if !dest.join(".git").exists() {
-        return clone_repo(repo_url, pat, dest).await;
+        clone_repo(repo_url, pat, dest).await?;
     }
 
     let auth_url = authenticated_url(repo_url, pat)?;
@@ -204,8 +215,53 @@ pub async fn refresh_repo(repo_url: &str, pat: Option<&str>, dest: &Path) -> Res
         pat,
     )
     .await?;
-    run_git(&["reset", "--hard", "origin/HEAD"], Some(dest), pat).await?;
+    let reset_target = match base {
+        Some(branch) => format!("origin/{branch}"),
+        None => "origin/HEAD".to_string(),
+    };
+    run_git(&["reset", "--hard", &reset_target], Some(dest), pat).await?;
     Ok(())
+}
+
+/// Whether `branch` exists as a head on the remote at `repo_url` — the T-13
+/// epic-create validation probe (`git ls-remote --heads <url> <branch>`).
+/// Cheap, read-only, and safe to call at request time: it never writes
+/// anything locally. `Ok(false)` means the remote answered but has no such
+/// head; any git failure (unreachable host, bad URL) surfaces as a normal
+/// [`GitError`] so the caller can distinguish "branch missing" from "remote
+/// unreachable" by the message alone (both are redacted here).
+pub async fn remote_branch_exists(
+    repo_url: &str,
+    pat: Option<&str>,
+    branch: &str,
+) -> Result<bool, GitError> {
+    let auth_url = authenticated_url(repo_url, pat)?;
+    let output = run_git_capture(&["ls-remote", "--heads", &auth_url, branch], None, pat).await?;
+    Ok(!output.is_empty())
+}
+
+/// The branch name `origin/HEAD` points at in `repo_dir` — the repo default
+/// branch as recorded in this clone (every fresh `git clone` writes the
+/// symbolic ref). This is the offline terminal of the design-doc §5
+/// resolution chain: when neither the epic nor the project records an
+/// explicit base branch, finalize resolves the PR target from the workspace
+/// itself instead of making a GitHub API round-trip. Errors (no symbolic
+/// ref — e.g. a hand-built clone) surface as a readable [`GitError`].
+pub async fn origin_default_branch(repo_dir: &Path) -> Result<String, GitError> {
+    const PREFIX: &str = "refs/remotes/origin/";
+    let full = run_git_capture(
+        &["symbolic-ref", "refs/remotes/origin/HEAD"],
+        Some(repo_dir),
+        None,
+    )
+    .await?;
+    full.strip_prefix(PREFIX)
+        .map(str::to_string)
+        .ok_or_else(|| {
+            GitError::new(format!(
+                "origin/HEAD points outside {PREFIX}: {full}"
+            ))
+        })
 }
 
 /// Clone `src` (a local filesystem path, not a network URL) into `dest` — the
@@ -476,6 +532,64 @@ mod tests {
         );
         assert!(!err.message.contains("ghp_"));
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // ---- T-13/T-14: remote_branch_exists / origin_default_branch ----------
+
+    /// `remote_branch_exists` against a local bare origin (no network, no PAT):
+    /// an existing head answers `true`, a missing one `false` — and the probe
+    /// never writes anything into the bare repo.
+    #[tokio::test]
+    async fn remote_branch_exists_distinguishes_present_from_missing() {
+        let src = temp_repo_dir("lsr-src");
+        init_repo(&src).await;
+        run_git_ok(&src, &["branch", "feature"]).await;
+
+        assert!(remote_branch_exists(&src.to_string_lossy(), None, "main")
+            .await
+            .unwrap());
+        assert!(!remote_branch_exists(&src.to_string_lossy(), None, "nope")
+            .await
+            .unwrap());
+
+        let _ = std::fs::remove_dir_all(&src);
+    }
+
+    #[tokio::test]
+    async fn remote_branch_exists_errors_on_an_unreachable_host_without_leaking_the_pat()
+    {
+        let pat = "ghp_lsRemoteSecret123";
+        let err = remote_branch_exists(
+            "https://dearborn.invalid/nope/nope.git",
+            Some(pat),
+            "main",
+        )
+        .await
+        .expect_err("an unreachable host must error");
+        assert!(!err.message.is_empty());
+        assert!(!err.message.contains(pat));
+        assert!(!err.message.contains("ghp_"));
+    }
+
+    /// `origin_default_branch` reads the branch a fresh clone checked out from,
+    /// offline — the finalize-time terminal of the §5 resolution chain.
+    #[tokio::test]
+    async fn origin_default_branch_reads_the_cloned_head_ref() {
+        let src = temp_repo_dir("odb-src");
+        init_repo(&src).await; // branch: main
+        let dest = temp_repo_dir("odb-clone");
+        clone_local(&src, &dest).await.unwrap();
+
+        let branch = origin_default_branch(&dest).await.unwrap();
+        assert_eq!(branch, "main");
+
+        // The epic-workspace shape: after checking out an epic branch locally,
+        // origin/HEAD still names the *base* branch it was cloned from.
+        checkout_new_branch(&dest, "dearborn/epic-x").await.unwrap();
+        assert_eq!(origin_default_branch(&dest).await.unwrap(), "main");
+
+        let _ = std::fs::remove_dir_all(&src);
+        let _ = std::fs::remove_dir_all(&dest);
     }
 
     fn now_nanos() -> u128 {

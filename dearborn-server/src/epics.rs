@@ -36,7 +36,7 @@ use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
 
 use crate::planning::config_for_phase;
-use crate::{AppError, AppResult, AppState};
+use crate::{git, projects, AppError, AppResult, AppState};
 
 /// Columns projected into an [`Epic`] DTO. The lease columns (`lease_owner`,
 /// `lease_expires_at`, `branch_name`) are internal executor state and are
@@ -46,7 +46,7 @@ use crate::{AppError, AppResult, AppState};
 /// epic's PR landed and, if it stalled, why.
 const EPIC_COLUMNS: &str =
     "id, project_id, title, description, product_context, technical_context, \
-     status, pr_url, pr_number, blocked_reason, created_at, updated_at";
+     base_branch, status, pr_url, pr_number, blocked_reason, created_at, updated_at";
 
 /// Columns projected into a [`TranscriptMessage`] DTO, in schema (§2.2) order.
 const MESSAGE_COLUMNS: &str = "id, epic_id, phase, role, content, seq, created_at";
@@ -72,6 +72,9 @@ pub struct Epic {
     pub description: Option<String>,
     pub product_context: Option<String>,
     pub technical_context: Option<String>,
+    /// The epic's §5 base-branch override (`None` = project default / repo
+    /// default). Set at creation only; immutable afterwards.
+    pub base_branch: Option<String>,
     pub status: String,
     pub pr_url: Option<String>,
     pub pr_number: Option<i64>,
@@ -123,6 +126,13 @@ pub struct CreateEpic {
     /// string is stored as `NULL`.
     #[serde(default)]
     description: Option<String>,
+    /// Optional base-branch override (design doc §5): this epic provisions
+    /// from and PRs into this branch instead of the project default / repo
+    /// default. Validated against the remote at creation time (`ls-remote`
+    /// with the project PAT; unknown branch → 400) and **immutable
+    /// afterwards** — no PATCH surface exists by design.
+    #[serde(default)]
+    base_branch: Option<String>,
 }
 
 /// `POST /epics/{id}/messages` body — append a `user` message to the transcript.
@@ -182,6 +192,38 @@ pub async fn create_epic(
         )));
     }
 
+    // Validate an explicit base branch against the remote now (design doc
+    // §5): a typo caught here never burns a provisioning run. Blank/whitespace
+    // is treated as "not provided" (stored NULL), mirroring `description`.
+    let base_branch = req
+        .base_branch
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty());
+    if let Some(branch) = base_branch {
+        let pat = projects::load_decrypted_pat(&state, &project_id).await?;
+        let exists = git::remote_branch_exists(
+            &project_repo_url(conn, &project_id).await?.as_str(),
+            pat.as_deref(),
+            branch,
+        )
+        .await;
+        match exists {
+            Ok(true) => {}
+            Ok(false) => {
+                return Err(AppError::BadRequest(format!(
+                    "base branch `{branch}` does not exist on the remote"
+                )));
+            }
+            Err(err) => {
+                return Err(AppError::BadRequest(format!(
+                    "could not verify base branch `{branch}` against the remote: {}",
+                    err.message
+                )));
+            }
+        }
+    }
+
     let id = ulid::Ulid::new().to_string();
     let now = now_ms();
 
@@ -194,9 +236,9 @@ pub async fn create_epic(
         .map(str::trim)
         .filter(|s| !s.is_empty());
     conn.execute(
-        "INSERT INTO epic (id, project_id, title, description, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
-        params![id.clone(), project_id, title, description, now, now],
+        "INSERT INTO epic (id, project_id, title, description, base_branch, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+        params![id.clone(), project_id, title, description, base_branch, now, now],
     )
     .await?;
 
@@ -692,12 +734,13 @@ fn row_to_epic(row: &Row) -> Result<Epic, libsql::Error> {
         description: row.get(3)?,
         product_context: row.get(4)?,
         technical_context: row.get(5)?,
-        status: row.get(6)?,
-        pr_url: row.get(7)?,
-        pr_number: row.get(8)?,
-        blocked_reason: row.get(9)?,
-        created_at: row.get(10)?,
-        updated_at: row.get(11)?,
+        base_branch: row.get(6)?,
+        status: row.get(7)?,
+        pr_url: row.get(8)?,
+        pr_number: row.get(9)?,
+        blocked_reason: row.get(10)?,
+        created_at: row.get(11)?,
+        updated_at: row.get(12)?,
     })
 }
 
@@ -728,6 +771,23 @@ pub(crate) async fn project_exists(conn: &Connection, project_id: &str) -> AppRe
         .query("SELECT 1 FROM project WHERE id = ?1", params![project_id])
         .await?;
     Ok(rows.next().await?.is_some())
+}
+
+/// The project's `repo_url`, for callers that need it before any epic row
+/// exists (epic-create's §5 remote validation probe). `404` if unknown.
+async fn project_repo_url(conn: &Connection, project_id: &str) -> AppResult<String> {
+    let mut rows = conn
+        .query(
+            "SELECT repo_url FROM project WHERE id = ?1",
+            params![project_id],
+        )
+        .await?;
+    match rows.next().await? {
+        Some(row) => Ok(row.get(0)?),
+        None => Err(AppError::NotFound(format!(
+            "project {project_id} not found"
+        ))),
+    }
 }
 
 async fn epic_exists(conn: &Connection, epic_id: &str) -> AppResult<bool> {
@@ -1089,6 +1149,156 @@ mod tests {
             .unwrap();
         assert_eq!(cleared.status(), StatusCode::OK);
         assert_eq!(body_json(cleared).await["product_context"], Json::Null);
+    }
+
+    /// A local bare git fixture with `main` + `release/1` heads — the
+    /// `ls-remote` probe target for the §5 epic-create validation tests
+    /// (offline, no PAT). The project row is inserted directly because its
+    /// repo_url is a local path, which `/projects`' https-only validation
+    /// would reject.
+    async fn seed_local_bare_project(
+        state: &crate::AppState,
+    ) -> (String, std::path::PathBuf) {
+        let dir = std::env::temp_dir().join(format!(
+            "dearborn-t13-bare-{}-{}",
+            std::process::id(),
+            ulid::Ulid::new()
+        ));
+        let run = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&dir)
+                .status()
+                .unwrap()
+                .success()
+        };
+        std::fs::create_dir_all(&dir).unwrap();
+        assert!(run(&["init", "--bare", "-b", "main"]));
+
+        // Seed commits via a throwaway clone, then push both branches.
+        let work = dir.with_extension("work");
+        std::fs::create_dir_all(&work).unwrap();
+        let wrun = |args: &[&str]| {
+            std::process::Command::new("git")
+                .args(args)
+                .current_dir(&work)
+                .status()
+                .unwrap()
+                .success()
+        };
+        assert!(wrun(&[
+            "clone",
+            dir.to_str().unwrap(),
+            work.to_str().unwrap()
+        ]));
+        std::fs::write(work.join("README.md"), "hi\n").unwrap();
+        assert!(wrun(&["config", "user.email", "t@example.com"]));
+        assert!(wrun(&["config", "user.name", "T"]));
+        assert!(wrun(&["add", "."]));
+        assert!(wrun(&["commit", "-m", "init"]));
+        assert!(wrun(&["branch", "release/1"]));
+        assert!(wrun(&["push", "origin", "main", "release/1"]));
+
+        let conn = state.db.conn();
+        let id = ulid::Ulid::new().to_string();
+        let now = now_ms();
+        conn.execute(
+            "INSERT INTO project (id, name, repo_url, created_at, updated_at) \
+             VALUES (?1, 'Bare', ?2, ?3, ?3)",
+            params![id.clone(), dir.to_string_lossy(), now],
+        )
+        .await
+        .unwrap();
+        (id, dir)
+    }
+
+    #[tokio::test]
+    async fn create_epic_with_existing_base_branch_stores_it_and_returns_it() {
+        use crate::{Config, Db};
+        let db = Db::connect(":memory:").await.unwrap();
+        db.run_migrations().await.unwrap();
+        let state = crate::AppState::with_planner(
+            Config::for_test(TOKEN),
+            db,
+            std::sync::Arc::new(crate::planning::testing::SilentPlanningAgent),
+        );
+        let app = app(state.clone());
+        let (project_id, _bare) = seed_local_bare_project(&state).await;
+
+        let created = app
+            .oneshot(req(
+                "POST",
+                &format!("/projects/{project_id}/epics"),
+                Some(json!({ "title": "Stacked", "base_branch": " release/1 " })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let epic = body_json(created).await;
+        // Trimmed on the way in, round-tripped on the way out.
+        assert_eq!(epic["base_branch"], "release/1");
+    }
+
+    #[tokio::test]
+    async fn create_epic_with_unknown_base_branch_is_structured_bad_request() {
+        use crate::{Config, Db};
+        let db = Db::connect(":memory:").await.unwrap();
+        db.run_migrations().await.unwrap();
+        let state = crate::AppState::with_planner(
+            Config::for_test(TOKEN),
+            db,
+            std::sync::Arc::new(crate::planning::testing::SilentPlanningAgent),
+        );
+        let app = app(state.clone());
+        let (project_id, _bare) = seed_local_bare_project(&state).await;
+
+        let response = app
+            .oneshot(req(
+                "POST",
+                &format!("/projects/{project_id}/epics"),
+                Some(json!({ "title": "Typo", "base_branch": "no-such-branch" })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(response).await["error"]["code"], "bad_request");
+    }
+
+    #[tokio::test]
+    async fn create_epic_blank_base_branch_stores_null_like_omitted() {
+        use crate::{Config, Db};
+        let db = Db::connect(":memory:").await.unwrap();
+        db.run_migrations().await.unwrap();
+        let state = crate::AppState::with_planner(
+            Config::for_test(TOKEN),
+            db,
+            std::sync::Arc::new(crate::planning::testing::SilentPlanningAgent),
+        );
+        let app = app(state.clone());
+        let project_id = seed_project(&app).await;
+
+        let blank = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                &format!("/projects/{project_id}/epics"),
+                Some(json!({ "title": "Blank base", "base_branch": "   " })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(blank.status(), StatusCode::CREATED);
+        assert_eq!(body_json(blank).await["base_branch"], Json::Null);
+
+        let omitted = app
+            .oneshot(req(
+                "POST",
+                &format!("/projects/{project_id}/epics"),
+                Some(json!({ "title": "Omitted base" })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(omitted.status(), StatusCode::CREATED);
+        assert_eq!(body_json(omitted).await["base_branch"], Json::Null);
     }
 
     #[tokio::test]

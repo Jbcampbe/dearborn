@@ -262,16 +262,16 @@ Ordered by dependency; each task is one reviewable unit. `[B]` = backend,
 
 ### Phase 4 — Base branch (backend)
 
-- [ ] **T-13. Epic-create `base_branch`** — `POST /projects/{id}/epics` accepts
+- [x] **T-13. Epic-create `base_branch`** — `POST /projects/{id}/epics` accepts
       optional `base_branch`; validated via `git ls-remote --heads origin`
       with the project PAT (400 on miss); stored on the epic row. No PATCH
       surface (immutable after creation).
-- [ ] **T-14. Provision-time resolution & snapshot** — chain
+- [x] **T-14. Provision-time resolution & snapshot** — chain
       `epic.base_branch ?? project.base_branch ?? repo default`; provisioning
       branches off `origin/<resolved>` instead of unconditional `origin/HEAD`
       (`git.rs::refresh_repo` gains a branch parameter); persist the resolved
       value onto `epic.base_branch` when the branch is cut.
-- [ ] **T-15. PR base** — `open_pr` targets the epic's resolved base branch
+- [x] **T-15. PR base** — `open_pr` targets the epic's resolved base branch
       (from the epic row / finalize-time resolution) instead of the fetched
       repo default; remove/retire the `fetch_default_branch` call on that path.
 

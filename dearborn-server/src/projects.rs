@@ -46,7 +46,7 @@ use crate::{AppError, AppResult, AppState};
 /// The columns projected into a [`Project`] DTO. Note the conspicuous absence of
 /// `pat_encrypted`: it is never read back into an API-facing shape.
 const PROJECT_COLUMNS: &str = "id, name, repo_url, setup_cmd, test_cmd, run_cmd, \
-     clone_path, clone_status, clone_error, created_at, updated_at";
+     base_branch, clone_path, clone_status, clone_error, created_at, updated_at";
 
 /// A project as returned by the API. **Never** carries `pat_encrypted`.
 ///
@@ -60,6 +60,13 @@ pub struct Project {
     pub setup_cmd: Option<String>,
     pub test_cmd: Option<String>,
     pub run_cmd: Option<String>,
+    /// The project's default base branch (design doc §5): new epics provision
+    /// from and PR into this branch unless the epic overrides it at creation.
+    /// `None` → each repo's own default branch (today's behavior). Free text,
+    /// deliberately unvalidated here — validation happens where it can be
+    /// checked against the remote (epic creation's `ls-remote` probe) or
+    /// surfaces as an ordinary provisioning failure.
+    pub base_branch: Option<String>,
     pub clone_path: Option<String>,
     pub clone_status: String,
     pub clone_error: Option<String>,
@@ -106,6 +113,13 @@ pub struct UpdateProject {
     test_cmd: Option<Option<String>>,
     #[serde(default, deserialize_with = "double_option")]
     run_cmd: Option<Option<String>>,
+    /// Set / clear the project default base branch (double-option, design doc
+    /// §5): absent → untouched, `null` → clear to `NULL` (repo default), value
+    /// → set. Not validated against the remote here — a project may be edited
+    /// before its first clone exists; bad names surface at provisioning or
+    /// epic-create time instead.
+    #[serde(default, deserialize_with = "double_option")]
+    base_branch: Option<Option<String>>,
     /// Set / clear the stored PAT (double-option): absent → untouched, `null` (or
     /// an empty string) → clear to `NULL`, value → re-encrypt and replace.
     #[serde(default, deserialize_with = "double_option")]
@@ -226,6 +240,7 @@ pub async fn update_project(
         ("setup_cmd = ?", req.setup_cmd),
         ("test_cmd = ?", req.test_cmd),
         ("run_cmd = ?", req.run_cmd),
+        ("base_branch = ?", req.base_branch.map(|opt| opt.filter(|v| !v.trim().is_empty()).map(|v| v.trim().to_string()))),
     ] {
         if let Some(value) = field {
             assignments.push(column);
@@ -315,7 +330,7 @@ pub async fn refresh_project(
         let repo_url = project.repo_url.clone();
         let dest = dest.clone();
         tokio::spawn(async move {
-            let result = git::refresh_repo(&repo_url, pat.as_deref(), &dest).await;
+            let result = git::refresh_repo(&repo_url, pat.as_deref(), &dest, None).await;
             record_clone_outcome(&state, &id, &dest, result).await;
         });
     }
@@ -409,11 +424,12 @@ fn row_to_project(row: &Row) -> Result<Project, libsql::Error> {
         setup_cmd: row.get(3)?,
         test_cmd: row.get(4)?,
         run_cmd: row.get(5)?,
-        clone_path: row.get(6)?,
-        clone_status: row.get(7)?,
-        clone_error: row.get(8)?,
-        created_at: row.get(9)?,
-        updated_at: row.get(10)?,
+        base_branch: row.get(6)?,
+        clone_path: row.get(7)?,
+        clone_status: row.get(8)?,
+        clone_error: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
     })
 }
 

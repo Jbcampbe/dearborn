@@ -48,13 +48,14 @@
 //! this project deliberately avoids (a `cargo tree` after this change should
 //! show no `openssl*` crate anywhere in the dependency graph).
 //!
-//! ## Base branch: read from GitHub, never assumed (T-514 AC)
-//! [`GithubHost::open_pr`] resolves the PR's base branch by calling `GET
-//! /repos/{owner}/{repo}` and reading `default_branch` — **not** a hardcoded
-//! `"main"` — because MILESTONE_2 §12 explicitly defers a per-project
-//! `base_branch` override to v2; until that lands, the repo's own default is
-//! the only correct target, and plenty of real repos still default to
-//! `master` or something else entirely.
+//! ## Base branch: supplied by the caller, never assumed (T-13/T-15)
+//! [`GithubHost::open_pr`] targets whatever `base` the [`OpenPrRequest`] names —
+//! resolved by the caller from the epic/project record (design doc §5) or, for
+//! pre-feature rows with no recorded base, from the workspace clone's own
+//! `origin/HEAD`. The original T-514 behavior (a live `GET /repos/{owner}/{repo}`
+//! reading `default_branch`, never a hardcoded `"main"`) was retired once §5's
+//! snapshot semantics landed: what Dearborn recorded at provision is exactly
+//! what GitHub sees at finalize, with no API round-trip in between.
 //!
 //! ## Redaction discipline
 //! Every error this module can produce — a `git push` failure (already
@@ -123,16 +124,22 @@ pub struct PushRequest<'a> {
     pub pat: Option<&'a str>,
 }
 
-/// [`GitHost::open_pr`]'s arguments. Deliberately has no `base` field — the
-/// implementation resolves the target branch itself (see the module doc's
-/// "base branch" section); a caller only ever supplies what it actually
-/// controls (title/body/head), never a base it would otherwise have to
-/// guess.
+/// [`GitHost::open_pr`]'s arguments.
+///
+/// `base` is the branch the PR targets — resolved by the **caller** from the
+/// epic/project record (design doc §5) or, failing that, the clone's own
+/// `origin/HEAD`. The pre-T-13 design resolved it here via a live
+/// `GET /repos/{owner}/{repo}` (`fetch_default_branch`); that lookup is
+/// retired: the host now only ever opens a PR against a base the caller
+/// explicitly named, so what was recorded at provision time is exactly what
+/// GitHub sees at finalize time.
 pub struct OpenPrRequest<'a> {
     pub repo_url: &'a str,
     pub pat: Option<&'a str>,
     /// The branch to open the PR *from* (§2.8's epic branch).
     pub head: &'a str,
+    /// The branch to open the PR *against* (§5-resolved base).
+    pub base: &'a str,
     pub title: &'a str,
     pub body: &'a str,
 }
@@ -299,34 +306,9 @@ impl GithubHost {
         }
     }
 
-    /// `GET /repos/{owner}/{repo}` → `default_branch` (T-514 AC: never
-    /// assume `main`).
-    async fn fetch_default_branch(
-        &self,
-        owner: &str,
-        repo: &str,
-        pat: Option<&str>,
-    ) -> Result<String, GitHostError> {
-        let resp = self
-            .authed(self.client.get(repo_info_url(owner, repo)), pat)
-            .send()
-            .await
-            .map_err(|e| redacted_reqwest_err(&e, pat))?;
-        let status = resp.status();
-        if !status.is_success() {
-            let text = resp.text().await.unwrap_or_default();
-            return Err(map_github_error(status.as_u16(), &text, pat));
-        }
-        let value: serde_json::Value = resp
-            .json()
-            .await
-            .map_err(|e| redacted_reqwest_err(&e, pat))?;
-        value
-            .get("default_branch")
-            .and_then(|v| v.as_str())
-            .map(str::to_string)
-            .ok_or_else(|| GitHostError::new("GitHub repo response is missing default_branch"))
-    }
+    // (The pre-T-13 `fetch_default_branch` helper was retired: the PR base now
+    // arrives on [`OpenPrRequest`], resolved by the caller from Dearborn's own
+    // records — see that struct's doc.)
 }
 
 impl Default for GithubHost {
@@ -350,8 +332,7 @@ impl GitHost for GithubHost {
     ) -> BoxFuture<'a, Result<OpenedPr, GitHostError>> {
         Box::pin(async move {
             let (owner, repo) = parse_owner_repo(req.repo_url)?;
-            let base = self.fetch_default_branch(&owner, &repo, req.pat).await?;
-            let json_body = build_open_pr_json(req.title, req.head, &base, req.body);
+            let json_body = build_open_pr_json(req.title, req.head, req.base, req.body);
 
             let resp = self
                 .authed(self.client.post(pulls_url(&owner, &repo)), req.pat)
@@ -418,7 +399,9 @@ pub mod testing {
     use std::sync::Mutex;
 
     /// One recorded `open_pr` call, everything a test needs to assert the
-    /// right title/head/base/body were sent.
+    /// right title/head/base/body were sent. `base` is verbatim from the
+    /// request — the fake has no opinion about branch resolution (the caller
+    /// owns that since T-13/T-15).
     #[derive(Debug, Clone)]
     pub struct RecordedOpenPr {
         pub repo_url: String,
@@ -439,12 +422,6 @@ pub mod testing {
         open_pr_failure: Option<String>,
         pr_url: String,
         pr_number: i64,
-        /// The base branch `open_pr` reports having targeted — `FakeHost`
-        /// never calls GitHub, so unlike `GithubHost` it cannot read the
-        /// repo's real `default_branch`; this fixed (overridable) value
-        /// stands in for it, and every call is still recorded so a test can
-        /// assert the exact value used ([`FakeHost::open_pr_calls`]).
-        default_branch: String,
         push_failure: Option<String>,
         /// When set, `push` returns `Ok(())` immediately without touching
         /// git at all — see [`FakeHost::stub_push_success`].
@@ -459,7 +436,6 @@ pub mod testing {
                 open_pr_failure: None,
                 pr_url: "https://github.com/fake-owner/fake-repo/pull/1".to_string(),
                 pr_number: 1,
-                default_branch: "main".to_string(),
                 push_failure: None,
                 push_stub_success: false,
                 check_auth_failure: None,
@@ -549,7 +525,7 @@ pub mod testing {
                     .push(RecordedOpenPr {
                         repo_url: req.repo_url.to_string(),
                         head: req.head.to_string(),
-                        base: self.default_branch.clone(),
+                        base: req.base.to_string(),
                         title: req.title.to_string(),
                         body: req.body.to_string(),
                     });
