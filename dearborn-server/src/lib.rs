@@ -18,6 +18,7 @@ pub mod error;
 pub mod evidence;
 pub mod git;
 pub mod git_host;
+pub mod harness_pi;
 pub mod hub;
 pub mod lanes;
 pub mod mcp;
@@ -87,7 +88,7 @@ pub struct AppState {
     pub breakdown: Arc<dyn BreakdownAgent>,
     /// The task-stage agent that drives `implement`/`fix`/`review`/
     /// `verify_complete`/`summarize` (T-512). Production is
-    /// [`task_agent::ClaudeTaskAgent`]; tests inject a scripted fake. Unlike
+    /// [`task_agent::CliTaskAgent`]; tests inject a scripted fake. Unlike
     /// `planner`/`breakdown`, a task-stage run is one-shot with no `resume`
     /// (D19) and has no in-flight slot of its own here — concurrency for
     /// task stages is the worker pool's job (T-510+: at most one stage per
@@ -236,7 +237,7 @@ impl AppState {
     /// hermetically (T-301). Production wiring ([`AppState::new`] /
     /// [`with_planner`](Self::with_planner)) defaults the breakdown agent to
     /// [`breakdown::ClaudeBreakdownAgent`]; the task agent defaults to
-    /// [`task_agent::ClaudeTaskAgent`] (override it via
+    /// [`task_agent::CliTaskAgent`] (override it via
     /// [`with_all_agents`](Self::with_all_agents)).
     pub fn with_agents(
         config: Config,
@@ -249,7 +250,7 @@ impl AppState {
             db,
             planner,
             breakdown,
-            Arc::new(task_agent::ClaudeTaskAgent::new()),
+            Arc::new(task_agent::CliTaskAgent::new()),
         )
     }
 

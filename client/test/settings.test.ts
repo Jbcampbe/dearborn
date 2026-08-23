@@ -7,8 +7,12 @@ import { describe, expect, it } from "vitest";
 
 import {
   AGENT_SLOTS,
+  MCP_BOUND_SLOTS,
   SLOT_LABELS,
+  SUPPORTED_HARNESSES,
   blankClears,
+  harnessCanBeDefault,
+  harnessSupportsSlot,
   promptSaveValue,
   type SlotSetting,
 } from "../src/api/settings";
@@ -106,5 +110,41 @@ describe("promptSaveValue (editor save semantics)", () => {
     const view = makeView({ system_prompt: defaultView().default_prompt.trim() });
     expect(promptSaveValue(view.default_prompt.trim(), view)).toBe(view.default_prompt.trim());
     expect(promptSaveValue("# still mine", overrideView())).toBe("# still mine");
+  });
+});
+
+// The client-side mirror of the server's harness/slot capability rules. These
+// exist so a picker never offers a combination `PUT` answers with a 400 — if
+// the server's rules move, these tests are the tripwire.
+describe("harness/slot capability", () => {
+  it("runs pi on every task-stage slot and on none of the MCP-bound ones", () => {
+    for (const slot of AGENT_SLOTS) {
+      const bound = MCP_BOUND_SLOTS.includes(slot);
+      expect(harnessSupportsSlot("pi", slot)).toBe(!bound);
+      // Claude speaks MCP, so it runs everything.
+      expect(harnessSupportsSlot("claude", slot)).toBe(true);
+    }
+  });
+
+  it("names exactly the three planning-side slots as MCP-bound", () => {
+    expect([...MCP_BOUND_SLOTS].sort()).toEqual([
+      "breakdown",
+      "planning_product",
+      "planning_technical",
+    ]);
+  });
+
+  it("makes no capability claims about a harness with no adapter", () => {
+    expect(SUPPORTED_HARNESSES).not.toContain("codex");
+    for (const slot of AGENT_SLOTS) {
+      expect(harnessSupportsSlot("codex", slot)).toBe(true);
+    }
+  });
+
+  it("only lets a harness that runs every slot be the global default", () => {
+    // Every slot without an override inherits the default, so pi cannot be it.
+    expect(harnessCanBeDefault("claude")).toBe(true);
+    expect(harnessCanBeDefault("pi")).toBe(false);
+    expect(harnessCanBeDefault("codex")).toBe(true);
   });
 });

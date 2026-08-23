@@ -62,6 +62,10 @@ use crate::{AppState, InflightGuard};
 pub struct PlanningConfig {
     /// Transcript phase these runs record under (`product` | `technical`).
     pub phase: &'static str,
+    /// The agent slot these runs resolve their settings under. Paired with
+    /// `phase` rather than derived from it so the settings vocabulary and the
+    /// transcript vocabulary stay independently renameable.
+    pub slot: crate::agent_slot::AgentSlot,
     /// Appended to the agent via `--append-system-prompt`; stable across turns.
     pub system_prompt: &'static str,
     /// Whether this phase exposes Dearborn's planning MCP tools (`update_epic`,
@@ -77,6 +81,7 @@ pub struct PlanningConfig {
 /// `read_codebase_context`.
 pub const PRODUCT_PLANNING: PlanningConfig = PlanningConfig {
     phase: "product",
+    slot: crate::agent_slot::AgentSlot::PlanningProduct,
     system_prompt: PRODUCT_PLANNING_PROMPT,
     tools_enabled: true,
 };
@@ -113,6 +118,7 @@ Be concise and conversational.";
 /// run's continuity preamble (see [`PlanningRunRequest::continuity`]).
 pub const TECHNICAL_PLANNING: PlanningConfig = PlanningConfig {
     phase: "technical",
+    slot: crate::agent_slot::AgentSlot::PlanningTechnical,
     system_prompt: TECHNICAL_PLANNING_PROMPT,
     tools_enabled: true,
 };
@@ -188,10 +194,15 @@ pub struct PlanningRunRequest {
     /// `&'static str`: it is the slot's live-resolved effective prompt (T6) —
     /// the project's override when set, else the phase's compiled default.
     pub system_prompt: String,
-    /// The harness key this run was resolved to (T7). Validated against
-    /// [`crate::agent_settings::SUPPORTED_HARNESS`] by
-    /// [`ClaudePlanningAgent::run`]; a non-supported key surfaces as an
-    /// `Error` + `Exited` event stream (the trait has no `Result`).
+    /// The slot this run's settings were resolved under — the planning phase's
+    /// [`PlanningConfig::slot`]. Carried on the request so
+    /// [`ClaudePlanningAgent::run`] can name the right slot when it refuses a
+    /// harness that cannot run it.
+    pub slot: crate::agent_slot::AgentSlot,
+    /// The harness key this run was resolved to (T7). Validated with
+    /// [`crate::agent_settings::harness_supports_slot`] by
+    /// [`ClaudePlanningAgent::run`]; a harness this slot cannot run surfaces as
+    /// an `Error` + `Exited` event stream (the trait has no `Result`).
     pub harness: String,
     /// The resolved model passed verbatim to the CLI; `None` → CLI default (T7).
     pub model: Option<String>,
@@ -246,18 +257,19 @@ impl PlanningAgent for ClaudePlanningAgent {
         let run_id = req.run_id.clone();
 
         // T7 spawn-validation, mirroring `run_agent_stage`'s task-stage check:
-        // a non-supported harness key means settings were hand-edited into a
-        // state the API refuses to create. Surface loudly through the same
-        // synthetic Error+Exited stream a spawn failure uses — the trait's
-        // return type has no room for a `Result`.
-        if req.harness != crate::agent_settings::SUPPORTED_HARNESS {
+        // a harness key this slot cannot run means settings were hand-edited
+        // into a state the API refuses to create. Surface loudly through the
+        // same synthetic Error+Exited stream a spawn failure uses — the trait's
+        // return type has no room for a `Result`. Planning is MCP-bound (the
+        // agent calls `update_epic`/`read_codebase_context` back into Dearborn),
+        // so this rejects an MCP-incapable harness as well as an unknown one.
+        if !crate::agent_settings::harness_supports_slot(&req.harness, req.slot) {
             let (tx, rx) = std::sync::mpsc::channel();
             let _ = tx.send(RunEvent::Error {
                 run_id: run_id.clone(),
-                message: format!(
-                    "unsupported harness `{}`: only \"{}\" can be spawned in v1",
-                    req.harness,
-                    crate::agent_settings::SUPPORTED_HARNESS
+                message: crate::agent_settings::unsupported_harness_message(
+                    &req.harness,
+                    req.slot,
                 ),
             });
             let _ = tx.send(RunEvent::Exited {
@@ -518,6 +530,7 @@ pub fn spawn_run(
             system_prompt: spawn_cfg.prompt,
             continuity,
             mcp,
+            slot: config.slot,
             harness: spawn_cfg.harness.clone(),
             model: spawn_cfg.model.clone(),
         };
@@ -1356,20 +1369,26 @@ mod tests {
 
     // ---- T7: unsupported-harness spawn validation -------------------------
 
-    #[test]
-    fn planning_agent_rejects_an_unsupported_harness_loudly() {
-        let agent = ClaudePlanningAgent::new();
-        let rx = agent.run(PlanningRunRequest {
-            run_id: "run-codex".to_string(),
+    /// Build a request for `harness` under the product-planning slot.
+    fn planning_req(run_id: &str, harness: &str) -> PlanningRunRequest {
+        PlanningRunRequest {
+            run_id: run_id.to_string(),
             prompt: "hello".to_string(),
             cwd: None,
             resume: None,
             system_prompt: "system".to_string(),
             continuity: None,
             mcp: None,
-            harness: "codex".to_string(),
+            slot: PRODUCT_PLANNING.slot,
+            harness: harness.to_string(),
             model: None,
-        });
+        }
+    }
+
+    #[test]
+    fn planning_agent_rejects_an_unsupported_harness_loudly() {
+        let agent = ClaudePlanningAgent::new();
+        let rx = agent.run(planning_req("run-codex", "codex"));
 
         let first = rx.iter().next().expect("an Error event must arrive");
         match first {
@@ -1385,6 +1404,32 @@ mod tests {
     }
 
     #[test]
+    fn planning_agent_rejects_a_spawnable_but_mcp_incapable_harness() {
+        // pi is a fully supported harness for task stages, but planning calls
+        // back into Dearborn over MCP and pi has no MCP client — so it is
+        // refused here, and the message says which of the two reasons applies.
+        let agent = ClaudePlanningAgent::new();
+        let rx = agent.run(planning_req("run-pi", crate::harness_pi::PI_HARNESS_ID));
+
+        match rx.iter().next().expect("an Error event must arrive") {
+            RunEvent::Error { message, .. } => {
+                assert!(message.contains("pi"), "error names the harness: {message}");
+                assert!(message.contains("MCP"), "error says why: {message}");
+                assert!(
+                    message.contains("planning_product"),
+                    "error names the slot: {message}"
+                );
+                assert!(
+                    !message.contains("unsupported"),
+                    "pi is supported, just not here: {message}"
+                );
+            }
+            other => panic!("expected RunEvent::Error, got {other:?}"),
+        }
+        assert!(rx.iter().any(|e| matches!(e, RunEvent::Exited { .. })));
+    }
+
+    #[test]
     fn planning_agent_accepts_the_supported_harness_request_shape() {
         // No live spawn here — a real `claude` binary would start. Instead:
         // build the request exactly as spawn_run does for the supported key
@@ -1394,17 +1439,7 @@ mod tests {
         // an Error stream too — so we only assert it did NOT fail with
         // "unsupported").
         let agent = ClaudePlanningAgent::new();
-        let rx = agent.run(PlanningRunRequest {
-            run_id: "run-claude".to_string(),
-            prompt: "hello".to_string(),
-            cwd: None,
-            resume: None,
-            system_prompt: "system".to_string(),
-            continuity: None,
-            mcp: None,
-            harness: crate::agent_settings::SUPPORTED_HARNESS.to_string(),
-            model: None,
-        });
+        let rx = agent.run(planning_req("run-claude", "claude"));
         let unsupported = rx
             .iter()
             .any(|e| matches!(&e, RunEvent::Error { message, .. } if message.contains("unsupported")));

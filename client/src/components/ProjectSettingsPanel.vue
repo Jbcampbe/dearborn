@@ -7,6 +7,7 @@ import {
   SLOT_LABELS,
   blankClears,
   getGlobalSettings,
+  harnessSupportsSlot,
   listProjectAgentSettings,
   promptSaveValue,
   updateProjectAgentSetting,
@@ -301,7 +302,14 @@ onMounted(load);
               class="input select"
             >
               <option value="">(global default)</option>
-              <option v-for="h in global?.enabled_harnesses ?? []" :key="h" :value="h">{{ h }}</option>
+              <option
+                v-for="h in global?.enabled_harnesses ?? []"
+                :key="h"
+                :value="h"
+                :disabled="!harnessSupportsSlot(h, view.slot)"
+              >
+                {{ h }}{{ harnessSupportsSlot(h, view.slot) ? "" : " — can't run this slot" }}
+              </option>
             </select>
           </div>
           <div>

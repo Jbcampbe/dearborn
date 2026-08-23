@@ -318,11 +318,71 @@ pub async fn harness_references(
 
 // ---- Per-run spawn config (T6/T7) ------------------------------------------
 
-/// The only harness whose CLI can actually be spawned in v1 (design §2). The
-/// settings schema is harness-ready, but until a second adapter is wired up a
-/// non-`"claude"` effective harness fails loudly at spawn-validation time
-/// rather than silently running Claude under another harness's name.
-pub const SUPPORTED_HARNESS: &str = "claude";
+/// Every harness key whose CLI Dearborn has an adapter for and can actually
+/// spawn (design §2). An effective harness outside this list fails loudly at
+/// spawn-validation time rather than silently running some *other* CLI under
+/// its name — the settings schema stays open (a hand-written key is still
+/// storable), the spawn path does not.
+pub const SUPPORTED_HARNESSES: &[&str] = &["claude", crate::harness_pi::PI_HARNESS_ID];
+
+/// The harnesses that can reach Dearborn's local MCP server ([`crate::mcp`]).
+///
+/// Only Claude Code speaks MCP among the CLIs Dearborn drives: pi has no MCP
+/// client at all (verified against the shipped CLI — no `--mcp-config`, no MCP
+/// transport). This is a **capability**, not a preference, which is why it is
+/// a list rather than a special case at each spawn site.
+pub const MCP_CAPABLE_HARNESSES: &[&str] = &["claude"];
+
+/// Whether `harness` is one Dearborn can spawn at all.
+pub fn is_supported_harness(harness: &str) -> bool {
+    SUPPORTED_HARNESSES.contains(&harness)
+}
+
+/// Whether a slot's run needs the agent to call *back* into Dearborn over MCP.
+///
+/// True for exactly the three planning-side slots: `planning_product` and
+/// `planning_technical` maintain the epic record through `update_epic` and
+/// read the canonical clone through `read_codebase_context`; `breakdown`
+/// builds the task DAG through `create_task`/`link_dependency`. The five
+/// task-stage slots act on a checked-out workspace with the CLI's own file
+/// tools and never call home, so they impose no such requirement.
+pub fn slot_requires_mcp(slot: AgentSlot) -> bool {
+    match slot {
+        AgentSlot::PlanningProduct | AgentSlot::PlanningTechnical | AgentSlot::Breakdown => true,
+        AgentSlot::Implement
+        | AgentSlot::Fix
+        | AgentSlot::Review
+        | AgentSlot::VerifyComplete
+        | AgentSlot::Summarize => false,
+    }
+}
+
+/// Whether `harness` can run `slot` — supported at all, and MCP-capable when
+/// the slot needs MCP. The single predicate every spawn site and the settings
+/// API validate against, so "which harness may run where" is stated once.
+pub fn harness_supports_slot(harness: &str, slot: AgentSlot) -> bool {
+    is_supported_harness(harness)
+        && (!slot_requires_mcp(slot) || MCP_CAPABLE_HARNESSES.contains(&harness))
+}
+
+/// The error message a spawn site (or the settings API) reports when
+/// [`harness_supports_slot`] says no. Written once so the planning, breakdown,
+/// and task-stage paths phrase the same refusal identically, and so the reason
+/// — unsupported vs. MCP-incapable — is never lost.
+pub fn unsupported_harness_message(harness: &str, slot: AgentSlot) -> String {
+    if !is_supported_harness(harness) {
+        format!(
+            "unsupported harness `{harness}`: Dearborn can spawn only {}",
+            SUPPORTED_HARNESSES.join(", ")
+        )
+    } else {
+        format!(
+            "harness `{harness}` cannot run the `{slot}` slot: that slot calls back into \
+             Dearborn over MCP, and only {} can do that",
+            MCP_CAPABLE_HARNESSES.join(", ")
+        )
+    }
+}
 
 /// The per-run config a spawn site needs (T6/T7): everything folds globals +
 /// overrides into one value read **at spawn time** (live-read, design §9 — no
@@ -544,6 +604,26 @@ pub async fn put_settings(
         )));
     }
 
+    // Every slot without an override inherits the default, so a default that
+    // cannot run some slot would silently break that slot's next run — which
+    // is exactly the "no silent fallback to another CLI mid-pipeline" the
+    // design rules out (§2). Refuse it here instead, naming the slot. Only
+    // checked for harnesses Dearborn can actually spawn: for an unknown key it
+    // makes no capability claims, and the long-standing behavior (storable,
+    // fails at spawn) is left alone.
+    if is_supported_harness(&merged.default_harness) {
+        if let Some(slot) = AgentSlot::ALL
+            .iter()
+            .copied()
+            .find(|slot| !harness_supports_slot(&merged.default_harness, *slot))
+        {
+            return Err(AppError::BadRequest(format!(
+                "{} — pick it per slot instead of as the global default",
+                unsupported_harness_message(&merged.default_harness, slot)
+            )));
+        }
+    }
+
     // The disable guard compares against the *stored* enablement set: any
     // harness leaving the set must have no explicit slot references left.
     for harness in &previous.enabled_harnesses {
@@ -702,6 +782,17 @@ pub async fn put_agent_setting(
                 return Err(AppError::BadRequest(format!(
                     "harness `{cleaned}` is not in enabled_harnesses {:?}",
                     global.enabled_harnesses
+                )));
+            }
+            // A harness Dearborn *can* spawn but that cannot run this
+            // particular slot is refused here, at configuration time, rather
+            // than at the next stage run. Unknown keys stay storable — the
+            // spawn sites already fail loudly on those, and refusing them here
+            // would break the existing "schema is open, spawn path is not"
+            // split (see `SUPPORTED_HARNESSES`).
+            if is_supported_harness(&cleaned) && !harness_supports_slot(&cleaned, slot) {
+                return Err(AppError::BadRequest(unsupported_harness_message(
+                    &cleaned, slot,
                 )));
             }
             setting.harness = Some(cleaned);
@@ -1353,6 +1444,131 @@ mod tests {
             body_json(put).await["error"]["code"],
             json!("bad_request")
         );
+    }
+
+    // ---- harness/slot capability (pi) --------------------------------------
+
+    #[test]
+    fn slot_capability_splits_the_mcp_bound_slots_from_the_task_stages() {
+        use crate::harness_pi::PI_HARNESS_ID;
+
+        // The three planning-side slots call back into Dearborn over MCP.
+        for slot in [
+            AgentSlot::PlanningProduct,
+            AgentSlot::PlanningTechnical,
+            AgentSlot::Breakdown,
+        ] {
+            assert!(slot_requires_mcp(slot), "{slot}");
+            assert!(harness_supports_slot("claude", slot), "{slot}");
+            assert!(!harness_supports_slot(PI_HARNESS_ID, slot), "{slot}");
+        }
+        // The five task stages act only on their workspace, so both harnesses
+        // run them.
+        for slot in [
+            AgentSlot::Implement,
+            AgentSlot::Fix,
+            AgentSlot::Review,
+            AgentSlot::VerifyComplete,
+            AgentSlot::Summarize,
+        ] {
+            assert!(!slot_requires_mcp(slot), "{slot}");
+            assert!(harness_supports_slot("claude", slot), "{slot}");
+            assert!(harness_supports_slot(PI_HARNESS_ID, slot), "{slot}");
+        }
+        // A harness with no adapter runs nothing at all.
+        assert!(!is_supported_harness("codex"));
+        assert!(!harness_supports_slot("codex", AgentSlot::Implement));
+    }
+
+    #[test]
+    fn the_refusal_message_distinguishes_unsupported_from_mcp_incapable() {
+        use crate::harness_pi::PI_HARNESS_ID;
+
+        let unknown = unsupported_harness_message("codex", AgentSlot::Implement);
+        assert!(unknown.contains("unsupported"), "{unknown}");
+        assert!(unknown.contains("codex"), "{unknown}");
+
+        let incapable = unsupported_harness_message(PI_HARNESS_ID, AgentSlot::Breakdown);
+        assert!(!incapable.contains("unsupported"), "{incapable}");
+        assert!(incapable.contains("MCP"), "{incapable}");
+        assert!(incapable.contains("breakdown"), "{incapable}");
+    }
+
+    #[tokio::test]
+    async fn put_slot_rejects_a_harness_that_cannot_run_that_slot() {
+        let (app, state) = test_app().await;
+        let project_id = seed_project(&state.db).await;
+        // Enable pi so the enablement check passes and the capability check is
+        // what actually refuses.
+        let enable = app
+            .clone()
+            .oneshot(req(
+                "PUT",
+                "/settings",
+                Some(json!({ "enabled_harnesses": ["claude", "pi"] })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(enable.status(), StatusCode::OK);
+
+        // pi on an MCP-bound slot: refused at configuration time.
+        let refused = app
+            .clone()
+            .oneshot(req(
+                "PUT",
+                &format!("/projects/{project_id}/agent-settings/breakdown"),
+                Some(json!({ "harness": "pi" })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(refused.status(), StatusCode::BAD_REQUEST);
+        let message = body_json(refused).await["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(message.contains("MCP"), "{message}");
+
+        // The same harness on a task-stage slot is accepted.
+        let ok = app
+            .clone()
+            .oneshot(req(
+                "PUT",
+                &format!("/projects/{project_id}/agent-settings/implement"),
+                Some(json!({ "harness": "pi" })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(ok.status(), StatusCode::OK);
+        let view = body_json(ok).await;
+        assert_eq!(view["harness"], json!("pi"));
+        assert_eq!(view["effective"]["harness"], json!("pi"));
+    }
+
+    #[tokio::test]
+    async fn put_settings_rejects_a_default_that_cannot_run_every_slot() {
+        // Every non-overridden slot inherits the default, so a default that
+        // cannot run the planning slots would break them silently. Refused,
+        // and the message points at the per-slot escape hatch.
+        let (app, _state) = test_app().await;
+        let put = app
+            .clone()
+            .oneshot(req(
+                "PUT",
+                "/settings",
+                Some(json!({
+                    "default_harness": "pi",
+                    "enabled_harnesses": ["claude", "pi"]
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(put.status(), StatusCode::BAD_REQUEST);
+        let message = body_json(put).await["error"]["message"]
+            .as_str()
+            .unwrap_or_default()
+            .to_string();
+        assert!(message.contains("MCP"), "{message}");
+        assert!(message.contains("per slot"), "{message}");
     }
 
     #[tokio::test]

@@ -38,6 +38,7 @@ use harness::{Claude, Harness, RunEvent, RunMode, RunRequest, RunTuning};
 use libsql::params;
 use serde_json::{json, Value};
 
+use crate::agent_slot::AgentSlot;
 use crate::epics::{fetch_epic, get_epic_clone_path, get_epic_project_id};
 use crate::{AppError, AppResult, AppState, InflightGuard};
 
@@ -85,9 +86,9 @@ pub struct BreakdownRunRequest {
     /// The breakdown instruction prompt — the slot's live-resolved effective
     /// text (T6): the project's override when set, else `BREAKDOWN_PROMPT`.
     pub system_prompt: String,
-    /// The harness key this run was resolved to (T7). Validated against
-    /// [`crate::agent_settings::SUPPORTED_HARNESS`] by
-    /// [`ClaudeBreakdownAgent::run`]; a non-supported key surfaces as an
+    /// The harness key this run was resolved to (T7). Validated with
+    /// [`crate::agent_settings::harness_supports_slot`] by
+    /// [`ClaudeBreakdownAgent::run`]; a harness this slot cannot run surfaces as an
     /// `Error` + `Exited` event stream (the trait has no `Result`).
     pub harness: String,
     /// The resolved model passed verbatim to the CLI; `None` → CLI default (T7).
@@ -124,18 +125,17 @@ impl BreakdownAgent for ClaudeBreakdownAgent {
     fn run(&self, req: BreakdownRunRequest) -> Receiver<RunEvent> {
         let run_id = req.run_id.clone();
 
-        // T7 spawn-validation, mirroring the planning agent's check: a
-        // non-supported harness key surfaces loudly through the same synthetic
-        // Error+Exited stream a spawn failure uses.
-        if req.harness != crate::agent_settings::SUPPORTED_HARNESS {
+        // T7 spawn-validation, mirroring the planning agent's check: a harness
+        // this slot cannot run surfaces loudly through the same synthetic
+        // Error+Exited stream a spawn failure uses. Breakdown builds the task
+        // DAG through Dearborn's MCP tools (`create_task`/`link_dependency`),
+        // so an MCP-incapable harness is refused here just like an unknown one.
+        const SLOT: AgentSlot = AgentSlot::Breakdown;
+        if !crate::agent_settings::harness_supports_slot(&req.harness, SLOT) {
             let (tx, rx) = std::sync::mpsc::channel();
             let _ = tx.send(RunEvent::Error {
                 run_id: run_id.clone(),
-                message: format!(
-                    "unsupported harness `{}`: only \"{}\" can be spawned in v1",
-                    req.harness,
-                    crate::agent_settings::SUPPORTED_HARNESS
-                ),
+                message: crate::agent_settings::unsupported_harness_message(&req.harness, SLOT),
             });
             let _ = tx.send(RunEvent::Exited {
                 run_id,
@@ -329,7 +329,7 @@ pub fn spawn_breakdown(state: AppState, epic_id: String, guard: InflightGuard) {
             crate::agent_settings::spawn_config(
                 &state.db,
                 &project_id,
-                crate::agent_slot::AgentSlot::Breakdown,
+                AgentSlot::Breakdown,
                 BREAKDOWN_PROMPT,
             )
             .await
@@ -885,5 +885,39 @@ mod tests {
         }
         let exited = rx.iter().find(|e| matches!(e, RunEvent::Exited { .. }));
         assert!(exited.is_some(), "stream must end with Exited");
+    }
+
+    #[test]
+    fn breakdown_agent_rejects_a_spawnable_but_mcp_incapable_harness() {
+        // pi runs task stages fine, but breakdown writes the task DAG through
+        // Dearborn's MCP tools and pi has no MCP client.
+        let agent = ClaudeBreakdownAgent::new();
+        let rx = agent.run(BreakdownRunRequest {
+            run_id: "run-pi".to_string(),
+            prompt: "break it down".to_string(),
+            plan: "plan".to_string(),
+            cwd: None,
+            mcp: None,
+            system_prompt: BREAKDOWN_PROMPT.to_string(),
+            harness: crate::harness_pi::PI_HARNESS_ID.to_string(),
+            model: None,
+        });
+
+        match rx.iter().next().expect("an Error event must arrive") {
+            RunEvent::Error { message, .. } => {
+                assert!(message.contains("pi"), "error names the harness: {message}");
+                assert!(message.contains("MCP"), "error says why: {message}");
+                assert!(
+                    message.contains("breakdown"),
+                    "error names the slot: {message}"
+                );
+                assert!(
+                    !message.contains("unsupported"),
+                    "pi is supported, just not here: {message}"
+                );
+            }
+            other => panic!("expected RunEvent::Error, got {other:?}"),
+        }
+        assert!(rx.iter().any(|e| matches!(e, RunEvent::Exited { .. })));
     }
 }

@@ -5,7 +5,9 @@ import { useAuthStore } from "../stores/auth";
 import { ApiError } from "../api/client";
 import {
   getGlobalSettings,
+  harnessCanBeDefault,
   updateGlobalSettings,
+  SUPPORTED_HARNESSES,
   type GlobalSettings,
 } from "../api/settings";
 
@@ -30,12 +32,12 @@ const models = ref<Record<string, string>>({});
 const defaultHarness = ref("");
 
 /**
- * Harness keys offered as toggles. v1 ships Claude-only (design §2) but the
- * schema and picker are harness-ready: `codex` is pre-listed so enabling it
- * later is a checkbox away. Anything else already enabled on the server
- * (custom key) joins this list when settings load.
+ * Harness keys offered as toggles: the ones Dearborn has an adapter for
+ * (`SUPPORTED_HARNESSES`) plus `codex`, still pre-listed so enabling it later
+ * is a checkbox away once an adapter exists. Anything else already enabled on
+ * the server (a custom key) joins this list when settings load.
  */
-const KNOWN_HARNESS = ["claude", "codex"];
+const KNOWN_HARNESS = [...SUPPORTED_HARNESSES, "codex"];
 const customHarness = ref("");
 
 async function load() {
@@ -72,10 +74,13 @@ function toggle(harness: string, on: boolean) {
   } else {
     enabled.value.delete(harness);
     enabled.value = new Set(enabled.value);
-    // A disabled harness can't stay the default; fall back to any survivor
-    // rather than letting PUT fail validation.
+    // A disabled harness can't stay the default; fall back to a survivor that
+    // can actually *be* the default (it must run every slot) rather than
+    // letting PUT fail validation.
     if (defaultHarness.value === harness) {
-      defaultHarness.value = [...enabled.value][0] ?? "";
+      const survivors = [...enabled.value];
+      defaultHarness.value =
+        survivors.find(harnessCanBeDefault) ?? survivors[0] ?? "";
     }
     delete models.value[harness];
     models.value = { ...models.value };
@@ -205,7 +210,9 @@ onMounted(load);
               @change="toggle(h, ($event.target as HTMLInputElement).checked)"
             />
             <span class="mono toggle-key">{{ h }}</span>
-            <span v-if="h === 'claude'" class="tag">installed adapter</span>
+            <span v-if="(SUPPORTED_HARNESSES as readonly string[]).includes(h)" class="tag">
+              installed adapter
+            </span>
           </label>
           <label v-for="h in [...enabled].filter((x) => !KNOWN_HARNESS.includes(x))" :key="h" class="toggle-row">
             <input
@@ -233,11 +240,28 @@ onMounted(load);
 
       <section class="card card-pad section">
         <h2 class="section-title">Default harness</h2>
-        <p class="hint">Used by every agent slot without its own override.</p>
+        <p class="hint">
+          Used by every agent slot without its own override — so it must be able to run
+          <em>every</em> slot. A harness that can't (pi has no MCP client, which planning and
+          breakdown need) is picked per slot instead, on a project's settings.
+        </p>
         <div class="radio-list">
-          <label v-for="h in [...enabled]" :key="h" class="radio-row">
-            <input v-model="defaultHarness" type="radio" name="default-harness" :value="h" class="radio" />
+          <label
+            v-for="h in [...enabled]"
+            :key="h"
+            class="radio-row"
+            :class="{ 'radio-row-disabled': !harnessCanBeDefault(h) }"
+          >
+            <input
+              v-model="defaultHarness"
+              type="radio"
+              name="default-harness"
+              :value="h"
+              class="radio"
+              :disabled="!harnessCanBeDefault(h)"
+            />
             <span class="mono">{{ h }}</span>
+            <span v-if="!harnessCanBeDefault(h)" class="hint">can't run every slot</span>
           </label>
         </div>
       </section>
@@ -359,6 +383,11 @@ onMounted(load);
   align-items: center;
   gap: var(--spacing-8);
   cursor: pointer;
+}
+
+.radio-row-disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
 }
 
 .model-row {

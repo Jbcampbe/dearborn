@@ -40,14 +40,31 @@ without them:
 - **`git`** — every workspace operation (canonical clone/refresh, per-epic and
   per-task clone, commit, push) shells out to the system `git`, the same way
   the T-103 canonical-clone path already does.
-- **`claude`** (the Claude Code CLI) — every agent stage (`implement`, `fix`,
-  `review`, `verify_complete`, `summarize`) runs it headless via the
-  [`agent-harness`](https://github.com/getlatentic/agent-harness) crate's
-  Claude adapter (`claude -p --permission-mode ...`). It must be logged in (or
-  `ANTHROPIC_API_KEY` set in the server's environment) — real agent stages
-  spend real tokens. `just test` never invokes it (see
-  [Testing](#testing)); `dearborn-server/tests/worker_live.rs` is the
-  `#[ignore]`d proof that exercises the real binary on demand.
+- **a coding-agent CLI** — every agent stage shells out to one, headless. Which
+  binary depends on the slot's configured harness (Settings → agent slots); the
+  two Dearborn has adapters for are:
+  - **`claude`** (the Claude Code CLI) — runs **every** slot, and is the default
+    everywhere. Driven via the
+    [`agent-harness`](https://github.com/getlatentic/agent-harness) crate's
+    Claude adapter (`claude -p --permission-mode ...`). It must be logged in (or
+    `ANTHROPIC_API_KEY` set in the server's environment).
+  - **`pi`** ([pi.dev](https://pi.dev)) — runs the five **task stages** only
+    (`implement`, `fix`, `review`, `verify_complete`, `summarize`). Driven via
+    Dearborn's own adapter (`dearborn-server/src/harness_pi.rs`: `pi --mode json
+    -p ...`), which parses pi's NDJSON into the same normalized `RunEvent`
+    stream. It must have a provider configured (`pi auth`, or any of the
+    provider API-key env vars pi documents).
+
+    **Not** the three planning-side slots (`planning_product`,
+    `planning_technical`, `breakdown`): those call *back* into Dearborn over MCP
+    to maintain the epic record and write the task DAG, and pi has no MCP
+    client. Selecting pi for one is refused with a 400 at configuration time,
+    and refused again at spawn if a settings row is hand-edited past that.
+
+  Real agent stages spend real tokens. `just test` never invokes either binary
+  (see [Testing](#testing)); `dearborn-server/tests/worker_live.rs` and
+  `dearborn-server/tests/harness_pi_live.rs` are the `#[ignore]`d proofs that
+  exercise the real binaries on demand.
 
 ## Getting started
 
@@ -126,12 +143,14 @@ a `401` clears the token and returns to the entry screen with an auth error.
 just test      # cargo test  +  cd client && npm test — the whole-repo gate
 ```
 
-Both suites are fully **hermetic** — no network, no real `claude`, no GitHub —
-so the gate runs anywhere without credentials. The two exceptions are
+Both suites are fully **hermetic** — no network, no real agent CLI, no GitHub —
+so the gate runs anywhere without credentials. The three exceptions are
 deliberate, `#[ignore]`d, and excluded from `just test`/`cargo test` by
-default: `dearborn-server/tests/mcp_live.rs` (T-203) and
-`dearborn-server/tests/worker_live.rs` (T-515), each documenting its own `cargo
-test -- --ignored` run command for exercising the real path on demand.
+default: `dearborn-server/tests/mcp_live.rs` (T-203),
+`dearborn-server/tests/worker_live.rs` (T-515), and
+`dearborn-server/tests/harness_pi_live.rs` (the pi adapter's wire-format
+tripwire), each documenting its own `cargo test -- --ignored` run command for
+exercising the real path on demand.
 
 ## Building
 

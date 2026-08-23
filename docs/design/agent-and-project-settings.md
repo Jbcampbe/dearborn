@@ -46,18 +46,79 @@ live harness, WS broadcast of setting changes — stays deferred.
 
 ## 2. Harnesses
 
-- Harness identity is a **string key** (`"claude"`, `"codex"`, …) everywhere —
+- Harness identity is a **string key** (`"claude"`, `"pi"`, …) everywhere —
   schema, API, settings rows — never a Rust-only enum crossing the wire.
-- **v1 exposes Claude only** (`ClaudeTaskAgent`, `ClaudePlanningAgent`,
-  `ClaudeBreakdownAgent` stay). The schema and picker are harness-ready;
-  enabling Codex later is adapter wiring + tests + a picker row, not a
-  migration. (`agent-harness` already compiles Claude/Codex/Bob adapters via
-  default features.)
 - **No credential management.** Hosts are assumed pre-authed (same stance as
-  toolchains for `setup_cmd`). Deferred along with multi-harness support.
+  toolchains for `setup_cmd`). Both shipped harnesses own their own login, so
+  Dearborn stores and injects nothing.
 - Disabling a harness that any project slot still references is refused by the
   API (**409** with the referencing slots) — explicit cleanup, no silent
   fallback to another CLI mid-pipeline.
+
+### 2.1 Which harnesses ship, and where each may run
+
+The schema stays open (any key is storable) but the **spawn path does not**:
+`agent_settings::SUPPORTED_HARNESSES` names the harnesses Dearborn has an
+adapter for, and an effective harness outside it fails loudly at spawn rather
+than silently running some other CLI under its name.
+
+| Harness | Adapter | Slots it may run |
+|---|---|---|
+| `claude` | `agent-harness`'s Claude adapter | all eight |
+| `pi` | Dearborn's own `harness_pi.rs` | the five task stages only |
+
+The split is a **capability**, not a preference. The three planning-side slots
+(`planning_product`, `planning_technical`, `breakdown`) call *back* into
+Dearborn over MCP — planning maintains the epic record via `update_epic` and
+reads the canonical clone via `read_codebase_context`; breakdown writes the
+task DAG via `create_task`/`link_dependency`. pi has no MCP client at all, so
+it cannot serve those slots. The five task stages act only on a checked-out
+workspace with the CLI's own file tools and never call home, so any adapter
+runs them.
+
+This is modelled as `slot_requires_mcp(slot)` × `MCP_CAPABLE_HARNESSES`, folded
+into one predicate — `harness_supports_slot(harness, slot)` — that every spawn
+site *and* the settings API validate against, so "which harness may run where"
+is stated once. Enforcement is layered, and deliberately fails early:
+
+1. **`PUT /projects/{id}/agent-settings/{slot}`** refuses an incompatible
+   harness with a **400** naming the slot and the reason.
+2. **`PUT /settings`** refuses a `default_harness` that cannot run *every*
+   slot, likewise **400** — every slot without an override inherits the
+   default, so allowing it would break the planning slots silently, which is
+   exactly the "no silent fallback" this section rules out. pi is therefore
+   selected **per slot**, never as the global default.
+3. **Each spawn site** re-checks, so a hand-edited settings row still fails
+   loudly (planning/breakdown as a synthetic `Error`+`Exited` stream, task
+   stages as `AgentStageError::UnsupportedHarness` before any `agent_run` row
+   is opened).
+
+Both capability checks skip keys Dearborn has no adapter for: it makes no
+capability claims about an unknown harness, and the long-standing behavior
+(storable, fails at spawn) is left alone. The client mirrors all of this in
+`api/settings.ts` so a picker never offers a combination the API would reject.
+
+### 2.2 Adding a harness
+
+The five task-stage slots resolve their harness per run, so the production
+`TaskAgent` (`CliTaskAgent`) dispatches on `req.harness` and holds no
+per-harness state. Adding one is:
+
+1. an adapter implementing `agent-harness`'s public `Harness` trait — in-repo,
+   not a fork of the crate (see `harness_pi.rs` for the shape: a pure
+   `build_*_args` flag mapping plus a `parse_*_line` NDJSON decoder feeding the
+   crate's `normalize_process_event`);
+2. a dialect arm in `task_agent::build_extra_args` for the read-only trio's
+   edit-tool denial — the one stage-driven flag, spelled differently per CLI
+   (`--disallowedTools Edit,Write,MultiEdit,NotebookEdit` vs pi's
+   `--exclude-tools edit,write`);
+3. entries in `SUPPORTED_HARNESSES` (and `MCP_CAPABLE_HARNESSES`, if it speaks
+   MCP) plus their client-side mirrors;
+4. an `#[ignore]`d live test against the real binary (`harness_pi_live.rs`) —
+   unit tests pin the wire format against captured samples, but only a live run
+   catches the CLI renaming an event or a flag out from under them.
+
+No spawn site changes.
 
 ## 3. Resolution model
 
@@ -240,6 +301,9 @@ Ordered by dependency; each task is one reviewable unit. `[B]` = backend,
       `ClaudeBreakdownAgent`) so `RunTuning.model` carries the resolved model.
       v1: any non-`"claude"` key resolves to an error at spawn-validation time
       (unreachable via API until a second harness ships, but fail loudly).
+      *(Superseded by Phase 7: the spawn sites now validate against
+      `harness_supports_slot`, and `ClaudeTaskAgent` was renamed
+      `CliTaskAgent` when it gained a second adapter.)*
 - [x] **T-8. Evidence columns** — add `harness`, `model`, `prompt_hash` to
       `agent_run`; write them at stage spawn (all agent stages incl. planning
       runs). Backfill not needed (NULL = predates feature).
@@ -303,3 +367,31 @@ Ordered by dependency; each task is one reviewable unit. `[B]` = backend,
       note about the retired live-default-branch lookup; §10/§11 agent runtime
       notes); SCRATCHPAD: strike the Global/Project settings bullets this
       implements, keep the deferred ones.
+
+### Phase 7 — Second harness: pi (§2.1)
+
+Retires the "v1 exposes Claude only" stance the original §2 took. The schema,
+resolution, and UI needed no migration — as designed.
+
+- [x] **T-22. pi adapter** — `harness_pi.rs`: `Pi` implementing `agent-harness`'s
+      public `Harness` trait, in-repo rather than a crate fork (the pinned
+      `=0.3.5` has no pi adapter, and neither does its successor). Pure
+      `build_pi_args` flag mapping (`--mode json -p --no-approve`, `--model`,
+      `--thinking`, `--session-id`, prompt positional-last) plus `parse_pi_line`
+      decoding pi's NDJSON into `ParsedLine`, both unit-tested against captured
+      wire samples.
+- [x] **T-23. Slot capability model** — `SUPPORTED_HARNESSES`,
+      `MCP_CAPABLE_HARNESSES`, `slot_requires_mcp`, and the single
+      `harness_supports_slot` predicate; all three spawn sites validate against
+      it, with `unsupported_harness_message` so "no adapter" and "no MCP" never
+      read the same.
+- [x] **T-24. Per-run dispatch** — `ClaudeTaskAgent` → `CliTaskAgent`, picking
+      the adapter from `req.harness`; `build_extra_args` gains the harness
+      dialect for the read-only trio's edit-tool denial.
+- [x] **T-25. API + client** — 400s on an incompatible slot harness and on a
+      global default that cannot run every slot; `api/settings.ts` mirrors the
+      capability rules so pickers disable what the API would reject.
+- [x] **T-26. Live proof** — `tests/harness_pi_live.rs`, `#[ignore]`d: drives a
+      real `pi` subprocess and asserts session id, model, streamed text, tool
+      start/end, and usage all decode. The tripwire for pi renaming an event or
+      a flag out from under the unit tests.

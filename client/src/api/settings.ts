@@ -30,6 +30,60 @@ export const AGENT_SLOTS = [
 export type AgentSlot = (typeof AGENT_SLOTS)[number];
 
 /**
+ * Harness keys Dearborn has an adapter for, in picker order. Mirrors the
+ * server's `agent_settings::SUPPORTED_HARNESSES`. Anything else is storable —
+ * the settings schema stays open — but fails at spawn, so the UI marks these
+ * as the ones that actually run.
+ */
+export const SUPPORTED_HARNESSES = ["claude", "pi"] as const;
+
+/**
+ * Harnesses that can reach Dearborn's local MCP server. Mirrors the server's
+ * `agent_settings::MCP_CAPABLE_HARNESSES`: only Claude Code speaks MCP among
+ * the CLIs Dearborn drives — pi has no MCP client at all.
+ */
+export const MCP_CAPABLE_HARNESSES = ["claude"] as const;
+
+/**
+ * The three slots whose agent calls *back* into Dearborn over MCP (planning
+ * maintains the epic record and reads the clone; breakdown writes the task
+ * DAG). Mirrors the server's `agent_settings::slot_requires_mcp` — the five
+ * task-stage slots act only on their workspace and need nothing from us.
+ */
+export const MCP_BOUND_SLOTS: readonly AgentSlot[] = [
+  "planning_product",
+  "planning_technical",
+  "breakdown",
+];
+
+/**
+ * Whether `harness` can run `slot`. The client-side mirror of the server's
+ * `harness_supports_slot`, so a picker never offers a combination the API
+ * will reject with a 400. Unknown harness keys are permitted here for the
+ * same reason the server permits them: Dearborn makes no capability claims
+ * about a key it has no adapter for.
+ */
+export function harnessSupportsSlot(harness: string, slot: AgentSlot): boolean {
+  if (!(SUPPORTED_HARNESSES as readonly string[]).includes(harness)) {
+    return true;
+  }
+  return (
+    !MCP_BOUND_SLOTS.includes(slot) ||
+    (MCP_CAPABLE_HARNESSES as readonly string[]).includes(harness)
+  );
+}
+
+/**
+ * Whether `harness` may be the **global default**. Every slot without an
+ * override inherits the default, so a default that cannot run some slot would
+ * break it silently — the server refuses one with a 400 and so does the
+ * picker.
+ */
+export function harnessCanBeDefault(harness: string): boolean {
+  return AGENT_SLOTS.every((slot) => harnessSupportsSlot(harness, slot));
+}
+
+/**
  * Global agent settings (`global_settings` singleton). `default_models` maps
  * harness key → model id; a `null` model means "let that CLI use its own
  * configured default". Missing map key = CLI default too.

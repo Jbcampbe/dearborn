@@ -8,7 +8,7 @@
 //! is exactly why it exists this early (Phase 1, not Phase 6) rather than
 //! after the whole pipeline is built out.
 //!
-//! This drives the REAL [`dearborn_server::task_agent::ClaudeTaskAgent`] (a
+//! This drives the REAL [`dearborn_server::task_agent::CliTaskAgent`] (a
 //! genuine `claude -p --permission-mode acceptEdits ...` subprocess, per
 //! `agent-harness`'s Claude adapter — see `task_agent.rs`'s module doc and
 //! `build_claude_args` in the `agent-harness` crate) through the REAL worker
@@ -90,7 +90,7 @@ use std::time::Duration;
 use dearborn_server::breakdown::ClaudeBreakdownAgent;
 use dearborn_server::git_host::testing::FakeHost;
 use dearborn_server::planning::ClaudePlanningAgent;
-use dearborn_server::task_agent::ClaudeTaskAgent;
+use dearborn_server::task_agent::CliTaskAgent;
 use dearborn_server::workspace;
 use dearborn_server::{worker, AppState, Config, Db, ExecutorConfig};
 
@@ -139,7 +139,7 @@ async fn live_implement_writes_commits_pushes_to_bare_origin_and_opens_a_fake_pr
     let bare_url = bare_dir.to_string_lossy().to_string();
     git_ok(&fixture_dir, &["push", &bare_url, "main"]).await;
 
-    // ---- real server state: real ClaudeTaskAgent + FakeHost (T-514's seam) ----
+    // ---- real server state: real CliTaskAgent + FakeHost (T-514's seam) ----
     let db = Db::connect(":memory:").await.unwrap();
     db.run_migrations().await.unwrap();
     let config = Config {
@@ -168,7 +168,7 @@ async fn live_implement_writes_commits_pushes_to_bare_origin_and_opens_a_fake_pr
         db,
         Arc::new(ClaudePlanningAgent::new()),
         Arc::new(ClaudeBreakdownAgent::new()),
-        Arc::new(ClaudeTaskAgent::new()), // <-- the real, live agent (T-512/T-515)
+        Arc::new(CliTaskAgent::new()), // <-- the real, live agent (T-512/T-515)
         fake_host.clone(),
     );
 
@@ -220,7 +220,7 @@ async fn live_implement_writes_commits_pushes_to_bare_origin_and_opens_a_fake_pr
     // `worker.rs`'s own hermetic tests use to drive a walk without the
     // claim/heartbeat pool machinery around it (see `worker::run_epic_pipeline`'s
     // doc) — the only thing different about this run is that `state.task_agent`
-    // is the real `ClaudeTaskAgent` instead of a scripted fake.
+    // is the real `CliTaskAgent` instead of a scripted fake.
     let run_result = tokio::time::timeout(
         LIVE_RUN_TIMEOUT,
         worker::run_epic_pipeline(state.clone(), epic_id.clone()),

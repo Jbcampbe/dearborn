@@ -24,6 +24,12 @@ Clients are a shared Vue/Tauri codebase, web-first.
   **[agent-harness](https://github.com/getlatentic/agent-harness)** — one
   `Harness` trait, normalized `RunEvent` stream (text, reasoning, tool calls,
   tokens, lifecycle).
+- **Two harnesses ship**: Claude Code (every slot) and [pi](https://pi.dev)
+  (task stages only — pi has no MCP client, and the planning/breakdown slots
+  call back into Dearborn over MCP). pi's adapter is Dearborn's own
+  (`harness_pi.rs`), written against the crate's public `Harness` trait rather
+  than forked into it; the cost of a third harness is a line parser and a flag
+  dialect, not a change to any spawn site.
 - **Prompts, harness, and model are runtime-configurable per project agent
   slot** (global defaults + per-project overrides; evidence recorded per run).
   See [docs/design/agent-and-project-settings.md](./docs/design/agent-and-project-settings.md).

@@ -43,7 +43,7 @@
 //! future author to "helpfully" wire up during, say, the fix loop (T-522) or
 //! the review/fix/re-review loop (T-531) — both of which *feel* like they
 //! want continuity. Leaving the field out entirely makes that mistake a
-//! compile error instead of a silent contract violation. [`ClaudeTaskAgent`]
+//! compile error instead of a silent contract violation. [`CliTaskAgent`]
 //! hard-codes `resume: None` on the underlying [`RunRequest`] to close the
 //! loop at the harness boundary too.
 //!
@@ -173,7 +173,7 @@
 //! MILESTONE_2 §11 risk 1 flagged `RunMode::Edit` + `--permission-mode` +
 //! tool flags as unproven — M1 never ran an agent read-write. `tests/
 //! worker_live.rs` (T-515) is the live proof: a real `claude` subprocess,
-//! `RunMode::Edit`, driven through the exact [`ClaudeTaskAgent::run`] below
+//! `RunMode::Edit`, driven through the exact [`CliTaskAgent::run`] below
 //! with **no changes**, wrote a file, and the write landed without any
 //! approval prompt blocking the run. The reason this worked with zero
 //! plumbing changes here: `agent-harness`'s Claude adapter
@@ -203,6 +203,9 @@ use std::sync::{Arc, Mutex};
 use std::time::Duration;
 
 use harness::{Claude, Harness, HarnessError, RunEvent, RunHandle, RunMode, RunRequest, RunTuning};
+
+use crate::agent_slot::AgentSlot;
+use crate::harness_pi::{Pi, PI_EDIT_TOOLS, PI_HARNESS_ID};
 use serde_json::Value;
 
 use crate::evidence::{self, CloseStage, OpenStage, StageHandle};
@@ -280,7 +283,7 @@ impl Stage {
         }
     }
 
-    /// Whether [`ClaudeTaskAgent`] additionally denies edit-shaped tools for
+    /// Whether [`CliTaskAgent`] additionally denies edit-shaped tools for
     /// this stage (see the module doc's "soft read-only enforcement"
     /// section). Exactly the `Ask`-mode agent trio — `Implement`/`Fix` need
     /// their edit tools; non-agent stages never reach this at all.
@@ -303,7 +306,7 @@ pub struct TaskRunRequest {
     /// Unique id for this run (a ULID); echoed back on every `RunEvent`.
     pub run_id: String,
     /// Which stage this is — decides `RunMode` and the denied-tools flag in
-    /// [`ClaudeTaskAgent`]. Must be [`Stage::is_agent_stage`].
+    /// [`CliTaskAgent`]. Must be [`Stage::is_agent_stage`].
     pub stage: Stage,
     /// The fully assembled prompt: the stage's static instructions
     /// ([`crate::spec::prompt_for`]) followed by the D8 context block
@@ -316,10 +319,11 @@ pub struct TaskRunRequest {
     /// directory (unlike planning's `Option<PathBuf>`, which may run
     /// tool-less): every task stage acts on a checked-out branch.
     pub cwd: PathBuf,
-    /// The harness key this run was resolved to (T7). Validated against
-    /// [`crate::agent_settings::SUPPORTED_HARNESS`] by [`run_agent_stage`]
-    /// before any spawn — a non-supported key fails loudly there instead of
-    /// silently running Claude under another harness's name.
+    /// The harness key this run was resolved to (T7). Validated with
+    /// [`crate::agent_settings::harness_supports_slot`] by [`run_agent_stage`]
+    /// before any spawn — a key this slot cannot run fails loudly there
+    /// instead of silently running one CLI under another's name — and then
+    /// used by [`CliTaskAgent::run`] to pick the adapter and the flag dialect.
     pub harness: String,
     /// The resolved model passed verbatim to the CLI (`RunTuning.model`);
     /// `None` → the CLI's own configured default (T7).
@@ -417,21 +421,28 @@ pub trait TaskAgent: Send + Sync {
     fn run(&self, req: TaskRunRequest) -> Result<(RunHandle, Receiver<RunEvent>), HarnessError>;
 }
 
-/// Production [`TaskAgent`]: drives Claude Code through the harness exactly
-/// as [`crate::planning::ClaudePlanningAgent`] does, with the task-stage
-/// specifics — `RunMode` from [`Stage::run_mode`], denied edit tools for the
-/// read-only-by-contract trio, always-fresh context (D19).
+/// Production [`TaskAgent`]: drives a coding-agent CLI through the harness
+/// with the task-stage specifics — `RunMode` from [`Stage::run_mode`], denied
+/// edit tools for the read-only-by-contract trio, always-fresh context (D19).
+///
+/// Unlike [`crate::planning::ClaudePlanningAgent`] and
+/// [`crate::breakdown::ClaudeBreakdownAgent`], this one is **not** tied to a
+/// single CLI: the five task-stage slots reach nothing outside their
+/// workspace, so any harness Dearborn has an adapter for can run them. Which
+/// one is decided per run by `req.harness` — the slot's live-resolved
+/// effective harness (T7) — so a project can point `implement` at pi and
+/// leave `review` on Claude without any state here changing.
 #[derive(Default)]
-pub struct ClaudeTaskAgent;
+pub struct CliTaskAgent;
 
-impl ClaudeTaskAgent {
+impl CliTaskAgent {
     /// Construct the production agent.
-    pub fn new() -> ClaudeTaskAgent {
-        ClaudeTaskAgent
+    pub fn new() -> CliTaskAgent {
+        CliTaskAgent
     }
 }
 
-impl TaskAgent for ClaudeTaskAgent {
+impl TaskAgent for CliTaskAgent {
     fn run(&self, req: TaskRunRequest) -> Result<(RunHandle, Receiver<RunEvent>), HarnessError> {
         // A non-agent stage has no `RunMode`; a caller that reaches this with
         // one is a bug upstream (T-513's job), not something to spawn a
@@ -445,7 +456,7 @@ impl TaskAgent for ClaudeTaskAgent {
             cwd: Some(req.cwd),
             mode,
             tuning: RunTuning {
-                extra_args: build_extra_args(req.stage),
+                extra_args: build_extra_args(req.stage, &req.harness),
                 // T7: the slot's resolved model rides through to the CLI;
                 // `None` keeps the CLI's own configured default exactly as
                 // before configurable agents existed.
@@ -456,30 +467,47 @@ impl TaskAgent for ClaudeTaskAgent {
             resume: None,
         };
 
+        // The harness key is validated by `run_agent_stage` before this is
+        // ever called, so an unknown key cannot reach here; Claude is the
+        // defensive fallback rather than a panic, matching how an unknown
+        // `RunMode` above degrades instead of aborting.
+        //
         // Returned straight through — see the module doc's "why the handle
         // is returned, not dropped" section. This is the whole point of the
         // divergence from `ClaudePlanningAgent::run`.
-        Claude::new().run_channel(request)
+        match req.harness.as_str() {
+            PI_HARNESS_ID => Pi::new().run_channel(request),
+            _ => Claude::new().run_channel(request),
+        }
     }
 }
 
 /// The exact `--disallowedTools` value for the read-only-by-contract trio
-/// (module doc: "soft read-only enforcement"). Named tools, comma-separated,
-/// matching the CLI's own flag shape (mirrors how `ClaudePlanningAgent` /
-/// `ClaudeBreakdownAgent` pass `--allowedTools`).
+/// (module doc: "soft read-only enforcement"), in Claude Code's dialect.
+/// Named tools, comma-separated, matching the CLI's own flag shape (mirrors
+/// how `ClaudePlanningAgent` / `ClaudeBreakdownAgent` pass `--allowedTools`).
 const DENIED_EDIT_TOOLS: &str = "Edit,Write,MultiEdit,NotebookEdit";
 
-/// Build the harness `extra_args` for `stage`. Factored out of
-/// [`ClaudeTaskAgent::run`] as a pure function (no harness, no spawn) so the
-/// stage → flags mapping is unit-tested directly instead of only through a
-/// live `claude` run.
-fn build_extra_args(stage: Stage) -> Vec<String> {
-    let mut args = Vec::new();
-    if stage.denies_edit_tools() {
-        args.push("--disallowedTools".to_string());
-        args.push(DENIED_EDIT_TOOLS.to_string());
+/// Build the harness `extra_args` for `stage` under `harness`. Factored out
+/// of [`CliTaskAgent::run`] as a pure function (no harness, no spawn) so the
+/// (stage, harness) → flags mapping is unit-tested directly instead of only
+/// through a live CLI run.
+///
+/// The only stage-driven flag is the read-only trio's edit-tool denial, and
+/// each CLI spells it differently — `--disallowedTools Edit,Write,…` for
+/// Claude Code, `--exclude-tools edit,write` for pi (whose built-in tool set
+/// is `read`/`bash`/`edit`/`write`, so the list is two names, not four). The
+/// *contract* is identical in both dialects, including its limit: `Bash` is
+/// deliberately not denied under either, so this stays the same "soft
+/// read-only enforcement" the module doc describes rather than a guarantee.
+fn build_extra_args(stage: Stage, harness: &str) -> Vec<String> {
+    if !stage.denies_edit_tools() {
+        return Vec::new();
     }
-    args
+    match harness {
+        PI_HARNESS_ID => vec!["--exclude-tools".to_string(), PI_EDIT_TOOLS.to_string()],
+        _ => vec!["--disallowedTools".to_string(), DENIED_EDIT_TOOLS.to_string()],
+    }
 }
 
 // ---- driving one agent stage to completion (D14) ---------------------------
@@ -754,12 +782,15 @@ pub enum AgentStageError {
     /// closed (`status = "error"`) before this is returned — see
     /// [`run_agent_stage`]'s handling of a failed `JoinHandle`.
     DrainFailed(String),
-    /// The run's resolved harness is not spawnable in this build (T7 — only
-    /// `"claude"` exists today). Checked **before** any row is opened: an
-    /// unsupported-harness request is a configuration bug the settings API
-    /// should have made unreachable (only enabled harnesses are selectable),
-    /// so there is no stage attempt to record evidence for.
-    UnsupportedHarness(String),
+    /// The run's resolved harness cannot run this stage's slot (T7): either
+    /// Dearborn has no adapter for it, or the slot needs a capability the
+    /// harness lacks. Checked **before** any row is opened — such a request is
+    /// a configuration bug the settings API should have made unreachable (only
+    /// enabled, slot-compatible harnesses are selectable), so there is no
+    /// stage attempt to record evidence for. Carries the slot as well as the
+    /// key so [`crate::agent_settings::unsupported_harness_message`] can say
+    /// *which* of the two reasons applies.
+    UnsupportedHarness { harness: String, slot: Option<AgentSlot> },
 }
 
 impl std::fmt::Display for AgentStageError {
@@ -768,11 +799,14 @@ impl std::fmt::Display for AgentStageError {
             AgentStageError::Db(e) => write!(f, "agent_run row error: {e}"),
             AgentStageError::Harness(e) => write!(f, "agent stage failed to start: {e}"),
             AgentStageError::DrainFailed(msg) => write!(f, "{msg}"),
-            AgentStageError::UnsupportedHarness(key) => write!(
-                f,
-                "unsupported harness `{key}`: only \"{}\" can be spawned in v1",
-                crate::agent_settings::SUPPORTED_HARNESS
-            ),
+            AgentStageError::UnsupportedHarness { harness, slot } => match slot {
+                Some(slot) => f.write_str(
+                    &crate::agent_settings::unsupported_harness_message(harness, *slot),
+                ),
+                // No slot means a non-agent stage reached an agent-only path —
+                // a caller bug, phrased as one rather than blamed on the key.
+                None => write!(f, "harness `{harness}` was resolved for a stage that has no agent slot"),
+            },
         }
     }
 }
@@ -804,11 +838,21 @@ pub async fn run_agent_stage(
     req: TaskRunRequest,
 ) -> Result<AgentStageOutcome, AgentStageError> {
     let conn = state.db.conn();
-    // T7 spawn-validation, before anything else: a non-supported harness key
-    // means settings were hand-edited into a state the API refuses to create.
-    // Fail loudly; no `agent_run` row is opened because no run was attempted.
-    if req.harness != crate::agent_settings::SUPPORTED_HARNESS {
-        return Err(AgentStageError::UnsupportedHarness(req.harness.clone()));
+    // T7 spawn-validation, before anything else: a harness key this stage's
+    // slot cannot run means settings were hand-edited into a state the API
+    // refuses to create. Fail loudly; no `agent_run` row is opened because no
+    // run was attempted. A non-agent stage has no slot, and cannot legally
+    // reach here at all — `AgentSlot::from_stage` returning `None` is the
+    // caller bug `run_mode()` already guards, so it is treated as unrunnable
+    // rather than waved through.
+    let slot = AgentSlot::from_stage(req.stage);
+    if !slot.is_some_and(|slot| {
+        crate::agent_settings::harness_supports_slot(&req.harness, slot)
+    }) {
+        return Err(AgentStageError::UnsupportedHarness {
+            harness: req.harness.clone(),
+            slot,
+        });
     }
     let stage_str = req.stage.as_str();
     let open = OpenStage {
@@ -1084,7 +1128,7 @@ const AGENT_TIMEOUT_KILL_GRACE_PERIOD: Duration = Duration::from_secs(5);
 // `breakdown::testing` exactly: every existing agent seam's fake lives this
 // way, reachable from any unit test in this crate (including a future
 // `worker.rs` test module), but invisible to the separate `tests/*.rs`
-// integration-test crate — those drive the real `ClaudeTaskAgent` instead
+// integration-test crate — those drive the real `CliTaskAgent` instead
 // (see `tests/worker_live.rs`, T-515), the same way `tests/mcp_live.rs` /
 // `tests/ws.rs` already do for planning. If a later phase's integration test
 // genuinely needs the scripted fake, promoting this module to a plain `pub
@@ -1396,25 +1440,37 @@ mod tests {
     // ---- build_extra_args (pure, no spawn) -----------------------------
 
     #[test]
-    fn implement_and_fix_get_no_disallowed_tools_flag() {
+    fn implement_and_fix_get_no_tool_flags_on_any_harness() {
         for stage in [Stage::Implement, Stage::Fix] {
-            let args = build_extra_args(stage);
-            assert!(
-                !args.iter().any(|a| a == "--disallowedTools"),
-                "{stage:?}: {args:?}"
-            );
+            for harness in ["claude", PI_HARNESS_ID] {
+                assert!(
+                    build_extra_args(stage, harness).is_empty(),
+                    "{stage:?} on {harness}: {:?}",
+                    build_extra_args(stage, harness)
+                );
+            }
         }
     }
 
     #[test]
-    fn review_family_gets_the_disallowed_edit_tools_flag() {
+    fn review_family_gets_the_denied_edit_tools_in_each_harness_dialect() {
         for stage in [Stage::Review, Stage::VerifyComplete, Stage::Summarize] {
-            let args = build_extra_args(stage);
-            let idx = args
+            let claude = build_extra_args(stage, "claude");
+            let idx = claude
                 .iter()
                 .position(|a| a == "--disallowedTools")
-                .unwrap_or_else(|| panic!("{stage:?} missing --disallowedTools: {args:?}"));
-            assert_eq!(args[idx + 1], DENIED_EDIT_TOOLS);
+                .unwrap_or_else(|| panic!("{stage:?} missing --disallowedTools: {claude:?}"));
+            assert_eq!(claude[idx + 1], DENIED_EDIT_TOOLS);
+
+            // Same contract, pi's dialect: a different flag and a different
+            // tool vocabulary, never Claude's names leaking into pi's argv.
+            let pi = build_extra_args(stage, PI_HARNESS_ID);
+            let idx = pi
+                .iter()
+                .position(|a| a == "--exclude-tools")
+                .unwrap_or_else(|| panic!("{stage:?} missing --exclude-tools: {pi:?}"));
+            assert_eq!(pi[idx + 1], PI_EDIT_TOOLS);
+            assert!(!pi.iter().any(|a| a == "--disallowedTools"), "{pi:?}");
         }
     }
 
@@ -1853,7 +1909,10 @@ mod tests {
         .await
         .expect_err("an unsupported harness must fail loudly at spawn-validation");
         match &err {
-            AgentStageError::UnsupportedHarness(key) => assert_eq!(key, "codex"),
+            AgentStageError::UnsupportedHarness { harness, slot } => {
+                assert_eq!(harness, "codex");
+                assert_eq!(*slot, Some(AgentSlot::Implement));
+            }
             other => panic!("expected UnsupportedHarness, got {other:?}"),
         }
         assert!(err.to_string().contains("codex"));
