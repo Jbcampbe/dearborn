@@ -10,6 +10,11 @@
 
 html {
   color-scheme: dark;
+  /* Always reserve the scrollbar gutter. Pages are centered (.page uses
+     margin: 0 auto), so a scrollbar that comes and goes as content height
+     changes — switching tabs, a panel finishing its load — would slide the
+     whole layout sideways. */
+  scrollbar-gutter: stable;
 }
 
 body {

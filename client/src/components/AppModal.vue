@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { watch } from "vue";
+import { onBeforeUnmount, watch } from "vue";
 import AppIcon from "./AppIcon.vue";
 
 // Shared modal surface: teleported overlay, Esc/overlay-click to close, body
@@ -22,14 +22,16 @@ watch(
   (open) => {
     if (open) {
       document.addEventListener("keydown", onKeydown);
-      document.body.style.overflow = "hidden";
     } else {
       document.removeEventListener("keydown", onKeydown);
-      document.body.style.overflow = "";
     }
   },
   { immediate: false },
 );
+
+onBeforeUnmount(() => {
+  document.removeEventListener("keydown", onKeydown);
+});
 </script>
 
 <template>
@@ -74,6 +76,9 @@ watch(
   background: rgba(4, 5, 6, 0.7);
   backdrop-filter: blur(3px);
   overflow-y: auto;
+  /* Panel is centered, so keep the overlay's own gutter reserved too — growing
+     content (a dragged-taller textarea) must not slide the panel sideways. */
+  scrollbar-gutter: stable;
 }
 
 .modal-panel {

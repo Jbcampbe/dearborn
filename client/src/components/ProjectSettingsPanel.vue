@@ -447,10 +447,6 @@ onMounted(load);
   margin-bottom: 4px;
 }
 
-.select {
-  appearance: auto;
-}
-
 .effective {
   margin-top: var(--spacing-10);
   font-family: var(--font-mono);
