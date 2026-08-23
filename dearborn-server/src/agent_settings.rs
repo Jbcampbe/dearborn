@@ -18,17 +18,22 @@
 //!    without naming a model drops to that CLI's own default rather than
 //!    passing a foreign model string (design §3).
 //!
-//! This module deliberately holds no HTTP surface — endpoints land in a later
-//! phase and are thin wrappers over these functions.
+//! The HTTP surface (T10–T12) is the thin layer at the bottom of this file:
+//! `GET`/`PUT /settings`, `GET /projects/{id}/agent-settings`, and
+//! `PUT /projects/{id}/agent-settings/{slot}`. It owns only validation and
+//! merge semantics — all reads/writes go through the store functions above it.
 
 use std::collections::HashMap;
 
+use axum::{extract::{Path, State}, Json};
 use libsql::params;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
+use serde_json::json;
 use thiserror::Error;
 
 use crate::agent_slot::AgentSlot;
 use crate::db::Db;
+use crate::{AppError, AppResult, AppState};
 
 /// Errors surfaced while reading or writing agent settings.
 #[derive(Debug, Error)]
@@ -44,6 +49,21 @@ pub enum SettingsError {
     /// its settings appear not to apply.
     #[error("unknown agent slot key `{0}`")]
     UnknownSlot(String),
+}
+
+impl From<SettingsError> for AppError {
+    fn from(err: SettingsError) -> Self {
+        match err {
+            // Query failures flow into the same generic-500 path as raw libsql
+            // errors everywhere else (logged in full, reported generically).
+            SettingsError::Libsql(e) => AppError::Db(crate::DbError::Libsql(e)),
+            // Corrupted settings rows / out-of-vocabulary slot keys are server
+            // state problems, not client mistakes — internal, never leaked.
+            err @ (SettingsError::StoredJson(_) | SettingsError::UnknownSlot(_)) => {
+                AppError::Internal(err.to_string())
+            }
+        }
+    }
 }
 
 // ---- Global settings (T3) ---------------------------------------------------
@@ -272,6 +292,30 @@ pub async fn delete_agent_setting(
     Ok(changed > 0)
 }
 
+/// Every `(project_id, slot)` whose override row names `harness` — the T10
+/// disable-guard's reference check. Only explicit per-slot harness overrides
+/// count as references: a stale entry in the global model map or a row that
+/// only pins a model/prompt inherits its harness and therefore does not block
+/// disabling (it re-keys to whatever is enabled next).
+pub async fn harness_references(
+    db: &Db,
+    harness: &str,
+) -> Result<Vec<(String, String)>, SettingsError> {
+    let mut rows = db
+        .conn()
+        .query(
+            "SELECT project_id, slot FROM agent_setting WHERE harness = ?1 \
+             ORDER BY project_id, slot",
+            params![harness],
+        )
+        .await?;
+    let mut refs = Vec::new();
+    while let Some(row) = rows.next().await? {
+        refs.push((row.get(0)?, row.get(1)?));
+    }
+    Ok(refs)
+}
+
 // ---- Per-run spawn config (T6/T7) ------------------------------------------
 
 /// The only harness whose CLI can actually be spawned in v1 (design §2). The
@@ -405,6 +449,262 @@ pub fn resolve_effective(
         model,
         prompt_source,
     }
+}
+
+// ---- HTTP surface (T10–T12) --------------------------------------------------
+
+/// A `PUT` field that must not be blank when a value is given: trim, then
+/// reject whitespace-only input. Used for harness keys and model ids — both
+/// are passed verbatim to CLI spawn, where an empty string would silently mean
+/// "no flag" instead of surfacing as the user's intended (bad) value.
+fn clean_value(value: String, field: &str) -> AppResult<String> {
+    let trimmed = value.trim();
+    if trimmed.is_empty() {
+        return Err(AppError::BadRequest(format!(
+            "{field} must not be empty"
+        )));
+    }
+    Ok(trimmed.to_string())
+}
+
+/// `GET /settings` — the global agent settings singleton.
+pub async fn get_settings(State(state): State<AppState>) -> AppResult<Json<GlobalSettings>> {
+    Ok(Json(get_global_settings(&state.db).await?))
+}
+
+/// `PUT /settings` body. Every field optional: absent → keep the stored value,
+/// present → replace it. (There are no per-field `null` clears here — the
+/// global row always exists and every facet has a well-defined empty state: an
+/// empty model map / empty enabled list is rejected by validation below.)
+#[derive(Debug, Deserialize)]
+pub struct UpdateGlobalSettings {
+    #[serde(default)]
+    default_harness: Option<String>,
+    #[serde(default)]
+    default_models: Option<HashMap<String, Option<String>>>,
+    #[serde(default)]
+    enabled_harnesses: Option<Vec<String>>,
+}
+
+/// `PUT /settings` — merge + validate + save globals.
+///
+/// Validation of the *merged* result:
+/// - `default_harness` must be in `enabled_harnesses` (a default nobody can
+///   select would make new overrides silently unresolvable).
+/// - `enabled_harnesses` must be non-empty (an empty enablement set would
+///   strand every slot with no harness at all).
+/// - Disabling a harness that any `agent_setting.harness` still names is a
+///   **409** listing the referencing slots — explicit cleanup, never a silent
+///   fallback to another CLI mid-pipeline (design §2).
+pub async fn put_settings(
+    State(state): State<AppState>,
+    Json(req): Json<UpdateGlobalSettings>,
+) -> AppResult<Json<GlobalSettings>> {
+    let previous = get_global_settings(&state.db).await?;
+    let mut merged = previous.clone();
+
+    if let Some(harness) = req.default_harness {
+        merged.default_harness = clean_value(harness, "default_harness")?;
+    }
+    if let Some(models) = req.default_models {
+        let mut cleaned = HashMap::new();
+        for (harness, model) in models {
+            let key = clean_value(harness, "default_models key")?;
+            let value = match model {
+                Some(m) => Some(clean_value(m, "default_models value")?),
+                None => None,
+            };
+            cleaned.insert(key, value);
+        }
+        merged.default_models = cleaned;
+    }
+    if let Some(enabled) = req.enabled_harnesses {
+        let mut cleaned: Vec<String> = Vec::new();
+        for harness in enabled {
+            let key = clean_value(harness, "enabled_harnesses entry")?;
+            if !cleaned.contains(&key) {
+                cleaned.push(key);
+            }
+        }
+        if cleaned.is_empty() {
+            return Err(AppError::BadRequest(
+                "enabled_harnesses must contain at least one harness".to_string(),
+            ));
+        }
+        merged.enabled_harnesses = cleaned;
+    }
+
+    if !merged
+        .enabled_harnesses
+        .contains(&merged.default_harness)
+    {
+        return Err(AppError::BadRequest(format!(
+            "default harness `{}` is not in enabled_harnesses {:?}",
+            merged.default_harness, merged.enabled_harnesses
+        )));
+    }
+
+    // The disable guard compares against the *stored* enablement set: any
+    // harness leaving the set must have no explicit slot references left.
+    for harness in &previous.enabled_harnesses {
+        if merged.enabled_harnesses.contains(harness) {
+            continue;
+        }
+        let refs = harness_references(&state.db, harness).await?;
+        if !refs.is_empty() {
+            let listed = refs
+                .iter()
+                .map(|(project_id, slot)| format!("project {project_id} slot {slot}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            return Err(AppError::Conflict(format!(
+                "cannot disable harness `{harness}`: still referenced by {listed}"
+            )));
+        }
+    }
+
+    save_global_settings(&state.db, &merged).await?;
+    Ok(Json(merged))
+}
+
+/// One slot's settings as rendered by the API: the raw override facets plus
+/// the server-resolved effective config, so the layered scheme is debuggable
+/// at a glance (design §3/§7). Absent override row → all-`null` raw fields.
+#[derive(Debug, Serialize)]
+pub struct SlotSettingView {
+    pub slot: AgentSlot,
+    pub harness: Option<String>,
+    pub model: Option<String>,
+    pub system_prompt: Option<String>,
+    pub effective: EffectiveConfig,
+}
+
+fn slot_view(slot: AgentSlot, setting: Option<&AgentSetting>, global: &GlobalSettings) -> SlotSettingView {
+    SlotSettingView {
+        effective: resolve_effective(global, setting),
+        harness: setting.and_then(|s| s.harness.clone()),
+        model: setting.and_then(|s| s.model.clone()),
+        system_prompt: setting.and_then(|s| s.system_prompt.clone()),
+        slot,
+    }
+}
+
+/// 404 unless the project row exists. Settings rows are meaningless without
+/// their project; rather than letting orphans linger, addressing one errors.
+async fn ensure_project(db: &Db, project_id: &str) -> AppResult<()> {
+    let mut rows = db
+        .conn()
+        .query("SELECT 1 FROM project WHERE id = ?1", params![project_id])
+        .await?;
+    if rows.next().await?.is_none() {
+        return Err(AppError::NotFound(format!("project {project_id} not found")));
+    }
+    Ok(())
+}
+
+/// `GET /projects/{id}/agent-settings` — all eight slots in canonical order,
+/// each with its raw overrides and resolved effective config.
+pub async fn get_project_agent_settings(
+    State(state): State<AppState>,
+    Path(project_id): Path<String>,
+) -> AppResult<Json<serde_json::Value>> {
+    ensure_project(&state.db, &project_id).await?;
+    let global = get_global_settings(&state.db).await?;
+    let overrides = list_agent_settings(&state.db, &project_id).await?;
+    // `list_agent_settings` already sorts into `AgentSlot::ALL` order; walk ALL
+    // so unset slots render too (absent row = inherit everything, §6).
+    let items: Vec<SlotSettingView> = AgentSlot::ALL
+        .iter()
+        .map(|slot| {
+            let setting = overrides.iter().find(|s| s.slot == *slot);
+            slot_view(*slot, setting, &global)
+        })
+        .collect();
+    Ok(Json(json!({ "items": items })))
+}
+
+/// `PUT /projects/{id}/agent-settings/{slot}` body — partial update with
+/// double-option semantics (same shape as `PATCH /projects/{id}`):
+/// absent → untouched, `null` → clear that override (= reset to inherited),
+/// value → set it.
+#[derive(Debug, Deserialize)]
+pub struct UpdateAgentSetting {
+    #[serde(default, deserialize_with = "crate::projects::double_option")]
+    harness: Option<Option<String>>,
+    #[serde(default, deserialize_with = "crate::projects::double_option")]
+    model: Option<Option<String>>,
+    #[serde(default, deserialize_with = "crate::projects::double_option")]
+    system_prompt: Option<Option<String>>,
+}
+
+/// `PUT /projects/{id}/agent-settings/{slot}` — partial update of one slot's
+/// override row. Unknown slot → **404** (the closed vocabulary is the API
+/// surface); unknown project → **404**; a `harness` value must be globally
+/// enabled; `model` values must be non-empty once trimmed. Clearing **all**
+/// three facets deletes the row outright rather than parking a NULL-only row
+/// (reset = delete, design §6).
+pub async fn put_agent_setting(
+    State(state): State<AppState>,
+    Path((project_id, slot_key)): Path<(String, String)>,
+    Json(req): Json<UpdateAgentSetting>,
+) -> AppResult<Json<SlotSettingView>> {
+    let slot = AgentSlot::parse(&slot_key).ok_or_else(|| {
+        AppError::NotFound(format!("unknown agent slot `{slot_key}`"))
+    })?;
+    ensure_project(&state.db, &project_id).await?;
+    let global = get_global_settings(&state.db).await?;
+
+    let mut setting = get_agent_setting(&state.db, &project_id, slot)
+        .await?
+        .unwrap_or(AgentSetting {
+            slot,
+            harness: None,
+            model: None,
+            system_prompt: None,
+        });
+
+    match req.harness {
+        Some(None) => setting.harness = None,
+        Some(Some(value)) => {
+            let cleaned = clean_value(value, "harness")?;
+            if !global.enabled_harnesses.contains(&cleaned) {
+                return Err(AppError::BadRequest(format!(
+                    "harness `{cleaned}` is not in enabled_harnesses {:?}",
+                    global.enabled_harnesses
+                )));
+            }
+            setting.harness = Some(cleaned);
+        }
+        None => {}
+    }
+    match req.model {
+        Some(None) => setting.model = None,
+        Some(Some(value)) => setting.model = Some(clean_value(value, "model")?),
+        None => {}
+    }
+    match req.system_prompt {
+        Some(None) => setting.system_prompt = None,
+        Some(Some(value)) => {
+            let trimmed = value.trim().to_string();
+            // An empty/whitespace prompt stores as cleared: resolution already
+            // treats empty overrides as absent (§3), so persisting one would
+            // only fake an "override" the resolver ignores.
+            setting.system_prompt = if trimmed.is_empty() { None } else { Some(trimmed) };
+        }
+        None => {}
+    }
+
+    if setting.harness.is_none() && setting.model.is_none() && setting.system_prompt.is_none() {
+        delete_agent_setting(&state.db, &project_id, slot).await?;
+    } else {
+        upsert_agent_setting(&state.db, &project_id, &setting).await?;
+    }
+
+    Ok(Json(slot_view(
+        slot,
+        Some(&setting),
+        &global,
+    )))
 }
 
 #[cfg(test)]
@@ -873,5 +1173,428 @@ mod tests {
         assert_ne!(a, b, "distinct prompts must hash distinctly");
         // Stability: hashing twice yields the same digest (no randomness).
         assert_eq!(a, prompt_hash("instructions A"));
+    }
+
+    // ---- HTTP surface (T10–T12) --------------------------------------------
+
+    use crate::{app, Config};
+    use axum::body::Body;
+    use axum::http::{
+        header::{AUTHORIZATION, CONTENT_TYPE},
+        Request, StatusCode,
+    };
+    use serde_json::Value as Json;
+    use tower::ServiceExt; // for `oneshot`
+
+    const TOKEN: &str = "s3cret-token";
+
+    async fn test_app() -> (axum::Router, crate::AppState) {
+        let db = Db::connect(":memory:").await.unwrap();
+        db.run_migrations().await.unwrap();
+        let state = crate::AppState::new(Config::for_test(TOKEN), db);
+        (app(state.clone()), state)
+    }
+
+    fn req(method: &str, uri: &str, body: Option<Json>) -> Request<Body> {
+        let builder = Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(AUTHORIZATION, format!("Bearer {TOKEN}"));
+        match body {
+            Some(v) => builder
+                .header(CONTENT_TYPE, "application/json")
+                .body(Body::from(v.to_string()))
+                .unwrap(),
+            None => builder.body(Body::empty()).unwrap(),
+        }
+    }
+
+    async fn body_json(response: axum::response::Response) -> Json {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        if bytes.is_empty() {
+            return Json::Null;
+        }
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    /// Create one project through the real API and return its id.
+    async fn create_project(app: &axum::Router) -> String {
+        let created = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                "/projects",
+                Some(json!({
+                    "name": "P",
+                    "repo_url": "https://example.com/p.git"
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        body_json(created).await["id"]
+            .as_str()
+            .unwrap()
+            .to_string()
+    }
+
+    #[tokio::test]
+    async fn get_settings_returns_the_seeded_defaults() {
+        let (app, _state) = test_app().await;
+        let got = app.oneshot(req("GET", "/settings", None)).await.unwrap();
+        assert_eq!(got.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(got).await,
+            json!({
+                "default_harness": "claude",
+                "default_models": { "claude": null },
+                "enabled_harnesses": ["claude"]
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn put_settings_round_trips_and_merges_partially() {
+        let (app, _state) = test_app().await;
+
+        let put = app
+            .clone()
+            .oneshot(req(
+                "PUT",
+                "/settings",
+                Some(json!({
+                    "default_harness": "codex",
+                    "default_models": {
+                        "claude": "sonnet-4-5",
+                        "codex": "gpt-5"
+                    },
+                    "enabled_harnesses": ["claude", "codex"]
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(put.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(put).await["default_harness"],
+            json!("codex")
+        );
+
+        // Partial PUT: only the model map changes; harness + enablement stay.
+        let patch = app
+            .clone()
+            .oneshot(req(
+                "PUT",
+                "/settings",
+                Some(json!({ "default_models": { "codex": "o4-mini" } })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(patch.status(), StatusCode::OK);
+        assert_eq!(
+            body_json(patch).await,
+            json!({
+                "default_harness": "codex",
+                "default_models": { "codex": "o4-mini" },
+                "enabled_harnesses": ["claude", "codex"]
+            })
+        );
+    }
+
+    #[tokio::test]
+    async fn put_settings_rejects_a_default_outside_the_enabled_set() {
+        let (app, _state) = test_app().await;
+        let put = app
+            .clone()
+            .oneshot(req(
+                "PUT",
+                "/settings",
+                Some(json!({ "default_harness": "codex" })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(put.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body_json(put).await["error"]["code"],
+            json!("bad_request")
+        );
+    }
+
+    #[tokio::test]
+    async fn put_settings_rejects_empty_enablement_and_blank_models() {
+        let (app, _state) = test_app().await;
+
+        let no_harnesses = app
+            .clone()
+            .oneshot(req(
+                "PUT",
+                "/settings",
+                Some(json!({ "enabled_harnesses": [] })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(no_harnesses.status(), StatusCode::BAD_REQUEST);
+
+        let blank_model = app
+            .clone()
+            .oneshot(req(
+                "PUT",
+                "/settings",
+                Some(json!({ "default_models": { "claude": "   " } })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(blank_model.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn put_settings_refuses_to_disable_a_referenced_harness_until_reset() {
+        let (app, _state) = test_app().await;
+        let project = create_project(&app).await;
+
+        // Enable codex, then point one slot's override at it.
+        let enable = app
+            .clone()
+            .oneshot(req(
+                "PUT",
+                "/settings",
+                Some(json!({ "enabled_harnesses": ["claude", "codex"] })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(enable.status(), StatusCode::OK);
+        let set = app
+            .clone()
+            .oneshot(req(
+                "PUT",
+                &format!("/projects/{project}/agent-settings/review"),
+                Some(json!({ "harness": "codex" })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(set.status(), StatusCode::OK);
+
+        // Disabling codex now conflicts, and the 409 names the referencing slot.
+        let disable = app
+            .clone()
+            .oneshot(req(
+                "PUT",
+                "/settings",
+                Some(json!({ "enabled_harnesses": ["claude"] })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(disable.status(), StatusCode::CONFLICT);
+        let body = body_json(disable).await;
+        assert_eq!(body["error"]["code"], json!("conflict"));
+        assert!(
+            body["error"]["message"]
+                .as_str()
+                .unwrap()
+                .contains(&format!("project {project} slot review")),
+            "409 must list the referencing slot: {:?}",
+            body["error"]["message"]
+        );
+
+        // Reset the slot override (null harness) — then disabling succeeds.
+        let reset = app
+            .clone()
+            .oneshot(req(
+                "PUT",
+                &format!("/projects/{project}/agent-settings/review"),
+                Some(json!({ "harness": null })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(reset.status(), StatusCode::OK);
+        let disable = app
+            .oneshot(req(
+                "PUT",
+                "/settings",
+                Some(json!({ "enabled_harnesses": ["claude"] })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(disable.status(), StatusCode::OK);
+    }
+
+    #[tokio::test]
+    async fn get_agent_settings_lists_all_eight_slots_with_effective_values() {
+        let (app, _state) = test_app().await;
+        let project = create_project(&app).await;
+
+        let got = app
+            .clone()
+            .oneshot(req(
+                "GET",
+                &format!("/projects/{project}/agent-settings"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(got.status(), StatusCode::OK);
+        let body = body_json(got).await;
+        let items = body["items"].as_array().unwrap();
+        assert_eq!(items.len(), 8, "the closed slot vocabulary, all present");
+        let slot_keys: Vec<&str> = items
+            .iter()
+            .map(|i| i["slot"].as_str().unwrap())
+            .collect();
+        assert_eq!(
+            slot_keys,
+            vec![
+                "planning_product",
+                "planning_technical",
+                "breakdown",
+                "implement",
+                "fix",
+                "review",
+                "verify_complete",
+                "summarize"
+            ]
+        );
+        // No overrides yet: raw facets null, effective resolves to the seed.
+        let first = &items[0];
+        assert_eq!(first["harness"], Json::Null);
+        assert_eq!(first["model"], Json::Null);
+        assert_eq!(first["system_prompt"], Json::Null);
+        assert_eq!(first["effective"]["harness"], json!("claude"));
+        assert_eq!(first["effective"]["model"], Json::Null);
+        assert_eq!(first["effective"]["prompt_source"], json!("default"));
+
+        // Unknown project → 404 envelope.
+        let missing = app
+            .oneshot(req(
+                "GET",
+                "/projects/does-not-exist/agent-settings",
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::NOT_FOUND);
+    }
+
+    #[tokio::test]
+    async fn put_agent_setting_sets_clears_and_deletes_on_full_reset() {
+        let (app, state) = test_app().await;
+        let project = create_project(&app).await;
+        let uri = format!("/projects/{project}/agent-settings/implement");
+
+        // Set harness (already enabled), model, and prompt.
+        let set = app
+            .clone()
+            .oneshot(req(
+                "PUT",
+                &uri,
+                Some(json!({
+                    "harness": "claude",
+                    "model": "  haiku  ",
+                    "system_prompt": "  implement carefully  "
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(set.status(), StatusCode::OK);
+        let view = body_json(set).await;
+        assert_eq!(view["harness"], json!("claude"));
+        assert_eq!(view["model"], json!("haiku"), "model is trimmed");
+        assert_eq!(
+            view["system_prompt"],
+            json!("implement carefully"),
+            "prompt is trimmed"
+        );
+        assert_eq!(view["effective"]["prompt_source"], json!("override"));
+
+        // Clear one facet: null → cleared, others untouched.
+        let clear_model = app
+            .clone()
+            .oneshot(req("PUT", &uri, Some(json!({ "model": null }))))
+            .await
+            .unwrap();
+        assert_eq!(clear_model.status(), StatusCode::OK);
+        let view = body_json(clear_model).await;
+        assert_eq!(view["model"], Json::Null);
+        assert_eq!(view["harness"], json!("claude"));
+
+        // Clear the rest: the row is deleted outright, not parked as NULLs.
+        let reset = app
+            .clone()
+            .oneshot(req(
+                "PUT",
+                &uri,
+                Some(json!({ "harness": null, "system_prompt": null })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(reset.status(), StatusCode::OK);
+        let view = body_json(reset).await;
+        assert_eq!(view["harness"], Json::Null);
+        assert_eq!(view["system_prompt"], Json::Null);
+        assert_eq!(view["effective"]["prompt_source"], json!("default"));
+        let mut rows = state
+            .db
+            .conn()
+            .query(
+                "SELECT COUNT(*) FROM agent_setting WHERE project_id = ?1",
+                libsql::params![project.as_str()],
+            )
+            .await
+            .unwrap();
+        let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(count, 0, "a fully-cleared override must not linger");
+    }
+
+    #[tokio::test]
+    async fn put_agent_setting_validates_slot_project_and_harness() {
+        let (app, _state) = test_app().await;
+        let project = create_project(&app).await;
+
+        // Unknown slot → 404.
+        let bad_slot = app
+            .clone()
+            .oneshot(req(
+                "PUT",
+                &format!("/projects/{project}/agent-settings/time_traveler"),
+                Some(json!({ "model": "m" })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(bad_slot.status(), StatusCode::NOT_FOUND);
+
+        // Unknown project → 404.
+        let bad_project = app
+            .clone()
+            .oneshot(req(
+                "PUT",
+                "/projects/does-not-exist/agent-settings/review",
+                Some(json!({ "model": "m" })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(bad_project.status(), StatusCode::NOT_FOUND);
+
+        // Harness outside the global enablement set → 400.
+        let disabled = app
+            .clone()
+            .oneshot(req(
+                "PUT",
+                &format!("/projects/{project}/agent-settings/review"),
+                Some(json!({ "harness": "codex" })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(disabled.status(), StatusCode::BAD_REQUEST);
+
+        // Blank model → 400.
+        let blank = app
+            .oneshot(req(
+                "PUT",
+                &format!("/projects/{project}/agent-settings/review"),
+                Some(json!({ "model": "" })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(blank.status(), StatusCode::BAD_REQUEST);
     }
 }

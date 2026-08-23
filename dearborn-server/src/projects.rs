@@ -115,7 +115,7 @@ pub struct UpdateProject {
 /// Deserialize a present-but-maybe-null field into `Some(_)`, leaving an absent
 /// field as `None` (via `#[serde(default)]`). This distinguishes "set to null"
 /// from "not provided" for partial updates.
-fn double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+pub(crate) fn double_option<'de, D, T>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
 where
     D: Deserializer<'de>,
     T: Deserialize<'de>,

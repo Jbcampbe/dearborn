@@ -407,6 +407,10 @@ pub fn app(state: AppState) -> Router {
     let protected = Router::new()
         .route("/whoami", get(whoami))
         .route(
+            "/settings",
+            get(agent_settings::get_settings).put(agent_settings::put_settings),
+        )
+        .route(
             "/projects",
             get(projects::list_projects).post(projects::create_project),
         )
@@ -428,6 +432,14 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/projects/:id/epics",
             get(epics::list_epics).post(epics::create_epic),
+        )
+        .route(
+            "/projects/:id/agent-settings",
+            get(agent_settings::get_project_agent_settings),
+        )
+        .route(
+            "/projects/:id/agent-settings/:slot",
+            axum::routing::put(agent_settings::put_agent_setting),
         )
         .route("/epics/:id", get(epics::get_epic).patch(epics::update_epic))
         .route(

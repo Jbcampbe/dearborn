@@ -249,14 +249,14 @@ Ordered by dependency; each task is one reviewable unit. `[B]` = backend,
 
 ### Phase 3 — Settings API (backend)
 
-- [ ] **T-10. `GET /settings` / `PUT /settings`** — full replace or partial
+- [x] **T-10. `GET /settings` / `PUT /settings`** — full replace or partial
       update of globals; validate default ∈ enabled set; refuse disabling a
       harness referenced by any `agent_setting` row (409 + referencing slots);
       model values trimmed/non-empty.
-- [ ] **T-11. `GET /projects/{id}/agent-settings`** — all eight slots in one
+- [x] **T-11. `GET /projects/{id}/agent-settings`** — all eight slots in one
       response: raw overrides **plus** server-resolved effective values
       (`prompt_source: "override"|"default"`).
-- [ ] **T-12. `PUT /projects/{id}/agent-settings/{slot}`** — partial update;
+- [x] **T-12. `PUT /projects/{id}/agent-settings/{slot}`** — partial update;
       `null` clears that field (= reset); unknown slot → 404; harness must be
       enabled globally.
 
