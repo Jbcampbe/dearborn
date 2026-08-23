@@ -4,6 +4,8 @@
 //! binary entrypoint so later tasks can add modules and integration tests
 //! cleanly.
 
+pub mod agent_settings;
+pub mod agent_slot;
 pub mod auth;
 pub mod board;
 pub mod breakdown;

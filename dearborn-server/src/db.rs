@@ -43,6 +43,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0004_executor",
         sql: include_str!("../migrations/0004_executor.sql"),
     },
+    Migration {
+        id: 5,
+        name: "0005_agent_settings",
+        sql: include_str!("../migrations/0005_agent_settings.sql"),
+    },
 ];
 
 /// Errors surfaced while opening the database or running migrations.
@@ -332,13 +337,16 @@ mod tests {
         }
 
         // Re-open (as a restarted server would) and run the full migration set:
-        // only 0004_executor should be newly applied.
+        // everything after 0003 (the pre-M2 state this DB simulates) applies.
+        // Counted dynamically so appending migration 0006+ later keeps this
+        // test honest without edits.
         {
             let db = Db::connect(path).await.unwrap();
+            let expected_new = MIGRATIONS.iter().filter(|m| m.id > 3).count() as u32;
             assert_eq!(
                 db.run_migrations().await.unwrap(),
-                1,
-                "only 0004_executor is newly applied on top of 1-3"
+                expected_new,
+                "every migration newer than the simulated pre-M2 state applies"
             );
 
             let mut rows = db
