@@ -80,6 +80,13 @@ export interface TranscriptMessage {
 export interface CreateEpicInput {
   title: string;
   description?: string;
+  /**
+   * Optional base-branch override (design §5): this epic provisions from and
+   * PRs into this branch instead of the project default / repo default.
+   * Validated against the remote at creation time (unknown branch → 400) and
+   * immutable afterwards — set it here or not at all.
+   */
+  base_branch?: string;
 }
 
 /** `POST /projects/{id}/epics` → the created epic (201, `status='Planning'`). */

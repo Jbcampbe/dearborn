@@ -53,6 +53,14 @@ function isActiveProject(id: string): boolean {
           <AppIcon name="home" :size="15" />
           <span>Projects</span>
         </RouterLink>
+        <RouterLink
+          class="nav-item"
+          :class="{ active: route.name === 'settings' }"
+          :to="{ name: 'settings' }"
+        >
+          <AppIcon name="sliders" :size="15" />
+          <span>Settings</span>
+        </RouterLink>
       </nav>
 
       <div class="side-section">

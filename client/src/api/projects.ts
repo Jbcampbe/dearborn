@@ -18,6 +18,12 @@ export interface Project {
   setup_cmd: string | null;
   test_cmd: string | null;
   run_cmd: string | null;
+  /**
+   * Default base branch for new epics (design §5); `null` → the repo's own
+   * default branch. Each epic snapshots its actual base at creation, so
+   * changing this never moves an existing epic.
+   */
+  base_branch: string | null;
   clone_path: string | null;
   clone_status: CloneStatus;
   clone_error: string | null;
@@ -54,9 +60,36 @@ export function createProject(token: string, input: CreateProjectInput): Promise
   });
 }
 
+/**
+ * `PATCH /projects/{id}` body. Absent keys are untouched; command-like fields
+ * use the server's double-option semantics — `null` clears the stored value,
+ * a value sets it (blank strings are stored as `NULL` by the server).
+ */
+export interface UpdateProjectBody {
+  name?: string;
+  repo_url?: string;
+  setup_cmd?: string | null;
+  test_cmd?: string | null;
+  run_cmd?: string | null;
+  /** Default base branch for new epics; `null` → repo default. */
+  base_branch?: string | null;
+}
+
 /** `POST /projects/{id}/refresh` → the project, now `clone_status='pending'`. */
 export function refreshProject(token: string, id: string): Promise<Project> {
   return apiFetch<Project>(`/projects/${encodeURIComponent(id)}/refresh`, token, {
     method: "POST",
+  });
+}
+
+/** `PATCH /projects/{id}` → the updated project (200). */
+export function updateProject(
+  token: string,
+  id: string,
+  body: UpdateProjectBody,
+): Promise<Project> {
+  return apiFetch<Project>(`/projects/${encodeURIComponent(id)}`, token, {
+    method: "PATCH",
+    body: JSON.stringify(body),
   });
 }

@@ -22,6 +22,9 @@ export default defineConfig({
       // One stage's full log (`GET /runs/{id}`, T-512/T-562) — a top-level
       // path, not nested under `/tasks`, so it needs its own proxy entry.
       "/runs": "http://127.0.0.1:8787",
+      // Global agent settings (design doc §7). Top-level `/settings` — the
+      // client route is singular `/agent-settings` so it does not clash here.
+      "/settings": "http://127.0.0.1:8787",
       // WebSocket — planning `RunEvent` live stream (T-202/T-204). `ws:true`
       // makes the dev proxy forward the Upgrade handshake to the Rust server.
       "/ws": { target: "ws://127.0.0.1:8787", ws: true },

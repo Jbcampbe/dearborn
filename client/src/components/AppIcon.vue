@@ -33,6 +33,7 @@ const ICONS: Record<string, string> = {
   search: `<circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5 14 14"/>`,
   dot: `<circle cx="8" cy="8" r="3" fill="currentColor" stroke="none"/>`,
   warning: `<path d="M8 2.2 14.5 13.5H1.5L8 2.2ZM8 6.5v3.5M8 11.5v.01"/>`,
+  sliders: `<path d="M3 4.5h6M11.5 4.5H13M3 11.5h1.5M7 11.5h6M9 2.8v3.4M5 9.8v3.4"/>`,
 };
 </script>
 

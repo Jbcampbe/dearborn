@@ -6,12 +6,22 @@ import PlanningView from "../components/PlanningView.vue";
 import EpicDetailView from "../components/EpicDetailView.vue";
 import DagEditorView from "../components/DagEditorView.vue";
 import EpicKanbanView from "../components/EpicKanbanView.vue";
+import SettingsView from "../components/SettingsView.vue";
 
 // Client-side routes. The top-level token gate lives in App.vue (an
 // unauthenticated user sees the token screen regardless of route), so these
 // routes are all "inside" the authenticated app.
 const routes: RouteRecordRaw[] = [
   { path: "/", name: "projects", component: ProjectsView },
+  {
+    // Global agent settings (design doc §8). `/settings` is the API's own
+    // namespace, so the client route is the distinct `/agent-settings` path to
+    // avoid shadowing it on hard reload / deep link (same pattern as
+    // `/project/:id`).
+    path: "/agent-settings",
+    name: "settings",
+    component: SettingsView,
+  },
   {
     // Singular `/project/:id` deliberately avoids the API's `/projects`
     // namespace: axum registers `GET /projects/:id` (and the Vite dev proxy

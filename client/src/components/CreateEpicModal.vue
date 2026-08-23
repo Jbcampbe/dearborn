@@ -15,6 +15,7 @@ const auth = useAuthStore();
 const router = useRouter();
 const title = ref("");
 const description = ref("");
+const baseBranch = ref("");
 const busy = ref(false);
 const error = ref<string | null>(null);
 const inputEl = ref<HTMLInputElement | null>(null);
@@ -25,6 +26,7 @@ watch(
     if (open) {
       title.value = "";
       description.value = "";
+      baseBranch.value = "";
       error.value = null;
       await nextTick();
       inputEl.value?.focus();
@@ -42,9 +44,13 @@ async function submit() {
   error.value = null;
   try {
     const blurb = description.value.trim();
+    const branch = baseBranch.value.trim();
     const epic = await createEpic(token, props.projectId, {
       title: trimmed,
       ...(blurb ? { description: blurb } : {}),
+      // Optional base-branch override (design §5): validated against the
+      // remote server-side; a bad name surfaces in `error` below.
+      ...(branch ? { base_branch: branch } : {}),
     });
     emit("close");
     await router.push({ name: "epic-planning", params: { id: epic.id } });
@@ -95,6 +101,26 @@ async function submit() {
           @keydown.enter.prevent="submit"
         />
       </div>
+      <details class="advanced">
+        <summary>Advanced</summary>
+        <div class="advanced-body">
+          <label class="label" for="epic-base-branch">
+            Base branch <span class="optional">(optional)</span>
+          </label>
+          <input
+            id="epic-base-branch"
+            v-model="baseBranch"
+            class="input mono"
+            type="text"
+            placeholder="(project default)"
+            :disabled="busy"
+          />
+          <p class="advanced-hint">
+            Branch off of and PR into this branch instead of the project default — e.g. to stack
+            on an unmerged branch. Validated against the remote; can't be changed later.
+          </p>
+        </div>
+      </details>
     </form>
     <template #footer>
       <button class="btn" :disabled="busy" @click="emit('close')">Cancel</button>
@@ -130,5 +156,40 @@ async function submit() {
 .optional {
   color: var(--text-muted);
   font-weight: var(--weight-regular);
+}
+
+.advanced {
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-cards);
+  padding: var(--spacing-8) var(--spacing-12);
+}
+
+.advanced summary {
+  cursor: pointer;
+  font-size: var(--text-label);
+  color: var(--text-faint);
+  user-select: none;
+}
+
+.advanced-body {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-4);
+  padding-top: var(--spacing-8);
+}
+
+.advanced-body .input {
+  font-family: var(--font-mono);
+  font-size: 12px;
+}
+
+.advanced-hint {
+  font-size: 11px;
+  color: var(--text-faint);
+  line-height: 1.5;
+}
+
+.mono {
+  font-family: var(--font-mono);
 }
 </style>

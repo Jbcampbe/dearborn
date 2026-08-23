@@ -277,18 +277,18 @@ Ordered by dependency; each task is one reviewable unit. `[B]` = backend,
 
 ### Phase 5 — Client
 
-- [ ] **T-16. API layer** — `client/src/api/settings.ts` (+ project
+- [x] **T-16. API layer** — `client/src/api/settings.ts` (+ project
       agent-settings calls): types mirroring the wire format (slot keys as
       string literals union), fetchers for all four endpoints.
-- [ ] **T-17. Global Settings view** — new route + nav entry in `AppShell`:
+- [x] **T-17. Global Settings view** — new route + nav entry in `AppShell`:
       harness toggles, default-harness selection, model-per-harness inputs;
       save via `PUT /settings`; show 409 reference errors inline.
-- [ ] **T-18. Project Settings tab** — tab in `ProjectDetailView`: default base
+- [x] **T-18. Project Settings tab** — tab in `ProjectDetailView`: default base
       branch field; eight slot cards (harness select limited to enabled
       harnesses, model input, effective-values line); Edit-prompt modal with
       textarea, VERDICT warning on the `review` slot, and Reset-to-default
       (writes `null`).
-- [ ] **T-19. CreateEpicModal base branch** — optional field, surfaced only as
+- [x] **T-19. CreateEpicModal base branch** — optional field, surfaced only as
       advanced/optional input; passes through to epic-create; server-side
       validation error shown inline.
 

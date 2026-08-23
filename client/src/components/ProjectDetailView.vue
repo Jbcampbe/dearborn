@@ -8,6 +8,7 @@ import { listEpics, type Epic } from "../api/epics";
 import CloneStatusBadge from "./CloneStatusBadge.vue";
 import ProjectKanbanView from "./ProjectKanbanView.vue";
 import CreateEpicModal from "./CreateEpicModal.vue";
+import ProjectSettingsPanel from "./ProjectSettingsPanel.vue";
 import StatusIcon from "./StatusIcon.vue";
 import AppIcon from "./AppIcon.vue";
 
@@ -26,6 +27,9 @@ const loading = ref(true);
 const error = ref<string | null>(null);
 const refreshing = ref(false);
 const epicModalOpen = ref(false);
+
+/** Which detail section is shown: the overview (default) or agent settings. */
+const tab = ref<"overview" | "settings">("overview");
 
 /** The board's exposed create-task opener (its TaskModal serves create + edit). */
 const kanban = ref<{ openCreateTask: () => void } | null>(null);
@@ -132,14 +136,36 @@ onMounted(load);
       <span class="current">{{ project?.name ?? "…" }}</span>
     </nav>
 
-    <div v-if="loading" class="loading-stack" aria-label="Loading project">
+    <nav class="tabs" aria-label="Project sections">
+      <button
+        class="tab"
+        :class="{ active: tab === 'overview' }"
+        @click="tab = 'overview'"
+      >
+        Overview
+      </button>
+      <button
+        class="tab"
+        :class="{ active: tab === 'settings' }"
+        @click="tab = 'settings'"
+      >
+        <AppIcon name="sliders" :size="13" />
+        Agent settings
+      </button>
+    </nav>
+
+    <div v-if="loading && tab === 'overview'" class="loading-stack" aria-label="Loading project">
       <div class="skeleton sk-title" />
       <div class="skeleton sk-block" />
       <div class="skeleton sk-block" />
     </div>
-    <p v-else-if="error" class="banner banner-error" role="alert">{{ error }}</p>
+    <p v-else-if="error && tab === 'overview'" class="banner banner-error" role="alert">{{ error }}</p>
 
     <template v-else-if="project">
+      <template v-if="tab === 'settings'">
+        <ProjectSettingsPanel :project-id="project.id" :key="project.id" />
+      </template>
+      <template v-else>
       <header class="head fade-in">
         <div class="head-main">
           <h1 class="page-title">{{ project.name }}</h1>
@@ -231,6 +257,7 @@ onMounted(load);
       </section>
 
       <ProjectKanbanView :id="project.id" ref="kanban" />
+      </template>
 
       <CreateEpicModal
         :open="epicModalOpen"
@@ -242,6 +269,39 @@ onMounted(load);
 </template>
 
 <style scoped>
+.tabs {
+  display: flex;
+  gap: 2px;
+  margin-bottom: var(--spacing-20);
+  border-bottom: 1px solid var(--border-hairline);
+}
+
+.tab {
+  display: inline-flex;
+  align-items: center;
+  gap: var(--spacing-6);
+  padding: 6px var(--spacing-12);
+  margin-bottom: -1px;
+  border: none;
+  border-bottom: 2px solid transparent;
+  background: transparent;
+  color: var(--text-muted);
+  font-size: var(--text-caption);
+  cursor: pointer;
+  transition:
+    color var(--duration-fast) var(--ease-out),
+    border-color var(--duration-fast) var(--ease-out);
+}
+
+.tab:hover {
+  color: var(--text-body);
+}
+
+.tab.active {
+  color: var(--text-primary);
+  border-bottom-color: currentColor;
+}
+
 .head {
   display: flex;
   align-items: flex-start;
