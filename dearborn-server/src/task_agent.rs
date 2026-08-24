@@ -179,22 +179,54 @@
 //! plumbing changes here: `agent-harness`'s Claude adapter
 //! (`build_claude_args`) already injects a *default* `--permission-mode
 //! acceptEdits` for `RunMode::Edit` whenever the caller hasn't set
-//! `--permission-mode` itself via `extra_args` — and [`build_extra_args`]
-//! never does for `Implement`/`Fix` (only the `Review`/`VerifyComplete`/
-//! `Summarize` trio gets `extra_args` at all, and that's `--disallowedTools`,
-//! a different flag). `acceptEdits` auto-approves `Edit`/`Write`/`MultiEdit`
-//! while leaving `Bash` gated; a task whose spec is satisfiable with the
-//! editor tools alone (the common case — the T-515 fixture asked for exactly
-//! one new file) never even hits the gated surface. The empirical run: one
-//! `claude -p` turn, no `--model`/`--max-turns` override, no `--resume`,
-//! cold-CLI-start-to-exit in well under 30s, one commit landing on the
-//! branch with the §2.8 subject, pushed and read back from the bare-origin
-//! fixture. **Caveat, not yet retired**: a task whose only path to
-//! satisfying its acceptance criteria requires `Bash` (e.g. running a
-//! generator script) will hit `acceptEdits`' gate and has not been
-//! empirically exercised — if that turns out to block real epics, the fix is
-//! a caller-supplied `--permission-mode` override via `extra_args` (the
-//! adapter already supports last-wins), not a change to this reasoning.
+//! `--permission-mode` itself via `extra_args` — which, at the time,
+//! [`build_extra_args`] never did for `Implement`/`Fix`. `acceptEdits`
+//! auto-approves `Edit`/`Write`/`MultiEdit` while leaving `Bash` gated; a
+//! task whose spec is satisfiable with the editor tools alone (the T-515
+//! fixture asked for exactly one new file) never even hits the gated
+//! surface. The empirical run: one `claude -p` turn, no `--model`/
+//! `--max-turns` override, no `--resume`, cold-CLI-start-to-exit in well
+//! under 30s, one commit landing on the branch with the §2.8 subject, pushed
+//! and read back from the bare-origin fixture.
+//!
+//! ## The `acceptEdits` caveat, retired
+//!
+//! T-515 left a caveat open: a task whose only path to its acceptance
+//! criteria runs through `Bash` would hit `acceptEdits`' gate, and nothing
+//! had exercised that. It does happen, and on the most ordinary task there
+//! is — an implement stage that wants to run the project's own build/test
+//! command (`cargo test`, say) to check its work before handing it to the
+//! gate. Headless, there is nobody to approve it, so the command simply
+//! fails.
+//!
+//! The fix is the one that caveat prescribed — a caller-supplied
+//! `--permission-mode` override via `extra_args`, not a change to the
+//! reasoning above. [`build_extra_args`] now passes `--permission-mode
+//! bypassPermissions` for `Implement`/`Fix` under Claude, exactly as
+//! [`crate::planning::ClaudePlanningAgent`] and
+//! [`crate::breakdown::ClaudeBreakdownAgent`] already do for their own
+//! headless runs; those two were the only agent seams that had it, and the
+//! task stages were the odd ones out. The adapter skips its `acceptEdits`
+//! default whenever the host names a mode, so this replaces that default
+//! rather than duplicating the flag.
+//!
+//! This widens what a write stage may do unattended — `Bash` included — but
+//! not what reaches `main`, because the backstops for these two stages were
+//! never the permission flag. They are the structural ones the "soft
+//! read-only enforcement" section already names: the `TestGate` stage and
+//! the cumulative-diff review (T-522/T-530), both of which run *outside* the
+//! agent and are untouched by any flag it runs under. `Implement` and `Fix`
+//! are expected to write to the workspace by definition; a gate that let
+//! them write but not verify what they wrote bought no safety, only a
+//! blinder.
+//!
+//! **Left deliberately alone**: the `Review`/`VerifyComplete`/`Summarize`
+//! trio runs `RunMode::Ask`, for which the adapter emits no
+//! `--permission-mode` at all, so those stages meet the CLI's default mode
+//! and their `Bash` stays gated the same way. If a reviewer is ever meant to
+//! *run* something rather than read it, that is the same fix applied to the
+//! trio — but it is a real loosening of the read-only contract above, not a
+//! typo to patch, and nothing needs it today.
 
 use std::collections::HashMap;
 use std::path::PathBuf;
@@ -488,26 +520,58 @@ impl TaskAgent for CliTaskAgent {
 /// how `ClaudePlanningAgent` / `ClaudeBreakdownAgent` pass `--allowedTools`).
 const DENIED_EDIT_TOOLS: &str = "Edit,Write,MultiEdit,NotebookEdit";
 
+/// The `--permission-mode` the write stages run under, in Claude Code's
+/// dialect. The adapter's own default when the host names no mode is
+/// `acceptEdits`, which auto-approves the editor tools but leaves `Bash`
+/// gated — an approval nobody can grant in a headless `claude -p` run. This
+/// is the same value `ClaudePlanningAgent` / `ClaudeBreakdownAgent` already
+/// pass for the same headless reason.
+const BYPASS_PERMISSIONS: &str = "bypassPermissions";
+
 /// Build the harness `extra_args` for `stage` under `harness`. Factored out
 /// of [`CliTaskAgent::run`] as a pure function (no harness, no spawn) so the
 /// (stage, harness) → flags mapping is unit-tested directly instead of only
 /// through a live CLI run.
 ///
-/// The only stage-driven flag is the read-only trio's edit-tool denial, and
-/// each CLI spells it differently — `--disallowedTools Edit,Write,…` for
-/// Claude Code, `--exclude-tools edit,write` for pi (whose built-in tool set
-/// is `read`/`bash`/`edit`/`write`, so the list is two names, not four). The
-/// *contract* is identical in both dialects, including its limit: `Bash` is
-/// deliberately not denied under either, so this stays the same "soft
-/// read-only enforcement" the module doc describes rather than a guarantee.
+/// Two stage-driven flags, on opposite sides of the write/read-only line.
+///
+/// The read-only trio's edit-tool denial, which each CLI spells differently —
+/// `--disallowedTools Edit,Write,…` for Claude Code, `--exclude-tools
+/// edit,write` for pi (whose built-in tool set is `read`/`bash`/`edit`/
+/// `write`, so the list is two names, not four). The *contract* is identical
+/// in both dialects, including its limit: `Bash` is deliberately not denied
+/// under either, so this stays the same "soft read-only enforcement" the
+/// module doc describes rather than a guarantee.
+///
+/// The write pair's `--permission-mode bypassPermissions`, Claude-only. It
+/// displaces the adapter's `acceptEdits` default (last-wins, and the adapter
+/// skips its own default entirely once the host names a mode, so the flag is
+/// never duplicated) so an `Implement`/`Fix` run can reach `Bash` and check
+/// its own work — the module doc's "acceptEdits caveat, retired" section has
+/// the full reasoning. pi needs no counterpart: `build_pi_args` already
+/// passes `--no-approve` and pi auto-runs every tool in print mode, so its
+/// write stages never meet an approval gate and there is no
+/// `--permission-mode` in its dialect to set.
 fn build_extra_args(stage: Stage, harness: &str) -> Vec<String> {
-    if !stage.denies_edit_tools() {
-        return Vec::new();
+    let is_pi = harness == PI_HARNESS_ID;
+    if stage.denies_edit_tools() {
+        return if is_pi {
+            vec!["--exclude-tools".to_string(), PI_EDIT_TOOLS.to_string()]
+        } else {
+            vec!["--disallowedTools".to_string(), DENIED_EDIT_TOOLS.to_string()]
+        };
     }
-    match harness {
-        PI_HARNESS_ID => vec!["--exclude-tools".to_string(), PI_EDIT_TOOLS.to_string()],
-        _ => vec!["--disallowedTools".to_string(), DENIED_EDIT_TOOLS.to_string()],
+    // Matched on the two write stages by name rather than on
+    // `!denies_edit_tools()`, which is also true of the five non-agent
+    // stages — those never reach a CLI at all, and must not pick up a flag
+    // on the way past.
+    if matches!(stage, Stage::Implement | Stage::Fix) && !is_pi {
+        return vec![
+            "--permission-mode".to_string(),
+            BYPASS_PERMISSIONS.to_string(),
+        ];
     }
+    Vec::new()
 }
 
 // ---- driving one agent stage to completion (D14) ---------------------------
@@ -1440,14 +1504,48 @@ mod tests {
     // ---- build_extra_args (pure, no spawn) -----------------------------
 
     #[test]
-    fn implement_and_fix_get_no_tool_flags_on_any_harness() {
+    fn implement_and_fix_bypass_permissions_on_claude_and_need_no_flag_on_pi() {
         for stage in [Stage::Implement, Stage::Fix] {
+            // Claude: the mode is named explicitly, displacing the adapter's
+            // `acceptEdits` default so the stage can reach `Bash` and run
+            // the project's own build/test command.
+            let claude = build_extra_args(stage, "claude");
+            let idx = claude
+                .iter()
+                .position(|a| a == "--permission-mode")
+                .unwrap_or_else(|| panic!("{stage:?} missing --permission-mode: {claude:?}"));
+            assert_eq!(claude[idx + 1], BYPASS_PERMISSIONS);
+            // Never the read-only trio's denial: a write stage keeps its
+            // editor tools.
+            assert!(
+                !claude.iter().any(|a| a == "--disallowedTools"),
+                "{stage:?}: {claude:?}"
+            );
+
+            // pi: `build_pi_args` already passes `--no-approve` and pi
+            // auto-runs every tool in print mode, so there is no gate to
+            // open and no `--permission-mode` in its dialect to open it
+            // with. Claude's flag must not leak into pi's argv.
+            let pi = build_extra_args(stage, PI_HARNESS_ID);
+            assert!(pi.is_empty(), "{stage:?} on pi: {pi:?}");
+        }
+    }
+
+    #[test]
+    fn non_agent_stages_get_no_extra_args_on_any_harness() {
+        // `build_extra_args` keys the write-stage flag on `Implement`/`Fix`
+        // by name, not on `!denies_edit_tools()` — which is also true of
+        // these five. They never reach a CLI, so they must stay bare.
+        for stage in [
+            Stage::Setup,
+            Stage::Preflight,
+            Stage::TestGate,
+            Stage::Commit,
+            Stage::Push,
+        ] {
             for harness in ["claude", PI_HARNESS_ID] {
-                assert!(
-                    build_extra_args(stage, harness).is_empty(),
-                    "{stage:?} on {harness}: {:?}",
-                    build_extra_args(stage, harness)
-                );
+                let args = build_extra_args(stage, harness);
+                assert!(args.is_empty(), "{stage:?} on {harness}: {args:?}");
             }
         }
     }
