@@ -47,7 +47,7 @@ use tower_http::{
 
 pub use breakdown::BreakdownAgent;
 pub use config::{Config, ConfigError, ExecutorConfig};
-pub use crypto::MasterKey;
+pub use crypto::{CryptoError, MasterKey};
 pub use db::{Db, DbError};
 pub use error::{AppError, AppResult};
 pub use git_host::GitHost;
@@ -79,6 +79,11 @@ pub struct AppState {
     /// AES-256 key (derived from `DEARBORN_MASTER_KEY`) used to encrypt/decrypt
     /// per-project PATs. Never serialised or logged.
     pub crypto: Arc<MasterKey>,
+    /// HMAC-SHA256 signing key for the self-contained access tokens (domain-
+    /// separated from `crypto`, so the two derivations of `DEARBORN_MASTER_KEY`
+    /// never share bytes). Deterministic, so sessions survive a restart. Never
+    /// serialised or logged.
+    pub auth_key: Arc<auth::AuthKey>,
     /// The planning agent that drives interactive epic-planning runs (T-202).
     /// Production is [`planning::ClaudePlanningAgent`]; tests inject a fake.
     pub planner: Arc<dyn PlanningAgent>,
@@ -292,11 +297,14 @@ impl AppState {
     ) -> AppState {
         let crypto = MasterKey::derive(&config.master_key)
             .expect("master key material validated non-empty at config load");
+        let auth_key = auth::AuthKey::derive(&config.master_key)
+            .expect("master key material validated non-empty at config load");
         AppState {
             config: Arc::new(config),
             db,
             hub: Arc::new(Hub::new()),
             crypto: Arc::new(crypto),
+            auth_key: Arc::new(auth_key),
             planner,
             breakdown,
             task_agent,

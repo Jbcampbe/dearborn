@@ -82,6 +82,13 @@ impl MasterKey {
         Ok(MasterKey(key))
     }
 
+    /// The raw 32 key bytes. Test-only — for asserting that
+    /// [`crate::auth::AuthKey`]'s derived signing key differs from this AES key.
+    #[cfg(test)]
+    pub(crate) fn raw_bytes(&self) -> &[u8; 32] {
+        &self.0
+    }
+
     fn cipher(&self) -> Aes256Gcm {
         Aes256Gcm::new(Key::<Aes256Gcm>::from_slice(&self.0))
     }

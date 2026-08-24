@@ -31,6 +31,12 @@ aes-gcm = "0.10"
 argon2 = "0.5"
 sha2 = "0.10"
 base64 = "0.22"
+# HMAC-SHA256 for the signed access-token codec (auth.rs). Already present
+# transitively, so no new crate enters the tree.
+hmac = "0.12"
+# Constant-time byte comparison for MAC verification in auth.rs. Also already
+# present transitively (via argon2/aes-gcm).
+subtle = "2"
 # GitHub API client for T-514's GitHost (push + PR). rustls (not native-tls /
 # OpenSSL) per D15 — see MILESTONE_2 §14 and dearborn-server/src/git_host.rs.
 reqwest = { version = "0.12", default-features = false, features = ["rustls-tls", "json"] }
