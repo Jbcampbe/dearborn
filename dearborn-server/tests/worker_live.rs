@@ -92,7 +92,7 @@ use dearborn_server::git_host::testing::FakeHost;
 use dearborn_server::planning::ClaudePlanningAgent;
 use dearborn_server::task_agent::CliTaskAgent;
 use dearborn_server::workspace;
-use dearborn_server::{worker, AppState, Config, Db, ExecutorConfig};
+use dearborn_server::{worker, AppState, AuthConfig, Config, Db, ExecutorConfig};
 
 const TOKEN: &str = "s3cret-token";
 
@@ -151,6 +151,10 @@ async fn live_implement_writes_commits_pushes_to_bare_origin_and_opens_a_fake_pr
         static_dir: "./client/dist".to_string(),
         auto_clone: false,
         argon2_fast: true,
+        auth: AuthConfig {
+            access_ttl_secs: 86_400,
+            refresh_ttl_secs: 15_552_000,
+        },
         executor: ExecutorConfig {
             worker_concurrency: 1,
             lease_ttl_secs: 300,

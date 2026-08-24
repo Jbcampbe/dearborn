@@ -56,8 +56,34 @@ pub struct Config {
     /// under either setting still verifies under the other. See
     /// [`crate::users::hash_password`].
     pub argon2_fast: bool,
+    /// Session-lifetime tuning for the multi-user auth epic. See [`AuthConfig`].
+    pub auth: AuthConfig,
     /// Executor worker-pool tuning (Milestone 2 §2.7). See [`ExecutorConfig`].
     pub executor: ExecutorConfig,
+}
+
+/// How long the two halves of a session live. Both fields resolve through the
+/// same env-then-file path as the rest of [`Config`] and are parsed with the
+/// same [`parse_or_warn`] the executor knobs use: a missing, unparseable, or
+/// zero value **warns and falls back to the default** rather than failing boot.
+///
+/// The split is what makes the product's "revocation is eventual, bounded by
+/// the access-token lifetime" literally true: the access token is verified
+/// offline (no database read), so a deactivation lands at the next refresh, at
+/// most `access_ttl_secs` later.
+#[derive(Debug, Clone)]
+pub struct AuthConfig {
+    /// Lifetime of a minted access token, in seconds
+    /// (`DEARBORN_ACCESS_TTL_SECS`). Default `86400` (24 h) — long enough that
+    /// day-to-day use never re-prompts, short enough to bound how stale a
+    /// revoked claim can get. **Rejects `0`**: a 0s access token would expire
+    /// before the response carrying it reached the browser.
+    pub access_ttl_secs: u64,
+    /// Absolute lifetime of a session's refresh token, in seconds
+    /// (`DEARBORN_REFRESH_TTL_SECS`). Default `15552000` (180 days), so a
+    /// browser left alone for a year re-prompts for a password but one left
+    /// alone over a holiday does not. **Rejects `0`** for the same reason.
+    pub refresh_ttl_secs: u64,
 }
 
 /// Tuning knobs for the executor worker pool (Milestone 2 §2.7). Every field
@@ -164,7 +190,8 @@ impl Config {
         let static_dir = resolve(&file, "DEARBORN_STATIC_DIR")
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| DEFAULT_STATIC_DIR.to_string());
-        let executor = executor_from(&resolve_executor_vars(&file));
+        let auth = auth_from(&resolve_vars(&file, AUTH_VAR_NAMES));
+        let executor = executor_from(&resolve_vars(&file, EXECUTOR_VAR_NAMES));
 
         Ok(Config {
             bind,
@@ -175,6 +202,7 @@ impl Config {
             static_dir,
             auto_clone: true,
             argon2_fast: false,
+            auth,
             executor,
         })
     }
@@ -194,14 +222,18 @@ const EXECUTOR_VAR_NAMES: &[&str] = &[
     "DEARBORN_POLL_INTERVAL_MS",
 ];
 
-/// Resolve every executor variable through the same env-then-file path as the
-/// rest of `Config` (via [`resolve`]), collecting the results into a plain
-/// map. Kept separate from [`executor_from`] so the actual parse-or-default
-/// logic is a pure function of a `HashMap`, testable without touching
-/// process-global env (see `mod tests`).
-fn resolve_executor_vars(file: &HashMap<String, String>) -> HashMap<String, String> {
+/// Environment variable names for every [`AuthConfig`] field, in declaration
+/// order.
+const AUTH_VAR_NAMES: &[&str] = &["DEARBORN_ACCESS_TTL_SECS", "DEARBORN_REFRESH_TTL_SECS"];
+
+/// Resolve a group of tuning variables through the same env-then-file path as
+/// the rest of `Config` (via [`resolve`]), collecting the results into a plain
+/// map. Kept separate from [`executor_from`]/[`auth_from`] so the actual
+/// parse-or-default logic is a pure function of a `HashMap`, testable without
+/// touching process-global env (see `mod tests`).
+fn resolve_vars(file: &HashMap<String, String>, names: &[&str]) -> HashMap<String, String> {
     let mut map = HashMap::new();
-    for key in EXECUTOR_VAR_NAMES {
+    for key in names {
         if let Some(v) = resolve(file, key) {
             map.insert((*key).to_string(), v);
         }
@@ -209,8 +241,21 @@ fn resolve_executor_vars(file: &HashMap<String, String>) -> HashMap<String, Stri
     map
 }
 
+/// Parse an [`AuthConfig`] out of an already-resolved key/value map (see
+/// [`resolve_vars`]). Pure, for the same reason [`executor_from`] is.
+///
+/// Both TTLs reject `0` and warn-and-default rather than failing boot: a bad
+/// session lifetime should degrade to the documented one, not stop an operator
+/// from reaching their own instance.
+fn auth_from(map: &HashMap<String, String>) -> AuthConfig {
+    AuthConfig {
+        access_ttl_secs: parse_or_warn(map, "DEARBORN_ACCESS_TTL_SECS", 86_400u64, true),
+        refresh_ttl_secs: parse_or_warn(map, "DEARBORN_REFRESH_TTL_SECS", 15_552_000u64, true),
+    }
+}
+
 /// Parse an [`ExecutorConfig`] out of an already-resolved key/value map (see
-/// [`resolve_executor_vars`]). Pure, so it is unit-tested directly with
+/// [`resolve_vars`]). Pure, so it is unit-tested directly with
 /// hand-built maps instead of through `from_env`, which would require
 /// mutating process-global env under a threaded test runner.
 fn executor_from(map: &HashMap<String, String>) -> ExecutorConfig {
@@ -232,7 +277,7 @@ fn executor_from(map: &HashMap<String, String>) -> ExecutorConfig {
     }
 }
 
-/// Parse a single executor tuning value out of a resolved map, falling back
+/// Parse a single tuning value (executor or auth) out of a resolved map, falling back
 /// to `default` (with a `tracing::warn!` naming the variable and the bad
 /// value) if the key is absent, empty, unparseable, or — when `reject_zero`
 /// is set — zero. Factors the "parse or warn-and-default" behavior so it is
@@ -364,6 +409,14 @@ impl Config {
             auto_clone: false,
             // Seeding a user per test case must not cost ~50ms of Argon2.
             argon2_fast: true,
+            // Production lifetimes: a test that wants an *expired* session
+            // writes the row's `expires_at` directly rather than waiting one
+            // out, so shortening these here would buy nothing and would make
+            // ordinary login/refresh tests race the clock.
+            auth: AuthConfig {
+                access_ttl_secs: 86_400,
+                refresh_ttl_secs: 15_552_000,
+            },
             executor: ExecutorConfig {
                 // 1 worker + a 10ms poll keep tests deterministic and fast.
                 worker_concurrency: 1,
@@ -538,6 +591,34 @@ mod tests {
         assert_eq!(cfg.max_test_fix_attempts, 0);
         assert_eq!(cfg.max_fix_rounds, 0);
         assert_eq!(cfg.verdict_retries, 0);
+    }
+
+    #[test]
+    fn auth_from_parses_both_ttls_and_defaults_when_absent() {
+        let cfg = auth_from(&map_of(&[
+            ("DEARBORN_ACCESS_TTL_SECS", "3600"),
+            ("DEARBORN_REFRESH_TTL_SECS", "604800"),
+        ]));
+        assert_eq!(cfg.access_ttl_secs, 3600);
+        assert_eq!(cfg.refresh_ttl_secs, 604_800);
+
+        let defaults = auth_from(&HashMap::new());
+        assert_eq!(defaults.access_ttl_secs, 86_400, "24 hours");
+        assert_eq!(defaults.refresh_ttl_secs, 15_552_000, "180 days");
+    }
+
+    #[test]
+    fn a_bad_ttl_warns_and_defaults_rather_than_failing_boot() {
+        // Unparseable, zero, and empty all degrade to the documented default —
+        // a mistyped session lifetime must never stop the server booting.
+        for bad in ["abc", "0", "", "-5", "1.5"] {
+            let cfg = auth_from(&map_of(&[
+                ("DEARBORN_ACCESS_TTL_SECS", bad),
+                ("DEARBORN_REFRESH_TTL_SECS", bad),
+            ]));
+            assert_eq!(cfg.access_ttl_secs, 86_400, "`{bad}` must fall back");
+            assert_eq!(cfg.refresh_ttl_secs, 15_552_000, "`{bad}` must fall back");
+        }
     }
 
     #[test]

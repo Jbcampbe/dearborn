@@ -26,7 +26,7 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use dearborn_server::{app, AppState, Config, Db, ExecutorConfig};
+use dearborn_server::{app, AppState, AuthConfig, Config, Db, ExecutorConfig};
 
 const TOKEN: &str = "s3cret-token";
 /// A unique string that only exists inside the fixture clone, so finding it in
@@ -57,6 +57,10 @@ async fn live_planning_agent_reads_clone_and_updates_epic_via_mcp() {
         static_dir: "./client/dist".to_string(),
         auto_clone: false,
         argon2_fast: true,
+        auth: AuthConfig {
+            access_ttl_secs: 86_400,
+            refresh_ttl_secs: 15_552_000,
+        },
         executor: ExecutorConfig {
             worker_concurrency: 1,
             lease_ttl_secs: 30,
@@ -209,6 +213,10 @@ async fn live_technical_planning_reads_clone_and_fills_technical_context() {
         static_dir: "./client/dist".to_string(),
         auto_clone: false,
         argon2_fast: true,
+        auth: AuthConfig {
+            access_ttl_secs: 86_400,
+            refresh_ttl_secs: 15_552_000,
+        },
         executor: ExecutorConfig {
             worker_concurrency: 1,
             lease_ttl_secs: 30,

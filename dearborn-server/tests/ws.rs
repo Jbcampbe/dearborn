@@ -8,7 +8,7 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use dearborn_server::{app, AppState, Config, Db, ExecutorConfig, Hub};
+use dearborn_server::{app, AppState, AuthConfig, Config, Db, ExecutorConfig, Hub};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio_tungstenite::connect_async;
@@ -31,6 +31,10 @@ async fn serve() -> (SocketAddr, Arc<Hub>) {
         static_dir: "./client/dist".to_string(),
         auto_clone: false,
         argon2_fast: true,
+        auth: AuthConfig {
+            access_ttl_secs: 86_400,
+            refresh_ttl_secs: 15_552_000,
+        },
         executor: ExecutorConfig {
             worker_concurrency: 1,
             lease_ttl_secs: 30,

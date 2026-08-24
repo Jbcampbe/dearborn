@@ -25,6 +25,7 @@ pub mod mcp;
 pub mod planning;
 pub mod pr;
 pub mod projects;
+pub mod sessions;
 pub mod spec;
 pub mod task_agent;
 pub mod tasks;
@@ -34,6 +35,7 @@ pub mod workspace;
 pub mod ws;
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
 
 use std::path::Path;
@@ -46,7 +48,7 @@ use tower_http::{
 };
 
 pub use breakdown::BreakdownAgent;
-pub use config::{Config, ConfigError, ExecutorConfig};
+pub use config::{AuthConfig, Config, ConfigError, ExecutorConfig};
 pub use crypto::{CryptoError, MasterKey};
 pub use db::{Db, DbError};
 pub use error::{AppError, AppResult};
@@ -84,6 +86,15 @@ pub struct AppState {
     /// never share bytes). Deterministic, so sessions survive a restart. Never
     /// serialised or logged.
     pub auth_key: Arc<auth::AuthKey>,
+    /// Whether this instance has been **claimed** — i.e. whether any `user` row
+    /// exists. Monotonic and cached: `false` means "not yet confirmed" and
+    /// triggers a `SELECT EXISTS(SELECT 1 FROM user)`; once that comes back
+    /// true it latches and no unauthenticated request ever counts users again.
+    ///
+    /// Latching is safe because a claimed instance can never become unclaimed:
+    /// `user` rows are never deleted, and the lockout guards make "zero active
+    /// admins" unreachable through the API. See [`AppState::instance_claimed`].
+    pub claimed: Arc<AtomicBool>,
     /// The planning agent that drives interactive epic-planning runs (T-202).
     /// Production is [`planning::ClaudePlanningAgent`]; tests inject a fake.
     pub planner: Arc<dyn PlanningAgent>,
@@ -305,6 +316,7 @@ impl AppState {
             hub: Arc::new(Hub::new()),
             crypto: Arc::new(crypto),
             auth_key: Arc::new(auth_key),
+            claimed: Arc::new(AtomicBool::new(false)),
             planner,
             breakdown,
             task_agent,
@@ -348,6 +360,39 @@ impl AppState {
         map.entry(project_id.to_string())
             .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
             .clone()
+    }
+
+    /// Whether this instance has any users yet — i.e. whether it has been
+    /// claimed through `POST /auth/setup`.
+    ///
+    /// Reads the cached latch first ([`AppState::claimed`]) and only falls
+    /// through to `SELECT EXISTS(SELECT 1 FROM user)` while it is still
+    /// `false`. That bounds the query to the *unclaimed* window: once an
+    /// instance has a user, no unauthenticated request counts users again, so
+    /// the public `/auth/status` probe cannot be turned into a database load
+    /// generator.
+    ///
+    /// `Relaxed` ordering is sufficient: the flag guards nothing but itself,
+    /// and the only transition is `false → true`. A racing reader that misses
+    /// a just-set latch simply runs one extra `EXISTS` query and reaches the
+    /// same answer.
+    pub async fn instance_claimed(&self) -> AppResult<bool> {
+        if self.claimed.load(Ordering::Relaxed) {
+            return Ok(true);
+        }
+        let mut rows = self
+            .db
+            .conn()
+            .query("SELECT EXISTS(SELECT 1 FROM user)", ())
+            .await?;
+        let exists = match rows.next().await? {
+            Some(row) => row.get::<i64>(0)? != 0,
+            None => false,
+        };
+        if exists {
+            self.claimed.store(true, Ordering::Relaxed);
+        }
+        Ok(exists)
     }
 
     /// Claim the in-flight slot for `epic_id` for a planning run.
@@ -412,7 +457,14 @@ pub fn app(state: AppState) -> Router {
         // Dearborn's local MCP server for planning runs (T-203). Authed by the
         // per-run capability token in the `:cap` path segment, NOT the browser
         // bearer token — so it lives outside the bearer layer, like `/ws`.
-        .route("/mcp/:cap", axum::routing::post(mcp::mcp_endpoint));
+        .route("/mcp/:cap", axum::routing::post(mcp::mcp_endpoint))
+        // First-launch claim, login, and session refresh. Unauthenticated by
+        // necessity: these are how a caller *gets* a credential, so they
+        // cannot sit behind one.
+        .route("/auth/status", get(sessions::auth_status))
+        .route("/auth/setup", axum::routing::post(sessions::setup))
+        .route("/auth/login", axum::routing::post(sessions::login))
+        .route("/auth/refresh", axum::routing::post(sessions::refresh));
 
     let protected = Router::new()
         .route("/whoami", get(whoami))
