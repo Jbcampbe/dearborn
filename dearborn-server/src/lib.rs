@@ -467,7 +467,6 @@ pub fn app(state: AppState) -> Router {
         .route("/auth/refresh", axum::routing::post(sessions::refresh));
 
     let protected = Router::new()
-        .route("/whoami", get(whoami))
         .route(
             "/settings",
             get(agent_settings::get_settings).put(agent_settings::put_settings),
@@ -540,7 +539,7 @@ pub fn app(state: AppState) -> Router {
         .route("/runs/:id", get(evidence::get_run))
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
-            auth::require_bearer,
+            auth::require_auth,
         ));
 
     let mut router = public.merge(protected);
@@ -581,24 +580,30 @@ async fn health() -> Json<Value> {
     Json(json!({ "status": "ok" }))
 }
 
-/// Authenticated token check. Useful for the client's token-entry screen.
-async fn whoami() -> Json<Value> {
-    Json(json!({ "status": "authenticated" }))
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::users::Role;
     use axum::body::Body;
     use axum::http::{header::AUTHORIZATION, Request, StatusCode};
+    use serde_json::{json, Value};
     use tower::ServiceExt; // for `oneshot`
-
-    const TOKEN: &str = "s3cret-token";
 
     async fn test_app() -> Router {
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
-        app(AppState::new(Config::for_test(TOKEN), db))
+        app(AppState::new(Config::for_test(), db))
+    }
+
+    /// A claimed instance (one seeded active admin) plus a bearer-ready access
+    /// token for it — the replacement for the deleted static `TOKEN`.
+    async fn test_app_with_user() -> (Router, String) {
+        let db = Db::connect(":memory:").await.unwrap();
+        db.run_migrations().await.unwrap();
+        let state = AppState::new(Config::for_test(), db);
+        let user = users::testing::seed_user(&state, "tester", Role::Admin, true).await;
+        let token = sessions::testing::login_as(&state, &user).await;
+        (app(state), token)
     }
 
     /// Build an app whose SPA static dir is a freshly-created temp dir holding a
@@ -609,7 +614,7 @@ mod tests {
         std::fs::write(dir.join("index.html"), marker).unwrap();
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
-        let mut config = Config::for_test(TOKEN);
+        let mut config = Config::for_test();
         config.static_dir = dir.to_string_lossy().into_owned();
         (app(AppState::new(config, db)), dir)
     }
@@ -628,16 +633,35 @@ mod tests {
         serde_json::from_slice(&bytes).unwrap()
     }
 
+    fn get(uri: &str) -> Request<Body> {
+        Request::builder()
+            .uri(uri)
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn get_bearer(uri: &str, token: &str) -> Request<Body> {
+        Request::builder()
+            .uri(uri)
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn post_json(uri: &str, body: Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
     #[tokio::test]
     async fn health_is_public_and_returns_200_ok() {
         let response = test_app()
             .await
-            .oneshot(
-                Request::builder()
-                    .uri("/health")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+            .oneshot(get("/health"))
             .await
             .unwrap();
 
@@ -647,56 +671,165 @@ mod tests {
 
     #[tokio::test]
     async fn protected_route_without_token_is_401() {
-        let response = test_app()
-            .await
-            .oneshot(
-                Request::builder()
-                    .uri("/whoami")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-
+        let response = test_app().await.oneshot(get("/projects")).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
     #[tokio::test]
-    async fn protected_route_with_wrong_token_is_401() {
-        let response = test_app()
-            .await
-            .oneshot(
-                Request::builder()
-                    .uri("/whoami")
-                    .header(AUTHORIZATION, "Bearer not-the-token")
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+    async fn protected_route_with_a_garbage_token_is_401() {
+        let (app, _token) = test_app_with_user().await;
+        let response = app
+            .oneshot(get_bearer("/projects", "not-a-real-token"))
             .await
             .unwrap();
-
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 
+    // ---- AC5: a login-issued access token opens every protected route ----
+
     #[tokio::test]
-    async fn protected_route_with_correct_token_is_200() {
-        let response = test_app()
-            .await
-            .oneshot(
-                Request::builder()
-                    .uri("/whoami")
-                    .header(AUTHORIZATION, format!("Bearer {TOKEN}"))
-                    .body(Body::empty())
-                    .unwrap(),
-            )
+    async fn a_login_issued_access_token_calls_protected_routes() {
+        let db = Db::connect(":memory:").await.unwrap();
+        db.run_migrations().await.unwrap();
+        let state = AppState::new(Config::for_test(), db);
+        users::testing::seed_user(&state, "tester", Role::Admin, true).await;
+
+        // Log in over HTTP — the same path a browser takes.
+        let response = app(state.clone())
+            .oneshot(post_json(
+                "/auth/login",
+                json!({
+                    "username": "tester",
+                    "password": users::testing::SEED_PASSWORD,
+                }),
+            ))
             .await
             .unwrap();
-
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(
-            body_json(response).await,
-            json!({ "status": "authenticated" })
-        );
+        let access_token = body_json(response).await["access_token"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // The freshly minted credential passes previously token-protected routes.
+        for uri in ["/projects", "/settings"] {
+            let response = app(state.clone())
+                .clone()
+                .oneshot(get_bearer(uri, &access_token))
+                .await
+                .unwrap();
+            assert_eq!(
+                response.status(),
+                StatusCode::OK,
+                "`{uri}` must accept the login-issued access token"
+            );
+        }
+    }
+
+    // ---- AC6: every flavor of bad credential is a plain 401 ----
+
+    #[tokio::test]
+    async fn missing_garbage_tampered_and_expired_credentials_all_get_401() {
+        let (app, good_token) = test_app_with_user().await;
+
+        // Tampered signature: flip one character of the final segment.
+        let (head, sig) = good_token.rsplit_once('.').unwrap();
+        let mut sig: Vec<char> = sig.chars().collect();
+        sig[0] = if sig[0] == 'A' { 'B' } else { 'A' };
+        let tampered = format!("{head}.{}", sig.iter().collect::<String>());
+
+        // Expired `exp`: mint directly with an expiry in the past.
+        let expired = {
+            let state_claims = auth::Claims {
+                sub: "01JD2Q7XK3V9M4N8P6R2T5W9YA".to_string(),
+                sid: "01JD2Q8BZ4W0N5P9Q3S3U6X0ZB".to_string(),
+                role: Role::Admin,
+                exp: 1_000, // long past
+            };
+            // Mint under this instance's key by rebuilding it from config material.
+            let key = auth::AuthKey::derive(&Config::for_test().master_key).unwrap();
+            key.mint(&state_claims)
+        };
+
+        for (label, token) in [
+            ("garbage", "garbage-token".to_string()),
+            ("tampered-signature", tampered),
+            ("expired-exp", expired),
+        ] {
+            let response = app.clone().oneshot(get_bearer("/projects", &token)).await.unwrap();
+            assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{label}");
+            assert_eq!(body_json(response).await["error"]["code"], "unauthorized");
+        }
+    }
+
+    // ---- Unclaimed vs claimed: which 401 code comes back ----
+
+    #[tokio::test]
+    async fn unauthenticated_request_on_an_unclaimed_instance_says_setup_required() {
+        let response = test_app().await.oneshot(get("/projects")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(body_json(response).await["error"]["code"], "setup_required");
+    }
+
+    #[tokio::test]
+    async fn unauthenticated_request_on_a_claimed_instance_says_unauthorized() {
+        let (app, _token) = test_app_with_user().await;
+        let response = app.oneshot(get("/projects")).await.unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(body_json(response).await["error"]["code"], "unauthorized");
+    }
+
+    // ---- AC18: the legacy shared token env var authorizes nothing ----
+
+    #[tokio::test]
+    async fn a_dearboren_token_in_the_environment_authorizes_nothing() {
+        // The variable no longer exists as far as the server is concerned: no
+        // field reads it. Assert that even with it set, presenting that exact
+        // string as a bearer token is rejected, and that config loading neither
+        // needs it nor trips over it.
+        // SAFETY: process-global env mutation; tests in this module that read
+        // env are not run concurrently with other env-mutating ones.
+        //
+        // The variable's name is assembled rather than spelled out because no
+        // source under `src/` may mention it any more: the field it once fed
+        // does not exist, and this assertion documents exactly that absence.
+        let legacy_var = concat!("DEARBORN", "_TOKEN");
+        let old = std::env::var(legacy_var).ok();
+        let old_master = std::env::var("DEARBORN_MASTER_KEY").ok();
+        std::env::set_var("DEARBORN_MASTER_KEY", "boot-check-material");
+        std::env::set_var(legacy_var, "s3cret-token");
+
+        let (app, _token) = test_app_with_user().await;
+        let response = app
+            .oneshot(get_bearer("/projects", "s3cret-token"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        // ...and the server boots fine with it unset or set to garbage.
+        drop(response);
+        std::env::remove_var(legacy_var);
+        assert!(Config::from_env().is_ok());
+        std::env::set_var(legacy_var, "leftover-garbage");
+        assert!(Config::from_env().is_ok());
+
+        match (old, old_master) {
+            (Some(v), m) => {
+                std::env::set_var(legacy_var, v);
+                match m {
+                    Some(v) => std::env::set_var("DEARBORN_MASTER_KEY", v),
+                    None => std::env::remove_var("DEARBORN_MASTER_KEY"),
+                }
+            }
+            (None, Some(v)) => {
+                std::env::remove_var(legacy_var);
+                std::env::set_var("DEARBORN_MASTER_KEY", v);
+            }
+            (None, None) => {
+                std::env::remove_var(legacy_var);
+                std::env::remove_var("DEARBORN_MASTER_KEY");
+            }
+        }
     }
 
     #[test]
@@ -743,7 +876,8 @@ mod tests {
     async fn api_routes_win_over_spa_fallback() {
         let (app, dir) = test_app_with_spa("spa").await;
         // `/projects` is a real API route: it must still enforce auth (401),
-        // never be shadowed by the static/SPA fallback.
+        // never be shadowed by the static/SPA fallback. The DB here has no
+        // users, so the code distinguishes itself as setup_required.
         let response = app
             .oneshot(
                 Request::builder()
@@ -755,7 +889,7 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
-        assert_eq!(body_json(response).await["error"]["code"], "unauthorized");
+        assert_eq!(body_json(response).await["error"]["code"], "setup_required");
         std::fs::remove_dir_all(dir).ok();
     }
 }

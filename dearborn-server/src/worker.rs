@@ -5892,13 +5892,53 @@ mod tests {
     use std::time::Duration;
     use tower::ServiceExt;
 
-    const TOKEN: &str = "s3cret-token";
+
+    /// The bearer credential HTTP tests present, minted **once per process**
+    /// from a seeded active admin (`crate::users::testing::seed_user` +
+    /// `crate::sessions::testing::login_as`) — the replacement for the deleted
+    /// static `TOKEN` constant. Access-token verification is stateless (one
+    /// HMAC check against the fixed test master key, no database read), so a
+    /// token minted here authenticates against every in-memory instance these
+    /// tests boot.
+    fn auth_bearer() -> &'static str {
+        static BEARER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        BEARER.get_or_init(|| {
+            // Seeding and login are async store calls, and `req` below is
+            // synchronous. Mint on a dedicated OS thread: `Runtime::block_on`
+            // panics if called from inside a test's own async context, but a
+            // plain thread has none, so a throwaway current-thread runtime is
+            // legal there.
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime");
+                let token = runtime.block_on(async {
+                    let db = crate::Db::connect(":memory:").await.unwrap();
+                    db.run_migrations().await.unwrap();
+                    let state =
+                        crate::AppState::new(crate::Config::for_test(), db);
+                    let user = crate::users::testing::seed_user(
+                        &state,
+                        "tester",
+                        crate::users::Role::Admin,
+                        true,
+                    )
+                    .await;
+                    crate::sessions::testing::login_as(&state, &user).await
+                });
+                tx.send(token).expect("bearer receiver dropped");
+            });
+            rx.recv().expect("bearer minter panicked")
+        })
+    }
 
     fn req(method: &str, uri: &str, body: Option<Value>) -> Request<Body> {
         let builder = Request::builder()
             .method(method)
             .uri(uri)
-            .header(AUTHORIZATION, format!("Bearer {TOKEN}"));
+            .header(AUTHORIZATION, format!("Bearer {}", auth_bearer()));
         match body {
             Some(v) => builder
                 .header(CONTENT_TYPE, "application/json")
@@ -5945,7 +5985,7 @@ mod tests {
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
         let state = AppState::with_all_agents_and_host(
-            Config::for_test(TOKEN),
+            Config::for_test(),
             db,
             Arc::new(SilentPlanningAgent),
             Arc::new(SilentBreakdownAgent),
@@ -7023,7 +7063,7 @@ mod tests {
     async fn pool_runs_exactly_worker_concurrency_epics_at_once() {
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
-        let mut config = Config::for_test(TOKEN);
+        let mut config = Config::for_test();
         config.executor.worker_concurrency = 2;
         let state = AppState::with_all_agents_and_host(
             config,
@@ -7982,7 +8022,7 @@ mod tests {
             observed: observed.clone(),
         });
         let state = AppState::with_all_agents_and_host(
-            Config::for_test(TOKEN),
+            Config::for_test(),
             db,
             Arc::new(SilentPlanningAgent),
             Arc::new(SilentBreakdownAgent),
@@ -8241,7 +8281,7 @@ mod tests {
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
         let state = AppState::with_all_agents_and_host(
-            Config::for_test(TOKEN),
+            Config::for_test(),
             db,
             Arc::new(SilentPlanningAgent),
             Arc::new(SilentBreakdownAgent),
@@ -10592,7 +10632,7 @@ mod tests {
     #[tokio::test]
     async fn worker_moves_on_to_a_different_epic_immediately_after_a_failure() {
         assert_eq!(
-            Config::for_test(TOKEN).executor.worker_concurrency,
+            Config::for_test().executor.worker_concurrency,
             1,
             "this test's proof depends on exactly one worker loop existing"
         );
@@ -11255,7 +11295,7 @@ mod tests {
     /// epic's lease is released same as any other task-scoped failure.
     #[tokio::test]
     async fn implement_timeout_fails_the_task_and_blocks_the_epic_the_ordinary_way() {
-        let mut config = Config::for_test(TOKEN);
+        let mut config = Config::for_test();
         config.executor.agent_stage_timeout_secs = 1;
 
         let gate = Arc::new(Gate::default());
@@ -12032,7 +12072,7 @@ mod tests {
     /// "ordering" section's whole point: non-blocking, not fast.
     #[tokio::test]
     async fn summarize_stage_timeout_still_opens_pr_with_template_only() {
-        let mut config = Config::for_test(TOKEN);
+        let mut config = Config::for_test();
         config.executor.agent_stage_timeout_secs = 1;
 
         // Not released until teardown at the very end (see the comment

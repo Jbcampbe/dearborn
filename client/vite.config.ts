@@ -11,7 +11,6 @@ export default defineConfig({
     // binary serves the built assets itself and no proxy is involved.
     proxy: {
       "/health": "http://127.0.0.1:8787",
-      "/whoami": "http://127.0.0.1:8787",
       "/projects": "http://127.0.0.1:8787",
       // Epics + planning transcript REST surface (T-201/T-204). Singular
       // `/epic/:id` is a client route (see router) so it does not clash here.

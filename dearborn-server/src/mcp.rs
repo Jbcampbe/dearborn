@@ -725,7 +725,6 @@ mod tests {
     use std::sync::Arc;
     use tower::ServiceExt;
 
-    const TOKEN: &str = "s3cret-token";
 
     /// Boot state + router with the silent planner (these tests exercise the MCP
     /// endpoint/tools directly and never start a real agent run).
@@ -733,7 +732,7 @@ mod tests {
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
         let state = AppState::with_planner(
-            Config::for_test(TOKEN),
+            Config::for_test(),
             db,
             Arc::new(crate::planning::testing::SilentPlanningAgent),
         );

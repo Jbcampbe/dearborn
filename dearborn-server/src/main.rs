@@ -6,7 +6,7 @@ use dearborn_server::{app, init_tracing, worker, AppState, Config, Db, MasterKey
 async fn main() {
     init_tracing();
 
-    // Fail fast on bad configuration (e.g. missing DEARBORN_MASTER_KEY / TOKEN)
+    // Fail fast on bad configuration (e.g. a missing DEARBORN_MASTER_KEY)
     // before we bind a socket or touch the database.
     let config = match Config::from_env() {
         Ok(config) => config,

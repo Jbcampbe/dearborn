@@ -552,7 +552,7 @@ mod tests {
     async fn test_state() -> AppState {
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
-        AppState::new(Config::for_test("unused"), db)
+        AppState::new(Config::for_test(), db)
     }
 
     /// A state backed by a real file on disk, plus the temp directory holding
@@ -572,7 +572,7 @@ mod tests {
             .await
             .unwrap();
         db.run_migrations().await.unwrap();
-        AppState::new(Config::for_test("unused"), db)
+        AppState::new(Config::for_test(), db)
     }
 
     fn post(uri: &str, body: Value) -> Request<Body> {

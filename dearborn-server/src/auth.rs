@@ -1,10 +1,18 @@
-//! Single-user bearer-token authentication, plus the self-contained signed
-//! access-token format for the multi-user epic.
+//! Request authentication for the multi-user access-token model, plus the
+//! self-contained signed access-token format it is built on.
 //!
-//! The existing static-token layer ([`require_bearer`]) is unchanged and stays
-//! applied as a `route_layer` over the protected router so that public routes
-//! (notably `GET /health`) bypass it entirely. The new [`AuthKey`] codec lives
-//! alongside it purely additively — nothing is swapped over yet.
+//! [`require_auth`] replaces the old shared-static-token bearer layer as
+//! the `route_layer` over the protected router: it reads the `Authorization:
+//! Bearer` header, verifies the presented token with the instance's [`AuthKey`]
+//! (stateless — one HMAC, zero database reads), inserts the resulting [`Claims`]
+//! into the request extensions, and lets the request through. Public routes
+//! (notably `GET /health`) bypass it entirely.
+//!
+//! On failure the layer returns `401`. When the token is absent or invalid
+//! **and** the instance has no users yet (unclaimed), it returns
+//! [`AppError::SetupRequired`] instead — still a `401`, but with the stable
+//! `setup_required` code the SPA branches on to show a create-admin form rather
+//! than a login form.
 //!
 //! ## Access-token format (no JWT dependency)
 //!
@@ -29,9 +37,10 @@
 //! material, and stable across restarts.
 
 use axum::{
+    async_trait,
     body::Body,
-    extract::State,
-    http::{header::AUTHORIZATION, Request},
+    extract::{FromRequestParts, State},
+    http::{header::AUTHORIZATION, request::Parts, Request},
     middleware::Next,
     response::Response,
 };
@@ -200,13 +209,23 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
 }
 
-/// Reject requests lacking a valid `Authorization: Bearer <token>` header.
+/// Authenticate a request by verifying its `Authorization: Bearer <token>`
+/// against the instance's signing key, then inserting the verified [`Claims`]
+/// into the request extensions for handlers to read via [`CurrentUser`].
 ///
-/// On failure returns [`AppError::Unauthorized`], which renders the standard
-/// JSON error envelope with a `401` status.
-pub async fn require_bearer(
+/// Verification is stateless: one HMAC check and an `exp` comparison, no
+/// database query — that is what keeps the hot path cheap. Revocation of a live
+/// token therefore does not happen mid-flight; it lands at the next refresh
+/// (`POST /auth/refresh` re-reads the user row).
+///
+/// On any failure returns `401` ([`AppError::Unauthorized`]), **except** when
+/// the instance is unclaimed — no `user` row exists yet — in which case it
+/// returns [`AppError::SetupRequired`]: same status, but the SPA can tell from
+/// the stable code that it should render the create-admin screen instead of the
+/// login screen.
+pub async fn require_auth(
     State(state): State<AppState>,
-    request: Request<Body>,
+    mut request: Request<Body>,
     next: Next,
 ) -> Result<Response, AppError> {
     let presented = request
@@ -215,9 +234,50 @@ pub async fn require_bearer(
         .and_then(|value| value.to_str().ok())
         .and_then(bearer_token);
 
-    match presented {
-        Some(token) if token == state.config.token => Ok(next.run(request).await),
-        _ => Err(AppError::Unauthorized),
+    let claims = match presented {
+        Some(token) => state.auth_key.verify(token).ok(),
+        None => None,
+    };
+    let Some(claims) = claims else {
+        return Err(unauthorized_or_setup(&state).await);
+    };
+
+    request.extensions_mut().insert(claims);
+    Ok(next.run(request).await)
+}
+
+/// The 401 an unauthenticated caller gets: `setup_required` while the instance
+/// has no users at all (so a fresh boot steers the browser to the claim form),
+/// plain `unauthorized` once anyone has signed up.
+async fn unauthorized_or_setup(state: &AppState) -> AppError {
+    if state.instance_claimed().await.unwrap_or(true) {
+        AppError::Unauthorized
+    } else {
+        AppError::SetupRequired
+    }
+}
+
+/// Extractor for the authenticated identity on protected routes.
+///
+/// Populated from the claims the [`require_auth`] middleware already verified
+/// and inserted into the request extensions — **zero database reads**. Like the
+/// token itself, `role` reflects mint time; ordinary routes deliberately trust
+/// it until refresh (eventual revocation). Any route taking `CurrentUser` is
+/// thereby gated behind a valid access token.
+#[derive(Debug, Clone)]
+pub struct CurrentUser(pub Claims);
+
+#[async_trait]
+impl FromRequestParts<AppState> for CurrentUser {
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, _state: &AppState) -> Result<Self, Self::Rejection> {
+        parts
+            .extensions
+            .get::<Claims>()
+            .cloned()
+            .map(CurrentUser)
+            .ok_or(AppError::Unauthorized)
     }
 }
 

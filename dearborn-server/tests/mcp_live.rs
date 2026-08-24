@@ -26,9 +26,8 @@
 use std::net::SocketAddr;
 use std::time::Duration;
 
-use dearborn_server::{app, AppState, AuthConfig, Config, Db, ExecutorConfig};
+use dearborn_server::{app, AppState, Config, Db};
 
-const TOKEN: &str = "s3cret-token";
 /// A unique string that only exists inside the fixture clone, so finding it in
 /// the epic record proves the agent truly read the file (not hallucinated it).
 const MARKER: &str = "DEARBORN_MAGIC_PINEAPPLE_42";
@@ -48,32 +47,18 @@ async fn live_planning_agent_reads_clone_and_updates_epic_via_mcp() {
     // ---- real server on an ephemeral port (claude connects back to /mcp/:cap) ----
     let db = Db::connect(":memory:").await.unwrap();
     db.run_migrations().await.unwrap();
-    let config = Config {
-        bind: "127.0.0.1:0".to_string(),
-        token: TOKEN.to_string(),
-        master_key: "test-master-key".to_string(),
-        db_path: ":memory:".to_string(),
-        clone_root: "./clones".to_string(),
-        static_dir: "./client/dist".to_string(),
-        auto_clone: false,
-        argon2_fast: true,
-        auth: AuthConfig {
-            access_ttl_secs: 86_400,
-            refresh_ttl_secs: 15_552_000,
-        },
-        executor: ExecutorConfig {
-            worker_concurrency: 1,
-            lease_ttl_secs: 30,
-            heartbeat_secs: 5,
-            agent_stage_timeout_secs: 10,
-            cmd_timeout_secs: 10,
-            max_test_fix_attempts: 3,
-            max_fix_rounds: 3,
-            verdict_retries: 1,
-            poll_interval_ms: 10,
-        },
-    };
+    let mut config = Config::for_test();
+    config.bind = "127.0.0.1:0".to_string();
+    config.clone_root = "./clones".to_string();
     let state = AppState::new(config, db); // production ClaudePlanningAgent
+    let user = dearborn_server::users::testing::seed_user(
+        &state,
+        "tester",
+        dearborn_server::users::Role::Admin,
+        true,
+    )
+    .await;
+    let token = dearborn_server::sessions::testing::login_as(&state, &user).await;
 
     // Seed a project pointing at the fixture clone, plus a Planning epic.
     let now = 1_700_000_000_000i64;
@@ -134,7 +119,7 @@ async fn live_planning_agent_reads_clone_and_updates_epic_via_mcp() {
             Request::builder()
                 .method("POST")
                 .uri(format!("/epics/{epic_id}/messages"))
-                .header(AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(AUTHORIZATION, format!("Bearer {token}"))
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     serde_json::json!({ "phase": "product", "content": prompt }).to_string(),
@@ -204,32 +189,18 @@ async fn live_technical_planning_reads_clone_and_fills_technical_context() {
 
     let db = Db::connect(":memory:").await.unwrap();
     db.run_migrations().await.unwrap();
-    let config = Config {
-        bind: "127.0.0.1:0".to_string(),
-        token: TOKEN.to_string(),
-        master_key: "test-master-key".to_string(),
-        db_path: ":memory:".to_string(),
-        clone_root: "./clones".to_string(),
-        static_dir: "./client/dist".to_string(),
-        auto_clone: false,
-        argon2_fast: true,
-        auth: AuthConfig {
-            access_ttl_secs: 86_400,
-            refresh_ttl_secs: 15_552_000,
-        },
-        executor: ExecutorConfig {
-            worker_concurrency: 1,
-            lease_ttl_secs: 30,
-            heartbeat_secs: 5,
-            agent_stage_timeout_secs: 10,
-            cmd_timeout_secs: 10,
-            max_test_fix_attempts: 3,
-            max_fix_rounds: 3,
-            verdict_retries: 1,
-            poll_interval_ms: 10,
-        },
-    };
+    let mut config = Config::for_test();
+    config.bind = "127.0.0.1:0".to_string();
+    config.clone_root = "./clones".to_string();
     let state = AppState::new(config, db);
+    let user = dearborn_server::users::testing::seed_user(
+        &state,
+        "tester",
+        dearborn_server::users::Role::Admin,
+        true,
+    )
+    .await;
+    let token = dearborn_server::sessions::testing::login_as(&state, &user).await;
 
     let now = 1_700_000_000_000i64;
     let project_id = ulid::Ulid::new().to_string();
@@ -281,7 +252,7 @@ async fn live_technical_planning_reads_clone_and_fills_technical_context() {
             Request::builder()
                 .method("POST")
                 .uri(format!("/epics/{epic_id}/advance-phase"))
-                .header(AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(AUTHORIZATION, format!("Bearer {token}"))
                 .body(Body::empty())
                 .unwrap(),
         )
@@ -301,7 +272,7 @@ async fn live_technical_planning_reads_clone_and_fills_technical_context() {
             Request::builder()
                 .method("POST")
                 .uri(format!("/epics/{epic_id}/messages"))
-                .header(AUTHORIZATION, format!("Bearer {TOKEN}"))
+                .header(AUTHORIZATION, format!("Bearer {token}"))
                 .header(CONTENT_TYPE, "application/json")
                 .body(Body::from(
                     serde_json::json!({ "phase": "technical", "content": prompt }).to_string(),

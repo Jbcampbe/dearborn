@@ -38,3 +38,4 @@ libc = { workspace = true }
 [dev-dependencies]
 tower = { workspace = true }
 tokio-tungstenite = { workspace = true }
+reqwest = { workspace = true }

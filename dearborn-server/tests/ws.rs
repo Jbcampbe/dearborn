@@ -8,54 +8,30 @@ use std::net::SocketAddr;
 use std::sync::Arc;
 use std::time::Duration;
 
-use dearborn_server::{app, AppState, AuthConfig, Config, Db, ExecutorConfig, Hub};
+use dearborn_server::users::testing::{seed_user, SEED_PASSWORD};
+use dearborn_server::{app, AppState, Config, Db, Hub};
 use futures_util::{SinkExt, StreamExt};
 use serde_json::{json, Value};
 use tokio_tungstenite::connect_async;
 use tokio_tungstenite::tungstenite::Error as WsError;
 use tokio_tungstenite::tungstenite::Message;
 
-const TOKEN: &str = "s3cret-token";
-
-/// Boot the real router on an ephemeral port; return the bound address and a
-/// handle to the shared `Hub` so the test can publish server-side events.
-async fn serve() -> (SocketAddr, Arc<Hub>) {
+/// Boot the real router on an ephemeral port; return the bound address, a
+/// handle to the shared `Hub` so the test can publish server-side events, and
+/// the state (so a test can seed users / mint credentials).
+async fn serve() -> (SocketAddr, Arc<Hub>, AppState) {
     let db = Db::connect(":memory:").await.unwrap();
     db.run_migrations().await.unwrap();
-    let config = Config {
-        bind: "127.0.0.1:0".to_string(),
-        token: TOKEN.to_string(),
-        master_key: "test-master-key".to_string(),
-        db_path: ":memory:".to_string(),
-        clone_root: "./clones".to_string(),
-        static_dir: "./client/dist".to_string(),
-        auto_clone: false,
-        argon2_fast: true,
-        auth: AuthConfig {
-            access_ttl_secs: 86_400,
-            refresh_ttl_secs: 15_552_000,
-        },
-        executor: ExecutorConfig {
-            worker_concurrency: 1,
-            lease_ttl_secs: 30,
-            heartbeat_secs: 5,
-            agent_stage_timeout_secs: 10,
-            cmd_timeout_secs: 10,
-            max_test_fix_attempts: 3,
-            max_fix_rounds: 3,
-            verdict_retries: 1,
-            poll_interval_ms: 10,
-        },
-    };
-    let state = AppState::new(config, db);
+    let state = AppState::new(Config::for_test(), db);
     let hub = state.hub.clone();
 
     let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
     let addr = listener.local_addr().unwrap();
+    let router = app(state.clone());
     tokio::spawn(async move {
-        axum::serve(listener, app(state)).await.unwrap();
+        axum::serve(listener, router).await.unwrap();
     });
-    (addr, hub)
+    (addr, hub, state)
 }
 
 /// Read the next text frame, decoded as JSON, failing if the socket closes or a
@@ -80,8 +56,10 @@ where
 
 #[tokio::test]
 async fn connect_subscribe_and_receive_a_server_pushed_event() {
-    let (addr, hub) = serve().await;
-    let url = format!("ws://{addr}/ws?token={TOKEN}");
+    let (addr, hub, state) = serve().await;
+    let user = seed_user(&state, "josiah", dearborn_server::users::Role::Admin, true).await;
+    let token = dearborn_server::sessions::testing::login_as(&state, &user).await;
+    let url = format!("ws://{addr}/ws?token={token}");
 
     let (mut socket, _resp) = connect_async(&url).await.expect("handshake should succeed");
 
@@ -114,8 +92,10 @@ async fn connect_subscribe_and_receive_a_server_pushed_event() {
 
 #[tokio::test]
 async fn events_only_reach_subscribers_of_that_topic() {
-    let (addr, hub) = serve().await;
-    let url = format!("ws://{addr}/ws?token={TOKEN}");
+    let (addr, hub, state) = serve().await;
+    let user = seed_user(&state, "josiah", dearborn_server::users::Role::Admin, true).await;
+    let token = dearborn_server::sessions::testing::login_as(&state, &user).await;
+    let url = format!("ws://{addr}/ws?token={token}");
     let (mut socket, _resp) = connect_async(&url).await.unwrap();
 
     socket
@@ -138,8 +118,10 @@ async fn events_only_reach_subscribers_of_that_topic() {
 
 #[tokio::test]
 async fn unsubscribe_stops_delivery() {
-    let (addr, hub) = serve().await;
-    let url = format!("ws://{addr}/ws?token={TOKEN}");
+    let (addr, hub, state) = serve().await;
+    let user = seed_user(&state, "josiah", dearborn_server::users::Role::Admin, true).await;
+    let token = dearborn_server::sessions::testing::login_as(&state, &user).await;
+    let url = format!("ws://{addr}/ws?token={token}");
     let (mut socket, _resp) = connect_async(&url).await.unwrap();
 
     socket
@@ -164,7 +146,7 @@ async fn unsubscribe_stops_delivery() {
 
 #[tokio::test]
 async fn unauthenticated_connect_is_rejected() {
-    let (addr, _hub) = serve().await;
+    let (addr, _hub, _state) = serve().await;
 
     // No token at all.
     let url = format!("ws://{addr}/ws");
@@ -173,7 +155,7 @@ async fn unauthenticated_connect_is_rejected() {
         other => panic!("expected 401 handshake rejection, got {other:?}"),
     }
 
-    // Wrong token.
+    // A token that is not a valid signed access token.
     let url = format!("ws://{addr}/ws?token=not-the-token");
     match connect_async(&url).await {
         Err(WsError::Http(resp)) => assert_eq!(resp.status(), 401),
@@ -183,15 +165,17 @@ async fn unauthenticated_connect_is_rejected() {
 
 #[tokio::test]
 async fn authorization_header_also_authenticates() {
-    let (addr, _hub) = serve().await;
+    let (addr, _hub, state) = serve().await;
+    let user = seed_user(&state, "josiah", dearborn_server::users::Role::Admin, true).await;
+    let token = dearborn_server::sessions::testing::login_as(&state, &user).await;
     let url = format!("ws://{addr}/ws");
 
-    // Native clients can present the bearer token via the header instead.
+    // Native clients can present the access token via the header instead.
     use tokio_tungstenite::tungstenite::client::IntoClientRequest;
     let mut request = url.into_client_request().unwrap();
     request
         .headers_mut()
-        .insert("Authorization", format!("Bearer {TOKEN}").parse().unwrap());
+        .insert("Authorization", format!("Bearer {token}").parse().unwrap());
 
     let (mut socket, _resp) = connect_async(request)
         .await
@@ -204,4 +188,79 @@ async fn authorization_header_also_authenticates() {
         .await
         .unwrap();
     assert_eq!(next_json(&mut socket).await["type"], "subscribed");
+}
+
+#[tokio::test]
+async fn garbage_and_expired_tokens_are_rejected_before_upgrade() {
+    let (addr, _hub, state) = serve().await;
+    let user = seed_user(&state, "josiah", dearborn_server::users::Role::Admin, true).await;
+
+    // Garbage: not even shaped like a token.
+    let url = format!("ws://{addr}/ws?token=garbage");
+    match connect_async(&url).await {
+        Err(WsError::Http(resp)) => assert_eq!(resp.status(), 401),
+        other => panic!("expected 401 handshake rejection, got {other:?}"),
+    }
+
+    // Expired: correctly signed by this instance's key, but with an `exp` in
+    // the past.
+    let expired = {
+        let key = dearborn_server::auth::AuthKey::derive("test-master-key").unwrap();
+        key.mint(&dearborn_server::auth::Claims {
+            sub: user.id.clone(),
+            sid: "01JD2Q8BZ4W0N5P9Q3S3U6X0ZB".to_string(),
+            role: dearborn_server::users::Role::Admin,
+            exp: 1_000, // long past
+        })
+    };
+    let url = format!("ws://{addr}/ws?token={expired}");
+    match connect_async(&url).await {
+        Err(WsError::Http(resp)) => assert_eq!(resp.status(), 401),
+        other => panic!("expected 401 handshake rejection, got {other:?}"),
+    }
+}
+
+/// AC5 end-to-end: log in over HTTP like a browser does, then use the returned
+/// access token both for a protected route and for the `/ws` handshake.
+#[tokio::test]
+async fn a_login_issued_access_token_calls_protected_routes_and_opens_the_socket() {
+    let (addr, hub, state) = serve().await;
+    seed_user(&state, "tester", dearborn_server::users::Role::Admin, true).await;
+
+    // POST /auth/login over real HTTP.
+    let client = reqwest::Client::new();
+    let response = client
+        .post(format!("http://{addr}/auth/login"))
+        .json(&json!({ "username": "tester", "password": SEED_PASSWORD }))
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+    let envelope: Value = response.json().await.unwrap();
+    let access_token = envelope["access_token"].as_str().unwrap().to_string();
+
+    // ...it calls a previously token-protected route...
+    let response = client
+        .get(format!("http://{addr}/projects"))
+        .bearer_auth(&access_token)
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), reqwest::StatusCode::OK);
+
+    // ...and it opens the /ws socket.
+    let url = format!("ws://{addr}/ws?token={access_token}");
+    let (mut socket, _resp) = connect_async(&url).await.expect("handshake should succeed");
+    socket
+        .send(Message::Text(
+            json!({ "type": "subscribe", "topic": "project:ac5" }).to_string(),
+        ))
+        .await
+        .unwrap();
+    assert_eq!(next_json(&mut socket).await["type"], "subscribed");
+    assert_eq!(
+        hub.publish("project:ac5", "message", json!({})),
+        1,
+        "the authenticated socket receives publishes"
+    );
 }

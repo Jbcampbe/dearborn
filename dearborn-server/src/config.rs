@@ -5,8 +5,10 @@
 //! `DEARBORN_CONFIG` at a `KEY=VALUE` file (`#` comments and blank lines are
 //! ignored) to use it. Environment variables always win over the file.
 //!
-//! Required values (`DEARBORN_TOKEN`, `DEARBORN_MASTER_KEY`) are validated at
-//! load time so the server fails fast at boot rather than at first request.
+//! The one required value (`DEARBORN_MASTER_KEY`) is validated at load time so
+//! the server fails fast at boot rather than at first request. There is no
+//! bearer-token setting any more: credentials are per-user access tokens minted
+//! by the `/auth/*` routes (see [`crate::auth`] and [`crate::sessions`]).
 
 use std::collections::HashMap;
 
@@ -28,8 +30,6 @@ pub const DEFAULT_STATIC_DIR: &str = "./client/dist";
 pub struct Config {
     /// Address the HTTP server binds to (`DEARBORN_BIND`).
     pub bind: String,
-    /// Single-user bearer token every non-`/health` route requires (`DEARBORN_TOKEN`).
-    pub token: String,
     /// AES-256-GCM key material used to encrypt PATs at rest (`DEARBORN_MASTER_KEY`).
     /// Validated for presence here; consumed by T-102.
     pub master_key: String,
@@ -168,14 +168,13 @@ pub enum ConfigError {
 impl Config {
     /// Resolve configuration from the environment plus an optional config file.
     ///
-    /// Fails fast if `DEARBORN_TOKEN` or `DEARBORN_MASTER_KEY` is missing/empty.
+    /// Fails fast if `DEARBORN_MASTER_KEY` is missing/empty.
     pub fn from_env() -> Result<Config, ConfigError> {
         let file = load_config_file()?;
 
         let bind = resolve(&file, "DEARBORN_BIND")
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| DEFAULT_BIND.to_string());
-        let token = required(&file, "DEARBORN_TOKEN")?;
         let master_key = required(&file, "DEARBORN_MASTER_KEY")?;
         let db_path = expand_tilde(
             resolve(&file, "DEARBORN_DB")
@@ -195,7 +194,6 @@ impl Config {
 
         Ok(Config {
             bind,
-            token,
             master_key,
             db_path,
             clone_root,
@@ -393,13 +391,16 @@ fn parse_config_file(contents: &str) -> HashMap<String, String> {
     map
 }
 
-#[cfg(test)]
 impl Config {
     /// Build a config for tests without touching process-global env.
-    pub fn for_test(token: &str) -> Config {
+    ///
+    /// Unconditionally `pub` (not `#[cfg(test)]`) for the same reason
+    /// [`crate::users::testing`] is: an integration test in `tests/` compiles as
+    /// its own crate and never sees anything gated behind this crate's
+    /// `#[cfg(test)]`.
+    pub fn for_test() -> Config {
         Config {
             bind: DEFAULT_BIND.to_string(),
-            token: token.to_string(),
             master_key: "test-master-key".to_string(),
             db_path: ":memory:".to_string(),
             clone_root: DEFAULT_CLONE_ROOT.to_string(),
@@ -441,8 +442,8 @@ mod tests {
 
     #[test]
     fn parse_ignores_comments_and_blanks() {
-        let map = parse_config_file("# a comment\n\nDEARBORN_TOKEN=abc\n");
-        assert_eq!(map.get("DEARBORN_TOKEN"), Some(&"abc".to_string()));
+        let map = parse_config_file("# a comment\n\nDEARBORN_DB=x.db\n");
+        assert_eq!(map.get("DEARBORN_DB"), Some(&"x.db".to_string()));
         assert_eq!(map.len(), 1);
     }
 
@@ -623,7 +624,7 @@ mod tests {
 
     #[test]
     fn for_test_yields_fast_executor_values() {
-        let cfg = Config::for_test("t");
+        let cfg = Config::for_test();
         assert_eq!(cfg.executor.worker_concurrency, 1);
         assert_eq!(cfg.executor.poll_interval_ms, 10);
         assert_eq!(cfg.executor.lease_ttl_secs, 30);
@@ -638,7 +639,7 @@ mod tests {
 
     #[test]
     fn internal_seams_default_off_in_tests_and_are_not_env_configurable() {
-        let cfg = Config::for_test("t");
+        let cfg = Config::for_test();
         // Neither seam is read from the environment — they exist only as
         // fields, so a `DEARBORN_ARGON2_FAST=1` in the environment is as
         // meaningless as a `DEARBORN_AUTO_CLONE=1`.

@@ -622,7 +622,7 @@ mod tests {
     async fn test_state() -> AppState {
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
-        AppState::new(Config::for_test("s3cret-token"), db)
+        AppState::new(Config::for_test(), db)
     }
 
     /// Assert an error is a `409 Conflict` carrying exactly `message`.

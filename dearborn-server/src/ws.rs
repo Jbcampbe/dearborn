@@ -6,14 +6,20 @@
 //!
 //! ## Authentication
 //!
-//! Browsers cannot set an `Authorization` header on the WS handshake, so the
-//! token is accepted from **either**:
-//!   * the `token` query parameter — `GET /ws?token=<DEARBORN_TOKEN>` (browsers), or
-//!   * an `Authorization: Bearer <DEARBORN_TOKEN>` header (native clients / tools).
+//! Browsers cannot set an `Authorization` header on the WS handshake, so an
+//! access token is accepted from **either**:
+//!   * the `token` query parameter — `GET /ws?token=<access token>` (browsers), or
+//!   * an `Authorization: Bearer <access token>` header (native clients / tools).
 //!
-//! Validation happens **before** the upgrade: a missing/invalid token is rejected
-//! with the standard `401` error envelope and the socket is never opened. `/ws` is
-//! therefore registered outside the header-only auth middleware, which would
+//! The presented token is verified against the instance's signing key
+//! ([`crate::auth::AuthKey`]) — the same stateless HMAC check the HTTP
+//! middleware performs; there is no shared static credential any more.
+//!
+//! Validation happens **before** the upgrade and is **handshake-only**: a
+//! missing/invalid token is rejected with the standard `401` error envelope and
+//! the socket is never opened, but a socket that already opened keeps working
+//! even after its access token expires — only reconnects need a fresh one.
+//! `/ws` is therefore registered outside the auth middleware, which would
 //! otherwise reject every browser handshake.
 //!
 //! ## Protocol
@@ -73,7 +79,10 @@ pub async fn ws_handler(
         .and_then(auth::bearer_token);
     let presented = header_token.or(auth_params.token.as_deref());
 
-    if presented != Some(state.config.token.as_str()) {
+    // Verify the presented access token with the instance's signing key —
+    // stateless (no DB read), exactly like the HTTP middleware.
+    let verified = presented.and_then(|token| state.auth_key.verify(token).ok());
+    if verified.is_none() {
         // Reject before upgrading: no socket is opened for an unauthenticated peer.
         return AppError::Unauthorized.into_response();
     }
