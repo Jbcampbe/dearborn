@@ -150,6 +150,7 @@ async fn live_implement_writes_commits_pushes_to_bare_origin_and_opens_a_fake_pr
         clone_root: clone_root.to_string_lossy().to_string(),
         static_dir: "./client/dist".to_string(),
         auto_clone: false,
+        argon2_fast: true,
         executor: ExecutorConfig {
             worker_concurrency: 1,
             lease_ttl_secs: 300,

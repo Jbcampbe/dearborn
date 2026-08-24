@@ -56,6 +56,7 @@ async fn live_planning_agent_reads_clone_and_updates_epic_via_mcp() {
         clone_root: "./clones".to_string(),
         static_dir: "./client/dist".to_string(),
         auto_clone: false,
+        argon2_fast: true,
         executor: ExecutorConfig {
             worker_concurrency: 1,
             lease_ttl_secs: 30,
@@ -207,6 +208,7 @@ async fn live_technical_planning_reads_clone_and_fills_technical_context() {
         clone_root: "./clones".to_string(),
         static_dir: "./client/dist".to_string(),
         auto_clone: false,
+        argon2_fast: true,
         executor: ExecutorConfig {
             worker_concurrency: 1,
             lease_ttl_secs: 30,

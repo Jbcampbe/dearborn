@@ -28,6 +28,7 @@ pub mod projects;
 pub mod spec;
 pub mod task_agent;
 pub mod tasks;
+pub mod users;
 pub mod worker;
 pub mod workspace;
 pub mod ws;

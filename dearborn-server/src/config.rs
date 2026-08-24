@@ -44,6 +44,18 @@ pub struct Config {
     /// (T-103). Always `true` in production; tests default it `false` so plain
     /// CRUD tests never shell out to git. Not env-configurable — an internal seam.
     pub auto_clone: bool,
+    /// Whether password hashing uses deliberately weak Argon2id parameters
+    /// (m=8 KiB, t=1, p=1) instead of the production cost. Always `false` in
+    /// production; tests default it `true`. Not env-configurable — an internal
+    /// seam, exactly like [`auto_clone`](Self::auto_clone).
+    ///
+    /// Production Argon2id burns ~40–60 ms of CPU per hash by design. That is
+    /// the point in production and pure tax in a test suite that seeds a user
+    /// per case, so the test config selects the cheapest legal parameters. The
+    /// PHC string records whichever parameters produced it, so a hash written
+    /// under either setting still verifies under the other. See
+    /// [`crate::users::hash_password`].
+    pub argon2_fast: bool,
     /// Executor worker-pool tuning (Milestone 2 §2.7). See [`ExecutorConfig`].
     pub executor: ExecutorConfig,
 }
@@ -162,6 +174,7 @@ impl Config {
             clone_root,
             static_dir,
             auto_clone: true,
+            argon2_fast: false,
             executor,
         })
     }
@@ -349,6 +362,8 @@ impl Config {
             // Plain CRUD tests must not shell out to git; T-103 tests that
             // exercise cloning flip this on explicitly.
             auto_clone: false,
+            // Seeding a user per test case must not cost ~50ms of Argon2.
+            argon2_fast: true,
             executor: ExecutorConfig {
                 // 1 worker + a 10ms poll keep tests deterministic and fast.
                 worker_concurrency: 1,
@@ -538,5 +553,19 @@ mod tests {
         assert_eq!(cfg.executor.max_test_fix_attempts, 3);
         assert_eq!(cfg.executor.max_fix_rounds, 3);
         assert_eq!(cfg.executor.verdict_retries, 1);
+    }
+
+    #[test]
+    fn internal_seams_default_off_in_tests_and_are_not_env_configurable() {
+        let cfg = Config::for_test("t");
+        // Neither seam is read from the environment — they exist only as
+        // fields, so a `DEARBORN_ARGON2_FAST=1` in the environment is as
+        // meaningless as a `DEARBORN_AUTO_CLONE=1`.
+        assert!(!cfg.auto_clone);
+        assert!(
+            cfg.argon2_fast,
+            "tests must not pay production Argon2 cost per seeded user"
+        );
+        assert!(!EXECUTOR_VAR_NAMES.contains(&"DEARBORN_ARGON2_FAST"));
     }
 }

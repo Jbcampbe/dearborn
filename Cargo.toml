@@ -25,6 +25,10 @@ tower-http = { version = "0.6", features = ["trace", "fs"] }
 tracing = "0.1"
 tracing-subscriber = { version = "0.3", features = ["env-filter"] }
 aes-gcm = "0.10"
+# Argon2id password hashing (RustCrypto, same family as aes-gcm/sha2 — pure
+# Rust, no C toolchain). Stores the PHC string so cost parameters travel with
+# each hash. See dearborn-server/src/users.rs.
+argon2 = "0.5"
 sha2 = "0.10"
 base64 = "0.22"
 # GitHub API client for T-514's GitHost (push + PR). rustls (not native-tls /

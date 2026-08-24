@@ -30,6 +30,7 @@ async fn serve() -> (SocketAddr, Arc<Hub>) {
         clone_root: "./clones".to_string(),
         static_dir: "./client/dist".to_string(),
         auto_clone: false,
+        argon2_fast: true,
         executor: ExecutorConfig {
             worker_concurrency: 1,
             lease_ttl_secs: 30,
