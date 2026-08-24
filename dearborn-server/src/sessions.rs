@@ -546,7 +546,6 @@ mod tests {
     use axum::body::Body;
     use axum::http::Request;
     use axum::Router;
-    use base64::Engine as _;
     use serde_json::{json, Value};
     use tower::ServiceExt; // for `oneshot`
 
