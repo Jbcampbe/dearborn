@@ -243,6 +243,74 @@ pub async fn close_stage(
     Ok(())
 }
 
+// ---- boot-time orphan reconciliation --------------------------------------
+
+/// The log note stamped into every row [`cancel_orphaned_running`] closes.
+/// Written into the evidence trail (not just the status column) so a human
+/// reading the run later sees *why* a stage that streamed real work ends in
+/// `cancelled` with no matching user action — the exact confusion behind
+/// "the UI showed two implementation agents": a server restart mid-stage
+/// left the old row `running` forever next to the new owner's fresh one.
+pub const ORPHANED_RUNNING_NOTE: &str =
+    "[dearborn: this stage was still marked running when the server booted — \
+     the process that owned it went away mid-run; closed as cancelled]";
+
+/// Close every `agent_run` row still `status='running'` as `cancelled`,
+/// appending [`ORPHANED_RUNNING_NOTE`] to each closed row's log. Called once
+/// at boot, right after [`crate::worker::clear_all_leases`]: under Dearborn's
+/// single-server assumption nothing can legitimately hold an open stage
+/// across a restart, so any `running` row at boot is by definition an
+/// orphan of a crashed/killed previous process — the agent it belonged to is
+/// gone and nothing else would ever write its terminal fields. Without this,
+/// the stale row sits next to the new owner's fresh attempt forever, and a
+/// task detail view presents both as live agents.
+///
+/// Returns the number of rows reconciled (0 on the common clean-restart
+/// path). Best-effort at the call site: a failure here logs but must not
+/// block boot — the lease machinery already guarantees correctness; this is
+/// purely evidence hygiene.
+pub async fn cancel_orphaned_running(conn: &Connection) -> Result<u64, libsql::Error> {
+    let now = now_ms();
+    conn.execute(
+        "UPDATE agent_run SET status = 'cancelled', ended_at = ?1, \
+         log = CASE WHEN log = '' THEN ?2 ELSE log || char(10) || ?2 END \
+         WHERE status = 'running'",
+        params![now, ORPHANED_RUNNING_NOTE],
+    )
+    .await
+}
+
+// ---- attempt numbering -----------------------------------------------------
+
+/// Next `attempt` value for (`task_id`, `stage`): one past the highest
+/// attempt already recorded for that pair, or 1 for a first-ever run.
+///
+/// Stages whose caller drives its own counter (review rounds, fix rounds,
+/// test-gate attempts) don't use this — but the initial implement stage used
+/// to hardcode `attempt = 1`, which made every re-run of a previously
+/// attempted task (a failed stage reset to Todo, or an orphaned InProgress
+/// task reset by a new owner after a crash) read as another indistinguishable
+/// "Attempt 1" in the timeline. Computing the number from the table instead
+/// makes a re-run honestly read "Attempt 2" without any pipeline state.
+pub async fn next_attempt(
+    conn: &Connection,
+    task_id: &str,
+    stage: &str,
+) -> Result<i64, libsql::Error> {
+    let mut rows = conn
+        .query(
+            "SELECT COALESCE(MAX(attempt), 0) + 1 FROM agent_run \
+             WHERE task_id = ?1 AND stage = ?2",
+            params![task_id, stage],
+        )
+        .await?;
+    let row = rows
+        .next()
+        .await?
+        .expect("a MAX aggregate always returns exactly one row");
+    row.get::<i64>(0)
+}
+
 /// Set `agent_run.verdict` on an **already-closed** row (T-530). A review (or
 /// future verify-complete) stage's caller only learns the D9 verdict by
 /// parsing [`crate::task_agent::AgentStageOutcome::text`] *after*
@@ -549,6 +617,144 @@ mod tests {
         let capped = cap_log(&log);
         assert!(capped.len() <= LOG_CAP_BYTES);
         assert!(capped.contains("elided"));
+    }
+
+    // ---- boot-time orphan reconciliation -----------------------------------
+
+    #[tokio::test]
+    async fn cancel_orphaned_running_closes_only_running_rows() {
+        let db = seeded_db().await;
+        let conn = db.conn();
+
+        let open = |stage: &'static str, attempt: i64| {
+            let conn = conn.clone();
+            async move {
+                open_stage(
+                    &conn,
+                    OpenStage {
+                        task_id: Some("task-1"),
+                        epic_id: Some("epic-1"),
+                        stage,
+                        attempt,
+                        harness: None,
+                        model: None,
+                        prompt_hash: None,
+                    },
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        // The orphan the reconciliation exists for: mid-flight, log already
+        // partially flushed.
+        let orphan_with_log = open("implement", 1).await;
+        flush_stage_log(conn, &orphan_with_log, "half a transcript")
+            .await
+            .unwrap();
+        // Second orphan whose log was never flushed (empty-log branch).
+        let orphan_empty_log = open("review", 0).await;
+        // A row that already reached a terminal state must be untouched.
+        let already_closed = open("fix", 1).await;
+        close_stage(
+            conn,
+            &already_closed,
+            CloseStage {
+                status: "ok",
+                session_id: Some("sess-7".to_string()),
+                verdict: None,
+                exit_code: Some(0),
+                log: "done normally".to_string(),
+            },
+        )
+        .await
+        .unwrap();
+
+        let closed = cancel_orphaned_running(conn).await.unwrap();
+        assert_eq!(closed, 2, "exactly the two `running` rows close");
+
+        let row = fetch_run_detail(conn, &orphan_with_log.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.summary.status, "cancelled");
+        assert!(row.summary.ended_at.is_some());
+        assert_eq!(
+            row.log,
+            format!("half a transcript\n{ORPHANED_RUNNING_NOTE}"),
+            "the note is appended to a flushed log"
+        );
+
+        let empty = fetch_run_detail(conn, &orphan_empty_log.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(empty.summary.status, "cancelled");
+        assert_eq!(empty.log, ORPHANED_RUNNING_NOTE);
+
+        let untouched = fetch_run_detail(conn, &already_closed.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(untouched.summary.status, "ok");
+        assert_eq!(untouched.log, "done normally");
+    }
+
+    #[tokio::test]
+    async fn cancel_orphaned_running_is_a_noop_when_nothing_runs() {
+        let db = seeded_db().await;
+        let n = cancel_orphaned_running(db.conn()).await.unwrap();
+        assert_eq!(n, 0);
+    }
+
+    // ---- attempt numbering -------------------------------------------------
+
+    #[tokio::test]
+    async fn next_attempt_is_one_past_the_highest_recorded_attempt() {
+        let db = seeded_db().await;
+        let conn = db.conn();
+        let open = |stage: &'static str, attempt: i64| {
+            let conn = conn.clone();
+            async move {
+                open_stage(
+                    &conn,
+                    OpenStage {
+                        task_id: Some("task-1"),
+                        epic_id: Some("epic-1"),
+                        stage,
+                        attempt,
+                        harness: None,
+                        model: None,
+                        prompt_hash: None,
+                    },
+                )
+                .await
+                .unwrap()
+            }
+        };
+
+        // A first-ever implement run is attempt 1...
+        assert_eq!(next_attempt(conn, "task-1", "implement").await.unwrap(), 1);
+        open("implement", 1).await;
+        // ...and after prior attempts exist (a re-run of a reset task), one
+        // past the highest — not another indistinguishable 1.
+        open("implement", 2).await;
+        assert_eq!(next_attempt(conn, "task-1", "implement").await.unwrap(), 3);
+
+        // Attempt counters are per (task, stage): review's rows don't leak
+        // into implement's numbering.
+        open("review", 0).await;
+        open("review", 1).await;
+        assert_eq!(next_attempt(conn, "task-1", "review").await.unwrap(), 2);
+        // A different task counts from scratch even at the same stage.
+        conn.execute(
+            "INSERT INTO task (id, epic_id, project_id, title, status, position, created_at, updated_at) \
+             VALUES ('task-2', 'epic-1', 'proj-1', 'T2', 'Todo', 2, 0, 0)",
+            (),
+        )
+        .await
+        .unwrap();
+        assert_eq!(next_attempt(conn, "task-2", "implement").await.unwrap(), 1);
     }
 
     // ---- open_stage / flush_stage_log / close_stage -----------------------

@@ -217,7 +217,10 @@ application-level mutex. Once claimed, a **heartbeat** renews the lease every
 `DEARBORN_HEARTBEAT_SECS` with a fenced write (`WHERE lease_owner = ?`) — if
 another worker's claim has already stolen the row, the fenced write affects
 zero rows, which is the sole signal the heartbeat needs to know its own lease
-is gone; it stops renewing and the pipeline body abandons the item at its next
+is gone; it stops renewing, kills any in-flight agent stage it owns (a
+`RunControl::cancel()` against the stage's handle in the cancel registry — a
+fenced-out walk must not leave an agent editing the workspace alongside the
+new owner's own re-run), and the pipeline body abandons the item at its next
 check, making no further writes.
 
 A lease's expiry (`DEARBORN_LEASE_TTL_SECS`, default `300`s) is purely
@@ -230,7 +233,11 @@ restart resumes in-flight work on the very first poll/notify instead of
 waiting out however much of the TTL happened to elapse. A dead worker's
 `InProgress` task (abandoned mid-flight, never finished) is reset to `Todo` as
 part of the next successful claim on its epic, so the DAG walk picks it back
-up rather than leaving it stuck.
+up rather than leaving it stuck. Boot also **reconciles the evidence table**:
+every `agent_run` row still `running` belongs to a stage whose owning process
+died, so each is closed as `cancelled` with an explanatory note appended to
+its log — without this, a restart mid-stage would leave a zombie `running`
+row sitting next to the re-run's fresh attempt in a task's pipeline view.
 
 ### Workspaces
 

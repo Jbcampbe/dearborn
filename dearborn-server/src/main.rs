@@ -1,6 +1,6 @@
 //! Dearborn server binary entrypoint.
 
-use dearborn_server::{app, init_tracing, worker, AppState, Config, Db, MasterKey};
+use dearborn_server::{app, evidence, init_tracing, worker, AppState, Config, Db, MasterKey};
 
 #[tokio::main]
 async fn main() {
@@ -48,6 +48,27 @@ async fn main() {
     // in-flight work. Must run before `spawn_pool` claims anything.
     if let Err(err) = worker::clear_all_leases(&db).await {
         tracing::warn!(error = %err, "boot: failed to clear stale leases");
+    }
+
+    // Boot-time evidence reconciliation: any `agent_run` row still `running`
+    // belonged to a stage owned by the previous process — under the same
+    // single-server assumption as the lease clear above, nothing can
+    // legitimately hold an open stage across a restart, and its agent is
+    // gone. Closing those rows here is what keeps a task's pipeline view from
+    // presenting a dead run's zombie `running` row next to the new owner's
+    // fresh attempt (i.e. "two implementation agents" for one task).
+    match evidence::cancel_orphaned_running(db.conn()).await {
+        Ok(0) => {}
+        Ok(n) => tracing::info!(
+            rows = n,
+            "boot: closed orphaned running agent runs as cancelled"
+        ),
+        Err(err) => {
+            // Best-effort hygiene only: correctness comes from the lease
+            // clear + the claim path's own orphan reset; a failure must not
+            // block boot.
+            tracing::warn!(error = %err, "boot: failed to close orphaned running agent runs");
+        }
     }
 
     let addr = config.bind.clone();

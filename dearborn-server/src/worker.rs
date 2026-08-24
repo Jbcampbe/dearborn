@@ -1756,6 +1756,24 @@ async fn renew_task_lease_once(
 /// fenced out). The caller (`try_claim_and_run`) aborts the returned handle
 /// when the item is released, on every exit path — see the module docs' "no
 /// reaper" note for why there is nothing else watching leases.
+///
+/// ## Fence-out is a kill, not just an abandonment
+///
+/// A fenced-out heartbeat means another owner now holds this item — and if
+/// an agent stage is still in flight, that stage's process must die *now*.
+/// Merely marking [`LeaseHandle`] lost left the walk oblivious until its
+/// current stage returned, which for a long implement run meant the old
+/// agent kept editing the workspace alongside (or after) the new owner's own
+/// re-run. So on fence-out we also call `RunControl::cancel()` on whatever
+/// handle the cancel registry holds under this item's id
+/// (`task_agent::cancel_registry_key`'s contract: epic id for an epic's
+/// walk, task id for a standalone claim — exactly what [`LeaseTable`] +
+/// `id` name here). Finding nothing registered is the correct silent no-op
+/// (no stage in flight — e.g. between tasks, or after the body finished).
+/// The cancelled stage's outcome flows back through `run_agent_stage` →
+/// `route_stage_failure`, which already knows how to route a cancellation
+/// without failing the task.
+#[allow(clippy::too_many_arguments)]
 fn spawn_heartbeat_generic(
     conn: Connection,
     table: LeaseTable,
@@ -1764,6 +1782,7 @@ fn spawn_heartbeat_generic(
     period: Duration,
     lease_ttl_secs: u64,
     lease: LeaseHandle,
+    cancel_registry: Arc<task_agent::CancelRegistry>,
 ) -> JoinHandle<()> {
     tokio::spawn(async move {
         loop {
@@ -1776,6 +1795,35 @@ fn spawn_heartbeat_generic(
                         table = table.as_str(),
                         worker = %worker_id,
                         "heartbeat: lease fenced out (0 rows affected); abandoning"
+                    );
+                    // Fence-out is a kill — see this function's doc. Registry
+                    // lookup is cheap and unconditional; finding nothing is
+                    // the normal no-stage-in-flight case. Fire-and-forget,
+                    // mirroring lanes.rs's T-542 cancel: never wait on the
+                    // kill itself.
+                    let cancelled = {
+                        let registry = cancel_registry
+                            .lock()
+                            .expect("cancel_registry mutex poisoned");
+                        match registry.get(&id) {
+                            Some(handle) => {
+                                if let Err(err) = handle.cancel() {
+                                    tracing::warn!(
+                                        item = %id,
+                                        error = %err,
+                                        "heartbeat fence-out: RunControl::cancel() failed \
+                                         (best-effort; the walk's lease.is_lost() checks remain)"
+                                    );
+                                }
+                                true
+                            }
+                            None => false,
+                        }
+                    };
+                    tracing::info!(
+                        item = %id,
+                        cancelled,
+                        "heartbeat: fenced out; in-flight stage killed"
                     );
                     lease.mark_lost();
                     return;
@@ -1804,6 +1852,7 @@ fn spawn_heartbeat(
     period: Duration,
     lease_ttl_secs: u64,
     lease: LeaseHandle,
+    cancel_registry: Arc<task_agent::CancelRegistry>,
 ) -> JoinHandle<()> {
     spawn_heartbeat_generic(
         conn,
@@ -1813,6 +1862,7 @@ fn spawn_heartbeat(
         period,
         lease_ttl_secs,
         lease,
+        cancel_registry,
     )
 }
 
@@ -1826,6 +1876,7 @@ fn spawn_task_heartbeat(
     period: Duration,
     lease_ttl_secs: u64,
     lease: LeaseHandle,
+    cancel_registry: Arc<task_agent::CancelRegistry>,
 ) -> JoinHandle<()> {
     spawn_heartbeat_generic(
         conn,
@@ -1835,6 +1886,7 @@ fn spawn_task_heartbeat(
         period,
         lease_ttl_secs,
         lease,
+        cancel_registry,
     )
 }
 
@@ -2011,6 +2063,7 @@ async fn run_claimed_epic(
         Duration::from_secs(state.config.executor.heartbeat_secs.max(1)),
         state.config.executor.lease_ttl_secs,
         lease.clone(),
+        state.cancel_registry.clone(),
     );
 
     // Run the body in its own task: isolates a panic from this long-lived
@@ -2067,6 +2120,7 @@ async fn run_claimed_standalone(
         Duration::from_secs(state.config.executor.heartbeat_secs.max(1)),
         state.config.executor.lease_ttl_secs,
         lease.clone(),
+        state.cancel_registry.clone(),
     );
 
     let body_state = state.clone();
@@ -2495,6 +2549,46 @@ enum TaskStepOutcome {
     Stop,
 }
 
+/// This task's next `Stage::Implement` attempt number ([`evidence::next_attempt`
+///]: one past the highest recorded, so a re-run of a previously-attempted task
+/// reads "Attempt 2", never a second indistinguishable "Attempt 1"), or the
+/// standard `agent_error` failure route. A whole-future box exactly like
+/// [`resolve_or_fail`] — same rationale: keeping the lookup *and* [`fail_item`]'s
+/// own sizeable future out of [`process_one_task`]'s generator layout and polled
+/// stack depth (that function sits at the bottom of every overflow margin this
+/// suite has ever hit). `Err(())` means the failure was routed — stop writing.
+#[allow(clippy::too_many_arguments)]
+fn next_implement_attempt_or_fail<'a>(
+    state: &'a AppState,
+    conn: &'a Connection,
+    epic_id: Option<&'a str>,
+    task_id: &'a str,
+    workspace: &'a ProvisionedWorkspace,
+    lease: &'a LeaseHandle,
+) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<i64, ()>> + Send + 'a>> {
+    Box::pin(async move {
+        match evidence::next_attempt(conn, task_id, Stage::Implement.as_str()).await {
+            Ok(n) => Ok(n),
+            Err(err) => {
+                if !lease.is_lost() {
+                    fail_item(
+                        state,
+                        FailureContext {
+                            epic_id,
+                            task_id: Some(task_id),
+                            reason: FailureReason::AgentError,
+                            message: &format!("failed to compute next attempt number: {err}"),
+                            push: PushIntent::Attempt(workspace),
+                        },
+                    )
+                    .await;
+                }
+                Err(())
+            }
+        }
+    })
+}
+
 /// `git add -A` + commit **iff** there is something to commit, opening the
 /// §2.2 `Stage::Commit` evidence row only when a commit actually happens
 /// (D13: every stage that *runs* gets a row, not every stage that could
@@ -2688,7 +2782,19 @@ async fn process_one_task(
     };
     let prompt = task_agent::assemble_prompt_text(&implement_cfg.prompt, &task_ctx);
 
-    // 3. Run the implement stage through the TaskAgent seam.
+    // 3. Run the implement stage through the TaskAgent seam. The attempt
+    //    number is computed, not hardcoded: one past whatever `implement`
+    //    attempts this task already has, so a re-run of a previously
+    //    attempted task (a failed stage reset to Todo, or an orphaned
+    //    InProgress task reset by a new owner after a crash/restart) reads
+    //    "Attempt 2" in the timeline instead of a second indistinguishable
+    //    "Attempt 1" sitting next to the first one.
+    let implement_attempt =
+        match next_implement_attempt_or_fail(state, conn, epic_id, task_id, workspace, lease).await
+        {
+            Ok(n) => n,
+            Err(()) => return TaskStepOutcome::Stop,
+        };
     let run_id = ulid::Ulid::new().to_string();
     let req = TaskRunRequest {
         run_id,
@@ -2705,7 +2811,7 @@ async fn process_one_task(
         AgentStageParams {
             task_id: Some(task_id),
             epic_id,
-            attempt: 1,
+            attempt: implement_attempt,
         },
         req,
     )
@@ -6529,6 +6635,7 @@ mod tests {
             Duration::from_millis(15),
             30,
             lease.clone(),
+            state.cancel_registry.clone(),
         );
 
         // Steal the lease.
@@ -6551,6 +6658,93 @@ mod tests {
         }
 
         handle.abort();
+    }
+
+    /// T-565: a fenced-out heartbeat must **kill** any in-flight agent stage
+    /// it owns — not just flag the lease lost. A gated `ScriptedTaskAgent`
+    /// run stands in for the real in-flight stage; its handle sits in the
+    /// cancel registry under the claimed item's id exactly as
+    /// `task_agent::CancelGuard` would hold it while the stage ran. After the
+    /// lease is stolen out from under the heartbeat, that registered handle
+    /// must observe `was_cancelled()` within one heartbeat period.
+    #[tokio::test]
+    async fn spawn_heartbeat_fence_out_cancels_a_registered_in_flight_handle() {
+        use crate::planning::testing::Gate;
+        use crate::task_agent::testing::ScriptedTaskAgent;
+        use crate::task_agent::{Stage, TaskAgent, TaskRunRequest};
+
+        let (state, _app) = test_app().await;
+        let project_id = seed_project(&state).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let conn = state.db.conn();
+        conn.execute(
+            "UPDATE epic SET lease_owner = 'me', lease_expires_at = ?1 WHERE id = ?2",
+            params![now_ms() + 60_000, epic_id.clone()],
+        )
+        .await
+        .unwrap();
+
+        // The in-flight stage: gated so it never reaches Exited on its own.
+        let gate = Arc::new(Gate::default());
+        let agent = ScriptedTaskAgent::new().with_gate(gate.clone());
+        let (handle, rx) = agent
+            .run(TaskRunRequest {
+                run_id: "run-fence-out-cancel".to_string(),
+                stage: Stage::Implement,
+                prompt: "go".to_string(),
+                cwd: std::env::temp_dir(),
+                harness: "claude".to_string(),
+                model: None,
+                prompt_hash: "test-prompt-hash".to_string(),
+            })
+            .unwrap();
+        state
+            .cancel_registry
+            .lock()
+            .unwrap()
+            .insert(epic_id.clone(), handle);
+
+        let lease = LeaseHandle::new();
+        let hb = spawn_heartbeat(
+            state.db.conn().clone(),
+            epic_id.clone(),
+            "me".to_string(),
+            Duration::from_millis(15),
+            30,
+            lease.clone(),
+            state.cancel_registry.clone(),
+        );
+
+        // Steal the lease.
+        conn.execute(
+            "UPDATE epic SET lease_owner = 'thief' WHERE id = ?1",
+            params![epic_id.clone()],
+        )
+        .await
+        .unwrap();
+
+        // The fenced-out heartbeat must have cancelled the registered handle
+        // within one period (bounded deadline poll per suite convention).
+        let registry = state.cancel_registry.clone();
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let was_cancelled = {
+                let map = registry.lock().unwrap();
+                map.get(&epic_id).map(|h| h.was_cancelled())
+            };
+            if was_cancelled == Some(true) {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("fenced-out heartbeat never cancelled the in-flight stage");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        assert!(lease.is_lost(), "fence-out must also flag the lease lost");
+
+        hb.abort();
+        gate.release();
+        drop(rx);
     }
 
     // ---- T-510: boot-time lease clear ----
@@ -6803,6 +6997,7 @@ mod tests {
             Duration::from_millis(15),
             30,
             lease.clone(),
+            state.cancel_registry.clone(),
         );
 
         conn.execute(
@@ -8352,8 +8547,7 @@ mod tests {
             .unwrap();
         // The standalone claim predicate only ever selects `InProgress`
         // (§2.4) — seed it claim-ready.
-        let task_id =
-            seed_standalone_task(&state, &project_id, "Solo", "InProgress").await;
+        let task_id = seed_standalone_task(&state, &project_id, "Solo", "InProgress").await;
 
         run_standalone_pipeline(state.clone(), task_id.clone()).await;
 
