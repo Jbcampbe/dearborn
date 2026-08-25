@@ -6,10 +6,10 @@ default:
 
 # Run the Rust backend alone.
 #
-# Required env vars (`DEARBORN_TOKEN`, `DEARBORN_MASTER_KEY`) are sourced from a
-# gitignored `.env` in the repo root if one exists; otherwise sensible dev
-# defaults are used so `just backend` works out of the box. Any var already
-# exported in your shell wins over both. See `.env.example`.
+# The one required env var (`DEARBORN_MASTER_KEY`) is sourced from a gitignored
+# `.env` in the repo root if one exists; otherwise sensible dev defaults are
+# used so `just backend` works out of the box. Any var already exported in your
+# shell wins over both. See `.env.example`.
 backend:
     #!/usr/bin/env bash
     set -euo pipefail
@@ -19,10 +19,9 @@ backend:
         . ./.env
         set +a
     fi
-    : "${DEARBORN_TOKEN:=dev-token}"
     : "${DEARBORN_MASTER_KEY:=dev-master-key}"
     : "${DEARBORN_BIND:=127.0.0.1:8787}"
-    export DEARBORN_TOKEN DEARBORN_MASTER_KEY DEARBORN_BIND
+    export DEARBORN_MASTER_KEY DEARBORN_BIND
     # cargo run -p dearborn-server
     cargo watch -x run
 

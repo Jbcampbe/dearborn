@@ -6,10 +6,70 @@ The contract every handler (T-101+) must follow. Established in T-004.
 
 - **Base:** all endpoints are served by the Dearborn binary over HTTP. TLS is
   terminated by the operator's reverse proxy (not by Dearborn).
-- **Auth:** every route **except `GET /health`** requires
-  `Authorization: Bearer <DEARBORN_TOKEN>`. A missing/invalid token yields `401`
-  with the standard error envelope (see below). `/health` is public.
+- **Auth:** Dearborn has named users with username + password login. There is
+  no shared static credential. A successful `POST /auth/login` (or first-launch
+  `POST /auth/setup`) returns a **session envelope**: a short-lived signed
+  **access token** (`DEARBORN_ACCESS_TTL_SECS`, default 86400 s = 24 h) plus a
+  long-lived opaque **refresh token** (`DEARBORN_REFRESH_TTL_SECS`, default
+  15552000 s = 180 days).
+  - The **access token** is self-contained (`v1.<payload>.<HMAC-SHA256>`,
+    HMAC key derived from `DEARBORN_MASTER_KEY`), so authenticating a request
+    costs no database read. Every route **except `GET /health`, `/auth/status`,
+    `/auth/setup`, `/auth/login`, `/auth/refresh`, and `/ws`/`/mcp/:cap`
+    (which authenticate themselves)** requires it:
+    `Authorization: Bearer <access token>` on HTTP, `?token=` on the `/ws`
+    handshake. A missing/expired/garbage token yields `401`; if the instance
+    has no users yet, the same routes yield `401 setup_required` instead.
+  - The **refresh token** is stateful — its SHA-256 hash is a `session` row.
+    `POST /auth/refresh` re-reads the user's `active` flag and role, so user
+    deactivation, demotion, and password resets take effect at refresh time at
+    the latest (bounded by the access-token lifetime). Revocation of a live
+    access token mid-flight is therefore *eventual* by design.
+  - Admin-only routes additionally re-read the caller's user row per request,
+    so a stale token can never keep exercising admin privilege.
 - **Content type:** requests and responses are `application/json` (UTF-8).
+
+### Authentication routes
+
+Public (outside the auth layer — these are how a caller *gets* a credential):
+
+| Action | Method + path | Body | Success status |
+| ------ | ------------- | ---- | -------------- |
+| boot probe: is setup needed? | `GET /auth/status` | — | `200` (`{"setup_required": bool}`) |
+| claim a fresh instance (creates the first admin) | `POST /auth/setup` | `{username, display_name, password}` | `201` (session envelope); `409` once any user exists |
+| log in | `POST /auth/login` | `{username, password}` | `200` (session envelope); `401 invalid_credentials` on unknown username / wrong password / deactivated account — always byte-identical |
+| exchange the refresh token for a new access token | `POST /auth/refresh` | `{refresh_token}` | `200` (`{access_token, expires_at, user}`); `401` on unknown/expired/revoked/inactive |
+
+Authenticated (behind the access-token layer):
+
+| Action | Method + path | Body | Success status |
+| ------ | ------------- | ---- | -------------- |
+| who am I (fresh user row for the UI) | `GET /auth/me` | — | `200` (user) |
+| end this device's session | `POST /auth/logout` | — | `204` (revokes the presented token's session id) |
+| change own password | `POST /auth/password` | `{current_password, new_password}` | `204`; `400` on a wrong current password or policy violation; revokes all other sessions |
+
+The session envelope is `{ "access_token", "expires_at", "refresh_token",
+"refresh_expires_at", "user": {id, username, display_name, role, active} }`.
+`password_hash` is never serialized.
+
+### User management (admin)
+
+Admin-only; every route re-reads the caller's row and requires an **active
+admin**, so a regular user gets `403 forbidden` (never `404`) even while their
+stale token is still live:
+
+| Action | Method + path | Body | Success status |
+| ------ | ------------- | ---- | -------------- |
+| list users | `GET /users` | — | `200` (`items`) |
+| create a user | `POST /users` | `{username, display_name, password, role}` | `201` (user); `409` on duplicate username |
+| edit a user (display name / role / active) | `PATCH /users/{id}` | `{display_name?, role?, active?}` | `200` (user) |
+| reset another user's password | `POST /users/{id}/password` | `{password}` | `204`; revokes all that user's sessions |
+
+Lockout guards (all store-level, so no handler can forget them): deactivating
+or demoting the **last active admin** fails `409` with a specific message, and
+an admin cannot deactivate their own account (`409`). Passwords are minimum
+12 characters (counted in characters, not bytes), no composition rules;
+deactivated users are rows kept forever with `active = 0`, never deleted.
 
 ## Route naming
 
@@ -438,8 +498,8 @@ rest live over WS with no gap.
 ## Identifiers & timestamps
 
 - **IDs** are opaque strings (ULID/UUID) generated server-side.
-- **Timestamps** are integers: unix **milliseconds** (matches the `*_at` and
-  `lease_expires_at` columns in the §2.2 schema).
+- **Timestamps** are integers: unix **milliseconds** (matches the `*_at`,
+  `expires_at`, and `lease_expires_at` columns in the §2.2 schema).
 
 ## Success responses
 
@@ -476,7 +536,10 @@ envelope:
 | `AppError` variant | HTTP status | `code`         | When                                            |
 | ------------------ | ----------- | -------------- | ----------------------------------------------- |
 | `BadRequest`       | `400`       | `bad_request`  | Malformed body / failed validation.             |
-| `Unauthorized`     | `401`       | `unauthorized` | Missing or invalid bearer token.                |
+| `Unauthorized`     | `401`       | `unauthorized` | Missing, invalid, or expired bearer token.      |
+| `InvalidCredentials` | `401`     | `invalid_credentials` | Login failed — identical body for unknown username, wrong password, and deactivated account (no information leaked). |
+| `SetupRequired`    | `401`       | `setup_required` | The instance has zero users; claim it via `POST /auth/setup`. Returned in place of plain `401 unauthorized` from protected routes while unclaimed. |
+| `Forbidden`        | `403`       | `forbidden`    | Authenticated but lacking the required privilege (admin-only `/users` routes, including a deactivated/demoted former admin with a live token). |
 | `NotFound`         | `404`       | `not_found`    | Addressed resource does not exist.              |
 | `Conflict`         | `409`       | `conflict`     | Conflicts with current state (dup, DAG cycle…). |
 | `Internal`         | `500`       | `internal`     | Unexpected server-side failure (detail hidden). |
@@ -495,16 +558,21 @@ Server-side code publishes through the shared `Hub` on `AppState`.
 ### Handshake auth
 
 A browser cannot set an `Authorization` header on a WebSocket handshake, so `/ws`
-accepts the bearer token from **either**:
+accepts an **access token** from **either**:
 
-- the query string — `GET /ws?token=<DEARBORN_TOKEN>` (browsers), **or**
-- an `Authorization: Bearer <DEARBORN_TOKEN>` header (native clients / tests).
+- the query string — `GET /ws?token=<access token>` (browsers), **or**
+- an `Authorization: Bearer <access token>` header (native clients / tests).
 
-The token is validated **before** the upgrade. An absent/invalid token is
-rejected with a `401` and the standard error envelope — the socket is never
-opened. Because of the query-param path, `/ws` is registered **outside** the
-header-only bearer middleware (which would reject every browser handshake);
-it does its own token check in the handler.
+The presented token is verified against the instance's signing key — the same
+stateless HMAC check the HTTP auth middleware performs; there is no shared
+static credential. The token is validated **before** the upgrade. An
+absent/invalid token is rejected with a `401` and the standard error envelope —
+the socket is never opened. Validation is **handshake-only**: a socket that has
+already opened keeps working even after its access token expires; only
+reconnects need a fresh one (clients call `POST /auth/refresh` first). Because
+of the query-param path, `/ws` is registered **outside** the header-only auth
+middleware (which would reject every browser handshake); it does its own token
+check in the handler.
 
 ### Message envelope
 
