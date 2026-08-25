@@ -64,6 +64,15 @@ const passwordModalOpen = ref(false);
           <AppIcon name="sliders" :size="15" />
           <span>Settings</span>
         </RouterLink>
+        <RouterLink
+          v-if="auth.isAdmin"
+          class="nav-item"
+          :class="{ active: route.name === 'users' }"
+          :to="{ name: 'users' }"
+        >
+          <AppIcon name="users" :size="15" />
+          <span>Users</span>
+        </RouterLink>
       </nav>
 
       <div class="side-section">
