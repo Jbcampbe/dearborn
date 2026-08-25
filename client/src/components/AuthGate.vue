@@ -96,7 +96,7 @@ async function submit() {
           v-model="password"
           class="input"
           type="password"
-          autocomplete="current-password"
+          :autocomplete="isSetup ? 'new-password' : 'current-password'"
         />
         <p v-if="isSetup" class="hint">At least 12 characters.</p>
 

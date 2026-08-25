@@ -120,6 +120,7 @@ export const useAuthStore = defineStore("auth", () => {
     accessExpiresAt.value = envelope.expires_at;
     refreshToken.value = envelope.refresh_token;
     user.value = envelope.user;
+    setupRequired.value = false;
     persist();
   }
 
