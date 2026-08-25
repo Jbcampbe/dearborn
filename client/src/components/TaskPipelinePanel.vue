@@ -270,8 +270,23 @@ onMounted(load);
         </button>
 
         <div v-if="expandedId === run.id" class="run-body">
-          <!-- Historical pills: completed stages only -- the running row
-               renders its live pills from state.liveTools instead. -->
+          <!-- Live pills: the currently-running stage renders directly from
+               state.liveTools, which applyPipelineFrame keeps in sync as
+               tool_start/tool_end frames stream over the WebSocket. -->
+          <div v-if="run.id === runningRunId && state.liveTools.length > 0" class="tool-row">
+            <span
+              v-for="call in state.liveTools"
+              :key="call.toolCallId"
+              class="tool-chip"
+              :data-status="call.status"
+            >
+              <span class="tool-dot" />
+              <span class="tool-name mono">{{ call.name }}</span>
+              <span class="tool-state">{{ call.status }}</span>
+            </span>
+          </div>
+          <!-- Historical pills: completed stages only -- fetched on expand
+               from GET /runs/{id}/events (see toggle()). -->
           <div v-if="run.id !== runningRunId && (eventsCache.get(run.id)?.length ?? 0) > 0" class="tool-row">
             <span
               v-for="call in eventsCache.get(run.id) ?? []"
