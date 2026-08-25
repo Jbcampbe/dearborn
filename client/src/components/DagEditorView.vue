@@ -106,7 +106,7 @@ async function load() {
       getDag(token, props.id),
     ]);
     hydrateDag(state, epicObj, dag);
-    stream = useDagStream(props.id, token, state, streamStatus);
+    stream = useDagStream(props.id, () => auth.ensureFresh(), state, streamStatus);
     // Non-blocking + non-fatal: the breadcrumb falls back to "…" without it.
     void getProject(token, epicObj.project_id)
       .then((p) => (projectName.value = p.name))

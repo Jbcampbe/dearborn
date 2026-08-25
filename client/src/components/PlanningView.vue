@@ -115,7 +115,7 @@ async function load() {
     // Only open the live stream once the history is in place. Pass our own
     // status ref so no extra watcher is needed (we're past an `await`, so the
     // setup effect scope is no longer current).
-    stream = useEpicStream(props.id, token, state, streamStatus);
+    stream = useEpicStream(props.id, () => auth.ensureFresh(), state, streamStatus);
     // Non-blocking + non-fatal: the breadcrumb falls back to "…" without it.
     void getProject(token, epic.project_id)
       .then((p) => (projectName.value = p.name))

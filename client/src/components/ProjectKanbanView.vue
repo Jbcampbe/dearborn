@@ -262,7 +262,7 @@ async function load() {
     const board = await getBoard(token, props.id);
     hydrateBoard(state, board);
     state.projectId = props.id;
-    stream = useBoardStream(props.id, token, state, streamStatus);
+    stream = useBoardStream(props.id, () => auth.ensureFresh(), state, streamStatus);
   } catch (err) {
     if (bounceIfAuth(err)) {
       return;
