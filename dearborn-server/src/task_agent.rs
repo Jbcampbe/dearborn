@@ -732,6 +732,26 @@ impl Drop for CancelGuard {
     }
 }
 
+/// One tool call observed during a stage's `RunEvent` stream, accumulated
+/// by [`AgentStageOutcome::absorb`] so the stage's `agent_run_events` rows
+/// can be persisted after the drain finishes (best-effort — a persistence
+/// failure must never fail the stage itself). Mirrors the wire shape of
+/// [`RunEvent::ToolStart`] / [`RunEvent::ToolEnd`] minus run bookkeeping
+/// (`run_id`) and payloads we don't store (`input` / `output`).
+#[derive(Debug, Clone)]
+pub struct ToolEventRecord {
+    /// `"tool_start"` or `"tool_end"`, matching the WS frame type the
+    /// planning view already speaks.
+    pub kind: &'static str,
+    /// Harness id pairing a `tool_start` with its `tool_end`.
+    pub tool_call_id: String,
+    /// The tool's name (`"tool_start"` only; empty string for
+    /// `"tool_end"`, which carries `ok` instead).
+    pub name: String,
+    /// `None` for `tool_start`; `Some(ok)` for `tool_end`.
+    pub ok: Option<bool>,
+}
+
 /// What a completed (or failed) agent stage leaves behind for the caller
 /// (T-513's DAG walk) to act on — e.g. deciding whether `Fix` produced a
 /// diff, or handing `text` to [`crate::spec::parse_verdict`] for a review
@@ -794,6 +814,12 @@ pub struct AgentStageOutcome {
     /// [`Default::default`] used only inside the drain closure before this
     /// field is populated.
     pub agent_run_id: String,
+    /// Every `ToolStart`/`ToolEnd` event seen in the stream, in arrival
+    /// order — recorded by [`AgentStageOutcome::absorb`] alongside `text`
+    /// so [`run_agent_stage`] can persist them into `agent_run_events`
+    /// once the drain completes. Empty when the stage never touched a
+    /// tool, in which case zero rows are written.
+    pub tool_events: Vec<ToolEventRecord>,
 }
 
 impl AgentStageOutcome {
@@ -821,6 +847,29 @@ impl AgentStageOutcome {
                 self.exit_code = *exit_code;
                 self.cancelled = *cancelled;
             }
+            // Tool calls are kept out of `text` (the log trail stays pure
+            // prose); they accumulate here instead so they can land in
+            // `agent_run_events` after the drain — see `tool_events`.
+            RunEvent::ToolStart {
+                tool_call_id,
+                name,
+                ..
+            } => self.tool_events.push(ToolEventRecord {
+                kind: "tool_start",
+                tool_call_id: tool_call_id.clone(),
+                name: name.clone(),
+                ok: None,
+            }),
+            RunEvent::ToolEnd {
+                tool_call_id,
+                ok,
+                ..
+            } => self.tool_events.push(ToolEventRecord {
+                kind: "tool_end",
+                tool_call_id: tool_call_id.clone(),
+                name: String::new(),
+                ok: Some(*ok),
+            }),
             _ => {}
         }
     }
@@ -1205,6 +1254,19 @@ pub async fn run_agent_stage(
         outcome.timed_out = true;
         outcome.cancelled = true;
     }
+
+    // TODO(tool-events epic): once `evidence::save_run_events` exists
+    // (sibling task "Add save_run_events and list_run_events to evidence.rs",
+    // alongside migration 0009's `agent_run_events` table), persist this
+    // stage's accumulated tool events here, best-effort, BEFORE close_stage:
+    //
+    //     evidence::save_run_events(conn, &stage_row.id, &outcome.tool_events).await;
+    //
+    // Best-effort per the spec: ignore/log any error rather than failing
+    // the stage — the row close below must always run. Note the existing
+    // `evidence` fns take `&Connection`, not `&DbConn`. It cannot be called
+    // today because that function does not exist yet in this branch, and
+    // referencing it would break `cargo check`.
 
     evidence::close_stage(
         conn,
