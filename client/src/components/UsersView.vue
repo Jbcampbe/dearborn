@@ -227,6 +227,7 @@ async function confirmDeactivate(): Promise<void> {
     // "cannot deactivate the last active admin" surface above the table.
     rowError.value =
       err instanceof Error ? err.message : "could not deactivate user";
+    deactivateTarget.value = null;
   } finally {
     deactivateBusy.value = false;
   }
