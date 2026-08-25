@@ -2881,7 +2881,17 @@ async fn process_one_task(
         .await
         .ok()
         .flatten();
-    match run_test_gate_loop(state, epic_id, project_id, task_id, workspace, pat.as_deref(), lease).await {
+    match run_test_gate_loop(
+        state,
+        epic_id,
+        project_id,
+        task_id,
+        workspace,
+        pat.as_deref(),
+        lease,
+    )
+    .await
+    {
         GateOutcome::Proceed => {}
         GateOutcome::Stop => return TaskStepOutcome::Stop,
     }
@@ -3138,8 +3148,17 @@ fn stage_spawn_config<'a>(
     state: &'a AppState,
     project_id: &'a str,
     stage: Stage,
-) -> std::pin::Pin<Box<impl std::future::Future<Output = Result<crate::agent_settings::SpawnConfig,
-crate::agent_settings::SettingsError>> + Send + 'a>> {
+) -> std::pin::Pin<
+    Box<
+        impl std::future::Future<
+                Output = Result<
+                    crate::agent_settings::SpawnConfig,
+                    crate::agent_settings::SettingsError,
+                >,
+            > + Send
+            + 'a,
+    >,
+> {
     Box::pin(async move {
         // Both unwraps are guarded by the callers' agent-stage-only contract:
         // every agent stage has a compiled default prompt and a slot mapping.
@@ -3167,9 +3186,13 @@ fn resolve_or_fail<'a>(
     stage: Stage,
     workspace: &'a ProvisionedWorkspace,
     lease: &'a LeaseHandle,
-) -> std::pin::Pin<Box<dyn std::future::Future<Output = Result<crate::agent_settings::SpawnConfig,
-()>
-> + Send + 'a>> {
+) -> std::pin::Pin<
+    Box<
+        dyn std::future::Future<Output = Result<crate::agent_settings::SpawnConfig, ()>>
+            + Send
+            + 'a,
+    >,
+> {
     Box::pin(async move {
         match stage_spawn_config(state, project_id, stage).await {
             Ok(cfg) => Ok(cfg),
@@ -3854,7 +3877,9 @@ async fn run_review_fix_converge(
                 // already routes the task to `Failed(test_gate_exhausted)`
                 // and the epic to `Blocked` from inside that call — this
                 // loop's only job on `GateOutcome::Stop` is to stop.
-                match run_test_gate_loop(state, epic_id, project_id, task_id, workspace, pat, lease).await {
+                match run_test_gate_loop(state, epic_id, project_id, task_id, workspace, pat, lease)
+                    .await
+                {
                     GateOutcome::Proceed => {}
                     GateOutcome::Stop => return ConvergenceOutcome::Stop,
                 }
@@ -4113,7 +4138,9 @@ async fn run_verify_complete(
             // Re-enter the normal pipeline (§6's own words): the identical
             // T-522 test gate `Stage::Implement`'s own path runs, reused
             // unmodified.
-            match run_test_gate_loop(state, epic_id, project_id, task_id, workspace, pat, lease).await {
+            match run_test_gate_loop(state, epic_id, project_id, task_id, workspace, pat, lease)
+                .await
+            {
                 GateOutcome::Proceed => {}
                 GateOutcome::Stop => return TaskStepOutcome::Stop,
             }
@@ -5349,27 +5376,26 @@ async fn push_and_open_pr(
     // explicit base (the epic's provision-time snapshot, or — standalone
     // tasks having no per-item record by design — the project default), else
     // the workspace clone's own `origin/HEAD` (offline; no GitHub API call).
-    let recorded_base = match recorded_base_branch(conn, epic_id, project.base_branch.as_deref())
-        .await
-    {
-        Ok(base) => base,
-        Err(err) => {
-            if !lease.is_lost() {
-                fail_item(
-                    state,
-                    FailureContext {
-                        epic_id,
-                        task_id,
-                        reason: FailureReason::PrFailed,
-                        message: &format!("failed to load recorded base branch: {err}"),
-                        push: PushIntent::Skip,
-                    },
-                )
-                .await;
+    let recorded_base =
+        match recorded_base_branch(conn, epic_id, project.base_branch.as_deref()).await {
+            Ok(base) => base,
+            Err(err) => {
+                if !lease.is_lost() {
+                    fail_item(
+                        state,
+                        FailureContext {
+                            epic_id,
+                            task_id,
+                            reason: FailureReason::PrFailed,
+                            message: &format!("failed to load recorded base branch: {err}"),
+                            push: PushIntent::Skip,
+                        },
+                    )
+                    .await;
+                }
+                return None;
             }
-            return None;
-        }
-    };
+        };
     let base = match recorded_base {
         Some(base) => base,
         None => match git::origin_default_branch(&workspace.workspace_path).await {
