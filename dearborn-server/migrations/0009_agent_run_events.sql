@@ -4,12 +4,6 @@
 -- reconstruct the exact tool-call timeline by ordering on the
 -- (agent_run_id, created_at) index: pair each tool_end row with the earlier
 -- tool_start row sharing its tool_call_id.
---
--- NOTE (task 0009 spec): an earlier draft of this migration committed on this
--- epic branch used `run_id` + `seq` and no index. This version replaces it
--- before release: DBs that already applied the old shape must be rebuilt or
--- reconciled manually, because the boot migration runner records id=9 as
--- applied and will not re-run this file.
 CREATE TABLE agent_run_events (
   id           TEXT    PRIMARY KEY,          -- ulid/uuid
   agent_run_id TEXT    NOT NULL REFERENCES agent_run(id),
