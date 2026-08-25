@@ -601,52 +601,8 @@ onMounted(load);
   50% { opacity: 1; }
 }
 
-.tool-row {
-  display: flex;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-.tool-chip {
-  display: inline-flex;
-  align-items: center;
-  gap: 6px;
-  padding: 3px 9px;
-  border-radius: var(--radius-pills);
-  border: 1px solid var(--border-hairline);
-  background: rgba(255, 255, 255, 0.02);
-  font-size: 11.5px;
-  color: var(--text-muted);
-}
-
-.tool-dot {
-  width: 5px;
-  height: 5px;
-  border-radius: var(--radius-pills);
-  background: var(--color-ash);
-}
-
-.tool-chip[data-status="running"] .tool-dot {
-  background: var(--color-signal-teal);
-  animation: pulse-dot 1.2s ease-in-out infinite;
-}
-
-.tool-chip[data-status="ok"] .tool-dot {
-  background: var(--color-pulse-green);
-}
-
-.tool-chip[data-status="error"] .tool-dot {
-  background: var(--color-coral-red);
-}
-
-.tool-name {
-  font-size: 11px;
-}
-
-.tool-state {
-  color: var(--text-faint);
-  font-size: 11px;
-}
+/* Tool call chips (.tool-row/.tool-chip et al.) are global utilities in
+   client/src/styles/ui.css so other panels can reuse them. */
 
 .phase-divider {
   display: flex;
