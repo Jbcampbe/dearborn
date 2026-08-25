@@ -365,7 +365,7 @@ onMounted(load);
 
 .run-attempt {
   font-size: var(--text-label);
-  color: var(--text-faint);
+  color: var(--text-muted);
 }
 
 .run-spacer {
@@ -384,7 +384,7 @@ onMounted(load);
 
 .run-duration {
   font-size: var(--text-label);
-  color: var(--text-faint);
+  color: var(--text-muted);
   white-space: nowrap;
   min-width: 5em;
   text-align: right;
