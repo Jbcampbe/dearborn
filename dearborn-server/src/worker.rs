@@ -2819,42 +2819,6 @@ async fn process_one_task(
     };
     let prompt = task_agent::assemble_prompt_text(&implement_cfg.prompt, &task_ctx);
 
-<<<<<<< Updated upstream
-    // 3. Run the implement stage through the TaskAgent seam. The attempt
-    //    number is computed, not hardcoded: one past whatever `implement`
-    //    attempts this task already has, so a re-run of a previously
-    //    attempted task (a failed stage reset to Todo, or an orphaned
-    //    InProgress task reset by a new owner after a crash/restart) reads
-    //    "Attempt 2" in the timeline instead of a second indistinguishable
-    //    "Attempt 1" sitting next to the first one.
-    let implement_attempt =
-        match next_implement_attempt_or_fail(state, conn, epic_id, task_id, workspace, lease).await
-        {
-            Ok(n) => n,
-            Err(()) => return TaskStepOutcome::Stop,
-        };
-    let run_id = ulid::Ulid::new().to_string();
-    let req = TaskRunRequest {
-        run_id,
-        stage: Stage::Implement,
-        prompt,
-        cwd: workspace.workspace_path.clone(),
-        harness: implement_cfg.harness,
-        model: implement_cfg.model,
-        prompt_hash: implement_cfg.prompt_hash,
-    };
-    let outcome = task_agent::run_agent_stage(
-        state,
-        &*state.task_agent,
-        AgentStageParams {
-            task_id: Some(task_id),
-            epic_id,
-            attempt: implement_attempt,
-        },
-        req,
-    )
-    .await;
-=======
     // 3. Run the implement stage through the TaskAgent seam — with a bounded
     //    auto-retry when the run fails on what looks like a *transient*
     //    provider condition (`DEARBORN_IMPLEMENT_TRANSIENT_RETRIES`, see
@@ -2876,7 +2840,24 @@ async fn process_one_task(
     //    falls through to the ordinary [`route_stage_failure`] handling
     //    unchanged, and exhausted retries land there too.
     let max_attempts = 1 + state.config.executor.implement_transient_retries as i64;
-    let mut attempt = 1i64;
+    // The starting attempt number is computed, not hardcoded: one past
+    // whatever `implement` attempts this task already has, so a re-run of a
+    // previously attempted task (a failed stage reset to Todo, or an
+    // orphaned InProgress task reset by a new owner after a crash/restart)
+    // reads "Attempt 2" in the timeline instead of a second
+    // indistinguishable "Attempt 1" sitting next to the first one. The retry
+    // loop below increments from wherever that lands.
+    let mut attempt =
+        match next_implement_attempt_or_fail(state, conn, epic_id, task_id, workspace, lease).await
+        {
+            Ok(n) => n,
+            Err(()) => return TaskStepOutcome::Stop,
+        };
+    // Total *tries this call* may make = the first try plus the bounded
+    // transient retries; expressed against the absolute `attempt` counter
+    // (which starts at one-past-the-highest-recorded, see above) so the
+    // guard below needs no separate per-call tally.
+    let last_attempt = attempt + max_attempts - 1;
     let outcome = loop {
         let run_id = ulid::Ulid::new().to_string();
         // Cloned per attempt, not built once outside the loop: `TaskRunRequest`
@@ -2902,7 +2883,6 @@ async fn process_one_task(
             req,
         )
         .await;
->>>>>>> Stashed changes
 
         let outcome = match outcome {
             Ok(outcome) => outcome,
@@ -2940,7 +2920,7 @@ async fn process_one_task(
         if outcome.is_ok()
             || outcome.timed_out
             || outcome.cancelled
-            || attempt >= max_attempts
+            || attempt >= last_attempt
             || !is_transient_provider_error(err_text)
         {
             break outcome;
