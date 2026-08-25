@@ -284,6 +284,11 @@ export const useAuthStore = defineStore("auth", () => {
    * state regardless of the result. An optional `reason` (e.g. a rejected
    * session's message) is displayed on the auth screen.
    */
+  function setCurrentUser(updated: AuthUser): void {
+    user.value = updated;
+    persist();
+  }
+
   async function logout(reason?: string): Promise<void> {
     const token = accessToken.value;
     if (token !== null) {
@@ -315,6 +320,7 @@ export const useAuthStore = defineStore("auth", () => {
     login,
     refresh,
     ensureFresh,
+    setCurrentUser,
     logout,
   };
 });

@@ -142,8 +142,7 @@ async function submitEdit(): Promise<void> {
     replaceUser(updated);
     // Keep the footer identity in sync when an admin edits their own record.
     if (auth.user !== null && auth.user.id === updated.id) {
-      auth.user.display_name = updated.display_name;
-      auth.user.role = updated.role;
+      auth.setCurrentUser(updated);
     }
     editUser.value = null;
   } catch (err) {
