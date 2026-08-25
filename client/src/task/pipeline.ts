@@ -229,6 +229,21 @@ export function splitLog(log: string): LogSegments {
   return { head: log.slice(0, idx), tail: log.slice(idx + ELISION_MARKER.length) };
 }
 
+// ---- live tool calls --------------------------------------------------------
+
+/**
+ * One tool invocation observed live on `task:<id>` for the currently-running
+ * stage: a `tool_start` frame opens a pill with `status = "running"`; the
+ * matching `tool_end` (same `toolCallId`) settles it to `"ok"` or `"error"`.
+ * Name + status only — no output/arguments — matching the planning view's
+ * chips.
+ */
+export interface ToolCall {
+  toolCallId: string;
+  name: string;
+  status: "running" | "ok" | "error";
+}
+
 // ---- view-model: hydrate + live tail (T-563) --------------------------------
 
 /**
@@ -262,11 +277,18 @@ export interface PipelineState {
    * that row's own log.
    */
   liveLogReconciled: boolean;
+  /**
+   * Tool-call pills for the currently-running stage, folded from live
+   * `tool_start`/`tool_end` frames (client-only state — historical stages get
+   * their pills from the REST events endpoint instead). Cleared whenever the
+   * running stage ends so one stage's tools never bleed into the next.
+   */
+  liveTools: ToolCall[];
 }
 
 /** A fresh, empty view model. */
 export function initialPipelineState(): PipelineState {
-  return { taskId: null, runs: [], liveLog: "", liveLogReconciled: false };
+  return { taskId: null, runs: [], liveLog: "", liveLogReconciled: false, liveTools: [] };
 }
 
 /**
@@ -308,6 +330,7 @@ export function hydratePipeline(
 export function resetLiveTail(state: PipelineState): PipelineState {
   state.liveLog = "";
   state.liveLogReconciled = false;
+  state.liveTools = [];
   return state;
 }
 
@@ -394,7 +417,9 @@ interface StageChangedPayload {
  *   `AgentStageOutcome::absorb` exactly so `mergeHydratedLog` can find a true
  *   overlap against the eventual REST log.
  * - `stage_changed`: advance the timeline (see `applyStageChanged`).
- * - everything else (`thinking`, `tool_start`, `tool_end`, `started`,
+ * - `tool_start`/`tool_end`: open/close a pill in `liveTools` for the
+ *   currently-running stage (see `ToolCall`).
+ * - everything else (`thinking`, `started`,
  *   `session`, `exited`, `usage`, `activity`, `suggested_edits`,
  *   `ask_question`, acks, future kinds): ignored. None of these are part of
  *   `agent_run.log` server-side (only `Text`/`Error` are folded into it — see
@@ -415,6 +440,23 @@ export function applyPipelineFrame(state: PipelineState, frame: PipelineFrame): 
     }
     case "stage_changed": {
       applyStageChanged(state, frame.payload as StageChangedPayload);
+      break;
+    }
+    case "tool_start": {
+      const p = frame.payload as { toolCallId?: string; name?: string } | null;
+      state.liveTools.push({
+        toolCallId: p?.toolCallId ?? "",
+        name: p?.name ?? "tool",
+        status: "running",
+      });
+      break;
+    }
+    case "tool_end": {
+      const p = frame.payload as { toolCallId?: string; ok?: boolean } | null;
+      const call = state.liveTools.find((c) => c.toolCallId === p?.toolCallId);
+      if (call) {
+        call.status = p?.ok ? "ok" : "error";
+      }
       break;
     }
     default:
@@ -472,5 +514,8 @@ function applyStageChanged(state: PipelineState, p: StageChangedPayload): void {
   if (wasRunning) {
     state.liveLog = "";
     state.liveLogReconciled = false;
+    // Tools belong to the stage that just ended; don't let them persist into
+    // whatever runs next.
+    state.liveTools = [];
   }
 }
