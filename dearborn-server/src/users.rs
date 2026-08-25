@@ -613,21 +613,20 @@ pub async fn update_user(
     Path(id): Path<String>,
     Json(body): Json<UpdateUserRequest>,
 ) -> AppResult<Json<User>> {
-    // Apply display_name / role changes (store handles the no-op case).
-    let mut user = update(&state.db, &id, body.display_name.as_deref(), body.role).await?;
-
-    // Apply active flag change separately, passing the actor id so the
-    // self-deactivation guard has a subject to compare against.
+    // Evaluate the active-flag change before committing any other mutation.
+    // The lockout guards inside set_active return 409 without touching the DB;
+    // running them first prevents a partial commit under an error response
+    // (e.g. display_name landing while the deactivation guard fires).
     if let Some(active) = body.active {
-        user = set_active(&state.db, &id, active, Some(&admin.id)).await?;
-        // Proactively revoke all sessions so a deactivated user cannot refresh
-        // their way past the flag. The `refresh` endpoint would reject them
-        // anyway (re-reading `active`), but early cleanup matches the
-        // session-invalidation matrix in the technical plan.
+        set_active(&state.db, &id, active, Some(&admin.id)).await?;
         if !active {
             crate::sessions::revoke_all_for_user(&state.db, &id).await?;
         }
     }
+
+    // Apply display_name / role changes last. update() re-reads the row so the
+    // returned User reflects both the active change above and these changes.
+    let user = update(&state.db, &id, body.display_name.as_deref(), body.role).await?;
 
     Ok(Json(user))
 }
