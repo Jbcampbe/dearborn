@@ -544,6 +544,7 @@ pub fn app(state: AppState) -> Router {
         .route("/tasks/:id/run", axum::routing::post(tasks::run_task))
         .route("/tasks/:id/runs", get(evidence::list_task_runs))
         .route("/runs/:id", get(evidence::get_run))
+        .route("/runs/:id/events", get(evidence::list_run_events_handler))
         // Admin-only user management. AdminUser gates each handler individually
         // (re-reading the user row), so a user-role token always gets 403.
         .route("/users", get(users::list_users).post(users::create_user))
