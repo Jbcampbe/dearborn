@@ -467,6 +467,12 @@ pub fn app(state: AppState) -> Router {
         .route("/auth/refresh", axum::routing::post(sessions::refresh));
 
     let protected = Router::new()
+        .route("/auth/me", get(sessions::me))
+        .route("/auth/logout", axum::routing::post(sessions::logout))
+        .route(
+            "/auth/password",
+            axum::routing::post(sessions::change_password),
+        )
         .route(
             "/settings",
             get(agent_settings::get_settings).put(agent_settings::put_settings),

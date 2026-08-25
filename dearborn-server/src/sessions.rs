@@ -50,7 +50,7 @@ use libsql::params;
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
-use crate::auth::{AuthKey, Claims};
+use crate::auth::{AuthKey, Claims, CurrentUser};
 use crate::config::AuthConfig;
 use crate::db::Db;
 use crate::users::{self, Role, User};
@@ -450,6 +450,76 @@ pub async fn refresh(
         expires_at,
         user,
     }))
+}
+
+/// `POST /auth/password` body.
+#[derive(Debug, Deserialize)]
+pub struct ChangePasswordRequest {
+    pub current_password: String,
+    pub new_password: String,
+}
+
+/// `GET /auth/me` — return the calling user's row, read fresh from the database
+/// so the UI always sees the current display name, role, and active state, even
+/// if those changed after the access token was minted.
+pub async fn me(
+    State(state): State<AppState>,
+    CurrentUser(claims): CurrentUser,
+) -> AppResult<Json<User>> {
+    let user = users::get(&state.db, &claims.sub)
+        .await?
+        .ok_or(AppError::Unauthorized)?;
+    Ok(Json(user))
+}
+
+/// `POST /auth/logout` — revoke the session named by the `sid` in the caller's
+/// access token and return `204`. No request body needed: `sid` is already in
+/// the token claims. Idempotent: a double-logout is a clean no-op (`revoke` is
+/// idempotent). The live access token continues to verify until its natural
+/// expiry; revocation is eventual.
+pub async fn logout(
+    State(state): State<AppState>,
+    CurrentUser(claims): CurrentUser,
+) -> AppResult<StatusCode> {
+    revoke(&state.db, &claims.sid).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+/// `POST /auth/password` — self-service password change.
+///
+/// Verifies `current_password` against the stored hash; a wrong one is `400`
+/// (not `401` — the caller is authenticated, just mistaken). Sets the new
+/// password (enforcing the same [`users::validate_password`] policy as every
+/// other write path), then revokes every **other** session but leaves the
+/// calling session's `sid` alive, so the browser the user changed their
+/// password in stays logged in.
+pub async fn change_password(
+    State(state): State<AppState>,
+    CurrentUser(claims): CurrentUser,
+    Json(req): Json<ChangePasswordRequest>,
+) -> AppResult<StatusCode> {
+    let phc = users::password_hash_of(&state.db, &claims.sub)
+        .await?
+        .ok_or(AppError::Unauthorized)?;
+
+    let password_ok = users::verify_password(&req.current_password, &phc).await?;
+    if !password_ok {
+        return Err(AppError::BadRequest(
+            "current password is incorrect".to_string(),
+        ));
+    }
+
+    users::set_password(
+        &state.db,
+        &claims.sub,
+        &req.new_password,
+        state.config.argon2_fast,
+    )
+    .await?;
+
+    revoke_all_for_user_except(&state.db, &claims.sub, &claims.sid).await?;
+
+    Ok(StatusCode::NO_CONTENT)
 }
 
 // ---- Helpers ----------------------------------------------------------------
@@ -1392,5 +1462,394 @@ mod tests {
         let response = app(state.clone()).oneshot(get("/projects")).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
         assert_eq!(body_json(response).await["error"]["code"], "unauthorized");
+    }
+
+    // ---- Helper: authenticated requests -------------------------------------
+
+    fn get_authed(uri: &str, token: &str) -> Request<Body> {
+        Request::builder()
+            .uri(uri)
+            .header("authorization", format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn post_authed(uri: &str, token: &str, body: Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header("authorization", format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    // ---- GET /auth/me -------------------------------------------------------
+
+    #[tokio::test]
+    async fn me_returns_the_calling_users_row_fresh() {
+        let state = test_state().await;
+        let user = seed_user(&state, "josiah", Role::User, true).await;
+        let token = testing::login_as(&state, &user).await;
+
+        let response = app(state.clone())
+            .oneshot(get_authed("/auth/me", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["id"], user.id);
+        assert_eq!(body["username"], "josiah");
+        assert_eq!(body["role"], "user");
+        assert_eq!(body["active"], true);
+    }
+
+    #[tokio::test]
+    async fn me_reflects_a_display_name_change_without_a_new_token() {
+        let state = test_state().await;
+        let user = seed_user(&state, "josiah", Role::User, true).await;
+        let token = testing::login_as(&state, &user).await;
+
+        // Change the display name directly in the store (simulating what the
+        // admin `PATCH /users/:id` route will do in a later task).
+        users::update(&state.db, &user.id, Some("New Display Name"), None)
+            .await
+            .unwrap();
+
+        // The same old token but the handler re-reads the row, so the fresh
+        // name comes back — the token's minted display name (there isn't one)
+        // is irrelevant.
+        let response = app(state.clone())
+            .oneshot(get_authed("/auth/me", &token))
+            .await
+            .unwrap();
+
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["display_name"], "New Display Name");
+    }
+
+    #[tokio::test]
+    async fn me_never_includes_password_hash() {
+        let state = test_state().await;
+        let user = seed_user(&state, "josiah", Role::Admin, true).await;
+        let token = testing::login_as(&state, &user).await;
+
+        let response = app(state.clone())
+            .oneshot(get_authed("/auth/me", &token))
+            .await
+            .unwrap();
+
+        let body = String::from_utf8(body_bytes(response).await).unwrap();
+        assert!(!body.contains("password_hash"), "leaked in {body}");
+        assert!(!body.contains("$argon2id$"), "leaked in {body}");
+    }
+
+    #[tokio::test]
+    async fn me_requires_a_valid_access_token() {
+        let state = test_state().await;
+        seed_user(&state, "josiah", Role::User, true).await;
+
+        let response = app(state.clone())
+            .oneshot(get("/auth/me"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+
+        let response = app(state.clone())
+            .oneshot(get_authed("/auth/me", "garbage"))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    // ---- POST /auth/logout (AC8) --------------------------------------------
+
+    #[tokio::test]
+    async fn logout_returns_204_removes_the_session_and_blocks_refresh() {
+        let state = test_state().await;
+        let user = seed_user(&state, "josiah", Role::User, true).await;
+        let issued = issue(&state.db, &state.auth_key, &user, &state.config.auth)
+            .await
+            .unwrap();
+
+        let response = app(state.clone())
+            .oneshot(post_authed(
+                "/auth/logout",
+                &issued.access_token,
+                json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        // The session row is gone.
+        assert_eq!(session_count(&state).await, 0);
+
+        // The refresh token no longer works.
+        let response = app(state.clone())
+            .oneshot(post(
+                "/auth/refresh",
+                json!({ "refresh_token": issued.refresh_token }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn logout_is_idempotent() {
+        let state = test_state().await;
+        let user = seed_user(&state, "josiah", Role::User, true).await;
+        let issued = issue(&state.db, &state.auth_key, &user, &state.config.auth)
+            .await
+            .unwrap();
+
+        // First logout succeeds.
+        let r1 = app(state.clone())
+            .oneshot(post_authed("/auth/logout", &issued.access_token, json!({})))
+            .await
+            .unwrap();
+        assert_eq!(r1.status(), StatusCode::NO_CONTENT);
+
+        // The access token itself is still valid (it hasn't expired), so a
+        // second call with the same token still passes require_auth but the
+        // revoke is a clean no-op.
+        let r2 = app(state.clone())
+            .oneshot(post_authed("/auth/logout", &issued.access_token, json!({})))
+            .await
+            .unwrap();
+        assert_eq!(r2.status(), StatusCode::NO_CONTENT);
+        assert_eq!(session_count(&state).await, 0);
+    }
+
+    #[tokio::test]
+    async fn logout_requires_a_valid_access_token() {
+        let state = test_state().await;
+        seed_user(&state, "josiah", Role::User, true).await;
+
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/logout")
+                    .header("content-type", "application/json")
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn logout_only_revokes_the_calling_session() {
+        let state = test_state().await;
+        let user = seed_user(&state, "josiah", Role::User, true).await;
+        let a = issue(&state.db, &state.auth_key, &user, &state.config.auth)
+            .await
+            .unwrap();
+        let b = issue(&state.db, &state.auth_key, &user, &state.config.auth)
+            .await
+            .unwrap();
+
+        app(state.clone())
+            .oneshot(post_authed("/auth/logout", &a.access_token, json!({})))
+            .await
+            .unwrap();
+
+        // Session A is gone; session B is still alive.
+        assert!(resolve_refresh(&state.db, &a.refresh_token)
+            .await
+            .unwrap()
+            .is_none());
+        assert!(resolve_refresh(&state.db, &b.refresh_token)
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    // ---- POST /auth/password (AC16, AC17) -----------------------------------
+
+    #[tokio::test]
+    async fn correct_current_password_changes_the_hash_and_the_new_one_logs_in() {
+        let state = test_state().await;
+        let user = seed_user(&state, "josiah", Role::User, true).await;
+        let issued = issue(&state.db, &state.auth_key, &user, &state.config.auth)
+            .await
+            .unwrap();
+
+        let response = app(state.clone())
+            .oneshot(post_authed(
+                "/auth/password",
+                &issued.access_token,
+                json!({
+                    "current_password": SEED_PASSWORD,
+                    "new_password": "brand-new-password-abc",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        // The new password logs in.
+        let response = app(state.clone())
+            .oneshot(post(
+                "/auth/login",
+                json!({ "username": "josiah", "password": "brand-new-password-abc" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+
+        // The old password no longer logs in.
+        let response = app(state.clone())
+            .oneshot(post(
+                "/auth/login",
+                json!({ "username": "josiah", "password": SEED_PASSWORD }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    #[tokio::test]
+    async fn wrong_current_password_is_400_and_does_not_change_the_hash() {
+        let state = test_state().await;
+        let user = seed_user(&state, "josiah", Role::User, true).await;
+        let token = testing::login_as(&state, &user).await;
+        let hash_before = users::password_hash_of(&state.db, &user.id)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let response = app(state.clone())
+            .oneshot(post_authed(
+                "/auth/password",
+                &token,
+                json!({
+                    "current_password": "totally-wrong-password",
+                    "new_password": "brand-new-password-abc",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // The stored hash is unchanged.
+        let hash_after = users::password_hash_of(&state.db, &user.id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(hash_before, hash_after);
+    }
+
+    #[tokio::test]
+    async fn password_change_keeps_the_calling_session_but_revokes_others() {
+        let state = test_state().await;
+        let user = seed_user(&state, "josiah", Role::User, true).await;
+        let calling = issue(&state.db, &state.auth_key, &user, &state.config.auth)
+            .await
+            .unwrap();
+        let other = issue(&state.db, &state.auth_key, &user, &state.config.auth)
+            .await
+            .unwrap();
+
+        let response = app(state.clone())
+            .oneshot(post_authed(
+                "/auth/password",
+                &calling.access_token,
+                json!({
+                    "current_password": SEED_PASSWORD,
+                    "new_password": "brand-new-password-abc",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+
+        // The calling session still refreshes.
+        let response = app(state.clone())
+            .oneshot(post(
+                "/auth/refresh",
+                json!({ "refresh_token": calling.refresh_token }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK, "calling session must survive");
+
+        // The other session cannot refresh.
+        let response = app(state.clone())
+            .oneshot(post(
+                "/auth/refresh",
+                json!({ "refresh_token": other.refresh_token }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "other session must be revoked");
+    }
+
+    #[tokio::test]
+    async fn new_password_policy_enforced_at_self_change_path() {
+        let state = test_state().await;
+        let user = seed_user(&state, "josiah", Role::User, true).await;
+        let token = testing::login_as(&state, &user).await;
+
+        // 11 characters is rejected.
+        let response = app(state.clone())
+            .oneshot(post_authed(
+                "/auth/password",
+                &token,
+                json!({
+                    "current_password": SEED_PASSWORD,
+                    "new_password": "elevenchars",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(
+            body_json(response).await["error"]["message"],
+            "password must be at least 12 characters"
+        );
+
+        // 12 all-lowercase characters, no digits or symbols, is accepted.
+        let response = app(state.clone())
+            .oneshot(post_authed(
+                "/auth/password",
+                &token,
+                json!({
+                    "current_password": SEED_PASSWORD,
+                    "new_password": "twelvecharss",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NO_CONTENT);
+    }
+
+    #[tokio::test]
+    async fn change_password_requires_a_valid_access_token() {
+        let state = test_state().await;
+        seed_user(&state, "josiah", Role::User, true).await;
+
+        let response = app(state.clone())
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri("/auth/password")
+                    .header("content-type", "application/json")
+                    .body(Body::from(
+                        json!({
+                            "current_password": "whatever",
+                            "new_password": "brand-new-password-abc",
+                        })
+                        .to_string(),
+                    ))
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
     }
 }
