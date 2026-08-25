@@ -281,6 +281,47 @@ impl FromRequestParts<AppState> for CurrentUser {
     }
 }
 
+/// Extractor for admin-only routes.
+///
+/// Like [`CurrentUser`], but additionally re-reads the user row and confirms
+/// `active = 1 AND role = 'admin'` *right now* — not at token mint time. This
+/// closes the one genuinely dangerous staleness window: a demoted or
+/// deactivated admin holding a still-valid access token cannot use it to call
+/// user-management routes, even though ordinary protected routes still accept
+/// that token (eventual-revocation by design).
+///
+/// Returns [`AppError::Forbidden`] — never `404` — for any caller that is
+/// authenticated but is not currently an active admin, including formerly-admin
+/// users whose role or active flag has changed since the token was minted.
+#[derive(Debug, Clone)]
+pub struct AdminUser(pub crate::users::User);
+
+#[async_trait]
+impl FromRequestParts<AppState> for AdminUser {
+    type Rejection = AppError;
+
+    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+        let claims = parts
+            .extensions
+            .get::<Claims>()
+            .cloned()
+            .ok_or(AppError::Unauthorized)?;
+
+        // Re-read the user row to confirm the *current* active + role, not the
+        // stale claims values. A 403 — not 401 — is the right response here:
+        // the token itself is valid; the caller lacks the required privilege.
+        let user = crate::users::get(&state.db, &claims.sub)
+            .await?
+            .ok_or_else(|| AppError::Forbidden("forbidden".to_string()))?;
+
+        if !user.active || user.role != Role::Admin {
+            return Err(AppError::Forbidden("forbidden".to_string()));
+        }
+
+        Ok(AdminUser(user))
+    }
+}
+
 /// Extract the token from an `Authorization` header value, if it is a Bearer
 /// credential. The scheme is matched case-insensitively per RFC 7235.
 ///

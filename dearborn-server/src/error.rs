@@ -39,6 +39,12 @@ pub enum AppError {
     /// to accidentally vary (product AC 4).
     #[error("invalid username or password")]
     InvalidCredentials,
+    /// 403 — the caller is authenticated but lacks the required privilege.
+    /// Used by the admin-only `/users` routes: a `user`-role token always
+    /// gets this, and so does a formerly-admin token whose holder was
+    /// deactivated or demoted while it was still live (D4).
+    #[error("{0}")]
+    Forbidden(String),
     /// 401 — the instance has no users yet, so there is nothing to log in to;
     /// the caller should claim it via `POST /auth/setup` instead.
     ///
@@ -77,6 +83,7 @@ impl AppError {
             AppError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
             AppError::InvalidCredentials => (StatusCode::UNAUTHORIZED, "invalid_credentials"),
             AppError::SetupRequired => (StatusCode::UNAUTHORIZED, "setup_required"),
+            AppError::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden"),
             AppError::NotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
             AppError::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
             AppError::Internal(_) | AppError::Db(_) => {
@@ -148,6 +155,10 @@ mod tests {
         assert_eq!(
             AppError::SetupRequired.status_and_code(),
             (StatusCode::UNAUTHORIZED, "setup_required")
+        );
+        assert_eq!(
+            AppError::Forbidden("x".into()).status_and_code(),
+            (StatusCode::FORBIDDEN, "forbidden")
         );
         assert_eq!(
             AppError::Internal("x".into()).status_and_code(),

@@ -543,6 +543,17 @@ pub fn app(state: AppState) -> Router {
         .route("/tasks/:id/run", axum::routing::post(tasks::run_task))
         .route("/tasks/:id/runs", get(evidence::list_task_runs))
         .route("/runs/:id", get(evidence::get_run))
+        // Admin-only user management. AdminUser gates each handler individually
+        // (re-reading the user row), so a user-role token always gets 403.
+        .route(
+            "/users",
+            get(users::list_users).post(users::create_user),
+        )
+        .route("/users/:id", axum::routing::patch(users::update_user))
+        .route(
+            "/users/:id/password",
+            axum::routing::post(users::reset_user_password),
+        )
         .route_layer(middleware::from_fn_with_state(
             state.clone(),
             auth::require_auth,
@@ -589,7 +600,8 @@ async fn health() -> Json<Value> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::users::Role;
+    use crate::sessions;
+    use crate::users::{self, Role};
     use axum::body::Body;
     use axum::http::{header::AUTHORIZATION, Request, StatusCode};
     use serde_json::{json, Value};
@@ -658,6 +670,26 @@ mod tests {
         Request::builder()
             .method("POST")
             .uri(uri)
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn post_json_bearer(uri: &str, token: &str, body: Value) -> Request<Body> {
+        Request::builder()
+            .method("POST")
+            .uri(uri)
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    fn patch_json_bearer(uri: &str, token: &str, body: Value) -> Request<Body> {
+        Request::builder()
+            .method("PATCH")
+            .uri(uri)
+            .header(AUTHORIZATION, format!("Bearer {token}"))
             .header("content-type", "application/json")
             .body(Body::from(body.to_string()))
             .unwrap()
@@ -876,6 +908,501 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(body_text(response).await, marker);
         std::fs::remove_dir_all(dir).ok();
+    }
+
+    // ---- Admin user-management routes (AC9–AC15, AC17) -------------------------
+
+    /// Build a shared AppState (backed by an in-memory DB) plus an admin token.
+    async fn admin_state_and_token() -> (AppState, String) {
+        let db = Db::connect(":memory:").await.unwrap();
+        db.run_migrations().await.unwrap();
+        let state = AppState::new(Config::for_test(), db);
+        let admin = users::testing::seed_user(&state, "admin", users::Role::Admin, true).await;
+        let token = sessions::testing::login_as(&state, &admin).await;
+        (state, token)
+    }
+
+    /// AC9: admin creates a user; that user logs in immediately with the given password.
+    #[tokio::test]
+    async fn ac9_admin_creates_user_who_can_log_in() {
+        let (state, admin_token) = admin_state_and_token().await;
+        let router = app(state);
+
+        let resp = router
+            .clone()
+            .oneshot(post_json_bearer(
+                "/users",
+                &admin_token,
+                json!({
+                    "username": "newbie",
+                    "display_name": "Newbie User",
+                    "password": "twelve-chars-ok",
+                    "role": "user"
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+        let body = body_json(resp).await;
+        assert_eq!(body["username"], "newbie");
+        assert_eq!(body["role"], "user");
+
+        // The created user can log in immediately.
+        let login_resp = router
+            .oneshot(post_json(
+                "/auth/login",
+                json!({ "username": "newbie", "password": "twelve-chars-ok" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(login_resp.status(), StatusCode::OK);
+    }
+
+    /// AC10: PATCH updates display name and role; promoted user passes admin route.
+    #[tokio::test]
+    async fn ac10_patch_updates_display_name_and_role() {
+        let (state, admin_token) = admin_state_and_token().await;
+        let regular = users::testing::seed_user(&state, "regular", users::Role::User, true).await;
+        let router = app(state.clone());
+
+        // Update display name and promote to admin.
+        let resp = router
+            .clone()
+            .oneshot(patch_json_bearer(
+                &format!("/users/{}", regular.id),
+                &admin_token,
+                json!({ "display_name": "Promoted User", "role": "admin" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+        let body = body_json(resp).await;
+        assert_eq!(body["display_name"], "Promoted User");
+        assert_eq!(body["role"], "admin");
+
+        // The promoted user's new access token (re-read via AdminUser) grants
+        // access to admin routes.
+        let promoted_token = sessions::testing::login_as(&state, &regular).await;
+        let admin_resp = router
+            .oneshot(get_bearer("/users", &promoted_token))
+            .await
+            .unwrap();
+        assert_eq!(admin_resp.status(), StatusCode::OK);
+    }
+
+    /// AC11: password reset — new password works, old does not, existing sessions fail to refresh.
+    #[tokio::test]
+    async fn ac11_password_reset_invalidates_old_password_and_sessions() {
+        let (state, admin_token) = admin_state_and_token().await;
+        let target = users::testing::seed_user(&state, "victim", users::Role::User, true).await;
+        // Issue a session for the target before the reset.
+        let pre_reset_refresh = {
+            let issued = sessions::issue(
+                &state.db,
+                &state.auth_key,
+                &target,
+                &state.config.auth,
+            )
+            .await
+            .unwrap();
+            issued.refresh_token
+        };
+        let router = app(state);
+
+        // Admin resets password.
+        let resp = router
+            .clone()
+            .oneshot(post_json_bearer(
+                &format!("/users/{}/password", target.id),
+                &admin_token,
+                json!({ "password": "brand-new-password" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+
+        // New password logs in.
+        let new_login = router
+            .clone()
+            .oneshot(post_json(
+                "/auth/login",
+                json!({ "username": "victim", "password": "brand-new-password" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(new_login.status(), StatusCode::OK);
+
+        // Old password no longer works.
+        let old_login = router
+            .clone()
+            .oneshot(post_json(
+                "/auth/login",
+                json!({ "username": "victim", "password": users::testing::SEED_PASSWORD }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(old_login.status(), StatusCode::UNAUTHORIZED);
+
+        // The pre-reset refresh token is revoked.
+        let refresh_resp = router
+            .oneshot(post_json(
+                "/auth/refresh",
+                json!({ "refresh_token": pre_reset_refresh }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(refresh_resp.status(), StatusCode::UNAUTHORIZED);
+    }
+
+    /// AC12: deactivate blocks login/refresh; row survives; reactivating restores login.
+    #[tokio::test]
+    async fn ac12_deactivation_blocks_login_and_refresh() {
+        let (state, admin_token) = admin_state_and_token().await;
+        let target = users::testing::seed_user(&state, "target", users::Role::User, true).await;
+        // Issue a session before deactivation so we can verify refresh is revoked.
+        let pre_deactivation_refresh = {
+            let issued = sessions::issue(
+                &state.db,
+                &state.auth_key,
+                &target,
+                &state.config.auth,
+            )
+            .await
+            .unwrap();
+            issued.refresh_token
+        };
+        let router = app(state);
+
+        // Deactivate.
+        let deactivate_resp = router
+            .clone()
+            .oneshot(patch_json_bearer(
+                &format!("/users/{}", target.id),
+                &admin_token,
+                json!({ "active": false }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(deactivate_resp.status(), StatusCode::OK);
+        assert_eq!(body_json(deactivate_resp).await["active"], false);
+
+        // Login is blocked.
+        let login_resp = router
+            .clone()
+            .oneshot(post_json(
+                "/auth/login",
+                json!({ "username": "target", "password": users::testing::SEED_PASSWORD }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(login_resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Row still exists and appears in GET /users.
+        let list_resp = router
+            .clone()
+            .oneshot(get_bearer("/users", &admin_token))
+            .await
+            .unwrap();
+        assert_eq!(list_resp.status(), StatusCode::OK);
+        let list = body_json(list_resp).await;
+        let items = list["items"].as_array().unwrap();
+        let target_item = items.iter().find(|u| u["username"] == "target").unwrap();
+        assert_eq!(target_item["active"], false);
+
+        // Refresh is blocked — the pre-deactivation session was revoked.
+        let refresh_resp = router
+            .clone()
+            .oneshot(post_json(
+                "/auth/refresh",
+                json!({ "refresh_token": pre_deactivation_refresh }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(refresh_resp.status(), StatusCode::UNAUTHORIZED);
+
+        // Reactivate restores login.
+        let reactivate_resp = router
+            .clone()
+            .oneshot(patch_json_bearer(
+                &format!("/users/{}", target.id),
+                &admin_token,
+                json!({ "active": true }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(reactivate_resp.status(), StatusCode::OK);
+
+        let restored_login = router
+            .oneshot(post_json(
+                "/auth/login",
+                json!({ "username": "target", "password": users::testing::SEED_PASSWORD }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(restored_login.status(), StatusCode::OK);
+    }
+
+    /// AC13: a user-role token gets 403 (not 404) on all four /users routes.
+    #[tokio::test]
+    async fn ac13_user_role_token_gets_403_on_all_admin_routes() {
+        let (state, _admin_token) = admin_state_and_token().await;
+        let regular = users::testing::seed_user(&state, "regular", users::Role::User, true).await;
+        let user_token = sessions::testing::login_as(&state, &regular).await;
+        let router = app(state);
+
+        // GET /users
+        let r = router
+            .clone()
+            .oneshot(get_bearer("/users", &user_token))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN, "GET /users");
+        assert_eq!(body_json(r).await["error"]["code"], "forbidden");
+
+        // POST /users
+        let r = router
+            .clone()
+            .oneshot(post_json_bearer(
+                "/users",
+                &user_token,
+                json!({ "username": "x", "display_name": "X", "password": "twelve-chars-ok", "role": "user" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN, "POST /users");
+
+        // PATCH /users/:id
+        let r = router
+            .clone()
+            .oneshot(patch_json_bearer(
+                "/users/some-id",
+                &user_token,
+                json!({ "display_name": "Y" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN, "PATCH /users/:id");
+
+        // POST /users/:id/password
+        let r = router
+            .oneshot(post_json_bearer(
+                "/users/some-id/password",
+                &user_token,
+                json!({ "password": "twelve-chars-ok" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::FORBIDDEN, "POST /users/:id/password");
+    }
+
+    /// AC14: demoting the last active admin returns 409; deactivating the last
+    /// active admin via HTTP always surfaces the self-deactivation guard first
+    /// (the "cannot deactivate the last active admin" guard is defence-in-depth
+    /// at the store level, tested exhaustively in `users::tests`).
+    #[tokio::test]
+    async fn ac14_last_active_admin_lockout_guards() {
+        let (state, admin_token) = admin_state_and_token().await;
+        let admin_id = {
+            let u = users::get_by_username(&state.db, "admin").await.unwrap().unwrap();
+            u.id
+        };
+        let router = app(state);
+
+        // Demoting the last active admin → 409 with the documented message.
+        // The demotion guard does not check for self vs. other, so this is
+        // reachable even when the actor and target are the same admin.
+        let resp = router
+            .clone()
+            .oneshot(patch_json_bearer(
+                &format!("/users/{admin_id}"),
+                &admin_token,
+                json!({ "role": "user" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            body_json(resp).await["error"]["message"],
+            "cannot demote the last active admin"
+        );
+
+        // Deactivating the last active admin: through HTTP the actor is an
+        // active admin, so the self-deactivation guard fires first (checked
+        // before the count check in `ensure_can_deactivate`). Both are 409;
+        // the self-deactivation message is tested below in AC15.
+        let resp = router
+            .oneshot(patch_json_bearer(
+                &format!("/users/{admin_id}"),
+                &admin_token,
+                json!({ "active": false }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    /// AC15: admin deactivating their own account returns 409.
+    #[tokio::test]
+    async fn ac15_self_deactivation_is_409() {
+        let (state, admin_token) = admin_state_and_token().await;
+        // Add a second admin so the only guard that fires is the self one.
+        users::testing::seed_user(&state, "admin2", users::Role::Admin, true).await;
+        let admin_id = {
+            let u = users::get_by_username(&state.db, "admin").await.unwrap().unwrap();
+            u.id
+        };
+        let router = app(state);
+
+        let resp = router
+            .oneshot(patch_json_bearer(
+                &format!("/users/{admin_id}"),
+                &admin_token,
+                json!({ "active": false }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            body_json(resp).await["error"]["message"],
+            "you cannot deactivate your own account"
+        );
+    }
+
+    /// AC17: 11-char password → 400 at admin create and reset; 12-char all-lowercase accepted.
+    #[tokio::test]
+    async fn ac17_password_policy_enforced_on_admin_create_and_reset() {
+        let (state, admin_token) = admin_state_and_token().await;
+        let target = users::testing::seed_user(&state, "target", users::Role::User, true).await;
+        let router = app(state);
+
+        // Admin create with 11-char password → 400.
+        let resp = router
+            .clone()
+            .oneshot(post_json_bearer(
+                "/users",
+                &admin_token,
+                json!({ "username": "shortpw", "display_name": "Short", "password": "elevenchars", "role": "user" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Admin create with 12-char all-lowercase → 201.
+        let resp = router
+            .clone()
+            .oneshot(post_json_bearer(
+                "/users",
+                &admin_token,
+                json!({ "username": "goodpw", "display_name": "Good", "password": "twelvecharss", "role": "user" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // Admin reset with 11-char password → 400.
+        let resp = router
+            .clone()
+            .oneshot(post_json_bearer(
+                &format!("/users/{}/password", target.id),
+                &admin_token,
+                json!({ "password": "elevenchars" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::BAD_REQUEST);
+
+        // Admin reset with 12-char all-lowercase → 204.
+        let resp = router
+            .oneshot(post_json_bearer(
+                &format!("/users/{}/password", target.id),
+                &admin_token,
+                json!({ "password": "twelvecharss" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::NO_CONTENT);
+    }
+
+    /// Duplicate username on create → 409, case-insensitive.
+    #[tokio::test]
+    async fn create_user_duplicate_username_is_409_case_insensitive() {
+        let (state, admin_token) = admin_state_and_token().await;
+        let router = app(state);
+
+        let resp = router
+            .clone()
+            .oneshot(post_json_bearer(
+                "/users",
+                &admin_token,
+                json!({ "username": "josiah", "display_name": "Josiah", "password": "twelve-chars-ok", "role": "user" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CREATED);
+
+        // Exact duplicate.
+        let resp = router
+            .clone()
+            .oneshot(post_json_bearer(
+                "/users",
+                &admin_token,
+                json!({ "username": "josiah", "display_name": "Dup", "password": "twelve-chars-ok", "role": "user" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+
+        // Case-variant duplicate.
+        let resp = router
+            .oneshot(post_json_bearer(
+                "/users",
+                &admin_token,
+                json!({ "username": "JOSIAH", "display_name": "Dup2", "password": "twelve-chars-ok", "role": "user" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::CONFLICT);
+    }
+
+    /// Privilege freshness: a deactivated admin's valid token gets 403 on admin routes immediately.
+    #[tokio::test]
+    async fn privilege_freshness_deactivated_admin_gets_403_on_admin_routes() {
+        let (state, _) = admin_state_and_token().await;
+        // Add a second admin to hold the "last active admin" slot.
+        let _second_admin =
+            users::testing::seed_user(&state, "admin2", users::Role::Admin, true).await;
+        let first_admin_user = users::get_by_username(&state.db, "admin").await.unwrap().unwrap();
+        // Get a token for the first admin *before* deactivation.
+        let first_admin_token = sessions::testing::login_as(&state, &first_admin_user).await;
+
+        // Deactivate the first admin via raw store (bypassing the admin API,
+        // which would block self-deactivation — the point is to test the token
+        // freshness check, not the guard).
+        state
+            .db
+            .conn()
+            .execute(
+                "UPDATE user SET active = 0 WHERE id = ?1",
+                libsql::params![first_admin_user.id.clone()],
+            )
+            .await
+            .unwrap();
+
+        let router = app(state);
+        // The still-valid token is rejected on admin routes.
+        let resp = router
+            .clone()
+            .oneshot(get_bearer("/users", &first_admin_token))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // But ordinary protected routes still accept it (eventual-revocation contract).
+        let resp = router
+            .oneshot(get_bearer("/projects", &first_admin_token))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
     }
 
     #[tokio::test]

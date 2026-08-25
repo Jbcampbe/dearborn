@@ -43,9 +43,15 @@ use argon2::password_hash::{
     rand_core::OsRng, PasswordHash, PasswordHasher, PasswordVerifier, SaltString,
 };
 use argon2::{Algorithm, Argon2, Params, Version};
+use axum::{
+    extract::{Path, State},
+    http::StatusCode,
+    Json,
+};
 use libsql::params;
 use serde::{Deserialize, Serialize};
 
+use crate::auth::AdminUser;
 use crate::db::Db;
 use crate::{AppError, AppResult, AppState};
 
@@ -556,6 +562,122 @@ fn now_ms() -> i64 {
         .duration_since(UNIX_EPOCH)
         .map(|d| d.as_millis() as i64)
         .unwrap_or(0)
+}
+
+// ---- Admin HTTP handlers ----------------------------------------------------
+
+/// `GET /users` — list every user, active and inactive, ordered by username.
+///
+/// `AdminUser` gate: re-reads the caller's row from DB and requires
+/// `active = 1 AND role = 'admin'`; a `user`-role token (or a demoted/
+/// deactivated admin token) always gets `403`, never `404`.
+pub async fn list_users(
+    State(state): State<AppState>,
+    AdminUser(_admin): AdminUser,
+) -> AppResult<Json<ListUsersResponse>> {
+    let items = list(&state.db).await?;
+    Ok(Json(ListUsersResponse { items }))
+}
+
+/// `POST /users` — admin-only user creation.
+///
+/// Returns `201 Created` with the new [`User`]. `400` on password-policy
+/// violation; `409` on a duplicate username (case-insensitive).
+pub async fn create_user(
+    State(state): State<AppState>,
+    AdminUser(_admin): AdminUser,
+    Json(body): Json<CreateUserRequest>,
+) -> AppResult<(StatusCode, Json<User>)> {
+    let user = create(
+        &state.db,
+        &body.username,
+        &body.display_name,
+        &body.password,
+        body.role,
+        state.config.argon2_fast,
+    )
+    .await?;
+    Ok((StatusCode::CREATED, Json(user)))
+}
+
+/// `PATCH /users/:id` — update display name, role, and/or active flag.
+///
+/// All fields are optional; absent fields are left untouched. The store-level
+/// lockout guards ([`ensure_can_deactivate`], [`ensure_can_demote`]) fire from
+/// inside [`update`] and [`set_active`] — this handler cannot forget them.
+///
+/// Returns `200 User` after applying all changes.
+pub async fn update_user(
+    State(state): State<AppState>,
+    AdminUser(admin): AdminUser,
+    Path(id): Path<String>,
+    Json(body): Json<UpdateUserRequest>,
+) -> AppResult<Json<User>> {
+    // Apply display_name / role changes (store handles the no-op case).
+    let mut user = update(&state.db, &id, body.display_name.as_deref(), body.role).await?;
+
+    // Apply active flag change separately, passing the actor id so the
+    // self-deactivation guard has a subject to compare against.
+    if let Some(active) = body.active {
+        user = set_active(&state.db, &id, active, Some(&admin.id)).await?;
+        // Proactively revoke all sessions so a deactivated user cannot refresh
+        // their way past the flag. The `refresh` endpoint would reject them
+        // anyway (re-reading `active`), but early cleanup matches the
+        // session-invalidation matrix in the technical plan.
+        if !active {
+            crate::sessions::revoke_all_for_user(&state.db, &id).await?;
+        }
+    }
+
+    Ok(Json(user))
+}
+
+/// `POST /users/:id/password` — admin password reset.
+///
+/// Sets a new password (same 12-character policy as every other write path)
+/// and revokes **all** of the target's sessions so the change takes effect at
+/// their next login — they cannot refresh their way past it. Returns `204 No
+/// Content`.
+pub async fn reset_user_password(
+    State(state): State<AppState>,
+    AdminUser(_admin): AdminUser,
+    Path(id): Path<String>,
+    Json(body): Json<ResetPasswordRequest>,
+) -> AppResult<StatusCode> {
+    set_password(&state.db, &id, &body.password, state.config.argon2_fast).await?;
+    crate::sessions::revoke_all_for_user(&state.db, &id).await?;
+    Ok(StatusCode::NO_CONTENT)
+}
+
+// ---- Admin wire types -------------------------------------------------------
+
+/// `GET /users` response envelope.
+#[derive(Debug, Serialize)]
+pub struct ListUsersResponse {
+    pub items: Vec<User>,
+}
+
+/// `POST /users` request body.
+#[derive(Debug, Deserialize)]
+pub struct CreateUserRequest {
+    pub username: String,
+    pub display_name: String,
+    pub password: String,
+    pub role: Role,
+}
+
+/// `PATCH /users/:id` request body. All fields are optional.
+#[derive(Debug, Deserialize)]
+pub struct UpdateUserRequest {
+    pub display_name: Option<String>,
+    pub role: Option<Role>,
+    pub active: Option<bool>,
+}
+
+/// `POST /users/:id/password` request body.
+#[derive(Debug, Deserialize)]
+pub struct ResetPasswordRequest {
+    pub password: String,
 }
 
 // ---- Test fixtures ----------------------------------------------------------
