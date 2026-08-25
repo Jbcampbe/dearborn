@@ -94,7 +94,7 @@ function bounceIfAuth(err: unknown): boolean {
 }
 
 async function load() {
-  const token = auth.token;
+  const token = auth.accessToken;
   if (token === null) {
     return;
   }
@@ -106,7 +106,7 @@ async function load() {
       getDag(token, props.id),
     ]);
     hydrateDag(state, epicObj, dag);
-    stream = useDagStream(props.id, token, state, streamStatus);
+    stream = useDagStream(props.id, () => auth.ensureFresh(), state, streamStatus);
     // Non-blocking + non-fatal: the breadcrumb falls back to "…" without it.
     void getProject(token, epicObj.project_id)
       .then((p) => (projectName.value = p.name))
@@ -122,7 +122,7 @@ async function load() {
 }
 
 async function addTask() {
-  const token = auth.token;
+  const token = auth.accessToken;
   const title = newTitle.value.trim();
   if (token === null || title.length === 0 || creating.value) {
     return;
@@ -164,7 +164,7 @@ function cancelEdit() {
 }
 
 async function saveEdit() {
-  const token = auth.token;
+  const token = auth.accessToken;
   const id = editingId.value;
   if (token === null || id === null || saving.value) {
     return;
@@ -205,7 +205,7 @@ function askRemoveTask(id: string) {
 }
 
 async function confirmRemoveTask() {
-  const token = auth.token;
+  const token = auth.accessToken;
   const id = confirmDeleteId.value;
   if (token === null || id === null || deleting.value) {
     return;
@@ -229,7 +229,7 @@ async function confirmRemoveTask() {
 }
 
 async function addDependency() {
-  const token = auth.token;
+  const token = auth.accessToken;
   if (token === null || linking.value) {
     return;
   }
@@ -259,7 +259,7 @@ async function addDependency() {
 }
 
 async function removeDependency(blockerId: string, blockedId: string) {
-  const token = auth.token;
+  const token = auth.accessToken;
   if (token === null) {
     return;
   }

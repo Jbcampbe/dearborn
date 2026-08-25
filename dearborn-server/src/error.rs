@@ -33,6 +33,26 @@ pub enum AppError {
     /// 401 — missing or invalid credentials.
     #[error("unauthorized")]
     Unauthorized,
+    /// 401 — a login was attempted and failed. **Deliberately carries no
+    /// payload**: unknown username, wrong password, and deactivated account
+    /// must all render the same bytes, so there is nothing here for a caller
+    /// to accidentally vary (product AC 4).
+    #[error("invalid username or password")]
+    InvalidCredentials,
+    /// 403 — the caller is authenticated but lacks the required privilege.
+    /// Used by the admin-only `/users` routes: a `user`-role token always
+    /// gets this, and so does a formerly-admin token whose holder was
+    /// deactivated or demoted while it was still live (D4).
+    #[error("{0}")]
+    Forbidden(String),
+    /// 401 — the instance has no users yet, so there is nothing to log in to;
+    /// the caller should claim it via `POST /auth/setup` instead.
+    ///
+    /// A `401` rather than a `409`/`404` so an unauthenticated client keeps a
+    /// **single status to branch on**, with the stable `setup_required` code
+    /// as the distinguisher.
+    #[error("instance setup required")]
+    SetupRequired,
     /// 404 — the addressed resource does not exist.
     #[error("{0}")]
     NotFound(String),
@@ -61,6 +81,9 @@ impl AppError {
         match self {
             AppError::BadRequest(_) => (StatusCode::BAD_REQUEST, "bad_request"),
             AppError::Unauthorized => (StatusCode::UNAUTHORIZED, "unauthorized"),
+            AppError::InvalidCredentials => (StatusCode::UNAUTHORIZED, "invalid_credentials"),
+            AppError::SetupRequired => (StatusCode::UNAUTHORIZED, "setup_required"),
+            AppError::Forbidden(_) => (StatusCode::FORBIDDEN, "forbidden"),
             AppError::NotFound(_) => (StatusCode::NOT_FOUND, "not_found"),
             AppError::Conflict(_) => (StatusCode::CONFLICT, "conflict"),
             AppError::Internal(_) | AppError::Db(_) => {
@@ -126,8 +149,47 @@ mod tests {
             (StatusCode::UNAUTHORIZED, "unauthorized")
         );
         assert_eq!(
+            AppError::InvalidCredentials.status_and_code(),
+            (StatusCode::UNAUTHORIZED, "invalid_credentials")
+        );
+        assert_eq!(
+            AppError::SetupRequired.status_and_code(),
+            (StatusCode::UNAUTHORIZED, "setup_required")
+        );
+        assert_eq!(
+            AppError::Forbidden("x".into()).status_and_code(),
+            (StatusCode::FORBIDDEN, "forbidden")
+        );
+        assert_eq!(
             AppError::Internal("x".into()).status_and_code(),
             (StatusCode::INTERNAL_SERVER_ERROR, "internal")
+        );
+    }
+
+    #[tokio::test]
+    async fn setup_required_is_a_401_distinguished_only_by_its_code() {
+        // The SPA branches on one status for "not authenticated" and reads the
+        // code to decide login screen vs. create-admin screen.
+        let response = AppError::SetupRequired.into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            body_json(response).await,
+            json!({ "error": { "code": "setup_required", "message": "instance setup required" } })
+        );
+    }
+
+    #[tokio::test]
+    async fn invalid_credentials_carries_one_fixed_message() {
+        let response = AppError::InvalidCredentials.into_response();
+        assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
+        assert_eq!(
+            body_json(response).await,
+            json!({
+                "error": {
+                    "code": "invalid_credentials",
+                    "message": "invalid username or password",
+                }
+            })
         );
     }
 

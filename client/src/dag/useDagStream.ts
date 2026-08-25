@@ -26,6 +26,17 @@ export interface DagStream {
 const MAX_RECONNECTS = 5;
 const BACKOFF_BASE_MS = 500;
 
+/**
+ * Async token provider: mints/returns a fresh access token before each connect
+ * attempt (including reconnects), so a socket reconnecting after a long idle
+ * presents a live token instead of an expired one. Resolving `null` means the
+ * caller is not authenticated; connecting then stops rather than retrying.
+ *
+ * The provider should be cheap when the stored token is still valid —
+ * `auth.ensureFresh()` only refreshes near expiry.
+ */
+export type TokenProvider = () => Promise<string | null>;
+
 /** Build the `ws(s)://…/ws?token=…` URL from the current origin. */
 function wsUrl(token: string): string {
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
@@ -35,16 +46,17 @@ function wsUrl(token: string): string {
 /**
  * Subscribe a reactive `DagState` to an epic's live DAG stream.
  *
- * @param epicId  the epic to subscribe to (`epic:<id>`).
- * @param token   the bearer token (passed in the WS query string).
- * @param state   the reactive view model the reducer folds frames into.
+ * @param epicId    the epic to subscribe to (`epic:<id>`).
+ * @param getToken  awaited on every connect attempt (including reconnects) to
+ *                  obtain the access token for the WS query string.
+ * @param state     the reactive view model the reducer folds frames into.
  * @param status  an optional external status ref to drive; one is created if
  *                omitted. Passing the component's own ref avoids a `watch` when
  *                this is called outside the setup scope (e.g. after `await`).
  */
 export function useDagStream(
   epicId: string,
-  token: string,
+  getToken: TokenProvider,
   state: DagState,
   status: Ref<StreamStatus> = ref<StreamStatus>("connecting"),
 ): DagStream {
@@ -55,11 +67,26 @@ export function useDagStream(
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
   let disposed = false;
 
-  function connect(): void {
+  async function connect(): Promise<void> {
     if (disposed) {
       return;
     }
     status.value = "connecting";
+
+    // Re-await the provider on every attempt so a reconnect after idle mints a
+    // fresh token instead of replaying an expired one.
+    let token: string | null;
+    try {
+      token = await getToken();
+    } catch {
+      scheduleReconnect();
+      return;
+    }
+    if (token === null) {
+      // Not authenticated (e.g. logged out); reconnecting cannot succeed.
+      status.value = "closed";
+      return;
+    }
 
     let ws: WebSocket;
     try {

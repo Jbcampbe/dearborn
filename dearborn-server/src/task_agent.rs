@@ -1748,7 +1748,7 @@ mod tests {
     // ---- run_agent_stage: evidence + WS streaming ----------------------
 
     async fn test_state() -> AppState {
-        test_state_with_config(Config::for_test("tok")).await
+        test_state_with_config(Config::for_test()).await
     }
 
     /// Like [`test_state`] but with a caller-supplied [`Config`] — T-543's
@@ -2321,7 +2321,7 @@ mod tests {
     /// than hanging the suite.
     #[tokio::test]
     async fn run_agent_stage_cancels_a_never_exiting_stage_at_the_deadline_and_still_returns() {
-        let mut config = Config::for_test("tok");
+        let mut config = Config::for_test();
         config.executor.agent_stage_timeout_secs = 1;
         let state = test_state_with_config(config).await;
 
@@ -2438,7 +2438,7 @@ mod tests {
     /// every stage regardless of whether the deadline was actually exceeded.
     #[tokio::test]
     async fn a_stage_that_finishes_within_the_deadline_is_not_marked_timed_out() {
-        let mut config = Config::for_test("tok");
+        let mut config = Config::for_test();
         config.executor.agent_stage_timeout_secs = 30; // generous; must not fire
         let state = test_state_with_config(config).await;
         let agent = ScriptedTaskAgent::new();
@@ -2487,7 +2487,7 @@ mod tests {
     /// (only the named stage gates) as well as the genericity.
     #[tokio::test]
     async fn run_agent_stage_times_out_a_non_implement_stage_the_same_way() {
-        let mut config = Config::for_test("tok");
+        let mut config = Config::for_test();
         config.executor.agent_stage_timeout_secs = 1;
         let state = test_state_with_config(config).await;
 

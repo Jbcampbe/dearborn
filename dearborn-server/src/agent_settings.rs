@@ -1308,20 +1308,60 @@ mod tests {
     use serde_json::Value as Json;
     use tower::ServiceExt; // for `oneshot`
 
-    const TOKEN: &str = "s3cret-token";
 
     async fn test_app() -> (axum::Router, crate::AppState) {
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
-        let state = crate::AppState::new(Config::for_test(TOKEN), db);
+        let state = crate::AppState::new(Config::for_test(), db);
         (app(state.clone()), state)
+    }
+
+    /// The bearer credential HTTP tests present, minted **once per process**
+    /// from a seeded active admin (`crate::users::testing::seed_user` +
+    /// `crate::sessions::testing::login_as`) — the replacement for the deleted
+    /// static `TOKEN` constant. Access-token verification is stateless (one
+    /// HMAC check against the fixed test master key, no database read), so a
+    /// token minted here authenticates against every in-memory instance these
+    /// tests boot.
+    fn auth_bearer() -> &'static str {
+        static BEARER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        BEARER.get_or_init(|| {
+            // Seeding and login are async store calls, and `req` below is
+            // synchronous. Mint on a dedicated OS thread: `Runtime::block_on`
+            // panics if called from inside a test's own async context, but a
+            // plain thread has none, so a throwaway current-thread runtime is
+            // legal there.
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime");
+                let token = runtime.block_on(async {
+                    let db = crate::Db::connect(":memory:").await.unwrap();
+                    db.run_migrations().await.unwrap();
+                    let state =
+                        crate::AppState::new(crate::Config::for_test(), db);
+                    let user = crate::users::testing::seed_user(
+                        &state,
+                        "tester",
+                        crate::users::Role::Admin,
+                        true,
+                    )
+                    .await;
+                    crate::sessions::testing::login_as(&state, &user).await
+                });
+                tx.send(token).expect("bearer receiver dropped");
+            });
+            rx.recv().expect("bearer minter panicked")
+        })
     }
 
     fn req(method: &str, uri: &str, body: Option<Json>) -> Request<Body> {
         let builder = Request::builder()
             .method(method)
             .uri(uri)
-            .header(AUTHORIZATION, format!("Bearer {TOKEN}"));
+            .header(AUTHORIZATION, format!("Bearer {}", auth_bearer()));
         match body {
             Some(v) => builder
                 .header(CONTENT_TYPE, "application/json")

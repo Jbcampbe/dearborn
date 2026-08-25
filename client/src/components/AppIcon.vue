@@ -33,7 +33,9 @@ const ICONS: Record<string, string> = {
   search: `<circle cx="7" cy="7" r="4.5"/><path d="M10.5 10.5 14 14"/>`,
   dot: `<circle cx="8" cy="8" r="3" fill="currentColor" stroke="none"/>`,
   warning: `<path d="M8 2.2 14.5 13.5H1.5L8 2.2ZM8 6.5v3.5M8 11.5v.01"/>`,
+  key: `<circle cx="5" cy="11" r="2.5"/><path d="M7 9 13.5 2.5M10.8 5.2l2 2M12.6 3.4l1.6 1.6"/>`,
   sliders: `<path d="M3 4.5h6M11.5 4.5H13M3 11.5h1.5M7 11.5h6M9 2.8v3.4M5 9.8v3.4"/>`,
+  users: `<circle cx="6" cy="5.5" r="2.3"/><path d="M1.8 13c.4-2.3 2-3.7 4.2-3.7S9.8 10.7 10.2 13M11 3.6a2.3 2.3 0 0 1 0 3.8M12 9.6c1.3.5 2 1.7 2.3 3.4"/>`,
 };
 </script>
 

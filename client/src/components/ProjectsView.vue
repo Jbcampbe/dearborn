@@ -21,7 +21,7 @@ const error = ref<string | null>(null);
 const createOpen = ref(false);
 
 async function load() {
-  const token = auth.token;
+  const token = auth.accessToken;
   if (token === null) {
     return;
   }

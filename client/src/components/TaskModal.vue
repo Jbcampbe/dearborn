@@ -104,7 +104,7 @@ function nullable(text: string): string | null {
 }
 
 async function submit() {
-  const token = auth.token;
+  const token = auth.accessToken;
   const trimmed = title.value.trim();
   if (token === null || trimmed.length === 0 || busy.value) {
     return;
@@ -139,7 +139,7 @@ async function submit() {
 }
 
 async function confirmDelete() {
-  const token = auth.token;
+  const token = auth.accessToken;
   if (token === null || props.task === null || busy.value) {
     return;
   }

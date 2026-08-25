@@ -81,7 +81,7 @@ function chooseNewTask() {
 }
 
 async function load() {
-  const token = auth.token;
+  const token = auth.accessToken;
   if (token === null) {
     return;
   }
@@ -106,7 +106,7 @@ async function load() {
 }
 
 async function reclone() {
-  const token = auth.token;
+  const token = auth.accessToken;
   if (token === null) {
     return;
   }

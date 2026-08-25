@@ -86,23 +86,50 @@ curl http://127.0.0.1:8787/health
 ```
 
 The server reads its configuration from the environment (see the
-[Configuration](#configuration) table below). `DEARBORN_TOKEN` and
-`DEARBORN_MASTER_KEY` are **required** — the server refuses to start without
-them:
+[Configuration](#configuration) table below). `DEARBORN_MASTER_KEY` is
+**required** — the server refuses to start without it:
 
 ```bash
-DEARBORN_TOKEN=my-secret-token DEARBORN_MASTER_KEY=... cargo run -p dearborn-server
+DEARBORN_MASTER_KEY=... cargo run -p dearborn-server
 # → dearborn-server listening on http://127.0.0.1:8787
 ```
 
-Every route except `GET /health` requires an `Authorization: Bearer <token>`
-header matching `DEARBORN_TOKEN`; requests without it get `401`:
+### Authentication
 
-```bash
-curl http://127.0.0.1:8787/health                                   # → 200 (public)
-curl -H "Authorization: Bearer my-secret-token" \
-     http://127.0.0.1:8787/whoami                                   # → 200 {"status":"authenticated"}
-```
+Dearborn has named users, each with their own username + password. There is no
+shared credential and nothing to configure: access works as **setup → login →
+refresh**.
+
+- **Setup.** A freshly started instance (zero users in the database) is
+  *unclaimed*: opening the SPA shows a create-admin form instead of a login
+  form, and `GET /auth/status` reports `{ "setup_required": true }`. Submitting
+  the form creates the first user with the admin role and logs them straight
+  in. Once any user exists the setup path closes permanently.
+- **Login.** Username + password via the SPA's login form (`POST
+  /auth/login`). A successful login issues a short-lived **access token**
+  (default 24 h) and a long-lived **refresh token** (default 180 days); the SPA
+  keeps both and attaches the access token as `Authorization: Bearer <token>`
+  on API calls and `?token=` on the `/ws` handshake.
+- **Refresh.** When the access token nears expiry the SPA transparently trades
+  the refresh token for a new access token (`POST /auth/refresh`), so
+  day-to-day use never re-prompts for a password — but a
+  browser left alone longer than the refresh-token lifetime does. Logging out
+  revokes that device's session.
+
+Two operational notes:
+
+- **A still-set `DEARBORN_TOKEN` environment variable is ignored.** The
+  variable stopped existing as far as the server is concerned — setting it
+  grants access to nothing, causes no boot failure, and produces no warning.
+- **Rotating `DEARBORN_MASTER_KEY` logs every user out** (every live session
+  stops verifying), in addition to invalidating every stored PAT — see
+  [Secret handling](#secret-handling).
+
+One accepted risk: because first-launch setup must be reachable without
+credentials, whoever reaches a freshly started instance first claims it by
+creating the admin. Dearborn binds to `127.0.0.1` by default, which keeps this
+local-only; if you expose the port more broadly (reverse proxy, container
+network, LAN), claim your instance immediately after starting it.
 
 ### Everything (server + Vite dev server)
 
@@ -112,8 +139,8 @@ just dev
 
 Runs the Rust server and the Vite dev server together. Vite serves the SPA on
 <http://localhost:5173> with hot-reload and proxies the API it calls (`/health`,
-`/whoami`, `/projects`, and the `/ws` WebSocket) to the Rust server on `:8787`.
-Ctrl-C stops both.
+`/auth/*`, `/users`, `/projects`, and the `/ws` WebSocket) to the Rust server
+on `:8787`. Ctrl-C stops both.
 
 ## Serving the client (T-006)
 
@@ -128,14 +155,17 @@ client-side routing works on deep links / refreshes.
 - API routes always win: `/health`, `/ws`, `/projects*` etc. are matched before
   the static fallback, so serving the SPA never shadows or unauth-exposes them.
   The static/SPA files are served **without** auth (so the shell can load and
-  prompt for a token); auth is enforced on the API calls the SPA then makes.
+  show the login/create-admin screen); auth is enforced on the API calls the
+  SPA then makes.
 - If the assets dir is missing (e.g. you ran `cargo run` without building the
   client), the server logs a warning and serves the **API only** — it does not
   crash. Build the client to get the SPA back.
 
-The SPA persists the bearer token in `localStorage`, shows a token-entry screen
-when none is set, attaches `Authorization: Bearer <token>` to API calls, and on
-a `401` clears the token and returns to the entry screen with an auth error.
+The SPA persists the session (access + refresh tokens and the logged-in user)
+in `localStorage`, shows a create-admin form on an unclaimed instance and a
+login form otherwise, attaches the access token to API calls, and transparently
+refreshes it when it nears expiry; on a failed refresh it clears the session
+and returns to the login screen.
 
 ## Testing
 
@@ -166,9 +196,10 @@ environment variables always take precedence over the file.
 
 | Variable              | Required | Default          | Purpose                                                                 |
 | --------------------- | :------: | ---------------- | ----------------------------------------------------------------------- |
-| `DEARBORN_TOKEN`      |   yes    | —                | Single-user bearer token; every route except `GET /health` requires it. |
-| `DEARBORN_MASTER_KEY` |   yes    | —                | Secret material for encrypting PATs at rest (see [Secret handling](#secret-handling)).|
+| `DEARBORN_MASTER_KEY` |   yes    | —                | Secret material for encrypting PATs at rest and signing access tokens (see [Secret handling](#secret-handling)).|
 | `DEARBORN_BIND`       |    no    | `127.0.0.1:8787` | Server bind address.                                                     |
+| `DEARBORN_ACCESS_TTL_SECS` | no | `86400`           | Access-token lifetime in seconds (default 24 h).                          |
+| `DEARBORN_REFRESH_TTL_SECS` | no | `15552000`        | Refresh-token lifetime in seconds (default 180 days).                     |
 | `DEARBORN_DB`         |    no    | `./dearborn.db`  | Path to the local libSQL database file (T-003).                         |
 | `DEARBORN_CLONE_ROOT` |    no    | `./clones`       | Root directory under which per-project clones live (T-103).             |
 | `DEARBORN_STATIC_DIR` |    no    | `./client/dist`  | Directory of built Vite SPA assets served at `/` (T-006).               |
@@ -184,7 +215,7 @@ environment variables always take precedence over the file.
 | `DEARBORN_POLL_INTERVAL_MS` | no | `1500`           | Fallback poll interval for workers, behind the notify.                   |
 
 The server **fails fast at boot** with a clear error (non-zero exit) if
-`DEARBORN_TOKEN` or `DEARBORN_MASTER_KEY` is missing or empty. The executor
+`DEARBORN_MASTER_KEY` is missing or empty. The session-TTL and executor
 variables above are best-effort: an invalid or unparseable value falls back to
 its default with a logged warning rather than failing boot (see
 `dearborn-server/src/config.rs`).
@@ -381,7 +412,10 @@ Per-project GitHub PATs are **encrypted at rest** with **AES-256-GCM** (T-102):
   which already carries its 128-bit auth tag).
 - **Rotation.** Changing `DEARBORN_MASTER_KEY` changes the derived key, so PATs
   encrypted under the old value stop decrypting (a wrong/rotated key yields a
-  GCM authentication error, never plaintext) and must be re-entered.
+  GCM authentication error, never plaintext) and must be re-entered. The same
+  rotation also invalidates every live login session — the access-token HMAC
+  key is derived from the same material with domain separation (`SHA-256("dearborn/auth-token/v1" || master_key)`, distinct from the AES key), so every
+  user is logged out and must log back in.
 - **Never returned, never logged.** A PAT is accepted only on `POST`/`PATCH
   /projects`; it is never included in any API response and never written to a
   log line (the request field is a redacted-`Debug` `Secret`). The decrypt path

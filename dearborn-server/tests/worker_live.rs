@@ -92,9 +92,8 @@ use dearborn_server::git_host::testing::FakeHost;
 use dearborn_server::planning::ClaudePlanningAgent;
 use dearborn_server::task_agent::CliTaskAgent;
 use dearborn_server::workspace;
-use dearborn_server::{worker, AppState, Config, Db, ExecutorConfig};
+use dearborn_server::{worker, AppState, Config, Db};
 
-const TOKEN: &str = "s3cret-token";
 
 /// Wall-clock ceiling for the whole pipeline call. Generous for a real
 /// `claude` cold start plus one trivial file-write turn, but bounded — see
@@ -142,26 +141,9 @@ async fn live_implement_writes_commits_pushes_to_bare_origin_and_opens_a_fake_pr
     // ---- real server state: real CliTaskAgent + FakeHost (T-514's seam) ----
     let db = Db::connect(":memory:").await.unwrap();
     db.run_migrations().await.unwrap();
-    let config = Config {
-        bind: "127.0.0.1:0".to_string(),
-        token: TOKEN.to_string(),
-        master_key: "test-master-key".to_string(),
-        db_path: ":memory:".to_string(),
-        clone_root: clone_root.to_string_lossy().to_string(),
-        static_dir: "./client/dist".to_string(),
-        auto_clone: false,
-        executor: ExecutorConfig {
-            worker_concurrency: 1,
-            lease_ttl_secs: 300,
-            heartbeat_secs: 30,
-            agent_stage_timeout_secs: 1800,
-            cmd_timeout_secs: 900,
-            max_test_fix_attempts: 3,
-            max_fix_rounds: 3,
-            verdict_retries: 1,
-            poll_interval_ms: 50,
-        },
-    };
+    let mut config = Config::for_test();
+    config.bind = "127.0.0.1:0".to_string();
+    config.clone_root = "./clones".to_string();
     let fake_host = Arc::new(FakeHost::new());
     let state = AppState::with_all_agents_and_host(
         config,

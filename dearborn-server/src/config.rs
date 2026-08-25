@@ -5,8 +5,10 @@
 //! `DEARBORN_CONFIG` at a `KEY=VALUE` file (`#` comments and blank lines are
 //! ignored) to use it. Environment variables always win over the file.
 //!
-//! Required values (`DEARBORN_TOKEN`, `DEARBORN_MASTER_KEY`) are validated at
-//! load time so the server fails fast at boot rather than at first request.
+//! The one required value (`DEARBORN_MASTER_KEY`) is validated at load time so
+//! the server fails fast at boot rather than at first request. There is no
+//! bearer-token setting any more: credentials are per-user access tokens minted
+//! by the `/auth/*` routes (see [`crate::auth`] and [`crate::sessions`]).
 
 use std::collections::HashMap;
 
@@ -28,8 +30,6 @@ pub const DEFAULT_STATIC_DIR: &str = "./client/dist";
 pub struct Config {
     /// Address the HTTP server binds to (`DEARBORN_BIND`).
     pub bind: String,
-    /// Single-user bearer token every non-`/health` route requires (`DEARBORN_TOKEN`).
-    pub token: String,
     /// AES-256-GCM key material used to encrypt PATs at rest (`DEARBORN_MASTER_KEY`).
     /// Validated for presence here; consumed by T-102.
     pub master_key: String,
@@ -44,8 +44,46 @@ pub struct Config {
     /// (T-103). Always `true` in production; tests default it `false` so plain
     /// CRUD tests never shell out to git. Not env-configurable — an internal seam.
     pub auto_clone: bool,
+    /// Whether password hashing uses deliberately weak Argon2id parameters
+    /// (m=8 KiB, t=1, p=1) instead of the production cost. Always `false` in
+    /// production; tests default it `true`. Not env-configurable — an internal
+    /// seam, exactly like [`auto_clone`](Self::auto_clone).
+    ///
+    /// Production Argon2id burns ~40–60 ms of CPU per hash by design. That is
+    /// the point in production and pure tax in a test suite that seeds a user
+    /// per case, so the test config selects the cheapest legal parameters. The
+    /// PHC string records whichever parameters produced it, so a hash written
+    /// under either setting still verifies under the other. See
+    /// [`crate::users::hash_password`].
+    pub argon2_fast: bool,
+    /// Session-lifetime tuning for the multi-user auth epic. See [`AuthConfig`].
+    pub auth: AuthConfig,
     /// Executor worker-pool tuning (Milestone 2 §2.7). See [`ExecutorConfig`].
     pub executor: ExecutorConfig,
+}
+
+/// How long the two halves of a session live. Both fields resolve through the
+/// same env-then-file path as the rest of [`Config`] and are parsed with the
+/// same [`parse_or_warn`] the executor knobs use: a missing, unparseable, or
+/// zero value **warns and falls back to the default** rather than failing boot.
+///
+/// The split is what makes the product's "revocation is eventual, bounded by
+/// the access-token lifetime" literally true: the access token is verified
+/// offline (no database read), so a deactivation lands at the next refresh, at
+/// most `access_ttl_secs` later.
+#[derive(Debug, Clone)]
+pub struct AuthConfig {
+    /// Lifetime of a minted access token, in seconds
+    /// (`DEARBORN_ACCESS_TTL_SECS`). Default `86400` (24 h) — long enough that
+    /// day-to-day use never re-prompts, short enough to bound how stale a
+    /// revoked claim can get. **Rejects `0`**: a 0s access token would expire
+    /// before the response carrying it reached the browser.
+    pub access_ttl_secs: u64,
+    /// Absolute lifetime of a session's refresh token, in seconds
+    /// (`DEARBORN_REFRESH_TTL_SECS`). Default `15552000` (180 days), so a
+    /// browser left alone for a year re-prompts for a password but one left
+    /// alone over a holiday does not. **Rejects `0`** for the same reason.
+    pub refresh_ttl_secs: u64,
 }
 
 /// Tuning knobs for the executor worker pool (Milestone 2 §2.7). Every field
@@ -130,14 +168,13 @@ pub enum ConfigError {
 impl Config {
     /// Resolve configuration from the environment plus an optional config file.
     ///
-    /// Fails fast if `DEARBORN_TOKEN` or `DEARBORN_MASTER_KEY` is missing/empty.
+    /// Fails fast if `DEARBORN_MASTER_KEY` is missing/empty.
     pub fn from_env() -> Result<Config, ConfigError> {
         let file = load_config_file()?;
 
         let bind = resolve(&file, "DEARBORN_BIND")
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| DEFAULT_BIND.to_string());
-        let token = required(&file, "DEARBORN_TOKEN")?;
         let master_key = required(&file, "DEARBORN_MASTER_KEY")?;
         let db_path = expand_tilde(
             resolve(&file, "DEARBORN_DB")
@@ -152,16 +189,18 @@ impl Config {
         let static_dir = resolve(&file, "DEARBORN_STATIC_DIR")
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| DEFAULT_STATIC_DIR.to_string());
-        let executor = executor_from(&resolve_executor_vars(&file));
+        let auth = auth_from(&resolve_vars(&file, AUTH_VAR_NAMES));
+        let executor = executor_from(&resolve_vars(&file, EXECUTOR_VAR_NAMES));
 
         Ok(Config {
             bind,
-            token,
             master_key,
             db_path,
             clone_root,
             static_dir,
             auto_clone: true,
+            argon2_fast: false,
+            auth,
             executor,
         })
     }
@@ -181,14 +220,18 @@ const EXECUTOR_VAR_NAMES: &[&str] = &[
     "DEARBORN_POLL_INTERVAL_MS",
 ];
 
-/// Resolve every executor variable through the same env-then-file path as the
-/// rest of `Config` (via [`resolve`]), collecting the results into a plain
-/// map. Kept separate from [`executor_from`] so the actual parse-or-default
-/// logic is a pure function of a `HashMap`, testable without touching
-/// process-global env (see `mod tests`).
-fn resolve_executor_vars(file: &HashMap<String, String>) -> HashMap<String, String> {
+/// Environment variable names for every [`AuthConfig`] field, in declaration
+/// order.
+const AUTH_VAR_NAMES: &[&str] = &["DEARBORN_ACCESS_TTL_SECS", "DEARBORN_REFRESH_TTL_SECS"];
+
+/// Resolve a group of tuning variables through the same env-then-file path as
+/// the rest of `Config` (via [`resolve`]), collecting the results into a plain
+/// map. Kept separate from [`executor_from`]/[`auth_from`] so the actual
+/// parse-or-default logic is a pure function of a `HashMap`, testable without
+/// touching process-global env (see `mod tests`).
+fn resolve_vars(file: &HashMap<String, String>, names: &[&str]) -> HashMap<String, String> {
     let mut map = HashMap::new();
-    for key in EXECUTOR_VAR_NAMES {
+    for key in names {
         if let Some(v) = resolve(file, key) {
             map.insert((*key).to_string(), v);
         }
@@ -196,8 +239,21 @@ fn resolve_executor_vars(file: &HashMap<String, String>) -> HashMap<String, Stri
     map
 }
 
+/// Parse an [`AuthConfig`] out of an already-resolved key/value map (see
+/// [`resolve_vars`]). Pure, for the same reason [`executor_from`] is.
+///
+/// Both TTLs reject `0` and warn-and-default rather than failing boot: a bad
+/// session lifetime should degrade to the documented one, not stop an operator
+/// from reaching their own instance.
+fn auth_from(map: &HashMap<String, String>) -> AuthConfig {
+    AuthConfig {
+        access_ttl_secs: parse_or_warn(map, "DEARBORN_ACCESS_TTL_SECS", 86_400u64, true),
+        refresh_ttl_secs: parse_or_warn(map, "DEARBORN_REFRESH_TTL_SECS", 15_552_000u64, true),
+    }
+}
+
 /// Parse an [`ExecutorConfig`] out of an already-resolved key/value map (see
-/// [`resolve_executor_vars`]). Pure, so it is unit-tested directly with
+/// [`resolve_vars`]). Pure, so it is unit-tested directly with
 /// hand-built maps instead of through `from_env`, which would require
 /// mutating process-global env under a threaded test runner.
 fn executor_from(map: &HashMap<String, String>) -> ExecutorConfig {
@@ -219,7 +275,7 @@ fn executor_from(map: &HashMap<String, String>) -> ExecutorConfig {
     }
 }
 
-/// Parse a single executor tuning value out of a resolved map, falling back
+/// Parse a single tuning value (executor or auth) out of a resolved map, falling back
 /// to `default` (with a `tracing::warn!` naming the variable and the bad
 /// value) if the key is absent, empty, unparseable, or — when `reject_zero`
 /// is set — zero. Factors the "parse or warn-and-default" behavior so it is
@@ -335,13 +391,16 @@ fn parse_config_file(contents: &str) -> HashMap<String, String> {
     map
 }
 
-#[cfg(test)]
 impl Config {
     /// Build a config for tests without touching process-global env.
-    pub fn for_test(token: &str) -> Config {
+    ///
+    /// Unconditionally `pub` (not `#[cfg(test)]`) for the same reason
+    /// [`crate::users::testing`] is: an integration test in `tests/` compiles as
+    /// its own crate and never sees anything gated behind this crate's
+    /// `#[cfg(test)]`.
+    pub fn for_test() -> Config {
         Config {
             bind: DEFAULT_BIND.to_string(),
-            token: token.to_string(),
             master_key: "test-master-key".to_string(),
             db_path: ":memory:".to_string(),
             clone_root: DEFAULT_CLONE_ROOT.to_string(),
@@ -349,6 +408,16 @@ impl Config {
             // Plain CRUD tests must not shell out to git; T-103 tests that
             // exercise cloning flip this on explicitly.
             auto_clone: false,
+            // Seeding a user per test case must not cost ~50ms of Argon2.
+            argon2_fast: true,
+            // Production lifetimes: a test that wants an *expired* session
+            // writes the row's `expires_at` directly rather than waiting one
+            // out, so shortening these here would buy nothing and would make
+            // ordinary login/refresh tests race the clock.
+            auth: AuthConfig {
+                access_ttl_secs: 86_400,
+                refresh_ttl_secs: 15_552_000,
+            },
             executor: ExecutorConfig {
                 // 1 worker + a 10ms poll keep tests deterministic and fast.
                 worker_concurrency: 1,
@@ -373,8 +442,8 @@ mod tests {
 
     #[test]
     fn parse_ignores_comments_and_blanks() {
-        let map = parse_config_file("# a comment\n\nDEARBORN_TOKEN=abc\n");
-        assert_eq!(map.get("DEARBORN_TOKEN"), Some(&"abc".to_string()));
+        let map = parse_config_file("# a comment\n\nDEARBORN_DB=x.db\n");
+        assert_eq!(map.get("DEARBORN_DB"), Some(&"x.db".to_string()));
         assert_eq!(map.len(), 1);
     }
 
@@ -526,8 +595,36 @@ mod tests {
     }
 
     #[test]
+    fn auth_from_parses_both_ttls_and_defaults_when_absent() {
+        let cfg = auth_from(&map_of(&[
+            ("DEARBORN_ACCESS_TTL_SECS", "3600"),
+            ("DEARBORN_REFRESH_TTL_SECS", "604800"),
+        ]));
+        assert_eq!(cfg.access_ttl_secs, 3600);
+        assert_eq!(cfg.refresh_ttl_secs, 604_800);
+
+        let defaults = auth_from(&HashMap::new());
+        assert_eq!(defaults.access_ttl_secs, 86_400, "24 hours");
+        assert_eq!(defaults.refresh_ttl_secs, 15_552_000, "180 days");
+    }
+
+    #[test]
+    fn a_bad_ttl_warns_and_defaults_rather_than_failing_boot() {
+        // Unparseable, zero, and empty all degrade to the documented default —
+        // a mistyped session lifetime must never stop the server booting.
+        for bad in ["abc", "0", "", "-5", "1.5"] {
+            let cfg = auth_from(&map_of(&[
+                ("DEARBORN_ACCESS_TTL_SECS", bad),
+                ("DEARBORN_REFRESH_TTL_SECS", bad),
+            ]));
+            assert_eq!(cfg.access_ttl_secs, 86_400, "`{bad}` must fall back");
+            assert_eq!(cfg.refresh_ttl_secs, 15_552_000, "`{bad}` must fall back");
+        }
+    }
+
+    #[test]
     fn for_test_yields_fast_executor_values() {
-        let cfg = Config::for_test("t");
+        let cfg = Config::for_test();
         assert_eq!(cfg.executor.worker_concurrency, 1);
         assert_eq!(cfg.executor.poll_interval_ms, 10);
         assert_eq!(cfg.executor.lease_ttl_secs, 30);
@@ -538,5 +635,19 @@ mod tests {
         assert_eq!(cfg.executor.max_test_fix_attempts, 3);
         assert_eq!(cfg.executor.max_fix_rounds, 3);
         assert_eq!(cfg.executor.verdict_retries, 1);
+    }
+
+    #[test]
+    fn internal_seams_default_off_in_tests_and_are_not_env_configurable() {
+        let cfg = Config::for_test();
+        // Neither seam is read from the environment — they exist only as
+        // fields, so a `DEARBORN_ARGON2_FAST=1` in the environment is as
+        // meaningless as a `DEARBORN_AUTO_CLONE=1`.
+        assert!(!cfg.auto_clone);
+        assert!(
+            cfg.argon2_fast,
+            "tests must not pay production Argon2 cost per seeded user"
+        );
+        assert!(!EXECUTOR_VAR_NAMES.contains(&"DEARBORN_ARGON2_FAST"));
     }
 }

@@ -863,12 +863,11 @@ mod tests {
         }
     }
 
-    const TOKEN: &str = "s3cret-token";
 
     async fn test_state(clone_root: &str) -> AppState {
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
-        let mut config = Config::for_test(TOKEN);
+        let mut config = Config::for_test();
         config.clone_root = clone_root.to_string();
         AppState::new(config, db)
     }

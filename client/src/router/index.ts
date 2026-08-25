@@ -7,12 +7,31 @@ import EpicDetailView from "../components/EpicDetailView.vue";
 import DagEditorView from "../components/DagEditorView.vue";
 import EpicKanbanView from "../components/EpicKanbanView.vue";
 import SettingsView from "../components/SettingsView.vue";
+import UsersView from "../components/UsersView.vue";
+import { useAuthStore } from "../stores/auth";
 
 // Client-side routes. The top-level token gate lives in App.vue (an
 // unauthenticated user sees the token screen regardless of route), so these
 // routes are all "inside" the authenticated app.
 const routes: RouteRecordRaw[] = [
   { path: "/", name: "projects", component: ProjectsView },
+  {
+    // Admin user management (multi-user auth epic). `/team` deliberately avoids
+    // the API's `/users` namespace: axum registers `GET /users` (and the Vite
+    // dev proxy forwards it), which would shadow this route on a hard reload /
+    // deep link — the same reason `/agent-settings` exists alongside `/settings`.
+    // The `beforeEnter` guard is cosmetic defense in depth; the server's `403`
+    // on every /users route is the real control.
+    path: "/team",
+    name: "users",
+    component: UsersView,
+    beforeEnter: (_to, _from) => {
+      const auth = useAuthStore();
+      if (!auth.isAdmin) {
+        return { name: "projects" };
+      }
+    },
+  },
   {
     // Global agent settings (design doc §8). `/settings` is the API's own
     // namespace, so the client route is the distinct `/agent-settings` path to

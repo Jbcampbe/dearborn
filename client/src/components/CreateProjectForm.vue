@@ -63,7 +63,7 @@ async function submit() {
   if (!validate()) {
     return;
   }
-  const token = auth.token;
+  const token = auth.accessToken;
   if (token === null) {
     return;
   }

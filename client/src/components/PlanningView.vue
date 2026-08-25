@@ -98,7 +98,7 @@ function bounceIfAuth(err: unknown): boolean {
 }
 
 async function load() {
-  const token = auth.token;
+  const token = auth.accessToken;
   if (token === null) {
     return;
   }
@@ -115,7 +115,7 @@ async function load() {
     // Only open the live stream once the history is in place. Pass our own
     // status ref so no extra watcher is needed (we're past an `await`, so the
     // setup effect scope is no longer current).
-    stream = useEpicStream(props.id, token, state, streamStatus);
+    stream = useEpicStream(props.id, () => auth.ensureFresh(), state, streamStatus);
     // Non-blocking + non-fatal: the breadcrumb falls back to "…" without it.
     void getProject(token, epic.project_id)
       .then((p) => (projectName.value = p.name))
@@ -131,7 +131,7 @@ async function load() {
 }
 
 async function send() {
-  const token = auth.token;
+  const token = auth.accessToken;
   const content = draft.value.trim();
   if (token === null || content.length === 0 || runInFlight.value || sending.value) {
     return;
@@ -156,7 +156,7 @@ async function send() {
 // Advance product → technical planning: the transcript continues on the same
 // sequence, and the composer flips to `phase: "technical"` (via `currentPhase`).
 async function advance() {
-  const token = auth.token;
+  const token = auth.accessToken;
   if (token === null || hasTechnical.value || advancing.value || runInFlight.value) {
     return;
   }
@@ -186,7 +186,7 @@ const breakDownDisabled = computed(
   () => advancing.value || runInFlight.value || breakingDown.value,
 );
 async function breakDown() {
-  const token = auth.token;
+  const token = auth.accessToken;
   if (token === null || !canBreakDown.value || breakDownDisabled.value) {
     return;
   }

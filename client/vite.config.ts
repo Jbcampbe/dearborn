@@ -11,7 +11,6 @@ export default defineConfig({
     // binary serves the built assets itself and no proxy is involved.
     proxy: {
       "/health": "http://127.0.0.1:8787",
-      "/whoami": "http://127.0.0.1:8787",
       "/projects": "http://127.0.0.1:8787",
       // Epics + planning transcript REST surface (T-201/T-204). Singular
       // `/epic/:id` is a client route (see router) so it does not clash here.
@@ -25,6 +24,13 @@ export default defineConfig({
       // Global agent settings (design doc §7). Top-level `/settings` — the
       // client route is singular `/agent-settings` so it does not clash here.
       "/settings": "http://127.0.0.1:8787",
+      // Auth surface: status probe, setup, login, refresh, logout. Public
+      // routes the SPA hits before it holds an access token.
+      "/auth": "http://127.0.0.1:8787",
+      // Admin user-management surface (multi-user auth epic). The client's
+      // users screen lives at `/team` so it does not clash with this prefix on
+      // a hard reload / deep link.
+      "/users": "http://127.0.0.1:8787",
       // WebSocket — planning `RunEvent` live stream (T-202/T-204). `ws:true`
       // makes the dev proxy forward the Upgrade handshake to the Rust server.
       "/ws": { target: "ws://127.0.0.1:8787", ws: true },

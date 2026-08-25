@@ -53,6 +53,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0006_agent_run_evidence",
         sql: include_str!("../migrations/0006_agent_run_evidence.sql"),
     },
+    Migration {
+        id: 7,
+        name: "0007_users",
+        sql: include_str!("../migrations/0007_users.sql"),
+    },
 ];
 
 /// Errors surfaced while opening the database or running migrations.
@@ -299,6 +304,184 @@ mod tests {
                 rows.next().await.unwrap().is_some(),
                 "missing index: {index}"
             );
+        }
+    }
+
+    /// A fresh boot's `0007_users` migration lands both auth tables with the
+    /// schema the technical plan §3 specifies: a case-insensitive unique
+    /// `username`, the `role` CHECK vocabulary, `active` defaulting to 1, and
+    /// the `session_user` index.
+    #[tokio::test]
+    async fn migration_0007_creates_the_user_and_session_tables() {
+        let db = Db::connect(":memory:").await.unwrap();
+        db.run_migrations().await.unwrap();
+
+        for (table, column) in [
+            ("user", "id"),
+            ("user", "username"),
+            ("user", "display_name"),
+            ("user", "password_hash"),
+            ("user", "role"),
+            ("user", "active"),
+            ("user", "created_at"),
+            ("user", "updated_at"),
+            ("session", "id"),
+            ("session", "user_id"),
+            ("session", "refresh_token_hash"),
+            ("session", "created_at"),
+            ("session", "expires_at"),
+            ("session", "last_used_at"),
+        ] {
+            let mut rows = db
+                .conn()
+                .query(&format!("PRAGMA table_info({table})"), ())
+                .await
+                .unwrap();
+            let mut found = false;
+            while let Some(row) = rows.next().await.unwrap() {
+                if row.get::<String>(1).unwrap() == column {
+                    found = true;
+                    break;
+                }
+            }
+            assert!(found, "missing column {table}.{column}");
+        }
+
+        let mut rows = db
+            .conn()
+            .query(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name='session_user'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(rows.next().await.unwrap().is_some(), "missing session_user");
+
+        // `active` defaults to 1 and `username` folds case in the unique index.
+        db.conn()
+            .execute(
+                "INSERT INTO user (id, username, display_name, password_hash, role, \
+                     created_at, updated_at) VALUES ('u1', 'Josiah', 'Josiah', 'x', 'admin', 1, 1)",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut rows = db
+            .conn()
+            .query(
+                "SELECT active FROM user WHERE username = 'josiah'",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows
+            .next()
+            .await
+            .unwrap()
+            .expect("NOCASE lookup finds the differently-cased row");
+        assert_eq!(row.get::<i64>(0).unwrap(), 1, "active defaults to 1");
+
+        // A case-variant duplicate collides on the unique index.
+        assert!(db
+            .conn()
+            .execute(
+                "INSERT INTO user (id, username, display_name, password_hash, role, \
+                     created_at, updated_at) VALUES ('u2', 'JOSIAH', 'J', 'x', 'user', 1, 1)",
+                (),
+            )
+            .await
+            .is_err());
+
+        // The role CHECK rejects anything outside the two-role vocabulary.
+        assert!(db
+            .conn()
+            .execute(
+                "INSERT INTO user (id, username, display_name, password_hash, role, \
+                     created_at, updated_at) VALUES ('u3', 'root', 'R', 'x', 'superuser', 1, 1)",
+                (),
+            )
+            .await
+            .is_err());
+    }
+
+    /// `0007_users` also applies cleanly to a database that already carries
+    /// every earlier migration — the real "existing `dearborn.db` restarts on
+    /// the new binary" upgrade path, which must add the two tables and nothing
+    /// else.
+    #[tokio::test]
+    async fn migration_0007_applies_cleanly_on_an_existing_database() {
+        let path = std::env::temp_dir().join(format!(
+            "dearborn-users-existing-{}-{}.db",
+            std::process::id(),
+            now_ms()
+        ));
+        let path = path.to_str().unwrap();
+
+        {
+            // Simulate a pre-auth installation: every migration before 7.
+            let db = Db::connect(path).await.unwrap();
+            db.conn()
+                .execute(
+                    "CREATE TABLE IF NOT EXISTS _migrations (\
+                         id         INTEGER PRIMARY KEY, \
+                         name       TEXT NOT NULL, \
+                         applied_at INTEGER NOT NULL\
+                     )",
+                    (),
+                )
+                .await
+                .unwrap();
+            for migration in MIGRATIONS.iter().filter(|m| m.id < 7) {
+                db.conn().execute_batch(migration.sql).await.unwrap();
+                db.conn()
+                    .execute(
+                        "INSERT INTO _migrations (id, name, applied_at) VALUES (?1, ?2, ?3)",
+                        (migration.id, migration.name, now_ms()),
+                    )
+                    .await
+                    .unwrap();
+            }
+            // Real data predating the migration must survive it.
+            db.conn()
+                .execute(
+                    "INSERT INTO project (id, name, repo_url, clone_status, created_at, updated_at) \
+                     VALUES ('p-1', 'P', 'https://example.com/p.git', 'ready', 1, 1)",
+                    (),
+                )
+                .await
+                .unwrap();
+        }
+
+        {
+            let db = Db::connect(path).await.unwrap();
+            let expected_new = MIGRATIONS.iter().filter(|m| m.id > 6).count() as u32;
+            assert_eq!(
+                db.run_migrations().await.unwrap(),
+                expected_new,
+                "every migration newer than the simulated pre-auth state applies"
+            );
+
+            // The instance starts unclaimed — zero users, not an error.
+            let mut rows = db.conn().query("SELECT COUNT(*) FROM user", ()).await.unwrap();
+            let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+            assert_eq!(count, 0);
+
+            // Pre-existing rows are untouched.
+            let mut rows = db
+                .conn()
+                .query("SELECT name FROM project WHERE id = 'p-1'", ())
+                .await
+                .unwrap();
+            assert_eq!(
+                rows.next().await.unwrap().unwrap().get::<String>(0).unwrap(),
+                "P"
+            );
+
+            assert_eq!(db.run_migrations().await.unwrap(), 0, "re-boot is a no-op");
+        }
+
+        for suffix in ["", "-shm", "-wal"] {
+            let _ = std::fs::remove_file(format!("{path}{suffix}"));
         }
     }
 

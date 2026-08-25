@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onMounted } from "vue";
+import { onMounted, ref } from "vue";
 import { RouterLink, useRoute } from "vue-router";
 import { useAuthStore } from "../stores/auth";
 import { useProjectsStore } from "../stores/projects";
@@ -7,6 +7,7 @@ import { ApiError } from "../api/client";
 import AppLogo from "./AppLogo.vue";
 import AppIcon from "./AppIcon.vue";
 import StatusIcon from "./StatusIcon.vue";
+import ChangePasswordModal from "./ChangePasswordModal.vue";
 
 // Authenticated app frame: a slim fixed sidebar (brand, primary nav, project
 // switcher, session) beside a scrollable content canvas. The project list is
@@ -16,7 +17,7 @@ const store = useProjectsStore();
 const route = useRoute();
 
 onMounted(async () => {
-  const token = auth.token;
+  const token = auth.accessToken;
   if (token === null || store.loaded) {
     return;
   }
@@ -34,6 +35,8 @@ onMounted(async () => {
 function isActiveProject(id: string): boolean {
   return route.name === "project-detail" && route.params.id === id;
 }
+
+const passwordModalOpen = ref(false);
 </script>
 
 <template>
@@ -61,6 +64,15 @@ function isActiveProject(id: string): boolean {
           <AppIcon name="sliders" :size="15" />
           <span>Settings</span>
         </RouterLink>
+        <RouterLink
+          v-if="auth.isAdmin"
+          class="nav-item"
+          :class="{ active: route.name === 'users' }"
+          :to="{ name: 'users' }"
+        >
+          <AppIcon name="users" :size="15" />
+          <span>Users</span>
+        </RouterLink>
       </nav>
 
       <div class="side-section">
@@ -86,12 +98,34 @@ function isActiveProject(id: string): boolean {
       </div>
 
       <div class="side-footer">
+        <div
+          v-if="auth.user !== null"
+          class="whoami"
+          :title="`@${auth.user.username}`"
+        >
+          <span class="whoami-name">{{ auth.user.display_name }}</span>
+          <span
+            class="badge role-badge"
+            :data-tone="auth.isAdmin ? 'violet' : 'neutral'"
+          >
+            {{ auth.user.role }}
+          </span>
+        </div>
+        <button class="nav-item" @click="passwordModalOpen = true">
+          <AppIcon name="key" :size="15" />
+          <span>Change password</span>
+        </button>
         <button class="nav-item logout" @click="auth.logout()">
           <AppIcon name="logout" :size="15" />
           <span>Log out</span>
         </button>
       </div>
     </aside>
+
+    <ChangePasswordModal
+      :open="passwordModalOpen"
+      @close="passwordModalOpen = false"
+    />
 
     <div class="content">
       <RouterView />
@@ -234,6 +268,26 @@ function isActiveProject(id: string): boolean {
   margin-top: auto;
   padding-top: var(--spacing-12);
   border-top: 1px solid var(--border-hairline);
+}
+
+.whoami {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-8);
+  padding: 0 var(--spacing-8) var(--spacing-8);
+}
+
+.whoami-name {
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+  font-size: var(--text-caption);
+  font-weight: var(--weight-medium);
+  color: var(--text-body);
+}
+
+.role-badge {
+  margin-left: auto;
 }
 
 .logout {

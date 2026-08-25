@@ -81,7 +81,7 @@ function bounceIfAuth(err: unknown): boolean {
 }
 
 async function load() {
-  const token = auth.token;
+  const token = auth.accessToken;
   if (token === null) {
     return;
   }
@@ -97,7 +97,7 @@ async function load() {
     // Only open the live stream once the initial state is in place. Pass our
     // own status ref so no extra watcher is needed (we're past an `await`, so
     // the setup effect scope is no longer current).
-    stream = useDagStream(props.id, token, state, streamStatus);
+    stream = useDagStream(props.id, () => auth.ensureFresh(), state, streamStatus);
     // Non-blocking + non-fatal: the breadcrumb falls back to "…" without it.
     void getProject(token, epicObj.project_id)
       .then((p) => (projectName.value = p.name))
@@ -141,7 +141,7 @@ function cancelEdit() {
 }
 
 async function save() {
-  const token = auth.token;
+  const token = auth.accessToken;
   const body = diffEpicEdits(baseline, draft);
   if (token === null || saveDisabled.value || Object.keys(body).length === 0) {
     return;

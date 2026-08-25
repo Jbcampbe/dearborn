@@ -137,7 +137,7 @@ async function onLaneDrop(lane: TaskStatus, event: DragEvent) {
   event.preventDefault();
   const drag = dragPayload.value;
   onDragEnd();
-  const token = auth.token;
+  const token = auth.accessToken;
   if (drag === null || token === null || !canDropOnTaskLane(drag.status, lane)) {
     return;
   }
@@ -172,7 +172,7 @@ function bounceIfAuth(err: unknown): boolean {
 const busyIds = reactive(new Set<string>());
 
 async function retryCard(node: DagNode) {
-  const token = auth.token;
+  const token = auth.accessToken;
   if (token === null || busyIds.has(node.id)) {
     return;
   }
@@ -191,7 +191,7 @@ async function retryCard(node: DagNode) {
 }
 
 async function load() {
-  const token = auth.token;
+  const token = auth.accessToken;
   if (token === null) {
     return;
   }
@@ -203,7 +203,7 @@ async function load() {
       getDag(token, props.id),
     ]);
     hydrateDag(state, epicObj, dag);
-    stream = useDagStream(props.id, token, state, streamStatus);
+    stream = useDagStream(props.id, () => auth.ensureFresh(), state, streamStatus);
     // Non-blocking + non-fatal: the breadcrumb falls back to "…" without it.
     void getProject(token, epicObj.project_id)
       .then((p) => (projectName.value = p.name))

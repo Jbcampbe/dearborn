@@ -851,7 +851,6 @@ mod tests {
     use serde_json::Value as Json;
     use tower::ServiceExt; // for `oneshot`
 
-    const TOKEN: &str = "s3cret-token";
 
     async fn test_app() -> axum::Router {
         let db = Db::connect(":memory:").await.unwrap();
@@ -860,17 +859,58 @@ mod tests {
         // planner: message triggers still fire a run, but it streams and persists
         // nothing (T-202's run behaviour is tested in `crate::planning`).
         app(AppState::with_planner(
-            Config::for_test(TOKEN),
+            Config::for_test(),
             db,
             std::sync::Arc::new(crate::planning::testing::SilentPlanningAgent),
         ))
+    }
+
+    /// The bearer credential HTTP tests present, minted **once per process**
+    /// from a seeded active admin (`crate::users::testing::seed_user` +
+    /// `crate::sessions::testing::login_as`) — the replacement for the deleted
+    /// static `TOKEN` constant. Access-token verification is stateless (one
+    /// HMAC check against the fixed test master key, no database read), so a
+    /// token minted here authenticates against every in-memory instance these
+    /// tests boot.
+    fn auth_bearer() -> &'static str {
+        static BEARER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
+        BEARER.get_or_init(|| {
+            // Seeding and login are async store calls, and `req` below is
+            // synchronous. Mint on a dedicated OS thread: `Runtime::block_on`
+            // panics if called from inside a test's own async context, but a
+            // plain thread has none, so a throwaway current-thread runtime is
+            // legal there.
+            let (tx, rx) = std::sync::mpsc::channel();
+            std::thread::spawn(move || {
+                let runtime = tokio::runtime::Builder::new_current_thread()
+                    .enable_all()
+                    .build()
+                    .expect("test runtime");
+                let token = runtime.block_on(async {
+                    let db = crate::Db::connect(":memory:").await.unwrap();
+                    db.run_migrations().await.unwrap();
+                    let state =
+                        crate::AppState::new(crate::Config::for_test(), db);
+                    let user = crate::users::testing::seed_user(
+                        &state,
+                        "tester",
+                        crate::users::Role::Admin,
+                        true,
+                    )
+                    .await;
+                    crate::sessions::testing::login_as(&state, &user).await
+                });
+                tx.send(token).expect("bearer receiver dropped");
+            });
+            rx.recv().expect("bearer minter panicked")
+        })
     }
 
     fn req(method: &str, uri: &str, body: Option<Json>) -> Request<Body> {
         let builder = Request::builder()
             .method(method)
             .uri(uri)
-            .header(AUTHORIZATION, format!("Bearer {TOKEN}"));
+            .header(AUTHORIZATION, format!("Bearer {}", auth_bearer()));
         match body {
             Some(v) => builder
                 .header(CONTENT_TYPE, "application/json")
@@ -927,7 +967,7 @@ mod tests {
     async fn epic_pr_and_blocked_reason_round_trip_but_lease_columns_stay_internal() {
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
-        let state = AppState::new(Config::for_test(TOKEN), db);
+        let state = AppState::new(Config::for_test(), db);
         let app = app(state.clone());
         let project_id = seed_project(&app).await;
         let id = create_epic_via_api(&app, &project_id, "Ship it").await["id"]
@@ -1021,7 +1061,7 @@ mod tests {
     async fn create_epic_starts_a_product_planning_session() {
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
-        let state = AppState::new(Config::for_test(TOKEN), db);
+        let state = AppState::new(Config::for_test(), db);
         let app = app(state.clone());
         let project_id = seed_project(&app).await;
         let epic = create_epic_via_api(&app, &project_id, "E").await;
@@ -1079,7 +1119,7 @@ mod tests {
     async fn update_epic_patches_title_and_contexts_and_publishes() {
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
-        let state = AppState::new(Config::for_test(TOKEN), db);
+        let state = AppState::new(Config::for_test(), db);
         let app = app(state.clone());
         let project_id = seed_project(&app).await;
         let created = create_epic_via_api(&app, &project_id, "Old title").await;
@@ -1218,7 +1258,7 @@ mod tests {
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
         let state = crate::AppState::with_planner(
-            Config::for_test(TOKEN),
+            Config::for_test(),
             db,
             std::sync::Arc::new(crate::planning::testing::SilentPlanningAgent),
         );
@@ -1245,7 +1285,7 @@ mod tests {
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
         let state = crate::AppState::with_planner(
-            Config::for_test(TOKEN),
+            Config::for_test(),
             db,
             std::sync::Arc::new(crate::planning::testing::SilentPlanningAgent),
         );
@@ -1270,7 +1310,7 @@ mod tests {
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
         let state = crate::AppState::with_planner(
-            Config::for_test(TOKEN),
+            Config::for_test(),
             db,
             std::sync::Arc::new(crate::planning::testing::SilentPlanningAgent),
         );
@@ -1456,7 +1496,7 @@ mod tests {
     async fn concurrent_appends_to_one_epic_get_unique_seqs() {
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
-        let state = AppState::new(Config::for_test(TOKEN), db);
+        let state = AppState::new(Config::for_test(), db);
         let app = app(state.clone());
         let project_id = seed_project(&app).await;
         let id = create_epic_via_api(&app, &project_id, "E").await["id"]
@@ -1566,7 +1606,7 @@ mod tests {
         {
             let db = Db::connect(&path_str).await.unwrap();
             db.run_migrations().await.unwrap();
-            let state = AppState::new(Config::for_test(TOKEN), db);
+            let state = AppState::new(Config::for_test(), db);
             let app = app(state.clone());
             let project_id = seed_project(&app).await;
             epic_id = create_epic_via_api(&app, &project_id, "Durable").await["id"]

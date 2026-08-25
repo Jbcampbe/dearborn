@@ -216,7 +216,7 @@ async function onLaneDrop(lane: EpicLane, event: DragEvent) {
   event.preventDefault();
   const drag = dragPayload.value;
   onDragEnd();
-  const token = auth.token;
+  const token = auth.accessToken;
   if (drag === null || token === null || !canDropOnProjectLane(drag.kind, drag.status, lane)) {
     return;
   }
@@ -252,7 +252,7 @@ function bounceIfAuth(err: unknown): boolean {
 }
 
 async function load() {
-  const token = auth.token;
+  const token = auth.accessToken;
   if (token === null) {
     return;
   }
@@ -262,7 +262,7 @@ async function load() {
     const board = await getBoard(token, props.id);
     hydrateBoard(state, board);
     state.projectId = props.id;
-    stream = useBoardStream(props.id, token, state, streamStatus);
+    stream = useBoardStream(props.id, () => auth.ensureFresh(), state, streamStatus);
   } catch (err) {
     if (bounceIfAuth(err)) {
       return;
@@ -274,7 +274,7 @@ async function load() {
 }
 
 async function moveLane(epic: Epic, target: EpicLane) {
-  const token = auth.token;
+  const token = auth.accessToken;
   if (token === null) {
     return;
   }
@@ -299,7 +299,7 @@ async function moveLane(epic: Epic, target: EpicLane) {
 const busyIds = reactive(new Set<string>());
 
 async function retryCard(task: Task) {
-  const token = auth.token;
+  const token = auth.accessToken;
   if (token === null || busyIds.has(task.id)) {
     return;
   }
@@ -319,7 +319,7 @@ async function retryCard(task: Task) {
 }
 
 async function runCard(task: Task) {
-  const token = auth.token;
+  const token = auth.accessToken;
   if (token === null || busyIds.has(task.id)) {
     return;
   }
@@ -339,7 +339,7 @@ async function runCard(task: Task) {
 }
 
 async function cancelEpic(epic: Epic) {
-  const token = auth.token;
+  const token = auth.accessToken;
   if (token === null || busyIds.has(epic.id)) {
     return;
   }
