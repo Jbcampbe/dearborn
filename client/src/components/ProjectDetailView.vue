@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { onBeforeUnmount, onMounted, ref } from "vue";
+import { onBeforeUnmount, onMounted, ref, watch } from "vue";
 import { RouterLink } from "vue-router";
 import { useAuthStore } from "../stores/auth";
 import { ApiError } from "../api/client";
@@ -126,6 +126,19 @@ async function reclone() {
 }
 
 onMounted(load);
+
+// vue-router reuses this component instance when navigating between two
+// /project/:id routes (e.g. picking another project in the left nav), so
+// `onMounted` alone never fires again and the previous project stays on
+// screen while only the URL changes. Reload whenever the route id changes.
+watch(
+  () => props.id,
+  () => {
+    closeNewMenu();
+    tab.value = "overview";
+    void load();
+  },
+);
 </script>
 
 <template>
