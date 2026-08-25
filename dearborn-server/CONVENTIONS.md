@@ -221,10 +221,22 @@ through one centralized router (`worker::fail_item`). It sets the epic
 `Blocked` with `blocked_reason` set to the exact MILESTONE_2 §2.3 reason
 (`preflight_red | setup_failed | workspace_error | test_gate_exhausted |
 review_not_converged | blocked | agent_error | timeout | cancelled |
-pr_failed`); when the failure has a specific task at fault, that `Task` is
+pr_failed`) plus one executor-level refinement (Rec 5):
+`provider_rate_limited`, routed when an **implement**-stage failure's error
+text matches the transient-provider predicate (`is_transient_provider_error`)
+after the bounded retry loop was exhausted — everything else stays
+`agent_error`. When the failure has a specific task at fault, that `Task` is
 also set `Failed` with the identical string in its own `failure_reason`
 column, so `POST /tasks/{id}/retry` (T-541) can find it. Both writes always
 carry the same reason string.
+
+Both writes also carry `failure_detail` (Rec 5, migration `0008_failure_detail`):
+the failure's human-readable message, redacted against the project PAT and
+URL userinfo, capped to head + tail around an elision marker at 2000 chars
+(the `evidence::cap_log` discipline). It is surfaced on the task/epic DTOs —
+so API responses and board frames show *why* next to *what* without DB
+spelunking — and cleared by retry alongside `failure_reason`, so a fresh
+attempt never inherits stale detail.
 
 On every `Blocked` transition the executor also attempts to **push the
 epic's branch** to the project's remote — whatever is already committed, so
@@ -263,8 +275,8 @@ do for `agent_error`.
 | retry a failed task | `POST /tasks/{id}/retry` | `200` (the updated task); `409` unless `Failed` |
 
 D11's one-shot recovery transition. For an **epic-scoped** task:
-`Failed → Todo` (clearing `failure_reason`), and — **iff** the task's parent
-epic is currently `Blocked` — that epic also moves `Blocked → InProgress`,
+`Failed → Todo` (clearing `failure_reason`/`failure_detail`), and — **iff**
+the task's parent epic is currently `Blocked` — that epic also moves `Blocked → InProgress`,
 clearing `blocked_reason` and its lease (`lease_owner`/`lease_expires_at`), so
 the worker pool's claim query (§2.4) can pick it up again. `404` if the task
 does not exist; `409 conflict` if it exists but is not currently `Failed` (no

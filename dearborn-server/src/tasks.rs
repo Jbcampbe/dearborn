@@ -30,14 +30,18 @@ use crate::{AppError, AppResult};
 /// they are internal claim/review-diff state, read by the worker via direct
 /// SQL (T-510+), never through this DTO. `branch_name` / `pr_url` / `pr_number`
 /// *are* projected: they are user-facing identity for a standalone task's run.
+/// `failure_detail` (Rec 5) is projected right after `failure_reason`: it is
+/// the redacted, length-capped failure message that pairs with the reason.
 const TASK_COLUMNS: &str = "id, epic_id, project_id, title, description, acceptance, status, \
-     failure_reason, agent_session_id, position, branch_name, pr_url, pr_number, created_at, updated_at";
+     failure_reason, failure_detail, agent_session_id, position, branch_name, pr_url, pr_number, created_at, updated_at";
 
 /// A task as returned by the store / API (`task`, §2.2).
 ///
 /// `epic_id` is `Option` because the schema permits standalone (parentless)
 /// tasks (`NULL => standalone`); breakdown always sets it. `failure_reason`
-/// (§2.3) is populated by the executor when a task lands in `Failed`.
+/// (§2.3) is populated by the executor when a task lands in `Failed`, and
+/// `failure_detail` (Rec 5) alongside it: the same event's redacted,
+/// length-capped message (`worker::fail_item`), cleared on retry.
 /// `branch_name` / `pr_url` / `pr_number` (M2 §2.1) are populated once a
 /// standalone task provisions its workspace and opens its own PR; they stay
 /// `null` for epic-scoped tasks (the epic carries the PR identity instead).
@@ -54,6 +58,10 @@ pub struct Task {
     /// `Todo | InProgress | Done | Failed | Cancelled` (readiness is computed).
     pub status: String,
     pub failure_reason: Option<String>,
+    /// The failed attempt's human-readable error text (Rec 5): redacted and
+    /// length-capped by `worker::fail_item` before it ever lands here, so a
+    /// triager can see *why* without cloning the branch or querying the DB.
+    pub failure_detail: Option<String>,
     pub agent_session_id: Option<String>,
     pub position: Option<i64>,
     pub branch_name: Option<String>,
@@ -660,7 +668,8 @@ pub async fn patch_task(
 
 /// `POST /tasks/{id}/retry` — D11's human-in-the-loop recovery transition
 /// (MILESTONE_2 §1 D11, §7 T-541, revised for standalone tasks by §8 T-551):
-/// for an **epic-scoped** task, `Failed → Todo` (clearing `failure_reason`),
+/// for an **epic-scoped** task, `Failed → Todo` (clearing `failure_reason`
+/// and its `failure_detail`),
 /// and — iff the parent epic is currently `Blocked` — `Blocked → InProgress`
 /// too (clearing `blocked_reason` and the lease), so the worker pool's claim
 /// query (`worker::claim_epic`, §2.4) picks the epic back up and re-attaches
@@ -693,7 +702,8 @@ pub async fn patch_task(
 /// standalone task has one row playing both roles, so restoring its
 /// claimability *is* resetting its work: this endpoint moves it straight to
 /// `InProgress` (via a `CASE WHEN epic_id IS NULL` in the single fenced
-/// `UPDATE` below), clearing `failure_reason` and the lease columns
+/// `UPDATE` below), clearing `failure_reason`/`failure_detail` and the lease
+/// columns
 /// (defensive — a `Failed` task's lease was already released by
 /// `worker::run_claimed_standalone` on every exit path, so these are
 /// normally already `NULL`; clearing them here costs nothing and mirrors the
@@ -764,6 +774,7 @@ pub async fn retry_task(
         "UPDATE task SET \
              status = CASE WHEN epic_id IS NULL THEN 'InProgress' ELSE 'Todo' END, \
              failure_reason = NULL, \
+             failure_detail = NULL, \
              lease_owner = NULL, \
              lease_expires_at = NULL, \
              updated_at = ?1 \
@@ -789,7 +800,7 @@ pub async fn retry_task(
     if let Some(epic_id) = task.epic_id.as_ref() {
         conn.execute(
             "UPDATE epic SET status = 'InProgress', blocked_reason = NULL, \
-                 lease_owner = NULL, lease_expires_at = NULL, updated_at = ?1 \
+                 failure_detail = NULL, lease_owner = NULL, lease_expires_at = NULL, updated_at = ?1 \
              WHERE id = ?2 AND status = 'Blocked'",
             params![now, epic_id.clone()],
         )
@@ -1048,13 +1059,14 @@ fn row_to_task(row: &Row) -> Result<Task, libsql::Error> {
         acceptance: row.get(5)?,
         status: row.get(6)?,
         failure_reason: row.get(7)?,
-        agent_session_id: row.get(8)?,
-        position: row.get(9)?,
-        branch_name: row.get(10)?,
-        pr_url: row.get(11)?,
-        pr_number: row.get(12)?,
-        created_at: row.get(13)?,
-        updated_at: row.get(14)?,
+        failure_detail: row.get(8)?,
+        agent_session_id: row.get(9)?,
+        position: row.get(10)?,
+        branch_name: row.get(11)?,
+        pr_url: row.get(12)?,
+        pr_number: row.get(13)?,
+        created_at: row.get(14)?,
+        updated_at: row.get(15)?,
     })
 }
 

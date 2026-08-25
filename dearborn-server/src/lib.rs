@@ -25,6 +25,7 @@ pub mod mcp;
 pub mod planning;
 pub mod pr;
 pub mod projects;
+pub(crate) mod retry;
 pub mod sessions;
 pub mod spec;
 pub mod task_agent;

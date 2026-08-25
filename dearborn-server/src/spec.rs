@@ -458,6 +458,7 @@ mod tests {
             acceptance: None,
             status: "Todo".to_string(),
             failure_reason: None,
+            failure_detail: None,
             agent_session_id: None,
             position: None,
             branch_name: None,

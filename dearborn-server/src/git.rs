@@ -53,11 +53,22 @@
 //! operation needing the PAT as a fetch is, and the workspace's persisted
 //! `origin` must stay the clean, token-free URL
 //! [`crate::workspace::provision_epic_workspace`] set at clone time.
+//! Because a push is also the finalize step most exposed to *transient*
+//! network flakiness (a mid-run 429 rate limit once failed an otherwise
+//! completed task; a flaky HTTP/2 send-pack path produced "RPC failed;
+//! HTTP 400 curl 22 ... unexpected disconnect"), it is wrapped in the shared
+//! bounded retry ([`crate::retry::retry_transient`]) with `-c
+//! http.version=HTTP/1.1` forced onto the push invocation itself — see
+//! [`push_branch`]'s own doc for why the loop lives here.
 
 use std::fmt;
+use std::future::Future;
 use std::path::Path;
+use std::time::Duration;
 
 use tokio::process::Command;
+
+use crate::retry::{retry_transient, BASE_DELAY, MAX_ATTEMPTS};
 
 /// A git operation failure. `message` is already **redacted** of any token and
 /// is safe to log or store in `clone_error`.
@@ -384,18 +395,83 @@ pub async fn commit_all(
 /// the same source of truth every other network operation in this crate
 /// uses, rather than trusting whatever `origin` happens to be configured to
 /// at push time.
+///
+/// ## Bounded retry + forced HTTP/1.1
+///
+/// The push runs through [`crate::retry::retry_transient`] (`MAX_ATTEMPTS`
+/// total tries, linear backoff of `BASE_DELAY * attempt`) because a failed
+/// push used to fail an entire completed task over a **transient** network
+/// blip — a mid-run 429 rate limit, or GitHub's flaky HTTP/2 send-pack path
+/// ("RPC failed; HTTP 400 curl 22 ... unexpected disconnect"). Every retry
+/// failure is logged with the already-redacted stderr.
+///
+/// The retry lives here rather than in [`crate::git_host::GithubHost::push`]
+/// for one reason: this function is the single choke point *every* push goes
+/// through — the production host delegates to it, and so does
+/// [`crate::git_host::testing::FakeHost`] — so one loop covers both, and no
+/// caller can forget it. Git-level failures cannot be classified reliably
+/// (the redacted stderr is free text), so *every* push failure gets the same
+/// bounded treatment: three attempts, then the last error surfaces exactly
+/// as before. Pushes are idempotent at the transport level (re-pushing an
+/// already-landed ref is a no-op), so a retried attempt can never double-
+/// apply anything.
+///
+/// `-c http.version=HTTP/1.1` is forced onto the push invocation itself:
+/// git-over-HTTPS defaults to HTTP/2 for `send-pack`, and that path produced
+/// the incident's spurious failures; HTTP/1.1 dodges it entirely. Scoped to
+/// the push command only (never written to `.git/config`) — the rest of
+/// this module keeps git's defaults.
 pub async fn push_branch(
     repo_dir: &Path,
     branch: &str,
     repo_url: &str,
     pat: Option<&str>,
 ) -> Result<(), GitError> {
+    push_branch_with_sleep(repo_dir, branch, repo_url, pat, |delay| {
+        tokio::time::sleep(delay)
+    })
+    .await
+}
+
+/// [`push_branch`] with the backoff sleep injected — the test seam that lets
+/// hermetic tests drive all three attempts without waiting real wall-clock
+/// time (see [`crate::retry`] for why the sleep is injectable at all).
+/// Production callers go through [`push_branch`]; only tests call this
+/// directly, passing a sleep that records durations instead of elapsing them.
+async fn push_branch_with_sleep<S, SFut>(
+    repo_dir: &Path,
+    branch: &str,
+    repo_url: &str,
+    pat: Option<&str>,
+    mut sleep: S,
+) -> Result<(), GitError>
+where
+    S: FnMut(Duration) -> SFut,
+    SFut: Future<Output = ()>,
+{
     let auth_url = authenticated_url(repo_url, pat)?;
     let url_override = format!("remote.origin.url={auth_url}");
-    run_git(
-        &["-c", &url_override, "push", "origin", branch],
-        Some(repo_dir),
-        pat,
+    // http.version=HTTP/1.1: see `push_branch`'s doc — the default HTTP/2
+    // send-pack path is the flaky one observed in the incident.
+    const HTTP_VERSION_OVERRIDE: &str = "http.version=HTTP/1.1";
+    let push_args = [
+        "-c",
+        &url_override,
+        "-c",
+        HTTP_VERSION_OVERRIDE,
+        "push",
+        "origin",
+        branch,
+    ];
+    retry_transient(
+        "push",
+        MAX_ATTEMPTS,
+        BASE_DELAY,
+        // All git failures get the bounded treatment: redacted stderr gives
+        // nothing reliable enough to classify as permanent.
+        |_: &GitError| true,
+        || async { run_git(&push_args, Some(repo_dir), pat).await },
+        |delay| sleep(delay),
     )
     .await
 }
@@ -780,19 +856,33 @@ mod tests {
         let _ = std::fs::remove_dir_all(&bare_dir);
     }
 
-    /// A push against an unreachable/bad URL fails, and the (redacted)
-    /// error is readable and never contains the token — mirrors
+    /// A push against an unreachable/bad URL fails after the bounded retry
+    /// exhausts its attempts, and the (redacted) error is readable and never
+    /// contains the token — mirrors
     /// `clone_of_bad_url_errors_with_redacted_reason` above for the push path.
+    /// Drives [`push_branch_with_sleep`] directly with an instant,
+    /// recording sleep so the test stays hermetic and fast while still
+    /// proving all three attempts were made with the linear backoff schedule.
     #[tokio::test]
-    async fn push_branch_bad_url_errors_with_redacted_reason() {
+    async fn push_branch_bad_url_errors_with_redacted_reason_after_bounded_retries()
+    {
+        use std::cell::RefCell;
+        use std::rc::Rc;
+
         let repo_dir = temp_repo_dir("push-badurl");
         init_repo(&repo_dir).await;
         let pat = "ghp_pushSecretToken123";
-        let err = push_branch(
+
+        let delays = Rc::new(RefCell::new(Vec::new()));
+        let err = push_branch_with_sleep(
             &repo_dir,
             "main",
             "https://dearborn.invalid/nope/nope.git",
             Some(pat),
+            |delay| {
+                delays.borrow_mut().push(delay);
+                std::future::ready(())
+            },
         )
         .await
         .expect_err("push to an unreachable host must fail");
@@ -803,6 +893,17 @@ mod tests {
             err.message
         );
         assert!(!err.message.contains("ghp_"));
+
+        // Bounded retry: three total attempts -> two backoff sleeps, spaced
+        // linearly (base_delay * attempt).
+        assert_eq!(
+            *delays.borrow(),
+            vec![
+                std::time::Duration::from_millis(500),
+                std::time::Duration::from_millis(1000)
+            ],
+            "linear backoff between the bounded push retries"
+        );
 
         let _ = std::fs::remove_dir_all(&repo_dir);
     }

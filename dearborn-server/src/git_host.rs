@@ -65,12 +65,27 @@
 //! see [`redacted_reqwest_err`]) — is passed through [`crate::git::redact`]
 //! before it becomes a [`GitHostError`]. Belt-and-suspenders: nothing this
 //! module returns is ever logged or stored unredacted.
+//!
+//! ## Bounded retry for transient API failures
+//! [`GithubHost::open_pr`] runs its POST through
+//! [`crate::retry::retry_transient`], retrying only on **clearly transient**
+//! HTTP statuses — 429 (rate limit; the incident that motivated this module:
+//! a mid-run 429 failed an otherwise-completed task) and any 5xx. Transport
+//! errors and 4xx validation failures (401/403/404/422 …) are *never*
+//! retried: retrying them cannot change the outcome, and 422 in particular
+//! means our own request payload is wrong, not that GitHub hiccuped.
+//! Attempts are bounded ([`crate::retry::MAX_ATTEMPTS`]) with linear backoff
+//! (`crate::retry::BASE_DELAY * attempt`), every failure is logged with its
+//! already-redacted error, and the backoff sleep is injectable so tests stay
+//! hermetic and instant.
 
 use std::future::Future;
 use std::path::Path;
 use std::pin::Pin;
+use std::time::Duration;
 
 use crate::git;
+use crate::retry::{retry_transient, BASE_DELAY, MAX_ATTEMPTS};
 
 /// A boxed, `Send` future — the hand-written equivalent of what `#[async_trait]`
 /// would generate, so [`GitHost`]'s methods can be `async` in spirit while the
@@ -226,9 +241,12 @@ pub fn parse_owner_repo(repo_url: &str) -> Result<(String, String), GitHostError
 
 const GITHUB_API_BASE: &str = "https://api.github.com";
 
-/// `POST` target for opening a PR.
-fn pulls_url(owner: &str, repo: &str) -> String {
-    format!("{GITHUB_API_BASE}/repos/{owner}/{repo}/pulls")
+/// `POST` target for opening a PR, against an explicitly named API base — the
+/// base is a parameter (rather than hardcoded) so tests can point `open_pr`
+/// at a local fake GitHub server instead of the real API, keeping the suite
+/// hermetic (see the module doc's "bounded retry" section).
+fn pulls_url_at(base: &str, owner: &str, repo: &str) -> String {
+    format!("{base}/repos/{owner}/{repo}/pulls")
 }
 
 /// `GET` target for repo metadata (`default_branch`) and the `check_auth` probe.
@@ -276,6 +294,33 @@ fn redacted_reqwest_err(err: &reqwest::Error, pat: Option<&str>) -> GitHostError
     GitHostError::new(git::redact(&err.to_string(), pat))
 }
 
+/// One classified `open_pr` attempt failure: the (already-redacted)
+/// [`GitHostError`] plus whether [`crate::retry::retry_transient`] is allowed
+/// another attempt on it. The classification happens while the raw status
+/// code is still available ([`GithubHost::post_open_pr_once`]) and is
+/// consumed by [`GithubHost::open_pr_at`]'s transience predicate.
+struct OpenPrAttemptErr {
+    retryable: bool,
+    err: GitHostError,
+}
+
+impl std::fmt::Display for OpenPrAttemptErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The inner message is already redacted, so logging through the retry
+        // loop's `error = %err` field stays within this module's redaction
+        // discipline.
+        f.write_str(&self.err.message)
+    }
+}
+
+impl OpenPrAttemptErr {
+    /// A failure no amount of retrying can fix (transport error, 4xx
+    /// validation error): surface it immediately.
+    fn permanent(err: GitHostError) -> OpenPrAttemptErr {
+        OpenPrAttemptErr { retryable: false, err }
+    }
+}
+
 /// The production [`GitHost`]: real `git push` (via [`crate::git::push_branch`])
 /// plus the real GitHub REST API for `open_pr`/`check_auth`.
 pub struct GithubHost {
@@ -309,6 +354,86 @@ impl GithubHost {
     // (The pre-T-13 `fetch_default_branch` helper was retired: the PR base now
     // arrives on [`OpenPrRequest`], resolved by the caller from Dearborn's own
     // records — see that struct's doc.)
+
+    /// [`GitHost::open_pr`] against an explicit API base with an injectable
+    /// backoff sleep — the seam tests drive instead of the real GitHub API so
+    /// the bounded-retry behavior (see the module doc) can be proven
+    /// hermetically: a local fake server answers the POSTs, and the sleep
+    /// records durations without elapsing them. Production callers go through
+    /// [`GitHost::open_pr`], which pins the real base and `tokio::time::sleep`.
+    async fn open_pr_at<S, SFut>(
+        &self,
+        api_base: &str,
+        req: OpenPrRequest<'_>,
+        mut sleep: S,
+    ) -> Result<OpenedPr, GitHostError>
+    where
+        S: FnMut(Duration) -> SFut,
+        SFut: Future<Output = ()>,
+    {
+        let (owner, repo) = parse_owner_repo(req.repo_url)?;
+        let json_body = build_open_pr_json(req.title, req.head, req.base, req.body);
+        let url = pulls_url_at(api_base, &owner, &repo);
+
+        // Bounded retry (Recommendation 4): 429/5xx get another try after a
+        // linear backoff; everything else surfaces immediately. See the
+        // module doc's "bounded retry for transient API failures" section.
+        retry_transient(
+            "open_pr",
+            MAX_ATTEMPTS,
+            BASE_DELAY,
+            |failure: &OpenPrAttemptErr| failure.retryable,
+            || self.post_open_pr_once(&url, req.pat, &json_body),
+            |delay| sleep(delay),
+        )
+        .await
+        .map_err(|failure| failure.err)
+        .and_then(|value| {
+            let url = value
+                .get("html_url")
+                .and_then(|v| v.as_str())
+                .ok_or_else(|| GitHostError::new("GitHub PR response is missing html_url"))?
+                .to_string();
+            let number = value
+                .get("number")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| GitHostError::new("GitHub PR response is missing number"))?;
+            Ok(OpenedPr { url, number })
+        })
+    }
+
+    /// One `POST .../pulls` attempt: send the request and classify the
+    /// outcome as success or as retryable/permanent failure. Classification
+    /// lives here (rather than in [`GitHost::open_pr`]) because it needs the
+    /// raw status code before it becomes an opaque [`GitHostError`] message.
+    async fn post_open_pr_once(
+        &self,
+        url: &str,
+        pat: Option<&str>,
+        json_body: &serde_json::Value,
+    ) -> Result<serde_json::Value, OpenPrAttemptErr> {
+        let resp = self
+            .authed(self.client.post(url), pat)
+            .json(json_body)
+            .send()
+            .await
+            .map_err(|e| OpenPrAttemptErr::permanent(redacted_reqwest_err(&e, pat)))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            // Clearly transient only: rate limiting and server-side errors.
+            // A 4xx validation error (401/403/422 …) means our own request
+            // cannot succeed however often we repeat it.
+            let retryable = status.as_u16() == 429 || status.is_server_error();
+            return Err(OpenPrAttemptErr {
+                retryable,
+                err: map_github_error(status.as_u16(), &text, pat),
+            });
+        }
+        resp.json()
+            .await
+            .map_err(|e| OpenPrAttemptErr::permanent(redacted_reqwest_err(&e, pat)))
+    }
 }
 
 impl Default for GithubHost {
@@ -331,34 +456,8 @@ impl GitHost for GithubHost {
         req: OpenPrRequest<'a>,
     ) -> BoxFuture<'a, Result<OpenedPr, GitHostError>> {
         Box::pin(async move {
-            let (owner, repo) = parse_owner_repo(req.repo_url)?;
-            let json_body = build_open_pr_json(req.title, req.head, req.base, req.body);
-
-            let resp = self
-                .authed(self.client.post(pulls_url(&owner, &repo)), req.pat)
-                .json(&json_body)
-                .send()
+            self.open_pr_at(GITHUB_API_BASE, req, |delay| tokio::time::sleep(delay))
                 .await
-                .map_err(|e| redacted_reqwest_err(&e, req.pat))?;
-            let status = resp.status();
-            if !status.is_success() {
-                let text = resp.text().await.unwrap_or_default();
-                return Err(map_github_error(status.as_u16(), &text, req.pat));
-            }
-            let value: serde_json::Value = resp
-                .json()
-                .await
-                .map_err(|e| redacted_reqwest_err(&e, req.pat))?;
-            let url = value
-                .get("html_url")
-                .and_then(|v| v.as_str())
-                .ok_or_else(|| GitHostError::new("GitHub PR response is missing html_url"))?
-                .to_string();
-            let number = value
-                .get("number")
-                .and_then(|v| v.as_i64())
-                .ok_or_else(|| GitHostError::new("GitHub PR response is missing number"))?;
-            Ok(OpenedPr { url, number })
         })
     }
 
@@ -618,7 +717,7 @@ mod tests {
     #[test]
     fn pulls_url_targets_the_right_repo() {
         assert_eq!(
-            pulls_url("octocat", "Hello-World"),
+            pulls_url_at(GITHUB_API_BASE, "octocat", "Hello-World"),
             "https://api.github.com/repos/octocat/Hello-World/pulls"
         );
     }
@@ -683,5 +782,148 @@ mod tests {
         };
         let host_err: GitHostError = git_err.into();
         assert_eq!(host_err.message, "fatal: boom");
+    }
+
+    // ---- open_pr bounded retry (hermetic, via a local fake GitHub) ---------
+
+    use std::cell::RefCell;
+    use std::net::SocketAddr;
+    use std::rc::Rc;
+    use std::sync::Arc;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+
+    /// A canned `open_pr` request against a syntactically valid github.com
+    /// repo URL (the API base is what actually gets hit, so no network ever
+    /// happens). `repo_url` still has to parse as a real GitHub URL because
+    /// `parse_owner_repo` runs before any I/O.
+    fn open_pr_request() -> OpenPrRequest<'static> {
+        OpenPrRequest {
+            repo_url: "https://github.com/octocat/Hello-World",
+            pat: None,
+            head: "dearborn/ship-it",
+            base: "main",
+            title: "Ship it",
+            body: "the body",
+        }
+    }
+
+    /// Spawn a minimal, fully-local HTTP server on `127.0.0.1:0` answering
+    /// each incoming request with the next canned `(status, json body)` from
+    /// `responses` (repeating the last one past the end), closing every
+    /// connection after one response. Returns the bound address plus an
+    /// atomic counter of requests served — the assertion surface for "how
+    /// many attempts did the retry loop actually make". No DNS, no external
+    /// network: this is the whole reason `open_pr_at` takes an api_base.
+    async fn spawn_fake_github(
+        responses: Vec<(&'static str, u16, &'static str)>,
+    ) -> (SocketAddr, Arc<AtomicUsize>) {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let served = Arc::new(AtomicUsize::new(0));
+        let served_task = served.clone();
+        tokio::spawn(async move {
+            let mut idx = 0usize;
+            while let Ok((socket, _)) = listener.accept().await {
+                let (name, status, body) = responses[idx.min(responses.len() - 1)];
+                idx += 1;
+                served_task.fetch_add(1, Ordering::SeqCst);
+                handle_one(socket, name, status, body).await;
+            }
+        });
+        (addr, served)
+    }
+
+    /// Serve one request/response pair on `socket`: drain the request head,
+    /// write a well-formed HTTP/1.1 reply with `connection: close`, drop.
+    async fn handle_one(
+        mut socket: tokio::net::TcpStream,
+        _name: &str,
+        status: u16,
+        body: &str,
+    ) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let mut buf = [0u8; 4096];
+        // Read until end-of-headers; contents are irrelevant to the test.
+        loop {
+            match socket.read(&mut buf).await {
+                Ok(n) if n > 0 => {
+                    if buf[..n].windows(4).any(|w| w == b"\r\n\r\n") {
+                        break;
+                    }
+                }
+                _ => break,
+            }
+        }
+        let reason = match status {
+            200..=299 => "Created",
+            429 => "Too Many Requests",
+            500 => "Internal Server Error",
+            503 => "Service Unavailable",
+            _ => "Unprocessable Entity",
+        };
+        let reply = format!(
+            "HTTP/1.1 {status} {reason}\r\n\
+             content-type: application/json\r\n\
+             content-length: {}\r\n\
+             connection: close\r\n\
+             \r\n\
+             {body}",
+            body.len()
+        );
+        let _ = socket.write_all(reply.as_bytes()).await;
+        let _ = socket.shutdown().await;
+    }
+
+    /// Record the requested backoff durations without elapsing them, keeping
+    /// the test instant while asserting the exact schedule.
+    fn instant_sleep(delays: Rc<RefCell<Vec<std::time::Duration>>>)
+    -> impl FnMut(std::time::Duration) -> std::future::Ready<()> {
+        move |delay| {
+            delays.borrow_mut().push(delay);
+            std::future::ready(())
+        }
+    }
+
+    #[tokio::test]
+    async fn open_pr_retries_a_500_then_succeeds_on_the_next_attempt() {
+        let pr_json =
+            r#"{"html_url": "https://github.com/octocat/Hello-World/pull/7", "number": 7}"#;
+        let (addr, served) = spawn_fake_github(vec![
+            ("500", 500, r#"{"message": "internal boom"}"#),
+            ("created", 201, pr_json),
+        ])
+        .await;
+        let delays = Rc::new(RefCell::new(Vec::new()));
+
+        let opened = GithubHost::new()
+            .open_pr_at(&format!("http://{addr}"), open_pr_request(), instant_sleep(delays.clone()))
+            .await
+            .expect("a transient 500 must be retried into success");
+
+        assert_eq!(opened.number, 7);
+        assert_eq!(opened.url, "https://github.com/octocat/Hello-World/pull/7");
+        assert_eq!(served.load(Ordering::SeqCst), 2, "exactly two POST attempts");
+        assert_eq!(
+            *delays.borrow(),
+            vec![BASE_DELAY],
+            "one linear-backoff sleep between the two attempts"
+        );
+    }
+
+    #[tokio::test]
+    async fn open_pr_never_retries_a_4xx_validation_error() {
+        let (addr, served) = spawn_fake_github(vec![("failed", 422, r#"{"message": "Validation Failed"}"#)])
+            .await;
+        let delays = Rc::new(RefCell::new(Vec::new()));
+
+        let err = GithubHost::new()
+            .open_pr_at(&format!("http://{addr}"), open_pr_request(), instant_sleep(delays.clone()))
+            .await
+            .expect_err("a 422 validation error must fail immediately");
+
+        assert!(err.message.contains("422"));
+        assert!(err.message.contains("Validation Failed"));
+        assert_eq!(served.load(Ordering::SeqCst), 1, "no second attempt after a validation error");
+        assert!(delays.borrow().is_empty(), "no backoff sleep before surfacing a 4xx");
     }
 }

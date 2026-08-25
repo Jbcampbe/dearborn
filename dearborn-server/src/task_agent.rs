@@ -758,7 +758,28 @@ pub struct AgentStageOutcome {
     /// `RunEvent` stream and has no notion of *why* a cancel happened.
     pub timed_out: bool,
     /// Whether an `Error` event was seen anywhere in the stream.
+    ///
+    /// Diagnostic only: a stream can carry an `Error` event and still finish
+    /// cleanly (a provider 429 mid-run that pi's harness retried through,
+    /// followed by a normal completion), so this flag deliberately does
+    /// *not* force [`Self::status`] to `"error"` on its own — see that
+    /// method's doc for the final-state rule that actually decides the
+    /// stage. Kept public so callers logging/routing a failure can tell
+    /// "the agent saw a provider error" apart from a bare non-zero exit,
+    /// and so [`Self::last_error_message`] has a cheap companion check.
     pub errored: bool,
+    /// The message carried by the most recently absorbed `Error` event, if
+    /// any (`None` when none was seen). Only the *last* one is kept because
+    /// the classification question is always about the run's final state:
+    /// earlier errors were survived (they are all still present verbatim in
+    /// [`Self::text`] as `[error] …` lines for the log trail); what a caller
+    /// diagnosing a failed stage wants is the error closest to whatever
+    /// terminal condition made the stage fail. Recorded by
+    /// [`AgentStageOutcome::absorb`] alongside `errored`, which only sees
+    /// the harness's own event stream and therefore cannot know whether an
+    /// individual `Error` turned out to be transient — the final-state call
+    /// belongs to [`Self::status`].
+    pub last_error_message: Option<String>,
     /// The `agent_run.id` this outcome's row was opened/closed under (T-530).
     /// [`run_agent_stage`] has already closed the row (with `verdict: None`)
     /// by the time it returns this outcome — a review/verify-complete
@@ -782,6 +803,11 @@ impl AgentStageOutcome {
             } => self.session_id = Some(id.clone()),
             RunEvent::Error { message, .. } => {
                 self.errored = true;
+                // The log trail keeps every error verbatim (the row's `log`
+                // column and any live WS subscriber both render from
+                // `text`), while `last_error_message` holds just the latest
+                // one for programmatic diagnosis — see its field doc.
+                self.last_error_message = Some(message.clone());
                 self.text.push_str(&format!("\n[error] {message}\n"));
             }
             RunEvent::Exited {
@@ -796,20 +822,41 @@ impl AgentStageOutcome {
         }
     }
 
-    /// The §2.1 terminal `agent_run.status` this outcome implies. `timed_out`
-    /// is checked *before* `cancelled` (T-543): both are `true` for a
-    /// deadline-killed stage (see [`Self::timed_out`]'s own doc — the kill
-    /// mechanism is identical, so `cancelled` is always set alongside it),
-    /// but `"timeout"` is the more precise, more actionable status for a
-    /// human reading `agent_run.status` — `"cancelled"` reads as "a human
-    /// asked to stop," which is specifically *not* what happened here.
+    /// The §2.1 terminal `agent_run.status` this outcome implies, judged by
+    /// the run's **final** state rather than by any single event seen along
+    /// the way. `timed_out` is checked *before* `cancelled` (T-543): both are
+    /// `true` for a deadline-killed stage (see [`Self::timed_out`]'s own doc
+    /// — the kill mechanism is identical, so `cancelled` is always set
+    /// alongside it), but `"timeout"` is the more precise, more actionable
+    /// status for a human reading `agent_run.status` — `"cancelled"` reads
+    /// as "a human asked to stop," which is specifically *not* what happened
+    /// here.
+    ///
+    /// An `Error` event in the stream is likewise not automatically terminal:
+    /// harnesses recover from provider transients (e.g. a mid-run HTTP 429
+    /// rate limit that the agent CLI retries through and then completes
+    /// normally), so a run that ends with a clean exit **and** non-empty
+    /// output text is `"ok"` even though [`Self::errored`] is set — failing
+    /// such a stage would discard a fix the agent fully completed. An error
+    /// only condemns the stage when the run did *not* demonstrably recover:
+    /// either the exit was non-zero/cancelled, or it exited 0 without having
+    /// produced any text at all (a silent failure must still fail, since
+    /// downstream stages would have nothing to act on). Runs that never saw
+    /// an error keep exactly the old rule — exit 0 is `"ok"`, anything else
+    /// is `"error"`. Note that review/verify-complete verdict parsing reads
+    /// [`Self::text`] after close, which this method never touches, so that
+    /// flow is unaffected either way.
     fn status(&self) -> &'static str {
         if self.timed_out {
             "timeout"
         } else if self.cancelled {
             "cancelled"
         } else if self.errored {
-            "error"
+            if self.exit_code == Some(0) && !self.text.is_empty() {
+                "ok"
+            } else {
+                "error"
+            }
         } else if self.exit_code == Some(0) {
             "ok"
         } else {
@@ -824,7 +871,11 @@ impl AgentStageOutcome {
     /// instead?). Exposed as its own method rather than making callers derive
     /// it from the public `cancelled`/`errored`/`exit_code` fields themselves
     /// — those fields stay public for diagnostics/logging, but the pass/fail
-    /// *decision* is made once, here.
+    /// *decision* is made once, here, under [`Self::status`]'s final-state
+    /// rule (so e.g. `errored == true` alone does not make this `false`: a
+    /// run that recovered from a transient provider error and exited 0 with
+    /// real output counts as complete, and the DAG walk proceeds to commit
+    /// the work the agent actually finished).
     pub fn is_ok(&self) -> bool {
         self.status() == "ok"
     }
@@ -1743,6 +1794,159 @@ mod tests {
         let written = std::fs::read_to_string(dir.join("out.txt")).unwrap();
         assert_eq!(written, "hello");
         std::fs::remove_dir_all(&dir).ok();
+    }
+
+    // ---- AgentStageOutcome: final-state classification -----------------
+    //
+    // Pure unit tests over [`AgentStageOutcome::absorb`] + [`status`]: an
+    // `Error` event mid-stream is not automatically terminal — a harness can
+    // recover from a provider transient (e.g. a retried HTTP 429) and still
+    // finish the whole stage cleanly, so the verdict is made from the run's
+    // *final* state (exit code + whether any output text was produced), not
+    // from the mere presence of an error event. Built by driving real
+    // `RunEvent`s through `absorb` so the same path `run_agent_stage`'s drain
+    // thread takes is what these assertions cover; no spawn, no network.
+
+    /// Feed `events` through a fresh outcome exactly the way the drain
+    /// thread does, returning it for status assertions.
+    fn absorbed(events: &[RunEvent]) -> AgentStageOutcome {
+        let mut outcome = AgentStageOutcome::default();
+        for event in events {
+            outcome.absorb(event);
+        }
+        outcome
+    }
+
+    #[test]
+    fn error_event_recovered_by_clean_exit_and_output_is_ok() {
+        let outcome = absorbed(&[
+            RunEvent::Started {
+                run_id: "r".to_string(),
+            },
+            RunEvent::Text {
+                run_id: "r".to_string(),
+                delta: "fixed the thing".to_string(),
+            },
+            // The incident shape: a transient provider error mid-run…
+            RunEvent::Error {
+                run_id: "r".to_string(),
+                message: "429 rate limited".to_string(),
+            },
+            RunEvent::Text {
+                run_id: "r".to_string(),
+                delta: "; retry succeeded".to_string(),
+            },
+            // …and a normal completion afterwards.
+            RunEvent::Exited {
+                run_id: "r".to_string(),
+                exit_code: Some(0),
+                cancelled: false,
+            },
+        ]);
+
+        assert!(outcome.errored, "the diagnostic flag must stay set");
+        assert_eq!(outcome.last_error_message.as_deref(), Some("429 rate limited"));
+        // The log trail keeps every error verbatim inside `text`.
+        assert!(outcome.text.contains("[error] 429 rate limited"));
+        assert!(outcome.text.contains("fixed the thing"));
+
+        // …but the recovered transient must not fail the stage: clean exit
+        // plus non-empty output is judged `ok`, so the DAG walk proceeds to
+        // commit the work the agent actually completed.
+        assert_eq!(outcome.status(), "ok");
+        assert!(outcome.is_ok());
+    }
+
+    #[test]
+    fn error_event_with_non_zero_exit_is_error() {
+        let outcome = absorbed(&[
+            RunEvent::Error {
+                run_id: "r".to_string(),
+                message: "provider exploded".to_string(),
+            },
+            RunEvent::Exited {
+                run_id: "r".to_string(),
+                exit_code: Some(1),
+                cancelled: false,
+            },
+        ]);
+        assert_eq!(outcome.status(), "error");
+        assert!(!outcome.is_ok());
+    }
+
+    #[test]
+    fn timeout_and_cancelled_still_take_precedence_over_the_final_state_rule() {
+        // A deadline-killed stage sets BOTH flags (same cancel mechanism,
+        // see `timed_out`'s doc) — `"timeout"` must win even when some text
+        // was streamed and an error was seen before the kill.
+        let mut timed_out = absorbed(&[
+            RunEvent::Text {
+                run_id: "r".to_string(),
+                delta: "partial output".to_string(),
+            },
+            RunEvent::Error {
+                run_id: "r".to_string(),
+                message: "mid-run hiccup".to_string(),
+            },
+            RunEvent::Exited {
+                run_id: "r".to_string(),
+                exit_code: None,
+                cancelled: true,
+            },
+        ]);
+        timed_out.timed_out = true;
+        assert_eq!(timed_out.status(), "timeout");
+        assert!(!timed_out.is_ok());
+
+        // A user-initiated cancel without a deadline stays `"cancelled"`.
+        let cancelled = absorbed(&[RunEvent::Exited {
+            run_id: "r".to_string(),
+            exit_code: None,
+            cancelled: true,
+        }]);
+        assert_eq!(cancelled.status(), "cancelled");
+        assert!(!cancelled.is_ok());
+    }
+
+    #[test]
+    fn error_event_with_clean_exit_but_no_output_is_error() {
+        // Silent failure must still fail: exiting 0 having produced nothing
+        // leaves downstream stages nothing to act on, so the recovered-
+        // transient allowance does not apply. (`absorb` appends an
+        // `[error] …` line to `text` for every Error event, so reaching this
+        // arm in production means text was cleared or hand-built empty —
+        // which is exactly why the guard lives in `status` itself rather
+        // than trusting the log trail.)
+        let outcome = AgentStageOutcome {
+            errored: true,
+            exit_code: Some(0),
+            ..AgentStageOutcome::default()
+        };
+        assert_eq!(outcome.status(), "error");
+        assert!(!outcome.is_ok());
+    }
+
+    #[test]
+    fn absorb_keeps_only_the_last_error_message_but_every_error_line_in_text() {
+        let outcome = absorbed(&[
+            RunEvent::Error {
+                run_id: "r".to_string(),
+                message: "first failure".to_string(),
+            },
+            RunEvent::Error {
+                run_id: "r".to_string(),
+                message: "second failure".to_string(),
+            },
+            RunEvent::Exited {
+                run_id: "r".to_string(),
+                exit_code: Some(2),
+                cancelled: false,
+            },
+        ]);
+        assert_eq!(outcome.last_error_message.as_deref(), Some("second failure"));
+        assert!(outcome.text.contains("[error] first failure"));
+        assert!(outcome.text.contains("[error] second failure"));
+        assert_eq!(outcome.status(), "error");
     }
 
     // ---- run_agent_stage: evidence + WS streaming ----------------------

@@ -58,6 +58,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0007_users",
         sql: include_str!("../migrations/0007_users.sql"),
     },
+    Migration {
+        id: 8,
+        name: "0008_failure_detail",
+        sql: include_str!("../migrations/0008_failure_detail.sql"),
+    },
 ];
 
 /// Errors surfaced while opening the database or running migrations.
@@ -304,6 +309,31 @@ mod tests {
                 rows.next().await.unwrap().is_some(),
                 "missing index: {index}"
             );
+        }
+    }
+
+    /// A fresh boot's `0008_failure_detail` migration lands the Rec-5
+    /// `failure_detail` column on both containers `worker::fail_item` writes
+    /// to. Same `PRAGMA table_info` discipline as the `0004` check above.
+    #[tokio::test]
+    async fn migration_0008_adds_failure_detail_to_task_and_epic() {
+        let db = Db::connect(":memory:").await.unwrap();
+        db.run_migrations().await.unwrap();
+
+        for (table, column) in [("task", "failure_detail"), ("epic", "failure_detail")] {
+            let mut rows = db
+                .conn()
+                .query(&format!("PRAGMA table_info({table})"), ())
+                .await
+                .unwrap();
+            let mut found = false;
+            while let Some(row) = rows.next().await.unwrap() {
+                if row.get::<String>(1).unwrap() == column {
+                    found = true;
+                    break;
+                }
+            }
+            assert!(found, "missing column {table}.{column}");
         }
     }
 

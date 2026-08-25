@@ -46,7 +46,7 @@ use crate::{git, projects, AppError, AppResult, AppState};
 /// epic's PR landed and, if it stalled, why.
 const EPIC_COLUMNS: &str =
     "id, project_id, title, description, product_context, technical_context, \
-     base_branch, status, pr_url, pr_number, blocked_reason, created_at, updated_at";
+     base_branch, status, pr_url, pr_number, blocked_reason, failure_detail, created_at, updated_at";
 
 /// Columns projected into a [`TranscriptMessage`] DTO, in schema (§2.2) order.
 const MESSAGE_COLUMNS: &str = "id, epic_id, phase, role, content, seq, created_at";
@@ -62,7 +62,9 @@ const INITIAL_PHASE: &str = "product";
 /// live by the planning agent in T-203; the description is a user-facing short
 /// blurb shown on kanban cards). `pr_url` / `pr_number` / `blocked_reason`
 /// (M2 §2.1) are populated by the executor: the PR identity once one opens, and
-/// the structured reason (§2.3) if the epic lands in `Blocked`. The lease
+/// the structured reason (§2.3) if the epic lands in `Blocked` — with
+/// `failure_detail` (Rec 5) alongside it: the same event's redacted,
+/// length-capped message. The lease
 /// columns are deliberately **not** on this struct — see [`EPIC_COLUMNS`].
 #[derive(Debug, Serialize)]
 pub struct Epic {
@@ -79,6 +81,9 @@ pub struct Epic {
     pub pr_url: Option<String>,
     pub pr_number: Option<i64>,
     pub blocked_reason: Option<String>,
+    /// The failed attempt's human-readable error text (Rec 5), redacted and
+    /// length-capped by `worker::fail_item` before it ever lands here.
+    pub failure_detail: Option<String>,
     pub created_at: i64,
     pub updated_at: i64,
 }
@@ -739,8 +744,9 @@ fn row_to_epic(row: &Row) -> Result<Epic, libsql::Error> {
         pr_url: row.get(8)?,
         pr_number: row.get(9)?,
         blocked_reason: row.get(10)?,
-        created_at: row.get(11)?,
-        updated_at: row.get(12)?,
+        failure_detail: row.get(11)?,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
     })
 }
 

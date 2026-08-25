@@ -142,6 +142,16 @@ pub struct ExecutorConfig {
     /// Default `1`. `0` is **accepted** — "no re-run, first miss fails" is a
     /// valid strict-contract configuration.
     pub verdict_retries: u32,
+    /// Extra attempts `process_one_task` gives the implement stage when its
+    /// recorded error text matches a transient provider signal (an HTTP 429
+    /// rate limit, an "overloaded"/5xx gateway response — see
+    /// `worker::is_transient_provider_error` for the exact match set)
+    /// (`DEARBORN_IMPLEMENT_TRANSIENT_RETRIES`). Default `1`: one automatic
+    /// retry on top of the original run, so a mid-run rate limit no longer
+    /// fails a task whose agent may already have finished (or nearly
+    /// finished) its fix. `0` is **accepted** — "fail on first transient,
+    /// never re-run" is a legitimate strict configuration, not a broken one.
+    pub implement_transient_retries: u32,
     /// Fallback poll interval for workers waiting on `tokio::sync::Notify`
     /// (`DEARBORN_POLL_INTERVAL_MS`) — the backstop in case a notify is
     /// missed. Default `1500`ms. **Rejects `0`**: a 0ms poll is a busy-loop.
@@ -217,6 +227,7 @@ const EXECUTOR_VAR_NAMES: &[&str] = &[
     "DEARBORN_MAX_TEST_FIX_ATTEMPTS",
     "DEARBORN_MAX_FIX_ROUNDS",
     "DEARBORN_VERDICT_RETRIES",
+    "DEARBORN_IMPLEMENT_TRANSIENT_RETRIES",
     "DEARBORN_POLL_INTERVAL_MS",
 ];
 
@@ -271,6 +282,12 @@ fn executor_from(map: &HashMap<String, String>) -> ExecutorConfig {
         max_test_fix_attempts: parse_or_warn(map, "DEARBORN_MAX_TEST_FIX_ATTEMPTS", 3u32, false),
         max_fix_rounds: parse_or_warn(map, "DEARBORN_MAX_FIX_ROUNDS", 3u32, false),
         verdict_retries: parse_or_warn(map, "DEARBORN_VERDICT_RETRIES", 1u32, false),
+        implement_transient_retries: parse_or_warn(
+            map,
+            "DEARBORN_IMPLEMENT_TRANSIENT_RETRIES",
+            1u32,
+            false,
+        ),
         poll_interval_ms: parse_or_warn(map, "DEARBORN_POLL_INTERVAL_MS", 1500u64, true),
     }
 }
@@ -426,10 +443,13 @@ impl Config {
                 agent_stage_timeout_secs: 10,
                 cmd_timeout_secs: 10,
                 // Ralph-parity counts stay at production defaults so tests
-                // exercise the real loop bounds (T-522, T-530+).
+                // exercise the real loop bounds (T-522, T-530+) — including
+                // this one, so implement-retry tests see the real one extra
+                // transient attempt rather than an off-by-one test-only bound.
                 max_test_fix_attempts: 3,
                 max_fix_rounds: 3,
                 verdict_retries: 1,
+                implement_transient_retries: 1,
                 poll_interval_ms: 10,
             },
         }
@@ -505,6 +525,7 @@ mod tests {
             ("DEARBORN_MAX_TEST_FIX_ATTEMPTS", "5"),
             ("DEARBORN_MAX_FIX_ROUNDS", "4"),
             ("DEARBORN_VERDICT_RETRIES", "2"),
+            ("DEARBORN_IMPLEMENT_TRANSIENT_RETRIES", "4"),
             ("DEARBORN_POLL_INTERVAL_MS", "2000"),
         ]);
         let cfg = executor_from(&map);
@@ -516,6 +537,7 @@ mod tests {
         assert_eq!(cfg.max_test_fix_attempts, 5);
         assert_eq!(cfg.max_fix_rounds, 4);
         assert_eq!(cfg.verdict_retries, 2);
+        assert_eq!(cfg.implement_transient_retries, 4);
         assert_eq!(cfg.poll_interval_ms, 2000);
     }
 
@@ -530,6 +552,7 @@ mod tests {
         assert_eq!(cfg.max_test_fix_attempts, 3);
         assert_eq!(cfg.max_fix_rounds, 3);
         assert_eq!(cfg.verdict_retries, 1);
+        assert_eq!(cfg.implement_transient_retries, 1);
         assert_eq!(cfg.poll_interval_ms, 1500);
     }
 
@@ -544,6 +567,7 @@ mod tests {
             ("DEARBORN_MAX_TEST_FIX_ATTEMPTS", "abc"),
             ("DEARBORN_MAX_FIX_ROUNDS", "abc"),
             ("DEARBORN_VERDICT_RETRIES", "abc"),
+            ("DEARBORN_IMPLEMENT_TRANSIENT_RETRIES", "abc"),
             ("DEARBORN_POLL_INTERVAL_MS", "abc"),
         ]);
         let cfg = executor_from(&map);
@@ -559,6 +583,10 @@ mod tests {
         assert_eq!(cfg.max_test_fix_attempts, defaults.max_test_fix_attempts);
         assert_eq!(cfg.max_fix_rounds, defaults.max_fix_rounds);
         assert_eq!(cfg.verdict_retries, defaults.verdict_retries);
+        assert_eq!(
+            cfg.implement_transient_retries,
+            defaults.implement_transient_retries
+        );
         assert_eq!(cfg.poll_interval_ms, defaults.poll_interval_ms);
     }
 
@@ -587,11 +615,13 @@ mod tests {
             ("DEARBORN_MAX_TEST_FIX_ATTEMPTS", "0"),
             ("DEARBORN_MAX_FIX_ROUNDS", "0"),
             ("DEARBORN_VERDICT_RETRIES", "0"),
+            ("DEARBORN_IMPLEMENT_TRANSIENT_RETRIES", "0"),
         ]);
         let cfg = executor_from(&map);
         assert_eq!(cfg.max_test_fix_attempts, 0);
         assert_eq!(cfg.max_fix_rounds, 0);
         assert_eq!(cfg.verdict_retries, 0);
+        assert_eq!(cfg.implement_transient_retries, 0);
     }
 
     #[test]
@@ -635,6 +665,7 @@ mod tests {
         assert_eq!(cfg.executor.max_test_fix_attempts, 3);
         assert_eq!(cfg.executor.max_fix_rounds, 3);
         assert_eq!(cfg.executor.verdict_retries, 1);
+        assert_eq!(cfg.executor.implement_transient_retries, 1);
     }
 
     #[test]

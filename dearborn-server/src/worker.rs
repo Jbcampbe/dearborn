@@ -284,6 +284,33 @@
 //! (`git add -A`/`git commit` sit *after* the whole `test_attempt` loop in
 //! the reference script, not inside it).
 //!
+//! ### Salvaging completed-but-uncommitted work on an ordinary implement
+//! ### failure
+//!
+//! "Commit only at known-green" describes every commit that follows a green
+//! gate — and it stays true: a red `test_cmd`, a fix-loop exhaustion, a red
+//! preflight all still leave the tree exactly as the agent left it. But the
+//! *implement stage itself* failing is different, because nothing downstream
+//! ever runs to give that attempt's work a second chance: the next claim re-
+//! provisions the workspace (`git reset --hard HEAD` + `git clean -fd`, see
+//! `provision_epic_workspace`) and destroys a dirty tree outright, and the
+//! failure triage push only ever pushes what is already committed — so hours
+//! of finished work whose only sin was a transient provider hiccup surfacing
+//! as one `RunEvent::Error` would simply vanish before any human saw it.
+//! The not-ok implement branch therefore salvages first: for an ordinary
+//! failure (`timed_out`/`cancelled` excluded), it calls [`commit_if_dirty`]
+//! with the same §2.8 `impl(<short id>): <title>` subject step 5 below uses
+//! (this diff is the task's first real commit) and the same lease fencing as
+//! every other write, committing whatever the agent completed onto the task
+//! branch **before** routing to [`route_stage_failure`] — which means
+//! [`fail_item`]'s `PushIntent::Attempt(workspace)` triage push then carries
+//! the salvaged commit to the remote, so a human triaging the board sees the
+//! work instead of losing it. A `cancelled` outcome deliberately skips this:
+//! a cancelled task resets to `Todo` and must keep its resumable dirty tree
+//! ([`handle_cancelled_task`] depends on that), and `timed_out` gets the
+//! same treatment (a deadline kill is a visible stop, not salvageable
+//! partial state worth enshrining in history).
+//!
 //! ### Attempt numbering starts at 0, and why a fix and the gate that follows
 //! ### it share a number
 //!
@@ -804,12 +831,18 @@
 //!
 //! [`fail_item`]'s last step, [`push_on_failure`], pushes whatever is
 //! already committed on the failing epic's branch — never anything more,
-//! because nothing between a task's last successful commit and its failure
-//! ever calls `git add`/`git commit` again (every commit step in this walk
-//! runs *before* any failure path, never after). A failing task's dirty
-//! working tree therefore cannot reach `origin` through this function by
-//! construction, not by a check it has to remember to perform — the AC's
-//! "never staged, committed, or pushed" is structural.
+//! because [`push_on_failure`] itself never stages anything: only explicitly
+//! committed content can reach `origin` through it. What changed (with the
+//! implement-failure salvage above) is *which* commits can be sitting there
+//! when it runs: an ordinary implement failure now runs [`commit_if_dirty`]
+//! *before* routing to [`fail_item`], so the triage push deliberately
+//! carries that salvaged commit — that is the point of salvaging at all.
+//! Everything else about the old structural guarantee still holds: a
+//! timed-out/cancelled outcome skips the salvage (a cancelled task keeps its
+//! resumable dirty tree), every other failure path still has nothing between
+//! its last commit and its failure, and raw uncommitted working-tree state
+//! still cannot reach `origin` through this function by construction, not by
+//! a check it has to remember to perform.
 //!
 //! Whether to even attempt it is [`PushIntent`], decided per call site:
 //!
@@ -2666,9 +2699,13 @@ async fn commit_if_dirty(
 /// re-test → re-commit → re-review convergence loop
 /// ([`run_review_fix_converge`]); no diff at all runs T-532's
 /// already-complete verification instead ([`run_verify_complete`]) — either
-/// way, `Done`. See the module doc's "The real implement walk", "Review,
-/// verdict, and convergence", "Review → fix → re-test → re-commit", and
-/// "Already-complete verification" sections for the rationale behind each
+/// way, `Done`. An implement run that comes back not-`ok` takes the failure
+/// exit instead: an ordinary failure first salvages whatever the agent
+/// completed with one more [`commit_if_dirty`] call (see the module doc's
+/// "Salvaging completed-but-uncommitted work" section), then routes through
+/// [`route_stage_failure`]. See the module doc's "The real implement walk",
+/// "Review, verdict, and convergence", "Review → fix → re-test → re-commit",
+/// and "Already-complete verification" sections for the rationale behind each
 /// step; this function is the literal implementation of that sequence.
 ///
 /// ## Generalized for T-551, not duplicated
@@ -2782,6 +2819,7 @@ async fn process_one_task(
     };
     let prompt = task_agent::assemble_prompt_text(&implement_cfg.prompt, &task_ctx);
 
+<<<<<<< Updated upstream
     // 3. Run the implement stage through the TaskAgent seam. The attempt
     //    number is computed, not hardcoded: one past whatever `implement`
     //    attempts this task already has, so a re-run of a previously
@@ -2816,25 +2854,106 @@ async fn process_one_task(
         req,
     )
     .await;
+=======
+    // 3. Run the implement stage through the TaskAgent seam — with a bounded
+    //    auto-retry when the run fails on what looks like a *transient*
+    //    provider condition (`DEARBORN_IMPLEMENT_TRANSIENT_RETRIES`, see
+    //    [`is_transient_provider_error`]). The incident this closes: pi
+    //    recovered from a mid-run HTTP 429, exited cleanly, and produced the
+    //    full fix — but an outcome carrying any `RunEvent::Error` can still
+    //    come back not-`ok` here (e.g. the recovery itself failed the
+    //    final-state check), and routing straight to `route_stage_failure`
+    //    discarded completed-but-uncommitted work whose only sin was an
+    //    upstream hiccup. One extra attempt (the default) re-runs the whole
+    //    stage against the same workspace; because every prior attempt's
+    //    partial output is just dirty-tree content at that point, a retry
+    //    overwrites it exactly like a human re-running would. Total attempts
+    //    are `1 + retries`; each attempt opens its own `agent_run` row under
+    //    its own incremented `attempt` number so the evidence trail shows the
+    //    full history rather than one overwritten row. Only a not-`ok`
+    //    outcome that is neither timed out nor cancelled and whose recorded
+    //    error text matches a transient signal earns a retry — anything else
+    //    falls through to the ordinary [`route_stage_failure`] handling
+    //    unchanged, and exhausted retries land there too.
+    let max_attempts = 1 + state.config.executor.implement_transient_retries as i64;
+    let mut attempt = 1i64;
+    let outcome = loop {
+        let run_id = ulid::Ulid::new().to_string();
+        // Cloned per attempt, not built once outside the loop: `TaskRunRequest`
+        // is consumed by `run_agent_stage`'s harness call (`agent.run(req)`),
+        // and each attempt needs its own fresh `run_id` anyway.
+        let req = TaskRunRequest {
+            run_id,
+            stage: Stage::Implement,
+            prompt: prompt.clone(),
+            cwd: workspace.workspace_path.clone(),
+            harness: implement_cfg.harness.clone(),
+            model: implement_cfg.model.clone(),
+            prompt_hash: implement_cfg.prompt_hash.clone(),
+        };
+        let outcome = task_agent::run_agent_stage(
+            state,
+            &*state.task_agent,
+            AgentStageParams {
+                task_id: Some(task_id),
+                epic_id,
+                attempt,
+            },
+            req,
+        )
+        .await;
+>>>>>>> Stashed changes
 
-    let outcome = match outcome {
-        Ok(outcome) => outcome,
-        Err(err) => {
-            if !lease.is_lost() {
-                fail_item(
-                    state,
-                    FailureContext {
-                        epic_id,
-                        task_id: Some(task_id),
-                        reason: FailureReason::AgentError,
-                        message: &format!("implement stage failed to start: {err}"),
-                        push: PushIntent::Attempt(workspace),
-                    },
-                )
-                .await;
+        let outcome = match outcome {
+            Ok(outcome) => outcome,
+            Err(err) => {
+                if !lease.is_lost() {
+                    fail_item(
+                        state,
+                        FailureContext {
+                            epic_id,
+                            task_id: Some(task_id),
+                            reason: FailureReason::AgentError,
+                            message: &format!("implement stage failed to start: {err}"),
+                            push: PushIntent::Attempt(workspace),
+                        },
+                    )
+                    .await;
+                }
+                return TaskStepOutcome::Stop;
             }
-            return TaskStepOutcome::Stop;
+        };
+
+        // Retry decision, kept next to the run itself so the four "this does
+        // not earn another attempt" conditions read as one guard: success,
+        // last attempt, timeout/cancel (both mean a human- or config-visible
+        // kill, never an upstream hiccup — `timed_out` is checked before
+        // `cancelled` for the same reason `route_stage_failure` checks it
+        // first), or error text that doesn't look transient. Everything else
+        // falls through to the ordinary `route_stage_failure` handling below,
+        // which is also where retries-exhausted lands (the loop simply exits
+        // on its last attempt without retrying).
+        let err_text = outcome
+            .last_error_message
+            .as_deref()
+            .unwrap_or(&outcome.text);
+        if outcome.is_ok()
+            || outcome.timed_out
+            || outcome.cancelled
+            || attempt >= max_attempts
+            || !is_transient_provider_error(err_text)
+        {
+            break outcome;
         }
+        tracing::warn!(
+            epic = ?epic_id,
+            task = %task_id,
+            attempt,
+            max_attempts,
+            error_text = %err_text,
+            "implement stage failed on a transient provider error; retrying"
+        );
+        attempt += 1;
     };
 
     // MILESTONE_2 §4 (tracer bullet): anything that fails here Blocks the
@@ -2843,6 +2962,45 @@ async fn process_one_task(
     // case `route_stage_failure` sends this to `handle_cancelled_task`
     // instead (see the module doc's "T-542: cancellation as a kill" section).
     if !outcome.is_ok() {
+        // Salvage commit (Recommendation 3): an ordinary failure can still
+        // leave hours of *finished* work sitting uncommitted in the workspace
+        // (the recovered-from-a-transient-hiccup incident this closes), and
+        // nothing downstream would ever save it — the next claim's re-
+        // provision (`git reset --hard HEAD` + `git clean -fd`) destroys a
+        // dirty tree outright, and `fail_item`'s triage push only pushes what
+        // is already committed. So commit whatever the agent managed to
+        // complete onto the task branch BEFORE routing to the failure path:
+        // the same §2.8 subject step 5 below would have used (this diff is
+        // the task's first real commit), the same attempt number `1`, and the
+        // same lease fencing every other write here respects (a lost lease
+        // means someone else owns the task; neither the salvage commit nor
+        // the failure routing that follows may act on the workspace). A
+        // `timed_out` or `cancelled` outcome deliberately skips this — a
+        // cancelled task resets to `Todo` and must keep its resumable dirty
+        // tree (see [`handle_cancelled_task`]), and a deadline kill deserves
+        // the same treatment — see the module doc's "Salvaging
+        // completed-but-uncommitted work" section for the full rationale.
+        if !outcome.timed_out && !outcome.cancelled && !lease.is_lost() {
+            let subject = format!("impl({}): {}", spec::short_id(task_id), task_title);
+            if let Err(err) = commit_if_dirty(
+                conn,
+                task_id,
+                epic_id,
+                &workspace.workspace_path,
+                &subject,
+                1,
+            )
+            .await
+            {
+                tracing::warn!(
+                    epic = ?epic_id,
+                    task = %task_id,
+                    error = %err,
+                    "salvage commit after an ordinary implement failure failed; \
+                     proceeding to the failure route with the tree as-is"
+                );
+            }
+        }
         route_stage_failure(
             state,
             epic_id,
@@ -2851,6 +3009,12 @@ async fn process_one_task(
             "implement stage did not complete successfully",
             workspace,
             lease,
+            // Rec 5: only the implement stage opts into the finer taxonomy —
+            // its retry loop already consults `is_transient_provider_error`,
+            // so exhausted-retries transient failures land here and get
+            // classified `provider_rate_limited` (with the provider's error
+            // text as the persisted detail) instead of `agent_error`.
+            true,
         )
         .await;
         return TaskStepOutcome::Stop;
@@ -3390,6 +3554,9 @@ async fn run_test_gate_loop(
                     "fix stage did not complete successfully",
                     workspace,
                     lease,
+                    // Not the implement stage — no transient-provider
+                    // classification; stays `agent_error`.
+                    false,
                 )
                 .await;
                 return GateOutcome::Stop;
@@ -3580,6 +3747,9 @@ async fn run_verdict_stage(
                 &format!("{stage_label} stage did not complete successfully"),
                 workspace,
                 lease,
+                // Not the implement stage — no transient-provider
+                // classification; stays `agent_error`.
+                false,
             )
             .await;
             return VerdictOutcome::Stop;
@@ -3835,6 +4005,9 @@ async fn run_review_fix_converge(
                             "review-round fix stage did not complete successfully",
                             workspace,
                             lease,
+                            // Not the implement stage — no transient-provider
+                            // classification; stays `agent_error`.
+                            false,
                         )
                         .await;
                         return ConvergenceOutcome::Stop;
@@ -4102,6 +4275,9 @@ async fn run_verify_complete(
                         "verify-complete fix stage did not complete successfully",
                         workspace,
                         lease,
+                        // Not the implement stage — no transient-provider
+                        // classification; stays `agent_error`.
+                        false,
                     )
                     .await;
                     return TaskStepOutcome::Stop;
@@ -4386,6 +4562,17 @@ enum FailureReason {
     /// task had already reached `Done` (T-514's finalize step). No task at
     /// fault — every task already succeeded; the failure is finalize's own.
     PrFailed,
+    /// Recommendation 5's finer taxonomy for an implement-stage failure whose
+    /// recorded error text matched [`is_transient_provider_error`] (an HTTP
+    /// 429 rate limit, a provider-overload notice, a gateway-level 5xx) after
+    /// the bounded retry loop had exhausted its extra attempts. This is the
+    /// incident that motivated the taxonomy: pi *recovered* from a mid-run 429
+    /// and finished the whole fix, but a residual error event failed the stage,
+    /// and the generic `agent_error` label told the triager nothing about the
+    /// upstream hiccup that actually caused it. Only the implement stage opts
+    /// into this classification (see [`route_stage_failure`]'s own doc); every
+    /// other agent-stage failure keeps [`FailureReason::AgentError`].
+    ProviderRateLimited,
 }
 
 impl FailureReason {
@@ -4405,6 +4592,7 @@ impl FailureReason {
             FailureReason::Timeout => "timeout",
             FailureReason::Cancelled => "cancelled",
             FailureReason::PrFailed => "pr_failed",
+            FailureReason::ProviderRateLimited => "provider_rate_limited",
         }
     }
 
@@ -4414,7 +4602,7 @@ impl FailureReason {
     /// test that actually drives each one through the router, rather than
     /// trusting the `as_str` match arms above by inspection alone.
     #[cfg(test)]
-    const ALL: [FailureReason; 10] = [
+    const ALL: [FailureReason; 11] = [
         FailureReason::PreflightRed,
         FailureReason::SetupFailed,
         FailureReason::WorkspaceError,
@@ -4425,6 +4613,7 @@ impl FailureReason {
         FailureReason::Timeout,
         FailureReason::Cancelled,
         FailureReason::PrFailed,
+        FailureReason::ProviderRateLimited,
     ];
 }
 
@@ -4460,8 +4649,8 @@ enum PushIntent<'a> {
 /// path. `task_id: None` is what lets a no-task failure (`preflight_red`,
 /// `setup_failed`, `workspace_error`, `pr_failed`) and a task-scoped one
 /// (`agent_error`, `test_gate_exhausted`, `review_not_converged`, `blocked`,
-/// and T-543's `timeout`) share the identical call shape — nothing else
-/// about the struct varies by failure kind.
+/// T-543's `timeout`, and Rec 5's `provider_rate_limited`) share the
+/// identical call shape — nothing else about the struct varies by failure kind.
 ///
 /// `epic_id: Option<&'a str>` (widened by T-551 from a bare `&'a str`) is the
 /// other half of the same duality, one level up: `Some(epic_id)` is every
@@ -4549,11 +4738,49 @@ async fn fail_item(state: &AppState, ctx: FailureContext<'_>) {
     let conn = state.db.conn();
     let now = now_ms();
 
+    // Rec 5: pair the structured reason with the human-readable message.
+    // The message is redacted against the owning project's PAT (and, in every
+    // case, against URL userinfo) and length-capped before it ever lands in a
+    // column — `failure_detail` is user-facing (it rides the task/epic DTOs
+    // onto the board frames), so it obeys the same redaction discipline as
+    // every other persisted failure text (`push_on_failure`, `clone_error`).
+    // The project has to be resolved first so the PAT can be decrypted; an
+    // epic-scoped failure reads it off the epic, a standalone one off the
+    // task itself. A vanished row or a failed decrypt degrades to no PAT —
+    // redaction then still strips URL userinfo, never blocks the failure
+    // already being recorded.
+    let conn_project_id = match ctx.epic_id {
+        Some(epic_id) => {
+            fetch_epic(conn, epic_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|epic| epic.project_id)
+        }
+        None => match ctx.task_id {
+            Some(task_id) => crate::tasks::fetch_task(conn, task_id)
+                .await
+                .ok()
+                .flatten()
+                .map(|task| task.project_id),
+            None => None,
+        },
+    };
+    let pat = match &conn_project_id {
+        Some(project_id) => crate::projects::load_decrypted_pat(state, project_id)
+            .await
+            .ok()
+            .flatten(),
+        None => None,
+    };
+    let failure_detail = cap_failure_detail(&git::redact(ctx.message, pat.as_deref()));
+
     if let Some(task_id) = ctx.task_id {
         let _ = conn
             .execute(
-                "UPDATE task SET status = 'Failed', failure_reason = ?1, updated_at = ?2 WHERE id = ?3",
-                params![reason, now, task_id],
+                "UPDATE task SET status = 'Failed', failure_reason = ?1, failure_detail = ?2, \
+                     updated_at = ?3 WHERE id = ?4",
+                params![reason, failure_detail.clone(), now, task_id],
             )
             .await;
     }
@@ -4583,9 +4810,10 @@ async fn fail_item(state: &AppState, ctx: FailureContext<'_>) {
 
     let took_epic = conn
         .execute(
-            "UPDATE epic SET status = 'Blocked', blocked_reason = ?1, updated_at = ?2 \
-             WHERE id = ?3 AND status = 'InProgress'",
-            params![reason, now, epic_id],
+            "UPDATE epic SET status = 'Blocked', blocked_reason = ?1, failure_detail = ?2, \
+                 updated_at = ?3 \
+             WHERE id = ?4 AND status = 'InProgress'",
+            params![reason, failure_detail, now, epic_id],
         )
         .await
         .map(|n| n > 0)
@@ -4610,6 +4838,37 @@ async fn fail_item(state: &AppState, ctx: FailureContext<'_>) {
     }
 }
 
+/// Longest [`cap_failure_detail`] output, in chars: `FAILURE_DETAIL_CAP_CHARS`
+/// plus the elision marker below (only ever appended together).
+const FAILURE_DETAIL_CAP_CHARS: usize = 2000;
+
+/// Rec 5's elision marker for an over-cap `failure_detail` — same shape and
+/// rationale as [`crate::evidence::cap_log`]'s own marker: a triager must be
+/// able to tell a truncated column from a short one at a glance.
+const FAILURE_DETAIL_ELISION_MARKER: &str =
+    "... [dearborn: failure_detail elided — exceeded 2000 chars] ...";
+
+/// Cap a redacted failure message to [`FAILURE_DETAIL_CAP_CHARS`] **chars**,
+/// keeping head + tail around [`FAILURE_DETAIL_ELISION_MARKER`] when it
+/// doesn't fit whole — the exact discipline [`crate::evidence::cap_log`] uses
+/// for transcripts, scaled down for one message: both ends of a failure text
+/// are informative (the operation that failed opens it; the actual error
+/// line usually closes it), while the middle of a long provider transcript
+/// is the likeliest place for repetitive noise. UTF-8 safe by construction:
+/// every slice comes from `char`-iterator takes/skips, never byte offsets.
+fn cap_failure_detail(text: &str) -> String {
+    let total = text.chars().count();
+    if total <= FAILURE_DETAIL_CAP_CHARS {
+        return text.to_string();
+    }
+    let budget = FAILURE_DETAIL_CAP_CHARS.saturating_sub(FAILURE_DETAIL_ELISION_MARKER.chars().count());
+    let head_len = budget / 2;
+    let tail_len = budget - head_len;
+    let head: String = text.chars().take(head_len).collect();
+    let tail: String = text.chars().skip(total - tail_len).collect();
+    format!("{head}{FAILURE_DETAIL_ELISION_MARKER}{tail}")
+}
+
 /// Best-effort push of `workspace`'s branch, the last thing [`fail_item`]
 /// does — the task/epic have already reached their terminal states by the
 /// time this runs, so nothing here can change *whether* the failure landed,
@@ -4623,12 +4882,17 @@ async fn fail_item(state: &AppState, ctx: FailureContext<'_>) {
 ///
 /// Never stages or commits anything: [`GitHost::push`] (in production,
 /// [`git::push_branch`]) only ever pushes what is already committed on
-/// `workspace`'s branch. A failing task's dirty working tree was never
-/// `git add`ed by anything upstream of this call (every commit step in this
-/// module runs `commit_if_dirty` *before* any failure path, never after), so
-/// there is nothing for this function to accidentally sweep up — the AC's
-/// "never staged, committed, or pushed" holds by construction, not by a
-/// check this function has to perform.
+/// `workspace`'s branch. Whatever commits exist when it runs were made
+/// explicitly upstream — including, on an ordinary implement failure, the
+/// deliberate salvage [`commit_if_dirty`] that runs just before
+/// [`route_stage_failure`] hands control here (see the module doc's
+/// "Salvaging completed-but-uncommitted work" section): that commit is meant
+/// to ride this very push so triage can see it. Raw working-tree state is
+/// still never swept up by this function — nothing here stages anything —
+/// and every other failure path still has nothing between its last commit
+/// and its failure, so "never staged, committed, or pushed" holds for
+/// everything except that one intentional salvage commit, which is committed
+/// on purpose, not swept up.
 async fn push_on_failure(
     state: &AppState,
     epic_id: Option<&str>,
@@ -4717,6 +4981,42 @@ async fn push_on_failure(
 // full design (the registry, the guard, why `fail_item` doesn't fit). This
 // is that section's literal implementation.
 
+/// Whether a failed agent-stage run's recorded error text matches a
+/// *transient upstream provider* signal — the class of condition that says
+/// "the provider hiccuped, not that the task's work is broken": an HTTP 429
+/// rate limit, a provider-overload notice, or a gateway-level 5xx. Matching
+/// is case-insensitive substring matching over the needles below, because
+/// these messages arrive as freeform harness/provider error lines (e.g.
+/// `Error: API returned 429 Too Many Requests`), never as structured codes.
+///
+/// Deliberately narrow: this predicate earns [`process_one_task`]'s implement
+/// stage one extra attempt (`DEARBORN_IMPLEMENT_TRANSIENT_RETRIES`), so it
+/// must not match ordinary failure text — a compile error, a red test, or a
+/// non-zero exit with no provider signal routes to [`route_stage_failure`] on
+/// the first attempt exactly as before. Some needles are subsumed by broader
+/// ones (`"temporarily rate-limited"` by `"rate-limited"`, `"502"` by itself
+/// inside any larger number containing it) — they are listed individually for
+/// traceability to the recommendation's match set, and substring matching is
+/// accepted as slightly over-eager here because a false positive costs only
+/// one bounded retry of a stage whose failure text mentioned a provider
+/// status line somewhere in its output.
+fn is_transient_provider_error(text: &str) -> bool {
+    const TRANSIENT_SIGNALS: &[&str] = &[
+        "429",
+        "rate-limited",
+        "rate limit",
+        "temporarily rate-limited",
+        "overloaded",
+        "502",
+        "503",
+        "504",
+        "bad gateway",
+        "service unavailable",
+    ];
+    let lowered = text.to_ascii_lowercase();
+    TRANSIENT_SIGNALS.iter().any(|needle| lowered.contains(needle))
+}
+
 /// Route a not-`ok` [`task_agent::AgentStageOutcome`] to whichever of three
 /// paths matches *why* it isn't `ok` — the single decision every call site in
 /// this module that inspects an agent stage's outcome now makes through this
@@ -4741,8 +5041,24 @@ async fn push_on_failure(
 ///    `Failed`).
 /// 3. Anything else — an ordinary agent-stage failure (non-zero exit, an
 ///    `Error` event, or a stage that never produced a clean `ok`). Routed
-///    through `fail_item` with [`FailureReason::AgentError`], unchanged from
-///    before T-542/T-543 existed.
+///    through `fail_item` — with [`FailureReason::AgentError`] by default,
+///    or [`FailureReason::ProviderRateLimited`] when `classify_transient_provider`
+///    is set and the outcome's recorded error text matches
+///    [`is_transient_provider_error`] (Rec 5's finer taxonomy; see below).
+///
+/// ## Rec 5: the transient-provider classification (`classify_transient_provider`)
+///
+/// Only the implement stage passes `true`. That stage already consults
+/// [`is_transient_provider_error`] for its bounded retry loop (the same
+/// predicate), so an implement failure that *still* looks transient after
+/// every attempt was exhausted is precisely the incident class Rec 5 names:
+/// a provider-side hiccup (HTTP 429 rate limit, overload notice, gateway
+/// 5xx) that says nothing about the task's work. Those land
+/// `provider_rate_limited` instead of the generic `agent_error`, with the
+/// provider's own error text as the `message` (so `fail_item` persists it
+/// redacted into `failure_detail`) rather than the caller's fixed label.
+/// Every other stage keeps `false`: their failures stay `agent_error`,
+/// exactly as before this parameter existed.
 ///
 /// `message`/`workspace` are exactly what the caller would have passed
 /// `fail_item` directly before T-542; they are simply ignored on the
@@ -4760,6 +5076,7 @@ async fn route_stage_failure(
     message: &str,
     workspace: &ProvisionedWorkspace,
     lease: &LeaseHandle,
+    classify_transient_provider: bool,
 ) {
     if lease.is_lost() {
         return;
@@ -4779,13 +5096,37 @@ async fn route_stage_failure(
     } else if outcome.cancelled {
         handle_cancelled_task(state, epic_id, task_id).await;
     } else {
+        let err_text = outcome
+            .last_error_message
+            .as_deref()
+            .unwrap_or(&outcome.text);
+        let (reason, detail_message) = if classify_transient_provider
+            && is_transient_provider_error(err_text)
+        {
+            tracing::warn!(
+                epic = ?epic_id,
+                task = %task_id,
+                error = %err_text,
+                "agent stage failed on a persistent transient-looking provider error; \
+                 recording provider_rate_limited"
+            );
+            (
+                FailureReason::ProviderRateLimited,
+                // The provider's own error text is what makes the failure
+                // triageable — persist it (redacted by `fail_item`) instead
+                // of the caller's generic stage-failure label.
+                err_text,
+            )
+        } else {
+            (FailureReason::AgentError, message)
+        };
         fail_item(
             state,
             FailureContext {
                 epic_id,
                 task_id: Some(task_id),
-                reason: FailureReason::AgentError,
-                message,
+                reason,
+                message: detail_message,
                 push: PushIntent::Attempt(workspace),
             },
         )
@@ -4818,9 +5159,12 @@ async fn route_stage_failure(
 ///   is already exactly `Cancelled`, never `Blocked`.
 /// - **No `epic_updated`/`board_updated`.** Also already published by that
 ///   same handler; this function only has a task-level change to announce.
-/// - **No push, no PR.** Identical property to every `fail_item` failure
-///   path: nothing between a task's last successful commit and a mid-stage
-///   cancellation ever calls `git add`/`git commit`, so there is nothing new
+/// - **No push, no PR.** Nothing between a task's last successful commit and
+///   a mid-stage cancellation ever calls `git add`/`git commit`: the
+///   implement-failure salvage step (module doc, "Salvaging
+///   completed-but-uncommitted work") explicitly skips `outcome.cancelled`
+///   outcomes for exactly this reason — a cancelled task resets to `Todo`
+///   below and must keep its resumable dirty tree — so there is nothing new
 ///   on the branch to push, and [`finalize_epic`] (the only place a PR ever
 ///   opens) is never reached — the walk stops mid-task, long before the DAG
 ///   could read fully `Done`.
@@ -9234,6 +9578,22 @@ mod tests {
         (row.get(0).unwrap(), row.get(1).unwrap())
     }
 
+    /// Read `failure_detail` directly off the task row (Rec 5) — same direct-
+    /// SQL discipline as [`fetch_task_row`], so these tests pin what the
+    /// executor *persisted* rather than what a DTO projection happens to map.
+    async fn fetch_task_detail(state: &AppState, task_id: &str) -> Option<String> {
+        let mut rows = state
+            .db
+            .conn()
+            .query(
+                "SELECT failure_detail FROM task WHERE id = ?1",
+                params![task_id],
+            )
+            .await
+            .unwrap();
+        rows.next().await.unwrap().unwrap().get(0).unwrap()
+    }
+
     /// D19's explicit AC: the fix agent's prompt contains the failing test
     /// output and **nothing** from the implement stage's own context — no
     /// spec block, no epic-context heading, no sibling manifest. Proven
@@ -9739,7 +10099,20 @@ mod tests {
         let epic_id = seed_epic(&state, &project_id, "InProgress").await;
         let a = seed_task(&state, &epic_id, &project_id, "A").await;
 
-        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+        // Run the pipeline in its own spawned task rather than a direct
+        // `.await`: the review-driven fix loop produces the largest per-task
+        // async frames in this module (implement + baseline review + the fix
+        // round + the nested unscripted test-gate fix attempts all live in
+        // one walk), and on the test harness's own thread they overflow the
+        // stack — the same hazard `assert_no_push_row`'s and
+        // `workspace_error_skips_the_push_cleanly`'s doc comments describe.
+        let walk_state = state.clone();
+        let walk_epic = epic_id.clone();
+        tokio::spawn(async move {
+            run_epic_pipeline(walk_state, walk_epic).await;
+        })
+        .await
+        .unwrap();
 
         let task = fetch_task_row(&state, &a).await;
         assert_eq!(task.0, "Failed", "the task itself must be Failed");
@@ -10497,6 +10870,10 @@ mod tests {
         assert_eq!(FailureReason::Timeout.as_str(), "timeout");
         assert_eq!(FailureReason::Cancelled.as_str(), "cancelled");
         assert_eq!(FailureReason::PrFailed.as_str(), "pr_failed");
+        assert_eq!(
+            FailureReason::ProviderRateLimited.as_str(),
+            "provider_rate_limited"
+        );
     }
 
     /// The AC's "every §2.3 reason reaches this path": every [`FailureReason`]
@@ -10578,6 +10955,144 @@ mod tests {
                 Some(reason.as_str())
             );
         }
+    }
+
+    // ---- Rec 5: triageable failures (`failure_detail`) ----------------------
+
+    /// Rec 5's persistence contract, driven directly through [`fail_item`]:
+    /// the failure message lands as `failure_detail` on both containers —
+    /// **redacted** (URL userinfo stripped even with no project PAT) and
+    /// **capped** (an over-cap message keeps exactly
+    /// [`FAILURE_DETAIL_CAP_CHARS`] chars, head + tail around the elision
+    /// marker, never a raw byte-slice through a multi-byte char).
+    #[tokio::test]
+    async fn fail_item_persists_redacted_and_capped_failure_detail() {
+        let (state, _app) = test_app().await;
+        let project_id = seed_project(&state).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let task_id = seed_task(&state, &epic_id, &project_id, "A").await;
+        set_task_status(&state, &task_id, "InProgress").await;
+
+        // Over-cap message whose head carries a credentialed URL and whose
+        // tail is a distinctive marker: both ends must survive capping, and
+        // the secret must not.
+        let secret = "super-secret-token";
+        let mut message = String::new();
+        message.push_str("clone failed: https://ci-bot:");
+        message.push_str(secret);
+        message.push_str("@github.com/acme/demo.git — ");
+        message.push_str(&"x".repeat(3000));
+        message.push_str("TAIL_MARKER: exit code 128");
+
+        fail_item(
+            &state,
+            FailureContext {
+                epic_id: Some(&epic_id),
+                task_id: Some(&task_id),
+                reason: FailureReason::AgentError,
+                message: &message,
+                push: PushIntent::Skip,
+            },
+        )
+        .await;
+
+        let detail = fetch_task_detail(&state, &task_id)
+            .await
+            .expect("fail_item must persist failure_detail on the task");
+        assert_eq!(
+            detail.chars().count(),
+            FAILURE_DETAIL_CAP_CHARS,
+            "an over-cap message is capped to exactly {FAILURE_DETAIL_CAP_CHARS} chars"
+        );
+        assert!(detail.contains(FAILURE_DETAIL_ELISION_MARKER));
+        // Redaction: the PAT-less path still strips URL userinfo...
+        assert!(detail.contains("https://***@github.com"), "{detail}");
+        assert!(!detail.contains(secret), "the token must not survive");
+        // ...and both informative ends survive the cap.
+        assert!(detail.starts_with("clone failed:"), "{detail}");
+        assert!(detail.ends_with("TAIL_MARKER: exit code 128"), "{detail}");
+
+        // The epic carries the same redacted, capped text alongside its own
+        // blocked_reason.
+        let epic = fetch_epic(state.db.conn(), &epic_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(epic.failure_detail.as_deref(), Some(detail.as_str()));
+
+        // A short message is stored verbatim — the cap is an upper bound,
+        // not a transformation.
+        let epic2 = seed_epic(&state, &project_id, "InProgress").await;
+        let task2 = seed_task(&state, &epic2, &project_id, "B").await;
+        set_task_status(&state, &task2, "InProgress").await;
+        fail_item(
+            &state,
+            FailureContext {
+                epic_id: Some(&epic2),
+                task_id: Some(&task2),
+                reason: FailureReason::AgentError,
+                message: "short failure",
+                push: PushIntent::Skip,
+            },
+        )
+        .await;
+        assert_eq!(
+            fetch_task_detail(&state, &task2).await.as_deref(),
+            Some("short failure")
+        );
+    }
+
+    /// Rec 5's surfacing + recovery contract end-to-end over the HTTP API on
+    /// a **standalone** task (which exercises `fail_item`'s no-epic branch —
+    /// the project must be resolved off the task row itself): `GET /tasks/{id}`
+    /// JSON includes `failure_detail` right next to `failure_reason` (the AC:
+    /// it surfaces wherever the reason does), and `POST /tasks/{id}/retry`
+    /// clears it so the fresh attempt doesn't inherit stale detail.
+    #[tokio::test]
+    async fn retry_clears_stale_failure_detail_and_api_surfaces_it() {
+        let (state, app) = test_app().await;
+        let project_id = seed_project(&state).await;
+        let task_id = seed_standalone_task(&state, &project_id, "Standalone A", "Todo").await;
+
+        fail_item(
+            &state,
+            FailureContext {
+                epic_id: None,
+                task_id: Some(&task_id),
+                reason: FailureReason::ProviderRateLimited,
+                message: "Error: API returned 429 Too Many Requests",
+                push: PushIntent::Skip,
+            },
+        )
+        .await;
+
+        // API JSON: failure_detail rides next to failure_reason.
+        let response = app
+            .clone()
+            .oneshot(req("GET", &format!("/tasks/{task_id}"), None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let body = body_json(response).await;
+        assert_eq!(body["failure_reason"], "provider_rate_limited");
+        assert_eq!(
+            body["failure_detail"],
+            "Error: API returned 429 Too Many Requests"
+        );
+
+        // Retry: 200, and the stale detail is gone from both the response
+        // and the row.
+        let response = app
+            .clone()
+            .oneshot(req("POST", &format!("/tasks/{task_id}/retry"), None))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let retried = body_json(response).await;
+        assert_eq!(retried["status"], "InProgress");
+        assert_eq!(retried["failure_reason"], serde_json::Value::Null);
+        assert_eq!(retried["failure_detail"], serde_json::Value::Null);
+        assert_eq!(fetch_task_detail(&state, &task_id).await, None);
     }
 
     /// The AC's headline push behavior: the epic branch is pushed on failure
@@ -10954,6 +11469,404 @@ mod tests {
         );
 
         cleanup_clone_root(&state, &project_id, &[&epic_a, &epic_b]);
+    }
+
+    // ---- Bounded implement-stage retry on transient provider errors ----
+    //
+    // The incident this hardens against: an implement run whose harness
+    // surfaced a mid-run provider 429 came back not-`ok`, was routed straight
+    // to `route_stage_failure`, and a fully-completed-but-uncommitted fix was
+    // discarded. These tests pin the contract of
+    // `DEARBORN_IMPLEMENT_TRANSIENT_RETRIES`: only a matching transient error
+    // earns one extra attempt (per the configured bound), each attempt opens
+    // its own `agent_run` row under an incremented `attempt` number, a
+    // recovered retry completes the whole pipeline normally, exhausted
+    // retries land in exactly Rec 5's `Failed(provider_rate_limited)` route,
+    // and any non-transient failure keeps the old single-attempt behavior.
+
+    /// `(attempt, status)` per `implement` agent_run row for `task_id`,
+    /// oldest first — the implement-retry counterpart to [`review_rows`],
+    /// trimmed to the two columns these tests actually assert on.
+    async fn implement_rows(state: &AppState, task_id: &str) -> Vec<(i64, String)> {
+        let mut rows = state
+            .db
+            .conn()
+            .query(
+                "SELECT attempt, status FROM agent_run \
+                 WHERE task_id = ?1 AND stage = 'implement' ORDER BY created_at ASC, rowid ASC",
+                params![task_id],
+            )
+            .await
+            .unwrap();
+        let mut out = Vec::new();
+        while let Some(row) = rows.next().await.unwrap() {
+            out.push((row.get(0).unwrap(), row.get(1).unwrap()));
+        }
+        out
+    }
+
+    /// A scripted implement run that fails like the incident's provider 429:
+    /// a non-zero exit whose output carries the transient signal (no files,
+    /// so a *retry* starting from a clean dirty-tree state is realistic).
+    fn transient_rate_limit_run() -> ScriptedRun {
+        ScriptedRun {
+            exit_code: Some(1),
+            text: vec!["Error: provider returned HTTP 429 rate limited\n".to_string()],
+            ..ScriptedRun::default()
+        }
+    }
+
+    /// A transient-looking implement error that recovers on the retry:
+    /// attempt 1 fails on a 429, attempt 2 writes a real file and exits clean,
+    /// and the rest of the pipeline (commit, default-scripted PASS review)
+    /// runs untouched to `Done`. Both attempts must be recorded under their
+    /// own incremented `attempt` number.
+    #[tokio::test]
+    async fn transient_implement_failure_is_retried_and_retry_completes_the_pipeline() {
+        let agent = Arc::new(
+            ScriptedTaskAgent::new()
+                .script(Stage::Implement, transient_rate_limit_run())
+                .script(Stage::Implement, writes_file("a.txt", "a")),
+        );
+        let (state, _app) = test_app_with_task_agent(agent).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let task_id = seed_task(&state, &epic_id, &project_id, "A").await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        // The retry succeeded, so nothing about this task looks failed.
+        assert_eq!(fetch_task_row(&state, &task_id).await.0, "Done");
+        assert_eq!(fetch_task_row(&state, &task_id).await.1, None);
+        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+
+        // Exactly the two expected attempts, each under its own incremented
+        // number: attempt 1 closed `error` (the 429), attempt 2 closed `ok`.
+        assert_eq!(
+            implement_rows(&state, &task_id).await,
+            vec![(1, "error".to_string()), (2, "ok".to_string())],
+            "the 429 attempt and the recovering retry must both leave evidence rows"
+        );
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// Transient errors that keep happening exhaust the bound (`for_test`
+    /// keeps the production default of 1 extra retry, so 2 attempts total)
+    /// and fall through to the ordinary `route_stage_failure` handling —
+    /// but Rec 5's finer taxonomy classifies them `provider_rate_limited`
+    /// (not the generic `agent_error`), with the provider's own error text
+    /// persisted (redacted, capped) as `failure_detail` on both the task and
+    /// the epic. Consequences are otherwise identical: task `Failed`, epic
+    /// `Blocked`, same push/retention behavior.
+    #[tokio::test]
+    async fn transient_implement_errors_exhausting_retries_fail_as_provider_rate_limited() {
+        let agent = Arc::new(
+            ScriptedTaskAgent::new()
+                .script(Stage::Implement, transient_rate_limit_run())
+                .script(Stage::Implement, transient_rate_limit_run()),
+        );
+        let (state, _app) = test_app_with_task_agent(agent).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let task_id = seed_task(&state, &epic_id, &project_id, "A").await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        assert_eq!(fetch_task_row(&state, &task_id).await.0, "Failed");
+        assert_eq!(
+            fetch_task_row(&state, &task_id).await.1.as_deref(),
+            Some("provider_rate_limited")
+        );
+        assert_eq!(epic_status(&state, &epic_id).await, "Blocked");
+
+        // Rec 5: the provider's error text rides along on both containers —
+        // this is what makes the failure triageable without DB spelunking.
+        assert!(
+            fetch_task_detail(&state, &task_id)
+                .await
+                .unwrap()
+                .contains("429"),
+            "task.failure_detail must carry the provider's rate-limit error"
+        );
+        let epic = fetch_epic(state.db.conn(), &epic_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(epic.blocked_reason.as_deref(), Some("provider_rate_limited"));
+        assert!(
+            epic.failure_detail.as_deref().unwrap_or_default().contains("429"),
+            "epic.failure_detail must carry the same redacted detail"
+        );
+
+        // Both bounded attempts ran — never a third — each under its own
+        // incremented attempt number.
+        assert_eq!(
+            implement_rows(&state, &task_id).await,
+            vec![(1, "error".to_string()), (2, "error".to_string())],
+            "exactly 1 + DEARBORN_IMPLEMENT_TRANSIENT_RETRIES attempts must run"
+        );
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// A non-transient failure (plain non-zero exit, no provider signal in
+    /// the output) must fail immediately on a single attempt — the retry is
+    /// earned only by a matching transient error, never by ordinary breakage.
+    #[tokio::test]
+    async fn non_transient_implement_failure_fails_immediately_on_a_single_attempt() {
+        let agent = Arc::new(ScriptedTaskAgent::new().script(
+            Stage::Implement,
+            ScriptedRun {
+                exit_code: Some(1),
+                text: vec!["error: could not compile the task's crate\n".to_string()],
+                ..ScriptedRun::default()
+            },
+        ));
+        let (state, _app) = test_app_with_task_agent(agent).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let task_id = seed_task(&state, &epic_id, &project_id, "A").await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        assert_eq!(fetch_task_row(&state, &task_id).await.0, "Failed");
+        assert_eq!(
+            fetch_task_row(&state, &task_id).await.1.as_deref(),
+            Some("agent_error")
+        );
+        assert_eq!(epic_status(&state, &epic_id).await, "Blocked");
+
+        // One attempt, no retry: the compile-error text matches none of the
+        // transient signals.
+        assert_eq!(
+            implement_rows(&state, &task_id).await,
+            vec![(1, "error".to_string())]
+        );
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    // ---- Recommendation 3: salvaging completed-but-uncommitted implement work
+    //
+    // The incident this hardens against: pi recovered from a mid-run 429 and
+    // finished the whole fix, but a residual `RunEvent::Error` made the
+    // outcome not-`ok`; the walk routed straight to `route_stage_failure`,
+    // `commit_if_dirty` (sitting after the ok-check) never ran, and the
+    // next claim's `git reset --hard HEAD && git clean -fd` destroyed the
+    // finished diff while the triage push pushed nothing. These tests pin
+    // the two halves of the salvage contract: an ordinary implement failure
+    // commits whatever the agent left behind onto the task branch *before*
+    // failing (`Failed(agent_error)`, triage push carries it), while a
+    // cancelled outcome commits nothing and keeps its resumable dirty tree.
+
+    /// A non-transient implement failure (plain non-zero exit) whose agent
+    /// still wrote real work: the salvage commit lands on the task branch
+    /// with the ordinary §2.8 subject, then the walk fails exactly as before
+    /// — `Failed(agent_error)` / epic `Blocked(agent_error)` — and
+    /// `fail_item`'s best-effort triage push now actually carries the
+    /// salvaged commit to origin (read back from the fixture, which doubles
+    /// as `origin` in these tests). The workspace is retained and clean: the
+    /// work is safe in history instead of sitting dirty in front of a reset.
+    #[tokio::test]
+    async fn failed_implement_salvages_completed_work_as_a_commit_and_fails_as_agent_error() {
+        let agent = Arc::new(ScriptedTaskAgent::new().script(
+            Stage::Implement,
+            ScriptedRun {
+                exit_code: Some(1),
+                text: vec!["error: could not compile the task's crate\n".to_string()],
+                files: vec![(PathBuf::from("work.txt"), "work\n".to_string())],
+                ..ScriptedRun::default()
+            },
+        ));
+        let (state, _app) = test_app_with_task_agent(agent).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let task_id = seed_task(&state, &epic_id, &project_id, "A").await;
+
+        run_epic_pipeline(state.clone(), epic_id.clone()).await;
+
+        // The task still fails as an ordinary agent-stage failure — salvage
+        // changes what survives, not how the failure reads.
+        assert_eq!(fetch_task_row(&state, &task_id).await.0, "Failed");
+        assert_eq!(
+            fetch_task_row(&state, &task_id).await.1.as_deref(),
+            Some("agent_error")
+        );
+        assert_eq!(epic_status(&state, &epic_id).await, "Blocked");
+
+        // The salvaged commit exists on the task branch, with step 5's own
+        // §2.8 subject and the failed attempt's file inside it.
+        let workspace_path = workspace::epic_workspace_path(&state.config.clone_root, &epic_id);
+        assert!(workspace_path.exists(), "workspace must be retained on failure");
+        let branch = epic_branch_name_column(&state, &epic_id).await;
+        let expected = format!("impl({}): A", spec::short_id(&task_id));
+        assert_eq!(
+            git_log_subjects_for_ref(&workspace_path, &branch).await,
+            vec!["init".to_string(), expected.clone()],
+            "the salvage commit must land on the task branch before the failure route"
+        );
+        assert_eq!(
+            git_show_file(&workspace_path, &branch, "work.txt").await,
+            "work",
+            "the salvaged commit must contain what the failed agent completed"
+        );
+        let status = git::status_porcelain(&workspace_path).await.unwrap();
+        assert!(
+            status.trim().is_empty(),
+            "after the salvage commit nothing may be left unstaged in the workspace"
+        );
+
+        // The triage push carried the salvaged commit to origin.
+        assert_eq!(
+            git_log_subjects_for_ref(&fixture.dir, &branch).await,
+            vec!["init".to_string(), expected],
+            "fail_item's push must carry the salvaged commit to the remote"
+        );
+        let mut rows = state
+            .db
+            .conn()
+            .query(
+                "SELECT status FROM agent_run WHERE epic_id = ?1 AND stage = 'push'",
+                params![epic_id.clone()],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("a push agent_run row");
+        assert_eq!(row.get::<String>(0).unwrap(), "ok", "the triage push must succeed");
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// The cancel half of the salvage contract: an implement run killed by a
+    /// real mid-flight cancellation (T-542's `POST /epics/{id}/lane` path,
+    /// `Exited { cancelled: true }`) must NOT be salvaged into a commit — a
+    /// cancelled task resets to `Todo` and must stay resumable from exactly
+    /// where it was, so its dirty tree survives uncommitted in the retained
+    /// workspace and HEAD never moves off `base_sha`. The kill/gate plumbing
+    /// mirrors
+    /// `cancel_during_implement_kills_it_in_flight_resets_task_retains_workspace_no_pr`
+    /// (every wait below is a bounded condition poll, no sleeps); what is new
+    /// here is the scripted stage writing a file first, so there is real
+    /// dirty-tree content a naive salvage would have committed.
+    #[tokio::test]
+    async fn cancelled_implement_commits_nothing_and_keeps_its_resumable_dirty_tree() {
+        let gate = Arc::new(Gate::default());
+        let agent: Arc<dyn TaskAgent> = Arc::new(
+            ScriptedTaskAgent::new()
+                .with_gate(gate.clone())
+                .script(
+                    Stage::Implement,
+                    ScriptedRun {
+                        text: vec!["partial output before the kill".to_string()],
+                        files: vec![(PathBuf::from("work.txt"), "work\n".to_string())],
+                        ..ScriptedRun::default()
+                    },
+                ),
+        );
+        let (state, app) = test_app_with_task_agent(agent).await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        let task_id = seed_task(&state, &epic_id, &project_id, "A").await;
+
+        let _handles = spawn_pool(state.clone());
+        state.notify.notify_waiters();
+
+        // Bounded readiness poll: wait until the cancel registry holds the
+        // implement stage's handle — the run is gated in flight.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if state.cancel_registry.lock().unwrap().contains_key(&epic_id) {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!("the cancel registry never gained an entry for the gated implement stage");
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Issue the real cancel over HTTP, then let the scripted stage exit
+        // carrying `cancelled: true` (its file write already happened before
+        // the gate — the tree is dirty at kill time).
+        let response = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                &format!("/epics/{epic_id}/lane"),
+                Some(json!({ "status": "Cancelled" })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        gate.release();
+
+        // Bounded readiness poll: the worker observed the cancelled outcome
+        // and reset the task to Todo.
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            if fetch_task_row(&state, &task_id).await.0 == "Todo" {
+                break;
+            }
+            if tokio::time::Instant::now() >= deadline {
+                panic!(
+                    "task never reset to Todo after the cancel: {:?}",
+                    fetch_task_row(&state, &task_id).await
+                );
+            }
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // Resumable, not failed.
+        let (status, failure_reason) = fetch_task_row(&state, &task_id).await;
+        assert_eq!(status, "Todo");
+        assert_eq!(failure_reason, None, "a cancelled task must carry no failure_reason");
+        assert_eq!(epic_status(&state, &epic_id).await, "Cancelled");
+
+        // NO commit: HEAD is still exactly base_sha.
+        let workspace_path = workspace::epic_workspace_path(&state.config.clone_root, &epic_id);
+        assert!(workspace_path.exists(), "workspace must be retained on a cancel");
+        let base_sha = task_base_sha(&state, &task_id)
+            .await
+            .expect("base_sha must have been recorded before the implement stage ran");
+        assert_eq!(
+            git_rev_parse(&workspace_path, "HEAD").await,
+            base_sha,
+            "a cancelled implement must never be salvaged into a commit"
+        );
+
+        // The dirty tree is preserved exactly as the agent left it — resumable.
+        let status = git::status_porcelain(&workspace_path).await.unwrap();
+        assert!(
+            !status.trim().is_empty(),
+            "the dirty tree must survive uncommitted for resume"
+        );
+        assert_eq!(
+            std::fs::read_to_string(workspace_path.join("work.txt")).unwrap(),
+            "work\n",
+            "the killed agent's completed work must still be in the working tree"
+        );
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// documented transient signals, and no false positives on ordinary
+    /// failure text (including empty output).
+    #[test]
+    fn transient_provider_predicate_matches_only_upstream_signals() {
+        assert!(is_transient_provider_error("Error: API returned 429 Too Many Requests"));
+        assert!(is_transient_provider_error(
+            "provider is temporarily rate-limited, back off"
+        ));
+        assert!(is_transient_provider_error("model overloaded, try again"));
+        assert!(is_transient_provider_error("502 Bad Gateway from upstream"));
+        assert!(is_transient_provider_error("SERVICE UNAVAILABLE"));
+        assert!(!is_transient_provider_error("error: could not compile"));
+        assert!(!is_transient_provider_error(""));
     }
 
     // ---- T-541: POST /tasks/{id}/retry — the full worker-side recovery loop ----

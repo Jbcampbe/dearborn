@@ -212,6 +212,7 @@ environment variables always take precedence over the file.
 | `DEARBORN_MAX_TEST_FIX_ATTEMPTS` | no | `3`         | Max attempts of the test-driven fix loop (ralph parity).                 |
 | `DEARBORN_MAX_FIX_ROUNDS` | no | `3`                | Max rounds of the review-convergence fix loop (ralph parity).            |
 | `DEARBORN_VERDICT_RETRIES` | no | `1`               | Extra re-runs when a review reply lacks a parseable verdict (ralph parity). |
+| `DEARBORN_IMPLEMENT_TRANSIENT_RETRIES` | no | `1`   | Extra implement-stage re-runs when its error matches a transient provider signal (429/overloaded/gateway 5xx). |
 | `DEARBORN_POLL_INTERVAL_MS` | no | `1500`           | Fallback poll interval for workers, behind the notify.                   |
 
 The server **fails fast at boot** with a clear error (non-zero exit) if
