@@ -613,10 +613,44 @@ pub async fn update_user(
     Path(id): Path<String>,
     Json(body): Json<UpdateUserRequest>,
 ) -> AppResult<Json<User>> {
-    // Evaluate the active-flag change before committing any other mutation.
-    // The lockout guards inside set_active return 409 without touching the DB;
-    // running them first prevents a partial commit under an error response
-    // (e.g. display_name landing while the deactivation guard fires).
+    // Load the current row once so all pre-write validations share a snapshot.
+    let current = get(&state.db, &id).await?.ok_or_else(|| not_found(&id))?;
+
+    // Validate display_name before any write. Without this, set_active could
+    // commit (deactivating the user and revoking sessions) while an empty
+    // display_name then returns 400 — a partial commit under an error response.
+    if let Some(ref name) = body.display_name {
+        validate_display_name(name)?;
+    }
+
+    // Deactivation guard up front against the current (unmodified) row.
+    if body.active == Some(false) {
+        ensure_can_deactivate(&state.db, &current, Some(&admin.id)).await?;
+    }
+
+    // Demotion guard: simulate the post-set_active state so a simultaneous
+    // reactivate+demote (e.g. `{ active: true, role: "user" }` on the sole
+    // inactive admin) is caught before set_active commits the reactivation.
+    // Using the pre-activation count: if the user is currently inactive and
+    // being set to active, the count after set_active would be +1 from now.
+    if let Some(new_role) = body.role {
+        if current.role == Role::Admin && new_role != Role::Admin {
+            let will_be_active = body.active.unwrap_or(current.active);
+            if will_be_active {
+                let mut admin_count = count_active_admins(&state.db).await?;
+                if !current.active && body.active == Some(true) {
+                    admin_count += 1;
+                }
+                if admin_count <= 1 {
+                    return Err(AppError::Conflict(
+                        "cannot demote the last active admin".to_string(),
+                    ));
+                }
+            }
+        }
+    }
+
+    // All validations passed — now commit the writes.
     if let Some(active) = body.active {
         set_active(&state.db, &id, active, Some(&admin.id)).await?;
         if !active {
@@ -624,8 +658,8 @@ pub async fn update_user(
         }
     }
 
-    // Apply display_name / role changes last. update() re-reads the row so the
-    // returned User reflects both the active change above and these changes.
+    // update() re-reads the row so the returned User reflects both the active
+    // change above and any display_name / role changes below.
     let user = update(&state.db, &id, body.display_name.as_deref(), body.role).await?;
 
     Ok(Json(user))

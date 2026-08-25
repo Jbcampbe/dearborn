@@ -1196,9 +1196,14 @@ mod tests {
     }
 
     /// AC14: demoting the last active admin returns 409; deactivating the last
-    /// active admin via HTTP always surfaces the self-deactivation guard first
-    /// (the "cannot deactivate the last active admin" guard is defence-in-depth
-    /// at the store level, tested exhaustively in `users::tests`).
+    /// active admin via HTTP surfaces the self-deactivation guard with its
+    /// specific message.
+    ///
+    /// The "cannot deactivate the last active admin" guard is defence-in-depth at
+    /// the store level and cannot be triggered via HTTP with actor != target:
+    /// `AdminUser` guarantees the actor is an active admin, so whenever the
+    /// target is also an active admin the count is ≥ 2, and the last-admin guard
+    /// never fires. It is tested exhaustively in `users::tests`.
     #[tokio::test]
     async fn ac14_last_active_admin_lockout_guards() {
         let (state, admin_token) = admin_state_and_token().await;
@@ -1226,10 +1231,10 @@ mod tests {
             "cannot demote the last active admin"
         );
 
-        // Deactivating the last active admin: through HTTP the actor is an
-        // active admin, so the self-deactivation guard fires first (checked
-        // before the count check in `ensure_can_deactivate`). Both are 409;
-        // the self-deactivation message is tested below in AC15.
+        // Deactivating the last active admin via HTTP: the actor IS that admin,
+        // so the self-deactivation guard fires first and surfaces its specific
+        // message. The last-admin deactivation message cannot be triggered via
+        // HTTP with actor != target (see doc comment above).
         let resp = router
             .oneshot(patch_json_bearer(
                 &format!("/users/{admin_id}"),
@@ -1239,6 +1244,10 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(resp.status(), StatusCode::CONFLICT);
+        assert_eq!(
+            body_json(resp).await["error"]["message"],
+            "you cannot deactivate your own account"
+        );
     }
 
     /// AC15: admin deactivating their own account returns 409.
@@ -1398,6 +1407,47 @@ mod tests {
         assert_eq!(resp.status(), StatusCode::FORBIDDEN);
 
         // But ordinary protected routes still accept it (eventual-revocation contract).
+        let resp = router
+            .oneshot(get_bearer("/projects", &first_admin_token))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::OK);
+    }
+
+    /// Privilege freshness: a demoted admin's valid token gets 403 on admin routes immediately.
+    #[tokio::test]
+    async fn privilege_freshness_demoted_admin_gets_403_on_admin_routes() {
+        let (state, _) = admin_state_and_token().await;
+        // Add a second admin to hold the "last active admin" slot so the raw
+        // SQL demotion below is not blocked by the guard.
+        let _second_admin =
+            users::testing::seed_user(&state, "admin2", users::Role::Admin, true).await;
+        let first_admin_user = users::get_by_username(&state.db, "admin").await.unwrap().unwrap();
+        let first_admin_token = sessions::testing::login_as(&state, &first_admin_user).await;
+
+        // Demote the first admin via raw SQL, bypassing the guard (which would
+        // refuse to demote the last active admin — not relevant here since there
+        // are two). The point is to test the token freshness check.
+        state
+            .db
+            .conn()
+            .execute(
+                "UPDATE user SET role = 'user' WHERE id = ?1",
+                libsql::params![first_admin_user.id.clone()],
+            )
+            .await
+            .unwrap();
+
+        let router = app(state);
+        // The still-valid token is rejected on admin routes.
+        let resp = router
+            .clone()
+            .oneshot(get_bearer("/users", &first_admin_token))
+            .await
+            .unwrap();
+        assert_eq!(resp.status(), StatusCode::FORBIDDEN);
+
+        // Ordinary protected routes still accept it (eventual-revocation contract).
         let resp = router
             .oneshot(get_bearer("/projects", &first_admin_token))
             .await
