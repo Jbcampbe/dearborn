@@ -2,6 +2,7 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 
 import { useAuthStore } from "../stores/auth";
+import { renderMarkdown } from "../lib/markdown";
 import { ApiError } from "../api/client";
 import { getRunEvents, getRunLog, getTaskRuns, type AgentRunDetail, type AgentRunSummary, type ToolCallEvent } from "../api/tasks";
 import {
@@ -304,11 +305,19 @@ onMounted(load);
             {{ logError.get(run.id) }}
           </p>
           <template v-else-if="expandedSegments">
-            <pre v-if="expandedSegments.head" class="log mono">{{ expandedSegments.head }}</pre>
+            <div
+              v-if="expandedSegments.head"
+              class="log-md md"
+              v-html="renderMarkdown(expandedSegments.head)"
+            />
             <p v-if="expandedSegments.tail !== null" class="log-elided">
               Log elided — exceeded 256 KB; showing head + tail
             </p>
-            <pre v-if="expandedSegments.tail" class="log mono">{{ expandedSegments.tail }}</pre>
+            <div
+              v-if="expandedSegments.tail"
+              class="log-md md"
+              v-html="renderMarkdown(expandedSegments.tail)"
+            />
             <p v-if="!expandedSegments.head && expandedSegments.tail === null" class="log-note">
               No output.
             </p>
@@ -395,7 +404,10 @@ onMounted(load);
   border-top: 1px solid var(--border-hairline);
 }
 
-.log {
+/* Rendered stage-log markdown — same container as the old `.log` <pre>, but
+   flowing text (no `white-space: pre-wrap`, no monospace): `.md` (ui.css)
+   handles code blocks/spans with its own monospace styling. */
+.log-md {
   margin: var(--spacing-8) 0 0;
   padding: var(--spacing-8) var(--spacing-12);
   background: var(--surface-void);
@@ -403,8 +415,6 @@ onMounted(load);
   border-radius: var(--radius-buttons);
   max-height: 320px;
   overflow: auto;
-  white-space: pre-wrap;
-  word-break: break-word;
   font-size: 12px;
   line-height: 1.55;
   color: var(--text-body);
