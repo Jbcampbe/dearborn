@@ -725,7 +725,6 @@ mod tests {
     use std::sync::Arc;
     use tower::ServiceExt;
 
-
     /// Boot state + router with the silent planner (these tests exercise the MCP
     /// endpoint/tools directly and never start a real agent run).
     async fn boot() -> (AppState, axum::Router) {

@@ -250,7 +250,10 @@ pub async fn revoke_all_for_user_except(db: &Db, user_id: &str, sid: &str) -> Ap
 pub async fn prune_expired(db: &Db) -> AppResult<u64> {
     Ok(db
         .conn()
-        .execute("DELETE FROM session WHERE expires_at <= ?1", params![now_ms()])
+        .execute(
+            "DELETE FROM session WHERE expires_at <= ?1",
+            params![now_ms()],
+        )
         .await?)
 }
 
@@ -714,15 +717,24 @@ mod tests {
     async fn status_is_setup_required_on_an_empty_db_and_false_once_a_user_exists() {
         let state = test_state().await;
 
-        let response = app(state.clone()).oneshot(get("/auth/status")).await.unwrap();
+        let response = app(state.clone())
+            .oneshot(get("/auth/status"))
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(body_json(response).await, json!({ "setup_required": true }));
 
         seed_user(&state, "josiah", Role::Admin, true).await;
 
-        let response = app(state.clone()).oneshot(get("/auth/status")).await.unwrap();
+        let response = app(state.clone())
+            .oneshot(get("/auth/status"))
+            .await
+            .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(body_json(response).await, json!({ "setup_required": false }));
+        assert_eq!(
+            body_json(response).await,
+            json!({ "setup_required": false })
+        );
     }
 
     #[tokio::test]
@@ -802,7 +814,9 @@ mod tests {
 
         // ...and the credentials it set work at the front door.
         assert!(body["refresh_token"].as_str().unwrap().len() >= 43);
-        assert!(body["refresh_expires_at"].as_i64().unwrap() > body["expires_at"].as_i64().unwrap());
+        assert!(
+            body["refresh_expires_at"].as_i64().unwrap() > body["expires_at"].as_i64().unwrap()
+        );
     }
 
     #[tokio::test]
@@ -1263,11 +1277,7 @@ mod tests {
             // 32 bytes, unpadded base64url → 43 characters.
             assert_eq!(issued.refresh_token.len(), 43);
             assert!(
-                URL_SAFE_NO_PAD
-                    .decode(&issued.refresh_token)
-                    .unwrap()
-                    .len()
-                    == REFRESH_TOKEN_BYTES
+                URL_SAFE_NO_PAD.decode(&issued.refresh_token).unwrap().len() == REFRESH_TOKEN_BYTES
             );
             assert!(seen.insert(issued.refresh_token), "tokens must not repeat");
         }
@@ -1526,7 +1536,10 @@ mod tests {
             .unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
-        assert_eq!(body_json(response).await["display_name"], "New Display Name");
+        assert_eq!(
+            body_json(response).await["display_name"],
+            "New Display Name"
+        );
     }
 
     #[tokio::test]
@@ -1550,10 +1563,7 @@ mod tests {
         let state = test_state().await;
         seed_user(&state, "josiah", Role::User, true).await;
 
-        let response = app(state.clone())
-            .oneshot(get("/auth/me"))
-            .await
-            .unwrap();
+        let response = app(state.clone()).oneshot(get("/auth/me")).await.unwrap();
         assert_eq!(response.status(), StatusCode::UNAUTHORIZED);
 
         let response = app(state.clone())
@@ -1574,11 +1584,7 @@ mod tests {
             .unwrap();
 
         let response = app(state.clone())
-            .oneshot(post_authed(
-                "/auth/logout",
-                &issued.access_token,
-                json!({}),
-            ))
+            .oneshot(post_authed("/auth/logout", &issued.access_token, json!({})))
             .await
             .unwrap();
         assert_eq!(response.status(), StatusCode::NO_CONTENT);
@@ -1776,7 +1782,11 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::OK, "calling session must survive");
+        assert_eq!(
+            response.status(),
+            StatusCode::OK,
+            "calling session must survive"
+        );
 
         // The other session cannot refresh.
         let response = app(state.clone())
@@ -1786,7 +1796,11 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "other session must be revoked");
+        assert_eq!(
+            response.status(),
+            StatusCode::UNAUTHORIZED,
+            "other session must be revoked"
+        );
     }
 
     #[tokio::test]

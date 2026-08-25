@@ -857,7 +857,6 @@ mod tests {
     use serde_json::Value as Json;
     use tower::ServiceExt; // for `oneshot`
 
-
     async fn test_app() -> axum::Router {
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
@@ -895,8 +894,7 @@ mod tests {
                 let token = runtime.block_on(async {
                     let db = crate::Db::connect(":memory:").await.unwrap();
                     db.run_migrations().await.unwrap();
-                    let state =
-                        crate::AppState::new(crate::Config::for_test(), db);
+                    let state = crate::AppState::new(crate::Config::for_test(), db);
                     let user = crate::users::testing::seed_user(
                         &state,
                         "tester",
@@ -1202,9 +1200,7 @@ mod tests {
     /// (offline, no PAT). The project row is inserted directly because its
     /// repo_url is a local path, which `/projects`' https-only validation
     /// would reject.
-    async fn seed_local_bare_project(
-        state: &crate::AppState,
-    ) -> (String, std::path::PathBuf) {
+    async fn seed_local_bare_project(state: &crate::AppState) -> (String, std::path::PathBuf) {
         let dir = std::env::temp_dir().join(format!(
             "dearborn-t13-bare-{}-{}",
             std::process::id(),

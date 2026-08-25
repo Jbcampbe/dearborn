@@ -325,14 +325,13 @@ pub fn spawn_breakdown(state: AppState, epic_id: String, guard: InflightGuard) {
         // T6/T7: resolve the Breakdown slot's live config at spawn time — the
         // project's system-prompt override when set, else `BREAKDOWN_PROMPT`,
         // plus the effective harness/model (design §9: read fresh per run).
-        let spawn_cfg = match
-            crate::agent_settings::spawn_config(
-                &state.db,
-                &project_id,
-                AgentSlot::Breakdown,
-                BREAKDOWN_PROMPT,
-            )
-            .await
+        let spawn_cfg = match crate::agent_settings::spawn_config(
+            &state.db,
+            &project_id,
+            AgentSlot::Breakdown,
+            BREAKDOWN_PROMPT,
+        )
+        .await
         {
             Ok(cfg) => cfg,
             Err(err) => {
@@ -608,7 +607,6 @@ mod tests {
     use tokio::sync::broadcast;
     use tower::ServiceExt;
 
-
     /// The bearer credential HTTP tests present, minted **once per process**
     /// from a seeded active admin (`crate::users::testing::seed_user` +
     /// `crate::sessions::testing::login_as`) — the replacement for the deleted
@@ -633,8 +631,7 @@ mod tests {
                 let token = runtime.block_on(async {
                     let db = crate::Db::connect(":memory:").await.unwrap();
                     db.run_migrations().await.unwrap();
-                    let state =
-                        crate::AppState::new(crate::Config::for_test(), db);
+                    let state = crate::AppState::new(crate::Config::for_test(), db);
                     let user = crate::users::testing::seed_user(
                         &state,
                         "tester",
@@ -918,7 +915,10 @@ mod tests {
         let first = rx.iter().next().expect("an Error event must arrive");
         match first {
             RunEvent::Error { message, .. } => {
-                assert!(message.contains("codex"), "error names the harness: {message}");
+                assert!(
+                    message.contains("codex"),
+                    "error names the harness: {message}"
+                );
                 assert!(message.contains("unsupported"), "error says why: {message}");
             }
             other => panic!("expected RunEvent::Error, got {other:?}"),

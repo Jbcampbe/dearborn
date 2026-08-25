@@ -268,11 +268,7 @@ pub async fn origin_default_branch(repo_dir: &Path) -> Result<String, GitError> 
     .await?;
     full.strip_prefix(PREFIX)
         .map(str::to_string)
-        .ok_or_else(|| {
-            GitError::new(format!(
-                "origin/HEAD points outside {PREFIX}: {full}"
-            ))
-        })
+        .ok_or_else(|| GitError::new(format!("origin/HEAD points outside {PREFIX}: {full}")))
 }
 
 /// Clone `src` (a local filesystem path, not a network URL) into `dest` — the
@@ -632,16 +628,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn remote_branch_exists_errors_on_an_unreachable_host_without_leaking_the_pat()
-    {
+    async fn remote_branch_exists_errors_on_an_unreachable_host_without_leaking_the_pat() {
         let pat = "ghp_lsRemoteSecret123";
-        let err = remote_branch_exists(
-            "https://dearborn.invalid/nope/nope.git",
-            Some(pat),
-            "main",
-        )
-        .await
-        .expect_err("an unreachable host must error");
+        let err = remote_branch_exists("https://dearborn.invalid/nope/nope.git", Some(pat), "main")
+            .await
+            .expect_err("an unreachable host must error");
         assert!(!err.message.is_empty());
         assert!(!err.message.contains(pat));
         assert!(!err.message.contains("ghp_"));
@@ -864,8 +855,7 @@ mod tests {
     /// recording sleep so the test stays hermetic and fast while still
     /// proving all three attempts were made with the linear backoff schedule.
     #[tokio::test]
-    async fn push_branch_bad_url_errors_with_redacted_reason_after_bounded_retries()
-    {
+    async fn push_branch_bad_url_errors_with_redacted_reason_after_bounded_retries() {
         use std::cell::RefCell;
         use std::rc::Rc;
 

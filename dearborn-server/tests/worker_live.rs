@@ -94,7 +94,6 @@ use dearborn_server::task_agent::CliTaskAgent;
 use dearborn_server::workspace;
 use dearborn_server::{worker, AppState, Config, Db};
 
-
 /// Wall-clock ceiling for the whole pipeline call. Generous for a real
 /// `claude` cold start plus one trivial file-write turn, but bounded — see
 /// the module doc's "how to run" section for why this lives in the test

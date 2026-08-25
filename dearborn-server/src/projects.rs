@@ -240,7 +240,13 @@ pub async fn update_project(
         ("setup_cmd = ?", req.setup_cmd),
         ("test_cmd = ?", req.test_cmd),
         ("run_cmd = ?", req.run_cmd),
-        ("base_branch = ?", req.base_branch.map(|opt| opt.filter(|v| !v.trim().is_empty()).map(|v| v.trim().to_string()))),
+        (
+            "base_branch = ?",
+            req.base_branch.map(|opt| {
+                opt.filter(|v| !v.trim().is_empty())
+                    .map(|v| v.trim().to_string())
+            }),
+        ),
     ] {
         if let Some(value) = field {
             assignments.push(column);
@@ -531,7 +537,6 @@ mod tests {
     use serde_json::Value as Json;
     use tower::ServiceExt; // for `oneshot`
 
-
     async fn test_app() -> axum::Router {
         let (app, _state) = test_app_with_state().await;
         app
@@ -571,8 +576,7 @@ mod tests {
                 let token = runtime.block_on(async {
                     let db = crate::Db::connect(":memory:").await.unwrap();
                     db.run_migrations().await.unwrap();
-                    let state =
-                        crate::AppState::new(crate::Config::for_test(), db);
+                    let state = crate::AppState::new(crate::Config::for_test(), db);
                     let user = crate::users::testing::seed_user(
                         &state,
                         "tester",

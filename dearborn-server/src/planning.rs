@@ -267,10 +267,7 @@ impl PlanningAgent for ClaudePlanningAgent {
             let (tx, rx) = std::sync::mpsc::channel();
             let _ = tx.send(RunEvent::Error {
                 run_id: run_id.clone(),
-                message: crate::agent_settings::unsupported_harness_message(
-                    &req.harness,
-                    req.slot,
-                ),
+                message: crate::agent_settings::unsupported_harness_message(&req.harness, req.slot),
             });
             let _ = tx.send(RunEvent::Exited {
                 run_id,
@@ -443,9 +440,13 @@ pub fn spawn_run(
             .ok()
             .flatten()
             .unwrap_or_default();
-        let spawn_cfg = match
-            crate::agent_settings::spawn_config(&state.db, &project_id, slot, config.system_prompt)
-                .await
+        let spawn_cfg = match crate::agent_settings::spawn_config(
+            &state.db,
+            &project_id,
+            slot,
+            config.system_prompt,
+        )
+        .await
         {
             Ok(cfg) => cfg,
             Err(err) => {
@@ -782,7 +783,6 @@ mod tests {
     use tokio::sync::broadcast;
     use tower::ServiceExt;
 
-
     /// The bearer credential HTTP tests present, minted **once per process**
     /// from a seeded active admin (`crate::users::testing::seed_user` +
     /// `crate::sessions::testing::login_as`) — the replacement for the deleted
@@ -807,8 +807,7 @@ mod tests {
                 let token = runtime.block_on(async {
                     let db = crate::Db::connect(":memory:").await.unwrap();
                     db.run_migrations().await.unwrap();
-                    let state =
-                        crate::AppState::new(crate::Config::for_test(), db);
+                    let state = crate::AppState::new(crate::Config::for_test(), db);
                     let user = crate::users::testing::seed_user(
                         &state,
                         "tester",
@@ -1433,7 +1432,10 @@ mod tests {
         let first = rx.iter().next().expect("an Error event must arrive");
         match first {
             RunEvent::Error { message, .. } => {
-                assert!(message.contains("codex"), "error names the harness: {message}");
+                assert!(
+                    message.contains("codex"),
+                    "error names the harness: {message}"
+                );
                 assert!(message.contains("unsupported"), "error says why: {message}");
             }
             other => panic!("expected RunEvent::Error, got {other:?}"),
@@ -1480,9 +1482,9 @@ mod tests {
         // "unsupported").
         let agent = ClaudePlanningAgent::new();
         let rx = agent.run(planning_req("run-claude", "claude"));
-        let unsupported = rx
-            .iter()
-            .any(|e| matches!(&e, RunEvent::Error { message, .. } if message.contains("unsupported")));
+        let unsupported = rx.iter().any(
+            |e| matches!(&e, RunEvent::Error { message, .. } if message.contains("unsupported")),
+        );
         assert!(
             !unsupported,
             "a supported-harness request must pass spawn validation"

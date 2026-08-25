@@ -146,8 +146,8 @@ impl AuthKey {
     }
 
     fn mac(&self, signing_input: &[u8]) -> [u8; 32] {
-        let mut mac = <Hmac<Sha256> as Mac>::new_from_slice(&self.0)
-            .expect("HMAC accepts any key length");
+        let mut mac =
+            <Hmac<Sha256> as Mac>::new_from_slice(&self.0).expect("HMAC accepts any key length");
         mac.update(signing_input);
         mac.finalize().into_bytes().into()
     }
@@ -155,9 +155,8 @@ impl AuthKey {
     /// Mint a signed token for `claims`:
     /// `v1.<b64url(payload)>.<b64url(HMAC-SHA256(key, "v1." + b64url(payload)))>`.
     pub fn mint(&self, claims: &Claims) -> String {
-        let payload = URL_SAFE_NO_PAD.encode(
-            serde_json::to_vec(claims).expect("Claims serialize cannot fail"),
-        );
+        let payload = URL_SAFE_NO_PAD
+            .encode(serde_json::to_vec(claims).expect("Claims serialize cannot fail"));
         let signing_input = format!("{TOKEN_VERSION}.{payload}");
         let signature = URL_SAFE_NO_PAD.encode(self.mac(signing_input.as_bytes()));
         format!("{signing_input}.{signature}")
@@ -191,7 +190,9 @@ impl AuthKey {
         }
 
         let claims: Claims = serde_json::from_slice(
-            &URL_SAFE_NO_PAD.decode(payload).map_err(|_| TokenError::Malformed)?,
+            &URL_SAFE_NO_PAD
+                .decode(payload)
+                .map_err(|_| TokenError::Malformed)?,
         )
         .map_err(|_| TokenError::Malformed)?;
 
@@ -271,7 +272,10 @@ pub struct CurrentUser(pub Claims);
 impl FromRequestParts<AppState> for CurrentUser {
     type Rejection = AppError;
 
-    async fn from_request_parts(parts: &mut Parts, _state: &AppState) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(
+        parts: &mut Parts,
+        _state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
         parts
             .extensions
             .get::<Claims>()
@@ -300,7 +304,10 @@ pub struct AdminUser(pub crate::users::User);
 impl FromRequestParts<AppState> for AdminUser {
     type Rejection = AppError;
 
-    async fn from_request_parts(parts: &mut Parts, state: &AppState) -> Result<Self, Self::Rejection> {
+    async fn from_request_parts(
+        parts: &mut Parts,
+        state: &AppState,
+    ) -> Result<Self, Self::Rejection> {
         let claims = parts
             .extensions
             .get::<Claims>()
@@ -423,15 +430,24 @@ mod tests {
         let token = key().mint(&test_claims());
         // Mint a different payload under the same key and graft its payload
         // segment onto the original signature.
-        let other = key().mint(&Claims { role: Role::User, ..test_claims() });
-        let spliced = format!("{}.{}", other.rsplit_once('.').unwrap().0, token.rsplit_once('.').unwrap().1);
+        let other = key().mint(&Claims {
+            role: Role::User,
+            ..test_claims()
+        });
+        let spliced = format!(
+            "{}.{}",
+            other.rsplit_once('.').unwrap().0,
+            token.rsplit_once('.').unwrap().1
+        );
         assert_eq!(key().verify(&spliced), Err(TokenError::BadSignature));
     }
 
     #[test]
     fn token_from_different_key_is_rejected() {
         let claims = test_claims();
-        let token = AuthKey::derive("other-instance-material").unwrap().mint(&claims);
+        let token = AuthKey::derive("other-instance-material")
+            .unwrap()
+            .mint(&claims);
         assert_eq!(key().verify(&token), Err(TokenError::BadSignature));
     }
 
@@ -448,7 +464,15 @@ mod tests {
             let sig = URL_SAFE_NO_PAD.encode(key.mac(format!("v2.{payload}").as_bytes()));
             format!("v2.{payload}.{sig}")
         };
-        for bad in [v2, v2_signed, format!("abc.{rest}"), format!("a.b.{rest}"), "".to_string(), ".".to_string(), "a.b".to_string()] {
+        for bad in [
+            v2,
+            v2_signed,
+            format!("abc.{rest}"),
+            format!("a.b.{rest}"),
+            "".to_string(),
+            ".".to_string(),
+            "a.b".to_string(),
+        ] {
             let err = key.verify(&bad).unwrap_err();
             assert_ne!(err, TokenError::Expired);
             assert!(matches!(err, TokenError::Malformed | TokenError::Version));
@@ -458,7 +482,10 @@ mod tests {
     #[test]
     fn expired_token_fails_as_expired_not_bad_signature() {
         let key = key();
-        let claims = Claims { exp: now_ms() - 1_000, ..test_claims() };
+        let claims = Claims {
+            exp: now_ms() - 1_000,
+            ..test_claims()
+        };
         let token = key.mint(&claims);
         // The signature is fine; the failure must be distinctly expiry.
         assert_eq!(key.verify(&token), Err(TokenError::Expired));

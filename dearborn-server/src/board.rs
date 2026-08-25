@@ -131,7 +131,6 @@ mod tests {
     use serde_json::Value as Json;
     use tower::ServiceExt;
 
-
     async fn test_app() -> (AppState, axum::Router) {
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
@@ -168,8 +167,7 @@ mod tests {
                 let token = runtime.block_on(async {
                     let db = crate::Db::connect(":memory:").await.unwrap();
                     db.run_migrations().await.unwrap();
-                    let state =
-                        crate::AppState::new(crate::Config::for_test(), db);
+                    let state = crate::AppState::new(crate::Config::for_test(), db);
                     let user = crate::users::testing::seed_user(
                         &state,
                         "tester",

@@ -25,7 +25,10 @@
 
 use std::collections::HashMap;
 
-use axum::{extract::{Path, State}, Json};
+use axum::{
+    extract::{Path, State},
+    Json,
+};
 use libsql::params;
 use serde::{Deserialize, Serialize};
 use serde_json::json;
@@ -137,10 +140,7 @@ pub async fn get_global_settings(db: &Db) -> Result<GlobalSettings, SettingsErro
 /// Write the global-settings singleton (upsert on `id = 1`) and bump
 /// `updated_at`. Full-row replace: the API layer owns merge semantics; this
 /// function owns durability.
-pub async fn save_global_settings(
-    db: &Db,
-    settings: &GlobalSettings,
-) -> Result<(), SettingsError> {
+pub async fn save_global_settings(db: &Db, settings: &GlobalSettings) -> Result<(), SettingsError> {
     let default_models = serde_json::to_string(&settings.default_models)?;
     let enabled = serde_json::to_string(&settings.enabled_harnesses)?;
     db.conn()
@@ -153,11 +153,7 @@ pub async fn save_global_settings(
                  default_models = excluded.default_models, \
                  enabled_harnesses = excluded.enabled_harnesses, \
                  updated_at = excluded.updated_at",
-            params![
-                settings.default_harness.clone(),
-                default_models,
-                enabled
-            ],
+            params![settings.default_harness.clone(), default_models, enabled],
         )
         .await?;
     Ok(())
@@ -182,8 +178,8 @@ fn row_to_setting(row: &libsql::Row) -> Result<AgentSetting, SettingsError> {
     // A stored key outside the enum means the DB predates or postdates this
     // binary's vocabulary. Surface it loudly rather than dropping the row:
     // silently hiding it would make settings appear to "not apply".
-    let slot = AgentSlot::parse(&slot_key)
-        .ok_or_else(|| SettingsError::UnknownSlot(slot_key.clone()))?;
+    let slot =
+        AgentSlot::parse(&slot_key).ok_or_else(|| SettingsError::UnknownSlot(slot_key.clone()))?;
     Ok(AgentSetting {
         slot,
         harness: row.get(1)?,
@@ -209,7 +205,11 @@ pub async fn get_agent_setting(
             params![project_id, slot.as_str()],
         )
         .await?;
-    Ok(rows.next().await?.map(|row| row_to_setting(&row)).transpose()?)
+    Ok(rows
+        .next()
+        .await?
+        .map(|row| row_to_setting(&row))
+        .transpose()?)
 }
 
 /// Read all of a project's override rows. Order follows [`AgentSlot::ALL`] so
@@ -493,13 +493,7 @@ pub fn resolve_effective(
         .unwrap_or_else(|| global.default_harness.clone());
     let model = slot_override
         .and_then(|o| o.model.clone())
-        .or_else(|| {
-            global
-                .default_models
-                .get(&harness)
-                .cloned()
-                .unwrap_or(None)
-        });
+        .or_else(|| global.default_models.get(&harness).cloned().unwrap_or(None));
     let prompt_source = match slot_override.map(|o| o.system_prompt.as_deref()) {
         Some(Some(prompt)) if !prompt.is_empty() => PromptSource::Override,
         _ => PromptSource::Default,
@@ -520,9 +514,7 @@ pub fn resolve_effective(
 fn clean_value(value: String, field: &str) -> AppResult<String> {
     let trimmed = value.trim();
     if trimmed.is_empty() {
-        return Err(AppError::BadRequest(format!(
-            "{field} must not be empty"
-        )));
+        return Err(AppError::BadRequest(format!("{field} must not be empty")));
     }
     Ok(trimmed.to_string())
 }
@@ -594,10 +586,7 @@ pub async fn put_settings(
         merged.enabled_harnesses = cleaned;
     }
 
-    if !merged
-        .enabled_harnesses
-        .contains(&merged.default_harness)
-    {
+    if !merged.enabled_harnesses.contains(&merged.default_harness) {
         return Err(AppError::BadRequest(format!(
             "default harness `{}` is not in enabled_harnesses {:?}",
             merged.default_harness, merged.enabled_harnesses
@@ -662,7 +651,11 @@ pub struct SlotSettingView {
     pub effective: EffectiveConfig,
 }
 
-fn slot_view(slot: AgentSlot, setting: Option<&AgentSetting>, global: &GlobalSettings) -> SlotSettingView {
+fn slot_view(
+    slot: AgentSlot,
+    setting: Option<&AgentSetting>,
+    global: &GlobalSettings,
+) -> SlotSettingView {
     SlotSettingView {
         effective: resolve_effective(global, setting),
         harness: setting.and_then(|s| s.harness.clone()),
@@ -690,13 +683,17 @@ pub fn default_prompt(slot: AgentSlot) -> &'static str {
         AgentSlot::Breakdown => BREAKDOWN_PROMPT,
         // Every agent stage has a compiled prompt (`spec.rs`'s own test
         // asserts non-empty for each); `expect` mirrors the spawn sites.
-        AgentSlot::Implement => prompt_for(Stage::Implement).expect("Stage::Implement always has a prompt"),
+        AgentSlot::Implement => {
+            prompt_for(Stage::Implement).expect("Stage::Implement always has a prompt")
+        }
         AgentSlot::Fix => prompt_for(Stage::Fix).expect("Stage::Fix always has a prompt"),
         AgentSlot::Review => prompt_for(Stage::Review).expect("Stage::Review always has a prompt"),
         AgentSlot::VerifyComplete => {
             prompt_for(Stage::VerifyComplete).expect("Stage::VerifyComplete always has a prompt")
         }
-        AgentSlot::Summarize => prompt_for(Stage::Summarize).expect("Stage::Summarize always has a prompt"),
+        AgentSlot::Summarize => {
+            prompt_for(Stage::Summarize).expect("Stage::Summarize always has a prompt")
+        }
     }
 }
 
@@ -708,7 +705,9 @@ async fn ensure_project(db: &Db, project_id: &str) -> AppResult<()> {
         .query("SELECT 1 FROM project WHERE id = ?1", params![project_id])
         .await?;
     if rows.next().await?.is_none() {
-        return Err(AppError::NotFound(format!("project {project_id} not found")));
+        return Err(AppError::NotFound(format!(
+            "project {project_id} not found"
+        )));
     }
     Ok(())
 }
@@ -759,9 +758,8 @@ pub async fn put_agent_setting(
     Path((project_id, slot_key)): Path<(String, String)>,
     Json(req): Json<UpdateAgentSetting>,
 ) -> AppResult<Json<SlotSettingView>> {
-    let slot = AgentSlot::parse(&slot_key).ok_or_else(|| {
-        AppError::NotFound(format!("unknown agent slot `{slot_key}`"))
-    })?;
+    let slot = AgentSlot::parse(&slot_key)
+        .ok_or_else(|| AppError::NotFound(format!("unknown agent slot `{slot_key}`")))?;
     ensure_project(&state.db, &project_id).await?;
     let global = get_global_settings(&state.db).await?;
 
@@ -811,7 +809,11 @@ pub async fn put_agent_setting(
             // An empty/whitespace prompt stores as cleared: resolution already
             // treats empty overrides as absent (§3), so persisting one would
             // only fake an "override" the resolver ignores.
-            setting.system_prompt = if trimmed.is_empty() { None } else { Some(trimmed) };
+            setting.system_prompt = if trimmed.is_empty() {
+                None
+            } else {
+                Some(trimmed)
+            };
         }
         None => {}
     }
@@ -822,11 +824,7 @@ pub async fn put_agent_setting(
         upsert_agent_setting(&state.db, &project_id, &setting).await?;
     }
 
-    Ok(Json(slot_view(
-        slot,
-        Some(&setting),
-        &global,
-    )))
+    Ok(Json(slot_view(slot, Some(&setting), &global)))
 }
 
 #[cfg(test)]
@@ -881,7 +879,8 @@ mod tests {
     fn no_model_anywhere_resolves_to_none_cli_default() {
         let g = global("claude", &[("claude", None)]);
         assert_eq!(
-            resolve_effective(&g, None).model, None,
+            resolve_effective(&g, None).model,
+            None,
             "seeded state (no models configured) must mean CLI default"
         );
     }
@@ -922,10 +921,7 @@ mod tests {
 
     #[test]
     fn override_model_with_new_harness_does_not_inherit_old_harness_model() {
-        let g = global(
-            "claude",
-            &[("claude", Some("sonnet")), ("codex", None)],
-        );
+        let g = global("claude", &[("claude", Some("sonnet")), ("codex", None)]);
         // Explicit codex model override stands; had it been None, the codex
         // map entry (None) would also win over sonnet.
         assert_eq!(
@@ -1041,7 +1037,10 @@ mod tests {
             .unwrap();
         let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
         assert_eq!(count, 1);
-        assert_eq!(get_global_settings(&db).await.unwrap(), GlobalSettings::default());
+        assert_eq!(
+            get_global_settings(&db).await.unwrap(),
+            GlobalSettings::default()
+        );
     }
 
     #[tokio::test]
@@ -1209,14 +1208,9 @@ mod tests {
         )
         .await
         .unwrap();
-        let cfg = spawn_config(
-            &db,
-            &project,
-            AgentSlot::Review,
-            "compiled review prompt",
-        )
-        .await
-        .unwrap();
+        let cfg = spawn_config(&db, &project, AgentSlot::Review, "compiled review prompt")
+            .await
+            .unwrap();
         assert_eq!(cfg.harness, "claude");
         assert_eq!(cfg.model, Some("haiku".to_string()));
         assert_eq!(cfg.prompt, "be harsh but fair");
@@ -1308,7 +1302,6 @@ mod tests {
     use serde_json::Value as Json;
     use tower::ServiceExt; // for `oneshot`
 
-
     async fn test_app() -> (axum::Router, crate::AppState) {
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
@@ -1340,8 +1333,7 @@ mod tests {
                 let token = runtime.block_on(async {
                     let db = crate::Db::connect(":memory:").await.unwrap();
                     db.run_migrations().await.unwrap();
-                    let state =
-                        crate::AppState::new(crate::Config::for_test(), db);
+                    let state = crate::AppState::new(crate::Config::for_test(), db);
                     let user = crate::users::testing::seed_user(
                         &state,
                         "tester",
@@ -1396,10 +1388,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(created.status(), StatusCode::CREATED);
-        body_json(created).await["id"]
-            .as_str()
-            .unwrap()
-            .to_string()
+        body_json(created).await["id"].as_str().unwrap().to_string()
     }
 
     #[tokio::test]
@@ -1480,10 +1469,7 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(put.status(), StatusCode::BAD_REQUEST);
-        assert_eq!(
-            body_json(put).await["error"]["code"],
-            json!("bad_request")
-        );
+        assert_eq!(body_json(put).await["error"]["code"], json!("bad_request"));
     }
 
     // ---- harness/slot capability (pi) --------------------------------------
@@ -1723,10 +1709,7 @@ mod tests {
             (AgentSlot::PlanningProduct, PRODUCT_PLANNING_PROMPT),
             (AgentSlot::PlanningTechnical, TECHNICAL_PLANNING_PROMPT),
             (AgentSlot::Breakdown, BREAKDOWN_PROMPT),
-            (
-                AgentSlot::Implement,
-                prompt_for(Stage::Implement).unwrap(),
-            ),
+            (AgentSlot::Implement, prompt_for(Stage::Implement).unwrap()),
             (AgentSlot::Fix, prompt_for(Stage::Fix).unwrap()),
             (AgentSlot::Review, prompt_for(Stage::Review).unwrap()),
             (
@@ -1779,10 +1762,7 @@ mod tests {
         let body = body_json(got).await;
         let items = body["items"].as_array().unwrap();
         assert_eq!(items.len(), 8, "the closed slot vocabulary, all present");
-        let slot_keys: Vec<&str> = items
-            .iter()
-            .map(|i| i["slot"].as_str().unwrap())
-            .collect();
+        let slot_keys: Vec<&str> = items.iter().map(|i| i["slot"].as_str().unwrap()).collect();
         assert_eq!(
             slot_keys,
             vec![
@@ -1807,11 +1787,7 @@ mod tests {
 
         // Unknown project → 404 envelope.
         let missing = app
-            .oneshot(req(
-                "GET",
-                "/projects/does-not-exist/agent-settings",
-                None,
-            ))
+            .oneshot(req("GET", "/projects/does-not-exist/agent-settings", None))
             .await
             .unwrap();
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);

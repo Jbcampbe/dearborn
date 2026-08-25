@@ -118,8 +118,7 @@ pub struct User {
 }
 
 /// The columns projected into a [`User`]. Note the absence of `password_hash`.
-const USER_COLUMNS: &str =
-    "id, username, display_name, role, active, created_at, updated_at";
+const USER_COLUMNS: &str = "id, username, display_name, role, active, created_at, updated_at";
 
 fn row_to_user(row: &libsql::Row) -> AppResult<User> {
     let role_raw: String = row.get(3)?;
@@ -845,8 +844,12 @@ mod tests {
             hash.starts_with("$argon2id$"),
             "expected an argon2id PHC string, got {hash}"
         );
-        assert!(verify_password("correct horse battery", &hash).await.unwrap());
-        assert!(!verify_password("correct horse batterz", &hash).await.unwrap());
+        assert!(verify_password("correct horse battery", &hash)
+            .await
+            .unwrap());
+        assert!(!verify_password("correct horse batterz", &hash)
+            .await
+            .unwrap());
         assert!(!verify_password("", &hash).await.unwrap());
     }
 
@@ -854,7 +857,10 @@ mod tests {
     async fn each_hash_gets_a_fresh_salt() {
         let a = hash_password("same password here", true).await.unwrap();
         let b = hash_password("same password here", true).await.unwrap();
-        assert_ne!(a, b, "identical passwords must not produce identical hashes");
+        assert_ne!(
+            a, b,
+            "identical passwords must not produce identical hashes"
+        );
         // Both still verify — the salt travels inside the PHC string.
         assert!(verify_password("same password here", &a).await.unwrap());
         assert!(verify_password("same password here", &b).await.unwrap());
@@ -900,7 +906,10 @@ mod tests {
         assert!(created.active, "new users are active");
         assert_eq!(created.created_at, created.updated_at);
 
-        assert_eq!(get(&state.db, &created.id).await.unwrap(), Some(created.clone()));
+        assert_eq!(
+            get(&state.db, &created.id).await.unwrap(),
+            Some(created.clone())
+        );
         assert_eq!(get(&state.db, "no-such-id").await.unwrap(), None);
 
         // Case-insensitive lookup: created as `Josiah`, found as `josiah`.
@@ -928,12 +937,17 @@ mod tests {
         .await
         .unwrap();
 
-        let stored = password_hash_of(&state.db, &user.id).await.unwrap().unwrap();
+        let stored = password_hash_of(&state.db, &user.id)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(stored.starts_with("$argon2id$"));
         assert!(verify_password("a-long-enough-password", &stored)
             .await
             .unwrap());
-        assert!(!verify_password("some-other-password", &stored).await.unwrap());
+        assert!(!verify_password("some-other-password", &stored)
+            .await
+            .unwrap());
     }
 
     #[tokio::test]
@@ -976,7 +990,11 @@ mod tests {
         .unwrap_err();
         assert!(matches!(err, AppError::Conflict(_)), "got {err:?}");
 
-        assert_eq!(list(&state.db).await.unwrap().len(), 1, "nothing was created");
+        assert_eq!(
+            list(&state.db).await.unwrap().len(),
+            1,
+            "nothing was created"
+        );
     }
 
     #[tokio::test]
@@ -1042,7 +1060,9 @@ mod tests {
         );
 
         // An empty display name is rejected.
-        assert!(update(&state.db, &user.id, Some("   "), None).await.is_err());
+        assert!(update(&state.db, &user.id, Some("   "), None)
+            .await
+            .is_err());
 
         // Unknown id is a 404.
         let err = update(&state.db, "no-such-id", Some("X"), None)
@@ -1055,14 +1075,20 @@ mod tests {
     async fn set_password_replaces_the_hash_and_enforces_the_policy() {
         let state = test_state().await;
         let user = seed_user(&state, "josiah", Role::User, true).await;
-        let before = password_hash_of(&state.db, &user.id).await.unwrap().unwrap();
+        let before = password_hash_of(&state.db, &user.id)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(verify_password(SEED_PASSWORD, &before).await.unwrap());
 
         set_password(&state.db, &user.id, "brand-new-password", true)
             .await
             .unwrap();
 
-        let after = password_hash_of(&state.db, &user.id).await.unwrap().unwrap();
+        let after = password_hash_of(&state.db, &user.id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_ne!(after, before);
         assert!(verify_password("brand-new-password", &after).await.unwrap());
         assert!(
@@ -1077,7 +1103,10 @@ mod tests {
         assert!(matches!(err, AppError::BadRequest(_)), "got {err:?}");
         // ...and the stored hash is unchanged by the rejected attempt.
         assert_eq!(
-            password_hash_of(&state.db, &user.id).await.unwrap().unwrap(),
+            password_hash_of(&state.db, &user.id)
+                .await
+                .unwrap()
+                .unwrap(),
             after
         );
 
@@ -1114,14 +1143,18 @@ mod tests {
         assert_eq!(list(&state.db).await.unwrap().len(), 2);
 
         // Reactivating restores it; a redundant call is a clean no-op.
-        assert!(set_active(&state.db, &user.id, true, Some(&admin.id))
-            .await
-            .unwrap()
-            .active);
-        assert!(set_active(&state.db, &user.id, true, Some(&admin.id))
-            .await
-            .unwrap()
-            .active);
+        assert!(
+            set_active(&state.db, &user.id, true, Some(&admin.id))
+                .await
+                .unwrap()
+                .active
+        );
+        assert!(
+            set_active(&state.db, &user.id, true, Some(&admin.id))
+                .await
+                .unwrap()
+                .active
+        );
 
         let err = set_active(&state.db, "no-such-id", false, Some(&admin.id))
             .await
@@ -1195,10 +1228,12 @@ mod tests {
 
         // With a second active admin the same call succeeds.
         seed_user(&state, "admin2", Role::Admin, true).await;
-        assert!(!set_active(&state.db, &admin.id, false, Some(&other.id))
-            .await
-            .unwrap()
-            .active);
+        assert!(
+            !set_active(&state.db, &admin.id, false, Some(&other.id))
+                .await
+                .unwrap()
+                .active
+        );
     }
 
     #[tokio::test]
@@ -1250,10 +1285,12 @@ mod tests {
             .unwrap_err();
         assert_conflict(err, "cannot deactivate the last active admin");
         // Deactivating the already-inactive one is a harmless no-op.
-        assert!(!set_active(&state.db, &benched.id, false, Some(&other.id))
-            .await
-            .unwrap()
-            .active);
+        assert!(
+            !set_active(&state.db, &benched.id, false, Some(&other.id))
+                .await
+                .unwrap()
+                .active
+        );
     }
 
     #[tokio::test]
@@ -1288,10 +1325,12 @@ mod tests {
         let admin = seed_user(&state, "admin", Role::Admin, true).await;
         let benched = seed_user(&state, "benched", Role::Admin, false).await;
 
-        assert!(set_active(&state.db, &benched.id, true, Some(&admin.id))
-            .await
-            .unwrap()
-            .active);
+        assert!(
+            set_active(&state.db, &benched.id, true, Some(&admin.id))
+                .await
+                .unwrap()
+                .active
+        );
         let regular = seed_user(&state, "regular", Role::User, true).await;
         assert_eq!(
             update(&state.db, &regular.id, None, Some(Role::Admin))
@@ -1312,7 +1351,10 @@ mod tests {
         assert_eq!(active.role, Role::Admin);
         assert!(active.active);
 
-        let hash = password_hash_of(&state.db, &active.id).await.unwrap().unwrap();
+        let hash = password_hash_of(&state.db, &active.id)
+            .await
+            .unwrap()
+            .unwrap();
         assert!(verify_password(SEED_PASSWORD, &hash).await.unwrap());
 
         // The inactive form bypasses the guards a real API call would hit.

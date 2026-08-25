@@ -317,7 +317,10 @@ impl OpenPrAttemptErr {
     /// A failure no amount of retrying can fix (transport error, 4xx
     /// validation error): surface it immediately.
     fn permanent(err: GitHostError) -> OpenPrAttemptErr {
-        OpenPrAttemptErr { retryable: false, err }
+        OpenPrAttemptErr {
+            retryable: false,
+            err,
+        }
     }
 }
 
@@ -789,8 +792,8 @@ mod tests {
     use std::cell::RefCell;
     use std::net::SocketAddr;
     use std::rc::Rc;
-    use std::sync::Arc;
     use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::sync::Arc;
 
     /// A canned `open_pr` request against a syntactically valid github.com
     /// repo URL (the API base is what actually gets hit, so no network ever
@@ -835,12 +838,7 @@ mod tests {
 
     /// Serve one request/response pair on `socket`: drain the request head,
     /// write a well-formed HTTP/1.1 reply with `connection: close`, drop.
-    async fn handle_one(
-        mut socket: tokio::net::TcpStream,
-        _name: &str,
-        status: u16,
-        body: &str,
-    ) {
+    async fn handle_one(mut socket: tokio::net::TcpStream, _name: &str, status: u16, body: &str) {
         use tokio::io::{AsyncReadExt, AsyncWriteExt};
         let mut buf = [0u8; 4096];
         // Read until end-of-headers; contents are irrelevant to the test.
@@ -876,8 +874,9 @@ mod tests {
 
     /// Record the requested backoff durations without elapsing them, keeping
     /// the test instant while asserting the exact schedule.
-    fn instant_sleep(delays: Rc<RefCell<Vec<std::time::Duration>>>)
-    -> impl FnMut(std::time::Duration) -> std::future::Ready<()> {
+    fn instant_sleep(
+        delays: Rc<RefCell<Vec<std::time::Duration>>>,
+    ) -> impl FnMut(std::time::Duration) -> std::future::Ready<()> {
         move |delay| {
             delays.borrow_mut().push(delay);
             std::future::ready(())
@@ -896,13 +895,21 @@ mod tests {
         let delays = Rc::new(RefCell::new(Vec::new()));
 
         let opened = GithubHost::new()
-            .open_pr_at(&format!("http://{addr}"), open_pr_request(), instant_sleep(delays.clone()))
+            .open_pr_at(
+                &format!("http://{addr}"),
+                open_pr_request(),
+                instant_sleep(delays.clone()),
+            )
             .await
             .expect("a transient 500 must be retried into success");
 
         assert_eq!(opened.number, 7);
         assert_eq!(opened.url, "https://github.com/octocat/Hello-World/pull/7");
-        assert_eq!(served.load(Ordering::SeqCst), 2, "exactly two POST attempts");
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            2,
+            "exactly two POST attempts"
+        );
         assert_eq!(
             *delays.borrow(),
             vec![BASE_DELAY],
@@ -912,18 +919,29 @@ mod tests {
 
     #[tokio::test]
     async fn open_pr_never_retries_a_4xx_validation_error() {
-        let (addr, served) = spawn_fake_github(vec![("failed", 422, r#"{"message": "Validation Failed"}"#)])
-            .await;
+        let (addr, served) =
+            spawn_fake_github(vec![("failed", 422, r#"{"message": "Validation Failed"}"#)]).await;
         let delays = Rc::new(RefCell::new(Vec::new()));
 
         let err = GithubHost::new()
-            .open_pr_at(&format!("http://{addr}"), open_pr_request(), instant_sleep(delays.clone()))
+            .open_pr_at(
+                &format!("http://{addr}"),
+                open_pr_request(),
+                instant_sleep(delays.clone()),
+            )
             .await
             .expect_err("a 422 validation error must fail immediately");
 
         assert!(err.message.contains("422"));
         assert!(err.message.contains("Validation Failed"));
-        assert_eq!(served.load(Ordering::SeqCst), 1, "no second attempt after a validation error");
-        assert!(delays.borrow().is_empty(), "no backoff sleep before surfacing a 4xx");
+        assert_eq!(
+            served.load(Ordering::SeqCst),
+            1,
+            "no second attempt after a validation error"
+        );
+        assert!(
+            delays.borrow().is_empty(),
+            "no backoff sleep before surfacing a 4xx"
+        );
     }
 }

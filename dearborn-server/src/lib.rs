@@ -546,10 +546,7 @@ pub fn app(state: AppState) -> Router {
         .route("/runs/:id", get(evidence::get_run))
         // Admin-only user management. AdminUser gates each handler individually
         // (re-reading the user row), so a user-role token always gets 403.
-        .route(
-            "/users",
-            get(users::list_users).post(users::create_user),
-        )
+        .route("/users", get(users::list_users).post(users::create_user))
         .route("/users/:id", axum::routing::patch(users::update_user))
         .route(
             "/users/:id/password",
@@ -653,10 +650,7 @@ mod tests {
     }
 
     fn get(uri: &str) -> Request<Body> {
-        Request::builder()
-            .uri(uri)
-            .body(Body::empty())
-            .unwrap()
+        Request::builder().uri(uri).body(Body::empty()).unwrap()
     }
 
     fn get_bearer(uri: &str, token: &str) -> Request<Body> {
@@ -698,11 +692,7 @@ mod tests {
 
     #[tokio::test]
     async fn health_is_public_and_returns_200_ok() {
-        let response = test_app()
-            .await
-            .oneshot(get("/health"))
-            .await
-            .unwrap();
+        let response = test_app().await.oneshot(get("/health")).await.unwrap();
 
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(body_json(response).await, json!({ "status": "ok" }));
@@ -795,7 +785,11 @@ mod tests {
             ("tampered-signature", tampered),
             ("expired-exp", expired),
         ] {
-            let response = app.clone().oneshot(get_bearer("/projects", &token)).await.unwrap();
+            let response = app
+                .clone()
+                .oneshot(get_bearer("/projects", &token))
+                .await
+                .unwrap();
             assert_eq!(response.status(), StatusCode::UNAUTHORIZED, "{label}");
             assert_eq!(body_json(response).await["error"]["code"], "unauthorized");
         }
@@ -998,14 +992,9 @@ mod tests {
         let target = users::testing::seed_user(&state, "victim", users::Role::User, true).await;
         // Issue a session for the target before the reset.
         let pre_reset_refresh = {
-            let issued = sessions::issue(
-                &state.db,
-                &state.auth_key,
-                &target,
-                &state.config.auth,
-            )
-            .await
-            .unwrap();
+            let issued = sessions::issue(&state.db, &state.auth_key, &target, &state.config.auth)
+                .await
+                .unwrap();
             issued.refresh_token
         };
         let router = app(state);
@@ -1062,14 +1051,9 @@ mod tests {
         let target = users::testing::seed_user(&state, "target", users::Role::User, true).await;
         // Issue a session before deactivation so we can verify refresh is revoked.
         let pre_deactivation_refresh = {
-            let issued = sessions::issue(
-                &state.db,
-                &state.auth_key,
-                &target,
-                &state.config.auth,
-            )
-            .await
-            .unwrap();
+            let issued = sessions::issue(&state.db, &state.auth_key, &target, &state.config.auth)
+                .await
+                .unwrap();
             issued.refresh_token
         };
         let router = app(state);
@@ -1193,7 +1177,11 @@ mod tests {
             ))
             .await
             .unwrap();
-        assert_eq!(r.status(), StatusCode::FORBIDDEN, "POST /users/:id/password");
+        assert_eq!(
+            r.status(),
+            StatusCode::FORBIDDEN,
+            "POST /users/:id/password"
+        );
     }
 
     /// AC14: demoting the last active admin returns 409; deactivating the last
@@ -1209,7 +1197,10 @@ mod tests {
     async fn ac14_last_active_admin_lockout_guards() {
         let (state, admin_token) = admin_state_and_token().await;
         let admin_id = {
-            let u = users::get_by_username(&state.db, "admin").await.unwrap().unwrap();
+            let u = users::get_by_username(&state.db, "admin")
+                .await
+                .unwrap()
+                .unwrap();
             u.id
         };
         let router = app(state);
@@ -1258,7 +1249,10 @@ mod tests {
         // Add a second admin so the only guard that fires is the self one.
         users::testing::seed_user(&state, "admin2", users::Role::Admin, true).await;
         let admin_id = {
-            let u = users::get_by_username(&state.db, "admin").await.unwrap().unwrap();
+            let u = users::get_by_username(&state.db, "admin")
+                .await
+                .unwrap()
+                .unwrap();
             u.id
         };
         let router = app(state);
@@ -1381,7 +1375,10 @@ mod tests {
         // Add a second admin to hold the "last active admin" slot.
         let _second_admin =
             users::testing::seed_user(&state, "admin2", users::Role::Admin, true).await;
-        let first_admin_user = users::get_by_username(&state.db, "admin").await.unwrap().unwrap();
+        let first_admin_user = users::get_by_username(&state.db, "admin")
+            .await
+            .unwrap()
+            .unwrap();
         // Get a token for the first admin *before* deactivation.
         let first_admin_token = sessions::testing::login_as(&state, &first_admin_user).await;
 
@@ -1423,7 +1420,10 @@ mod tests {
         // SQL demotion below is not blocked by the guard.
         let _second_admin =
             users::testing::seed_user(&state, "admin2", users::Role::Admin, true).await;
-        let first_admin_user = users::get_by_username(&state.db, "admin").await.unwrap().unwrap();
+        let first_admin_user = users::get_by_username(&state.db, "admin")
+            .await
+            .unwrap()
+            .unwrap();
         let first_admin_token = sessions::testing::login_as(&state, &first_admin_user).await;
 
         // Demote the first admin via raw SQL, bypassing the guard (which would

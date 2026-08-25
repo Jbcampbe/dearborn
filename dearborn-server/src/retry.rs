@@ -110,7 +110,9 @@ mod tests {
 
     /// Record the requested delays without actually waiting, so the test
     /// asserts on the backoff schedule itself rather than on wall-clock time.
-    fn instant_sleep(delays: Rc<RefCell<Vec<Duration>>>) -> impl FnMut(Duration) -> std::future::Ready<()> {
+    fn instant_sleep(
+        delays: Rc<RefCell<Vec<Duration>>>,
+    ) -> impl FnMut(Duration) -> std::future::Ready<()> {
         move |delay| {
             delays.borrow_mut().push(delay);
             std::future::ready(())
@@ -169,8 +171,15 @@ mod tests {
         .await;
 
         assert_eq!(result.unwrap_err(), "permanent rejection");
-        assert_eq!(*calls.borrow(), 1, "a non-transient failure must not be retried");
-        assert!(delays.borrow().is_empty(), "no backoff sleep before bailing out");
+        assert_eq!(
+            *calls.borrow(),
+            1,
+            "a non-transient failure must not be retried"
+        );
+        assert!(
+            delays.borrow().is_empty(),
+            "no backoff sleep before bailing out"
+        );
     }
 
     #[tokio::test]

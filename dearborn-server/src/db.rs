@@ -398,10 +398,7 @@ mod tests {
             .unwrap();
         let mut rows = db
             .conn()
-            .query(
-                "SELECT active FROM user WHERE username = 'josiah'",
-                (),
-            )
+            .query("SELECT active FROM user WHERE username = 'josiah'", ())
             .await
             .unwrap();
         let row = rows
@@ -492,7 +489,11 @@ mod tests {
             );
 
             // The instance starts unclaimed — zero users, not an error.
-            let mut rows = db.conn().query("SELECT COUNT(*) FROM user", ()).await.unwrap();
+            let mut rows = db
+                .conn()
+                .query("SELECT COUNT(*) FROM user", ())
+                .await
+                .unwrap();
             let count: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
             assert_eq!(count, 0);
 
@@ -503,7 +504,12 @@ mod tests {
                 .await
                 .unwrap();
             assert_eq!(
-                rows.next().await.unwrap().unwrap().get::<String>(0).unwrap(),
+                rows.next()
+                    .await
+                    .unwrap()
+                    .unwrap()
+                    .get::<String>(0)
+                    .unwrap(),
                 "P"
             );
 

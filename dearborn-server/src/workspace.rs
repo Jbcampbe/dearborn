@@ -719,10 +719,7 @@ mod tests {
 
     #[test]
     fn resolve_base_branch_falls_back_to_project_default() {
-        assert_eq!(
-            resolve_base_branch(None, Some("release")),
-            Some("release")
-        );
+        assert_eq!(resolve_base_branch(None, Some("release")), Some("release"));
     }
 
     #[test]
@@ -862,7 +859,6 @@ mod tests {
             let _ = std::fs::remove_dir_all(&self.dir);
         }
     }
-
 
     async fn test_state(clone_root: &str) -> AppState {
         let db = Db::connect(":memory:").await.unwrap();
@@ -1093,7 +1089,10 @@ mod tests {
         assert_eq!(current, outcome.branch_name);
 
         // The snapshot landed on the epic row in the same write as branch_name.
-        assert_eq!(epic_base_branch_column(&state, &epic_id).await, Some("release".to_string()));
+        assert_eq!(
+            epic_base_branch_column(&state, &epic_id).await,
+            Some("release".to_string())
+        );
     }
 
     /// §5 chain permutation (epic set, project set) at the I/O level: the

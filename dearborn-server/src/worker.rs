@@ -4730,13 +4730,11 @@ async fn fail_item(state: &AppState, ctx: FailureContext<'_>) {
     // redaction then still strips URL userinfo, never blocks the failure
     // already being recorded.
     let conn_project_id = match ctx.epic_id {
-        Some(epic_id) => {
-            fetch_epic(conn, epic_id)
-                .await
-                .ok()
-                .flatten()
-                .map(|epic| epic.project_id)
-        }
+        Some(epic_id) => fetch_epic(conn, epic_id)
+            .await
+            .ok()
+            .flatten()
+            .map(|epic| epic.project_id),
         None => match ctx.task_id {
             Some(task_id) => crate::tasks::fetch_task(conn, task_id)
                 .await
@@ -4841,7 +4839,8 @@ fn cap_failure_detail(text: &str) -> String {
     if total <= FAILURE_DETAIL_CAP_CHARS {
         return text.to_string();
     }
-    let budget = FAILURE_DETAIL_CAP_CHARS.saturating_sub(FAILURE_DETAIL_ELISION_MARKER.chars().count());
+    let budget =
+        FAILURE_DETAIL_CAP_CHARS.saturating_sub(FAILURE_DETAIL_ELISION_MARKER.chars().count());
     let head_len = budget / 2;
     let tail_len = budget - head_len;
     let head: String = text.chars().take(head_len).collect();
@@ -4994,7 +4993,9 @@ fn is_transient_provider_error(text: &str) -> bool {
         "service unavailable",
     ];
     let lowered = text.to_ascii_lowercase();
-    TRANSIENT_SIGNALS.iter().any(|needle| lowered.contains(needle))
+    TRANSIENT_SIGNALS
+        .iter()
+        .any(|needle| lowered.contains(needle))
 }
 
 /// Route a not-`ok` [`task_agent::AgentStageOutcome`] to whichever of three
@@ -5080,26 +5081,25 @@ async fn route_stage_failure(
             .last_error_message
             .as_deref()
             .unwrap_or(&outcome.text);
-        let (reason, detail_message) = if classify_transient_provider
-            && is_transient_provider_error(err_text)
-        {
-            tracing::warn!(
-                epic = ?epic_id,
-                task = %task_id,
-                error = %err_text,
-                "agent stage failed on a persistent transient-looking provider error; \
-                 recording provider_rate_limited"
-            );
-            (
-                FailureReason::ProviderRateLimited,
-                // The provider's own error text is what makes the failure
-                // triageable — persist it (redacted by `fail_item`) instead
-                // of the caller's generic stage-failure label.
-                err_text,
-            )
-        } else {
-            (FailureReason::AgentError, message)
-        };
+        let (reason, detail_message) =
+            if classify_transient_provider && is_transient_provider_error(err_text) {
+                tracing::warn!(
+                    epic = ?epic_id,
+                    task = %task_id,
+                    error = %err_text,
+                    "agent stage failed on a persistent transient-looking provider error; \
+                     recording provider_rate_limited"
+                );
+                (
+                    FailureReason::ProviderRateLimited,
+                    // The provider's own error text is what makes the failure
+                    // triageable — persist it (redacted by `fail_item`) instead
+                    // of the caller's generic stage-failure label.
+                    err_text,
+                )
+            } else {
+                (FailureReason::AgentError, message)
+            };
         fail_item(
             state,
             FailureContext {
@@ -6348,7 +6348,6 @@ mod tests {
     use std::time::Duration;
     use tower::ServiceExt;
 
-
     /// The bearer credential HTTP tests present, minted **once per process**
     /// from a seeded active admin (`crate::users::testing::seed_user` +
     /// `crate::sessions::testing::login_as`) — the replacement for the deleted
@@ -6373,8 +6372,7 @@ mod tests {
                 let token = runtime.block_on(async {
                     let db = crate::Db::connect(":memory:").await.unwrap();
                     db.run_migrations().await.unwrap();
-                    let state =
-                        crate::AppState::new(crate::Config::for_test(), db);
+                    let state = crate::AppState::new(crate::Config::for_test(), db);
                     let user = crate::users::testing::seed_user(
                         &state,
                         "tester",
@@ -11575,9 +11573,15 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(epic.blocked_reason.as_deref(), Some("provider_rate_limited"));
+        assert_eq!(
+            epic.blocked_reason.as_deref(),
+            Some("provider_rate_limited")
+        );
         assert!(
-            epic.failure_detail.as_deref().unwrap_or_default().contains("429"),
+            epic.failure_detail
+                .as_deref()
+                .unwrap_or_default()
+                .contains("429"),
             "epic.failure_detail must carry the same redacted detail"
         );
 
@@ -11682,7 +11686,10 @@ mod tests {
         // The salvaged commit exists on the task branch, with step 5's own
         // §2.8 subject and the failed attempt's file inside it.
         let workspace_path = workspace::epic_workspace_path(&state.config.clone_root, &epic_id);
-        assert!(workspace_path.exists(), "workspace must be retained on failure");
+        assert!(
+            workspace_path.exists(),
+            "workspace must be retained on failure"
+        );
         let branch = epic_branch_name_column(&state, &epic_id).await;
         let expected = format!("impl({}): A", spec::short_id(&task_id));
         assert_eq!(
@@ -11717,7 +11724,11 @@ mod tests {
             .await
             .unwrap();
         let row = rows.next().await.unwrap().expect("a push agent_run row");
-        assert_eq!(row.get::<String>(0).unwrap(), "ok", "the triage push must succeed");
+        assert_eq!(
+            row.get::<String>(0).unwrap(),
+            "ok",
+            "the triage push must succeed"
+        );
 
         cleanup_clone_root(&state, &project_id, &[&epic_id]);
     }
@@ -11736,18 +11747,15 @@ mod tests {
     #[tokio::test]
     async fn cancelled_implement_commits_nothing_and_keeps_its_resumable_dirty_tree() {
         let gate = Arc::new(Gate::default());
-        let agent: Arc<dyn TaskAgent> = Arc::new(
-            ScriptedTaskAgent::new()
-                .with_gate(gate.clone())
-                .script(
-                    Stage::Implement,
-                    ScriptedRun {
-                        text: vec!["partial output before the kill".to_string()],
-                        files: vec![(PathBuf::from("work.txt"), "work\n".to_string())],
-                        ..ScriptedRun::default()
-                    },
-                ),
-        );
+        let agent: Arc<dyn TaskAgent> =
+            Arc::new(ScriptedTaskAgent::new().with_gate(gate.clone()).script(
+                Stage::Implement,
+                ScriptedRun {
+                    text: vec!["partial output before the kill".to_string()],
+                    files: vec![(PathBuf::from("work.txt"), "work\n".to_string())],
+                    ..ScriptedRun::default()
+                },
+            ));
         let (state, app) = test_app_with_task_agent(agent).await;
         let fixture = GitFixture::new().await;
         let project_id = seed_project_with_workspace(&state, &fixture).await;
@@ -11804,12 +11812,18 @@ mod tests {
         // Resumable, not failed.
         let (status, failure_reason) = fetch_task_row(&state, &task_id).await;
         assert_eq!(status, "Todo");
-        assert_eq!(failure_reason, None, "a cancelled task must carry no failure_reason");
+        assert_eq!(
+            failure_reason, None,
+            "a cancelled task must carry no failure_reason"
+        );
         assert_eq!(epic_status(&state, &epic_id).await, "Cancelled");
 
         // NO commit: HEAD is still exactly base_sha.
         let workspace_path = workspace::epic_workspace_path(&state.config.clone_root, &epic_id);
-        assert!(workspace_path.exists(), "workspace must be retained on a cancel");
+        assert!(
+            workspace_path.exists(),
+            "workspace must be retained on a cancel"
+        );
         let base_sha = task_base_sha(&state, &task_id)
             .await
             .expect("base_sha must have been recorded before the implement stage ran");
@@ -11838,7 +11852,9 @@ mod tests {
     /// failure text (including empty output).
     #[test]
     fn transient_provider_predicate_matches_only_upstream_signals() {
-        assert!(is_transient_provider_error("Error: API returned 429 Too Many Requests"));
+        assert!(is_transient_provider_error(
+            "Error: API returned 429 Too Many Requests"
+        ));
         assert!(is_transient_provider_error(
             "provider is temporarily rate-limited, back off"
         ));

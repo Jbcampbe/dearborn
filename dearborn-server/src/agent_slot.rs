@@ -87,9 +87,7 @@ impl AgentSlot {
             Stage::Review => Some(AgentSlot::Review),
             Stage::VerifyComplete => Some(AgentSlot::VerifyComplete),
             Stage::Summarize => Some(AgentSlot::Summarize),
-            Stage::Setup | Stage::Preflight | Stage::TestGate | Stage::Commit | Stage::Push => {
-                None
-            }
+            Stage::Setup | Stage::Preflight | Stage::TestGate | Stage::Commit | Stage::Push => None,
         }
     }
 }
@@ -166,7 +164,10 @@ mod tests {
             Some(AgentSlot::Implement)
         );
         assert_eq!(AgentSlot::from_stage(Stage::Fix), Some(AgentSlot::Fix));
-        assert_eq!(AgentSlot::from_stage(Stage::Review), Some(AgentSlot::Review));
+        assert_eq!(
+            AgentSlot::from_stage(Stage::Review),
+            Some(AgentSlot::Review)
+        );
         assert_eq!(
             AgentSlot::from_stage(Stage::VerifyComplete),
             Some(AgentSlot::VerifyComplete)

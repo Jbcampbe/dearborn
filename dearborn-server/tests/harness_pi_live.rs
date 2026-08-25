@@ -101,11 +101,17 @@ fn live_pi_run_streams_session_text_tools_and_usage() {
 
     let _ = std::fs::remove_dir_all(&dir);
 
-    assert!(seen.errors.is_empty(), "run reported errors: {:?}", seen.errors);
+    assert!(
+        seen.errors.is_empty(),
+        "run reported errors: {:?}",
+        seen.errors
+    );
     assert_eq!(seen.exit_code, Some(0), "pi exited non-zero");
 
     // `agent_run.session_id` evidence: the header line still carries an id.
-    let session_id = seen.session_id.expect("no Session event carried a session id");
+    let session_id = seen
+        .session_id
+        .expect("no Session event carried a session id");
     assert!(!session_id.is_empty());
 
     // `agent_run.model` evidence: the assistant message still names a model.

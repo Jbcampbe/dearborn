@@ -307,10 +307,7 @@ pub fn parse_pi_line(line: &str) -> ParsedLine {
         // `agent_run.session_id` evidence handle.
         Some("session") => {
             parsed.session = Some(SessionInfo {
-                session_id: value
-                    .get("id")
-                    .and_then(Value::as_str)
-                    .map(str::to_owned),
+                session_id: value.get("id").and_then(Value::as_str).map(str::to_owned),
                 model: None,
             });
         }
@@ -612,7 +609,10 @@ mod tests {
         let session = parsed.session.unwrap();
         // Id-less, so it can never clobber the header's session id.
         assert!(session.session_id.is_none());
-        assert_eq!(session.model.as_deref(), Some("openrouter/stealth/ox-alpha"));
+        assert_eq!(
+            session.model.as_deref(),
+            Some("openrouter/stealth/ox-alpha")
+        );
         // A *user* message_start carries no model and yields nothing.
         assert!(parse_pi_line(
             r#"{"type":"message_start","message":{"role":"user","content":[]}}"#

@@ -558,7 +558,10 @@ fn build_extra_args(stage: Stage, harness: &str) -> Vec<String> {
         return if is_pi {
             vec!["--exclude-tools".to_string(), PI_EDIT_TOOLS.to_string()]
         } else {
-            vec!["--disallowedTools".to_string(), DENIED_EDIT_TOOLS.to_string()]
+            vec![
+                "--disallowedTools".to_string(),
+                DENIED_EDIT_TOOLS.to_string(),
+            ]
         };
     }
     // Matched on the two write stages by name rather than on
@@ -905,7 +908,10 @@ pub enum AgentStageError {
     /// stage attempt to record evidence for. Carries the slot as well as the
     /// key so [`crate::agent_settings::unsupported_harness_message`] can say
     /// *which* of the two reasons applies.
-    UnsupportedHarness { harness: String, slot: Option<AgentSlot> },
+    UnsupportedHarness {
+        harness: String,
+        slot: Option<AgentSlot>,
+    },
 }
 
 impl std::fmt::Display for AgentStageError {
@@ -915,12 +921,15 @@ impl std::fmt::Display for AgentStageError {
             AgentStageError::Harness(e) => write!(f, "agent stage failed to start: {e}"),
             AgentStageError::DrainFailed(msg) => write!(f, "{msg}"),
             AgentStageError::UnsupportedHarness { harness, slot } => match slot {
-                Some(slot) => f.write_str(
-                    &crate::agent_settings::unsupported_harness_message(harness, *slot),
-                ),
+                Some(slot) => f.write_str(&crate::agent_settings::unsupported_harness_message(
+                    harness, *slot,
+                )),
                 // No slot means a non-agent stage reached an agent-only path —
                 // a caller bug, phrased as one rather than blamed on the key.
-                None => write!(f, "harness `{harness}` was resolved for a stage that has no agent slot"),
+                None => write!(
+                    f,
+                    "harness `{harness}` was resolved for a stage that has no agent slot"
+                ),
             },
         }
     }
@@ -961,9 +970,7 @@ pub async fn run_agent_stage(
     // caller bug `run_mode()` already guards, so it is treated as unrunnable
     // rather than waved through.
     let slot = AgentSlot::from_stage(req.stage);
-    if !slot.is_some_and(|slot| {
-        crate::agent_settings::harness_supports_slot(&req.harness, slot)
-    }) {
+    if !slot.is_some_and(|slot| crate::agent_settings::harness_supports_slot(&req.harness, slot)) {
         return Err(AgentStageError::UnsupportedHarness {
             harness: req.harness.clone(),
             slot,
@@ -1845,7 +1852,10 @@ mod tests {
         ]);
 
         assert!(outcome.errored, "the diagnostic flag must stay set");
-        assert_eq!(outcome.last_error_message.as_deref(), Some("429 rate limited"));
+        assert_eq!(
+            outcome.last_error_message.as_deref(),
+            Some("429 rate limited")
+        );
         // The log trail keeps every error verbatim inside `text`.
         assert!(outcome.text.contains("[error] 429 rate limited"));
         assert!(outcome.text.contains("fixed the thing"));
@@ -1943,7 +1953,10 @@ mod tests {
                 cancelled: false,
             },
         ]);
-        assert_eq!(outcome.last_error_message.as_deref(), Some("second failure"));
+        assert_eq!(
+            outcome.last_error_message.as_deref(),
+            Some("second failure")
+        );
         assert!(outcome.text.contains("[error] first failure"));
         assert!(outcome.text.contains("[error] second failure"));
         assert_eq!(outcome.status(), "error");
@@ -2138,8 +2151,7 @@ mod tests {
     async fn run_agent_stage_writes_harness_model_and_prompt_hash_evidence() {
         let state = test_state().await;
         let agent = ScriptedTaskAgent::new().script(Stage::Review, ScriptedRun::default());
-        let dir =
-            std::env::temp_dir().join(format!("dearborn-evidence-{}", ulid::Ulid::new()));
+        let dir = std::env::temp_dir().join(format!("dearborn-evidence-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&dir).unwrap();
 
         let outcome = run_agent_stage(
@@ -2176,7 +2188,10 @@ mod tests {
             .unwrap();
         let row = rows.next().await.unwrap().expect("a row was written");
         assert_eq!(row.get::<String>(0).unwrap(), "claude");
-        assert_eq!(row.get::<Option<String>>(1).unwrap().as_deref(), Some("test-model"));
+        assert_eq!(
+            row.get::<Option<String>>(1).unwrap().as_deref(),
+            Some("test-model")
+        );
         assert_eq!(
             row.get::<Option<String>>(2).unwrap().as_deref(),
             Some(crate::agent_settings::prompt_hash("review prompt").as_str())
@@ -2253,8 +2268,7 @@ mod tests {
         let state = test_state().await;
 
         let agent = ScriptedTaskAgent::new().script(Stage::Implement, ScriptedRun::default());
-        let dir =
-            std::env::temp_dir().join(format!("dearborn-live-read-{}", ulid::Ulid::new()));
+        let dir = std::env::temp_dir().join(format!("dearborn-live-read-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&dir).unwrap();
 
         // Stage run 1: everything at defaults.
@@ -2344,7 +2358,10 @@ mod tests {
         let row2 = rows.next().await.unwrap().unwrap();
         assert_eq!(row2.get::<i64>(0).unwrap(), 2);
         assert_eq!(row2.get::<String>(1).unwrap(), "claude");
-        assert_eq!(row2.get::<Option<String>>(2).unwrap().as_deref(), Some("haiku"));
+        assert_eq!(
+            row2.get::<Option<String>>(2).unwrap().as_deref(),
+            Some("haiku")
+        );
         assert_eq!(row2.get::<String>(3).unwrap(), cfg2.prompt_hash);
         std::fs::remove_dir_all(&dir).ok();
     }
