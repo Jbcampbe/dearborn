@@ -26,6 +26,7 @@
 //! capability token). Dearborn — not the agent — owns the `Planning → Ready`
 //! lane transition, exactly as ARCHITECTURE §11 requires.
 
+use std::collections::HashMap;
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 
@@ -263,6 +264,11 @@ async fn technical_session_exists(state: &AppState, epic_id: &str) -> AppResult<
 
 // ---- run orchestration ---------------------------------------------------
 
+/// Prefix every Dearborn-scoped MCP tool name carries on the wire (see
+/// `crate::mcp`): `mcp__dearborn__create_task`, `mcp__dearborn__link_dependency`,
+/// `mcp__dearborn__update_epic`. Harness-side tools (Read, Grep, …) don't match.
+const DEARBORN_MCP_PREFIX: &str = "mcp__dearborn__";
+
 /// What a drained breakdown run leaves behind, persisted after the stream ends.
 #[derive(Default)]
 struct BreakdownOutcome {
@@ -270,6 +276,12 @@ struct BreakdownOutcome {
     log: String,
     /// The harness session id captured from `RunEvent::Session` (evidence).
     session_id: Option<String>,
+    /// Tool calls started but not yet ended, by id — so a failed `ToolEnd` can
+    /// be attributed to the tool that made it (`ToolEnd` carries only the id).
+    pending_tools: HashMap<String, String>,
+    /// Dearborn-scoped MCP tools whose call ended not-ok, in failure order,
+    /// paired with whatever failure output the harness reported.
+    failed_tool_calls: Vec<(String, String)>,
 }
 
 impl BreakdownOutcome {
@@ -280,6 +292,34 @@ impl BreakdownOutcome {
                 session_id: Some(id),
                 ..
             } => self.session_id = Some(id.clone()),
+            RunEvent::ToolStart {
+                tool_call_id,
+                name,
+                ..
+            } => {
+                self.pending_tools
+                    .insert(tool_call_id.clone(), name.clone());
+            }
+            RunEvent::ToolEnd {
+                tool_call_id,
+                ok: false,
+                output,
+                ..
+            } => {
+                // Only Dearborn-scoped MCP tool failures count: those are the
+                // writes behind the task DAG. A failed harness-side read
+                // (Read/Grep/…) can't leave the DAG half-written, and treating
+                // it as fatal would block runs over noise.
+                if let Some(name) = self.pending_tools.remove(tool_call_id) {
+                    if name.starts_with(DEARBORN_MCP_PREFIX) {
+                        self.failed_tool_calls
+                            .push((name, output.clone().unwrap_or_default()));
+                    }
+                }
+            }
+            RunEvent::ToolEnd { tool_call_id, .. } => {
+                self.pending_tools.remove(tool_call_id);
+            }
             _ => {}
         }
     }
@@ -406,23 +446,66 @@ pub fn spawn_breakdown(state: AppState, epic_id: String, guard: InflightGuard) {
             Err(_) => return, // blocking task panicked; nothing reliable to persist
         };
 
+        // A Dearborn-scoped MCP tool failing means part of the task DAG may be
+        // missing or half-wired — even though the model's closing summary will
+        // happily claim success. (This exact shape happened for real: an
+        // external DB lock made every `create_task` fail mid-run, the model
+        // declared "All 12 tasks created" anyway, and only the run's *final*
+        // writes — this agent_run row plus the Planning → Ready transition —
+        // landed after the lock cleared. The result was a Ready epic with zero
+        // tasks that nothing would ever retry.) So: when a scoped tool failed,
+        // record the run as `error`, append why to its log, and leave the epic
+        // in `Planning` — where POST /epics/{id}/breakdown can simply re-run it.
+        let dag_write_failed = !outcome.failed_tool_calls.is_empty();
+        if dag_write_failed {
+            tracing::error!(
+                epic = %epic_id,
+                failed_tools = ?outcome.failed_tool_calls,
+                "breakdown: Dearborn MCP tool call(s) failed; refusing Planning → Ready"
+            );
+        }
+
         // Record per-run evidence (the tasks/edges were persisted live by the
         // MCP tools during the run), including which agent settings produced
         // it (T8).
+        let mut log = outcome.log;
+        if dag_write_failed {
+            let failed = outcome
+                .failed_tool_calls
+                .iter()
+                .map(|(tool, output)| {
+                    if output.is_empty() {
+                        tool.clone()
+                    } else {
+                        format!("{tool} ({output})")
+                    }
+                })
+                .collect::<Vec<_>>()
+                .join(", ");
+            log.push_str(&format!(
+                "\n\n[dearborn] breakdown aborted: {} Dearborn MCP tool call(s) failed ({}) — \
+                 the epic stays in `Planning` so breakdown can be re-run.",
+                outcome.failed_tool_calls.len(),
+                failed
+            ));
+        }
+
         let run_id = ulid::Ulid::new().to_string();
+        let status = if dag_write_failed { "error" } else { "ok" };
         let _ = conn
             .execute(
                 "INSERT INTO agent_run (id, task_id, epic_id, stage, session_id, log, created_at, \
                  attempt, status, verdict, started_at, ended_at, exit_code, \
                  harness, model, prompt_hash) \
-                 VALUES (?1, NULL, ?2, 'breakdown', ?3, ?4, ?5, 1, 'ok', NULL, ?5, ?5, NULL, \
-                 ?6, ?7, ?8)",
+                 VALUES (?1, NULL, ?2, 'breakdown', ?3, ?4, ?5, 1, ?6, NULL, ?5, ?5, NULL, \
+                 ?7, ?8, ?9)",
                 params![
                     run_id,
                     epic_id.clone(),
                     outcome.session_id,
-                    outcome.log,
+                    log,
                     now_ms(),
+                    status,
                     spawn_cfg.harness,
                     spawn_cfg.model,
                     spawn_cfg.prompt_hash,
@@ -430,13 +513,17 @@ pub fn spawn_breakdown(state: AppState, epic_id: String, guard: InflightGuard) {
             )
             .await;
 
-        // Dearborn owns the lane transition: Planning → Ready.
-        let _ = conn
-            .execute(
-                "UPDATE epic SET status = 'Ready', updated_at = ?1 WHERE id = ?2 AND status = 'Planning'",
-                params![now_ms(), epic_id.clone()],
-            )
-            .await;
+        // Dearborn owns the lane transition: Planning → Ready — but only when
+        // the whole tool surface came back clean (see above). The publish block
+        // below still runs either way so a subscribed client re-renders.
+        if !dag_write_failed {
+            let _ = conn
+                .execute(
+                    "UPDATE epic SET status = 'Ready', updated_at = ?1 WHERE id = ?2 AND status = 'Planning'",
+                    params![now_ms(), epic_id.clone()],
+                )
+                .await;
+        }
 
         // Publish the final DAG and the updated epic so the client re-renders.
         crate::mcp::publish_dag(&state, &epic_id).await;
@@ -501,6 +588,68 @@ pub(crate) mod testing {
         pub prompt: String,
         pub plan: String,
         pub had_mcp: bool,
+    }
+
+    /// A [`BreakdownAgent`] that emits a failed harness-side read AND a failed
+    /// Dearborn MCP `create_task` call, then a confident closing summary and a
+    /// clean exit — the exact "model claims success, writes failed" shape the
+    /// Planning → Ready guard exists for.
+    pub struct FailedToolCallBreakdownAgent;
+
+    impl BreakdownAgent for FailedToolCallBreakdownAgent {
+        fn run(&self, req: BreakdownRunRequest) -> Receiver<RunEvent> {
+            let (tx, rx) = std::sync::mpsc::channel();
+            let run_id = req.run_id;
+            std::thread::spawn(move || {
+                let _ = tx.send(RunEvent::Started {
+                    run_id: run_id.clone(),
+                });
+                let _ = tx.send(RunEvent::Session {
+                    run_id: run_id.clone(),
+                    session_id: Some("bd-fail".to_string()),
+                    model: Some("fake-model".to_string()),
+                });
+                // A failed harness-side read: must NOT trip the guard.
+                let _ = tx.send(RunEvent::ToolStart {
+                    run_id: run_id.clone(),
+                    tool_call_id: "t1".to_string(),
+                    name: "Read".to_string(),
+                    input: None,
+                    tool_kind: harness::ToolKind::Read,
+                });
+                let _ = tx.send(RunEvent::ToolEnd {
+                    run_id: run_id.clone(),
+                    tool_call_id: "t1".to_string(),
+                    ok: false,
+                    output: None,
+                });
+                // The failed DAG write: must trip the guard.
+                let _ = tx.send(RunEvent::ToolStart {
+                    run_id: run_id.clone(),
+                    tool_call_id: "t2".to_string(),
+                    name: format!("{DEARBORN_MCP_PREFIX}create_task"),
+                    input: None,
+                    tool_kind: harness::ToolKind::Other,
+                });
+                let _ = tx.send(RunEvent::ToolEnd {
+                    run_id: run_id.clone(),
+                    tool_call_id: "t2".to_string(),
+                    ok: false,
+                    output: Some("database is locked".to_string()),
+                });
+                // The model's (untrustworthy) closing summary.
+                let _ = tx.send(RunEvent::Text {
+                    run_id: run_id.clone(),
+                    delta: "All 12 tasks created.".to_string(),
+                });
+                let _ = tx.send(RunEvent::Exited {
+                    run_id,
+                    exit_code: Some(0),
+                    cancelled: false,
+                });
+            });
+            rx
+        }
     }
 
     /// A scripted [`BreakdownAgent`] that, per run, invokes a caller-supplied
@@ -806,6 +955,50 @@ mod tests {
         assert_eq!(runs.len(), 1);
         assert!(runs[0].plan.contains("export feature"));
         assert!(runs[0].plan.contains("axum route"));
+    }
+
+    /// A Dearborn-scoped MCP tool call failing must abort the run: the epic
+    /// stays in `Planning` (re-triggerable), the evidence row closes as
+    /// `error`, and the failure note names the failed tool. A failed
+    /// harness-side read alone does NOT abort (the first scripted tool).
+    #[tokio::test]
+    async fn breakdown_stays_in_planning_when_a_dearborn_tool_call_fails() {
+        let (state, app) = app_with_breakdown(Arc::new(FailedToolCallBreakdownAgent)).await;
+        let project_id = seed_project(&app).await;
+        let epic_id = create_epic(&app, &project_id).await;
+        advance(&app, &epic_id).await;
+
+        let response = trigger(&app, &epic_id).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+
+        // Wait until the evidence row lands (the run is backgrounded).
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        loop {
+            let mut rows = state
+                .db
+                .conn()
+                .query(
+                    "SELECT status, log FROM agent_run WHERE epic_id = ?1",
+                    params![epic_id.clone()],
+                )
+                .await
+                .unwrap();
+            if let Some(row) = rows.next().await.unwrap() {
+                // The run is recorded as an error, with the failed tool named
+                // in its log.
+                assert_eq!(row.get::<String>(0).unwrap(), "error");
+                let log: String = row.get(1).unwrap();
+                assert!(log.contains("create_task"));
+                assert!(log.contains("database is locked"));
+                break;
+            }
+            assert!(tokio::time::Instant::now() < deadline, "agent_run never landed");
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+
+        // The epic never left Planning — breakdown is simply re-runnable.
+        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        assert_eq!(epic.status, "Planning");
     }
 
     #[tokio::test]

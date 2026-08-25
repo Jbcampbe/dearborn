@@ -28,9 +28,6 @@
 //! (see `crate::git::redact` and `git_host`'s "redaction discipline" module
 //! doc section); no secret can reach the log through here.
 //!
-//! Retrying is always **bounded**: three total attempts (`MAX_ATTEMPTS`),
-//! matching the incident profile — one flaky blip, maybe two, but never a
-//! sustained outage worth burning minutes on inside the worker pipeline.
 
 use std::future::Future;
 use std::time::Duration;

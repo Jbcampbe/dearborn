@@ -87,6 +87,7 @@ impl Db {
     pub async fn connect(path: &str) -> Result<Db, DbError> {
         let database = Builder::new_local(path).build().await?;
         let conn = database.connect()?;
+        apply_pragmas(&conn).await;
         Ok(Db {
             _database: Arc::new(database),
             conn,
@@ -136,6 +137,33 @@ impl Db {
         }
 
         Ok(newly_applied)
+    }
+}
+
+/// Busy timeout applied to every connection, in milliseconds. A transient
+/// external lock (e.g. DBeaver holding the file open) becomes a short wait
+/// instead of an instant `database is locked` failure on the first write.
+const BUSY_TIMEOUT_MS: i64 = 5000;
+
+/// Connection pragmas applied once per connection at open.
+///
+/// WAL lets external readers coexist with server writers — in rollback-journal
+/// mode a single long-running read transaction elsewhere on the host blocked
+/// every server write with `SQLITE_BUSY`, which is exactly how a breakdown run
+/// ended up silently creating zero tasks while reporting success (see
+/// [`crate::breakdown`] for the guard that makes such runs fail loudly now).
+/// Both pragmas are best-effort: WAL is meaningless for `":memory:"` databases
+/// (the pragma reports `memory` rather than erroring), and a failure to set
+/// either one degrades to today's behavior rather than refusing to boot.
+async fn apply_pragmas(conn: &Connection) {
+    if let Err(err) = conn.execute_batch("PRAGMA journal_mode = WAL;").await {
+        tracing::warn!(error = %err, "could not enable WAL journal mode");
+    }
+    if let Err(err) = conn
+        .execute_batch(&format!("PRAGMA busy_timeout = {BUSY_TIMEOUT_MS};"))
+        .await
+    {
+        tracing::warn!(error = %err, "could not apply busy timeout");
     }
 }
 
@@ -225,6 +253,51 @@ mod tests {
         );
         assert_eq!(row.get::<String>(3).unwrap(), "pending");
         assert!(rows.next().await.unwrap().is_none());
+    }
+
+    /// A connection opened against a file-backed database runs in WAL mode with
+    /// the busy timeout applied — the two pragmas that keep an external reader
+    /// (DBeaver et al.) from turning into instant `database is locked` failures.
+    #[tokio::test]
+    async fn connect_applies_wal_and_busy_timeout_to_file_backed_databases() {
+        let path = std::env::temp_dir().join(format!(
+            "dearborn-pragma-test-{}-{}.db",
+            std::process::id(),
+            now_ms()
+        ));
+        let path = path.to_str().unwrap();
+
+        {
+            let db = Db::connect(path).await.unwrap();
+            let mut rows = db
+                .conn()
+                .query("PRAGMA journal_mode", ())
+                .await
+                .unwrap();
+            let mode: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
+            assert_eq!(mode.to_lowercase(), "wal");
+
+            let mut rows = db.conn().query("PRAGMA busy_timeout", ()).await.unwrap();
+            let timeout_ms: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+            assert_eq!(timeout_ms, BUSY_TIMEOUT_MS);
+        }
+
+        for suffix in ["", "-shm", "-wal"] {
+            let _ = std::fs::remove_file(format!("{path}{suffix}"));
+        }
+    }
+
+    /// In-memory databases cannot do WAL (there is no file); opening one must
+    /// still succeed — the pragma degrades gracefully instead of failing boot.
+    #[tokio::test]
+    async fn connect_on_memory_database_tolerates_unavailable_wal() {
+        let db = Db::connect(":memory:").await.unwrap();
+        db.run_migrations().await.unwrap();
+        // Any statement works afterwards — the connection is usable.
+        db.conn()
+            .execute("CREATE TABLE t (x INTEGER)", ())
+            .await
+            .unwrap();
     }
 
     #[tokio::test]

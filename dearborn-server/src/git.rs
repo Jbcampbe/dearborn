@@ -884,14 +884,16 @@ mod tests {
         );
         assert!(!err.message.contains("ghp_"));
 
-        // Bounded retry: three total attempts -> two backoff sleeps, spaced
-        // linearly (base_delay * attempt).
+        // Bounded retry: `MAX_ATTEMPTS` total attempts -> one backoff sleep
+        // between each pair of attempts, spaced linearly (base_delay * attempt).
+        // Computed from the constants so bumping either one can't silently
+        // stale this expectation out.
+        let expected: Vec<std::time::Duration> = (1..MAX_ATTEMPTS)
+            .map(|attempt| BASE_DELAY * attempt)
+            .collect();
         assert_eq!(
             *delays.borrow(),
-            vec![
-                std::time::Duration::from_millis(500),
-                std::time::Duration::from_millis(1000)
-            ],
+            expected,
             "linear backoff between the bounded push retries"
         );
 
