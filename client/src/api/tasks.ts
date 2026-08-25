@@ -229,6 +229,27 @@ export function getRunLog(token: string, runId: string): Promise<AgentRunDetail>
   return apiFetch<AgentRunDetail>(`/runs/${encodeURIComponent(runId)}`, token);
 }
 
+/**
+ * One persisted tool-call event for an agent run (`agent_run_events` table).
+ * `tool_start` rows carry the tool `name` with `ok: null`; `tool_end` rows
+ * carry an empty `name` and the outcome in `ok`. Pair them by `toolCallId`.
+ */
+export interface ToolCallEvent {
+  kind: "tool_start" | "tool_end";
+  toolCallId: string;
+  name: string;
+  ok: boolean | null;
+}
+
+/**
+ * `GET /runs/{id}/events` → one stage run's persisted tool-call events,
+ * oldest first. `404` (`ApiError`) if unknown. Called only on demand — once
+ * per expanded pipeline row, alongside `getRunLog`.
+ */
+export function getRunEvents(token: string, runId: string): Promise<ToolCallEvent[]> {
+  return apiFetch<ToolCallEvent[]>(`/runs/${encodeURIComponent(runId)}/events`, token);
+}
+
 /** `POST /epics/{id}/dependencies` → the created edge (201). */
 export function linkDependency(
   token: string,
