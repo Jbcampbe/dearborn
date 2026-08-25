@@ -418,6 +418,39 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+// ---- tool-event rows (agent_run_events) ------------------------------------
+
+/// Insert one `agent_run_events` row per entry in `events`, in arrival order.
+/// Called best-effort after the stage drain — a failure here must never fail
+/// the stage itself (the caller ignores the returned `Result`).
+/// An empty `events` slice is a no-op: zero rows are inserted without error,
+/// satisfying the "a stage with no tool calls inserts zero rows" AC.
+pub async fn save_run_events(
+    conn: &Connection,
+    run_id: &str,
+    events: &[crate::task_agent::ToolEventRecord],
+) -> Result<(), libsql::Error> {
+    for (seq, ev) in events.iter().enumerate() {
+        let id = ulid::Ulid::new().to_string();
+        conn.execute(
+            "INSERT INTO agent_run_events \
+             (id, run_id, seq, kind, tool_call_id, name, ok) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+            params![
+                id,
+                run_id,
+                seq as i64,
+                ev.kind,
+                ev.tool_call_id.clone(),
+                ev.name.clone(),
+                ev.ok.map(|b| b as i64),
+            ],
+        )
+        .await?;
+    }
+    Ok(())
+}
+
 // ---- REST: task stage history + one stage's log (§2.5) ---------------------
 
 /// One `agent_run` row as returned by `GET /tasks/{id}/runs` — **without**

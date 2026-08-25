@@ -63,6 +63,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0008_failure_detail",
         sql: include_str!("../migrations/0008_failure_detail.sql"),
     },
+    Migration {
+        id: 9,
+        name: "0009_agent_run_events",
+        sql: include_str!("../migrations/0009_agent_run_events.sql"),
+    },
 ];
 
 /// Errors surfaced while opening the database or running migrations.

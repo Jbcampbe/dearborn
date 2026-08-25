@@ -1255,18 +1255,13 @@ pub async fn run_agent_stage(
         outcome.cancelled = true;
     }
 
-    // TODO(tool-events epic): once `evidence::save_run_events` exists
-    // (sibling task "Add save_run_events and list_run_events to evidence.rs",
-    // alongside migration 0009's `agent_run_events` table), persist this
-    // stage's accumulated tool events here, best-effort, BEFORE close_stage:
-    //
-    //     evidence::save_run_events(conn, &stage_row.id, &outcome.tool_events).await;
-    //
-    // Best-effort per the spec: ignore/log any error rather than failing
-    // the stage — the row close below must always run. Note the existing
-    // `evidence` fns take `&Connection`, not `&DbConn`. It cannot be called
-    // today because that function does not exist yet in this branch, and
-    // referencing it would break `cargo check`.
+    // Best-effort: a persistence failure here must never fail the stage — the
+    // close_stage call below must always run regardless.
+    if let Err(e) =
+        evidence::save_run_events(conn, &stage_row.id, &outcome.tool_events).await
+    {
+        tracing::warn!(run_id = %stage_row.id, error = %e, "failed to persist tool events");
+    }
 
     evidence::close_stage(
         conn,
