@@ -39,7 +39,7 @@ use std::time::Duration;
 /// Bounded deliberately: the worker pipeline must fail fast enough for a
 /// human to re-drive it, while still riding out transient blips like the
 /// mid-run rate-limit seen in the incident.
-pub(crate) const MAX_ATTEMPTS: u32 = 3;
+pub(crate) const MAX_ATTEMPTS: u32 = 10;
 
 /// The delay after attempt *N* is `BASE_DELAY * N`: 500 ms after the first
 /// failure, 1 s after the second. Short and linear — these retries exist for
