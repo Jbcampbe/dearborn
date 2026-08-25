@@ -1255,13 +1255,9 @@ pub async fn run_agent_stage(
         outcome.cancelled = true;
     }
 
-    // Best-effort: a persistence failure here must never fail the stage — the
-    // close_stage call below must always run regardless.
-    if let Err(e) =
-        evidence::save_run_events(conn, &stage_row.id, &outcome.tool_events).await
-    {
-        tracing::warn!(run_id = %stage_row.id, error = %e, "failed to persist tool events");
-    }
+    // Best-effort inside save_run_events itself: failures are logged there,
+    // never propagated, so the close_stage call below always runs regardless.
+    evidence::save_run_events(conn, &stage_row.id, &outcome.tool_events).await;
 
     evidence::close_stage(
         conn,

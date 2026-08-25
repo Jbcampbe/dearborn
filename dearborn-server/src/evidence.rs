@@ -422,33 +422,88 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
 
 /// Insert one `agent_run_events` row per entry in `events`, in arrival order.
 /// Called best-effort after the stage drain — a failure here must never fail
-/// the stage itself (the caller ignores the returned `Result`).
+/// the stage itself, so errors are logged and swallowed instead of returned.
 /// An empty `events` slice is a no-op: zero rows are inserted without error,
 /// satisfying the "a stage with no tool calls inserts zero rows" AC.
 pub async fn save_run_events(
     conn: &Connection,
     run_id: &str,
     events: &[crate::task_agent::ToolEventRecord],
-) -> Result<(), libsql::Error> {
-    for (seq, ev) in events.iter().enumerate() {
+) {
+    for ev in events {
         let id = ulid::Ulid::new().to_string();
-        conn.execute(
-            "INSERT INTO agent_run_events \
-             (id, run_id, seq, kind, tool_call_id, name, ok) \
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-            params![
-                id,
-                run_id,
-                seq as i64,
-                ev.kind,
-                ev.tool_call_id.clone(),
-                ev.name.clone(),
-                ev.ok.map(|b| b as i64),
-            ],
+        if let Err(e) = conn
+            .execute(
+                "INSERT INTO agent_run_events \
+                 (id, agent_run_id, kind, tool_call_id, name, ok, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    id,
+                    run_id,
+                    ev.kind,
+                    ev.tool_call_id.clone(),
+                    ev.name.clone(),
+                    ev.ok.map(|b| b as i64),
+                    now_ms(),
+                ],
+            )
+            .await
+        {
+            tracing::warn!(run_id = %run_id, error = %e, "failed to persist tool event");
+        }
+    }
+}
+
+/// One `agent_run_events` row as returned by [`list_run_events`] — the same
+/// JSON shape the planning transcript uses for tool rows (`toolCallId` camel-
+/// cased on the wire), so a client can pair starts/ends with the identical
+/// logic it already speaks.
+#[derive(Debug, Clone, Serialize)]
+pub struct RunEventRow {
+    pub kind: String,
+    #[serde(rename = "toolCallId")]
+    pub tool_call_id: String,
+    pub name: String,
+    pub ok: Option<bool>,
+}
+
+/// All `agent_run_events` rows for one run, in insertion order: `created_at`
+/// first (matching the `(agent_run_id, created_at)` index), `rowid` as the
+/// tiebreak — two events minted in the same millisecond would otherwise have
+/// an arbitrary relative order, and `rowid` always increases with insertion.
+pub async fn list_run_events(
+    conn: &Connection,
+    run_id: &str,
+) -> Result<Vec<RunEventRow>, libsql::Error> {
+    let mut rows = conn
+        .query(
+            "SELECT kind, tool_call_id, name, ok FROM agent_run_events \
+             WHERE agent_run_id = ?1 ORDER BY created_at ASC, rowid ASC",
+            params![run_id],
         )
         .await?;
+    let mut items = Vec::new();
+    while let Some(row) = rows.next().await? {
+        items.push(RunEventRow {
+            kind: row.get(0)?,
+            tool_call_id: row.get(1)?,
+            name: row.get(2)?,
+            ok: row.get::<Option<i64>>(3)?.map(|v| v != 0),
+        });
     }
-    Ok(())
+    Ok(items)
+}
+
+/// `GET /runs/{id}/events` — one run's tool-call timeline, in insertion
+/// order. Auth comes from the shared bearer `require_auth` middleware layer
+/// (like every other protected route), not a per-handler extractor.
+pub async fn list_run_events_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> AppResult<Json<Vec<RunEventRow>>> {
+    let conn = state.db.conn();
+    let events = list_run_events(conn, &id).await?;
+    Ok(Json(events))
 }
 
 // ---- REST: task stage history + one stage's log (§2.5) ---------------------
@@ -1066,6 +1121,86 @@ mod tests {
         );
         assert!(row.log.contains("stage panicked"));
         assert!(row.summary.ended_at.is_some());
+    }
+
+    // ---- tool-event rows (agent_run_events) -------------------------------
+
+    #[tokio::test]
+    async fn save_and_list_run_events_round_trip_in_insertion_order() {
+        let db = seeded_db().await;
+        let conn = db.conn();
+        let handle = open_stage(
+            conn,
+            OpenStage {
+                task_id: Some("task-1"),
+                epic_id: Some("epic-1"),
+                stage: "implement",
+                attempt: 1,
+                harness: None,
+                model: None,
+                prompt_hash: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // An empty slice inserts nothing and is not an error.
+        save_run_events(conn, &handle.id, &[]).await;
+        assert!(list_run_events(conn, &handle.id).await.unwrap().is_empty());
+
+        use crate::task_agent::ToolEventRecord;
+        save_run_events(
+            conn,
+            &handle.id,
+            &[
+                ToolEventRecord {
+                    kind: "tool_start",
+                    tool_call_id: "call-1".to_string(),
+                    name: "read".to_string(),
+                    ok: None,
+                },
+                ToolEventRecord {
+                    kind: "tool_end",
+                    tool_call_id: "call-1".to_string(),
+                    name: String::new(),
+                    ok: Some(true),
+                },
+                ToolEventRecord {
+                    kind: "tool_start",
+                    tool_call_id: "call-2".to_string(),
+                    name: "edit".to_string(),
+                    ok: None,
+                },
+            ],
+        )
+        .await;
+
+        let events = list_run_events(conn, &handle.id).await.unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].kind, "tool_start");
+        assert_eq!(events[0].tool_call_id, "call-1");
+        assert_eq!(events[0].name, "read");
+        assert_eq!(events[0].ok, None);
+        assert_eq!(events[1].kind, "tool_end");
+        assert_eq!(events[1].ok, Some(true));
+        assert_eq!(events[2].name, "edit");
+
+        // Rows for a *different* run don't leak in.
+        let other = open_stage(
+            conn,
+            OpenStage {
+                task_id: Some("task-1"),
+                epic_id: Some("epic-1"),
+                stage: "review",
+                attempt: 1,
+                harness: None,
+                model: None,
+                prompt_hash: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(list_run_events(conn, &other.id).await.unwrap().is_empty());
     }
 
     // ---- REST: GET /tasks/{id}/runs, GET /runs/{id} ------------------------
