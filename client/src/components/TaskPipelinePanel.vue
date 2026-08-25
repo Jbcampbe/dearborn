@@ -3,7 +3,7 @@ import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue"
 
 import { useAuthStore } from "../stores/auth";
 import { ApiError } from "../api/client";
-import { getRunLog, getTaskRuns, type AgentRunDetail, type AgentRunSummary } from "../api/tasks";
+import { getRunEvents, getRunLog, getTaskRuns, type AgentRunDetail, type AgentRunSummary, type ToolCallEvent } from "../api/tasks";
 import {
   attemptLabel,
   durationLabel,
@@ -17,6 +17,7 @@ import {
   stageLabel,
   verdictLabel,
   type PipelineState,
+  type ToolCall,
 } from "../task/pipeline";
 import { usePipelineStream, type PipelineStream, type StreamStatus } from "../task/usePipelineStream";
 import AppIcon from "./AppIcon.vue";
@@ -59,6 +60,11 @@ onBeforeUnmount(() => stream?.close());
 const expandedId = ref<string | null>(null);
 /** Per-run full-log cache, keyed by `agent_run.id` — fetched once per row. */
 const logCache = reactive(new Map<string, AgentRunDetail>());
+/**
+ * Per-run historical tool-call pills, keyed by `agent_run.id` — folded from
+ * `GET /runs/{id}/events` on expand, fetched once per row alongside the log.
+ */
+const eventsCache = reactive(new Map<string, ToolCall[]>());
 const logLoading = reactive(new Set<string>());
 const logError = reactive(new Map<string, string>());
 
@@ -103,6 +109,7 @@ async function load() {
   error.value = null;
   expandedId.value = null;
   logCache.clear();
+  eventsCache.clear();
   logLoading.clear();
   logError.clear();
 
@@ -167,6 +174,11 @@ async function toggle(run: AgentRunSummary) {
   if (token === null) {
     return;
   }
+  // Historical pills are best-effort: a failed events fetch must not affect
+  // the log below it, so swallow everything except an auth bounce.
+  void getRunEvents(token, run.id)
+    .then((events) => eventsCache.set(run.id, foldToolEvents(events)))
+    .catch(() => {});
   logLoading.add(run.id);
   logError.delete(run.id);
   try {
@@ -180,6 +192,32 @@ async function toggle(run: AgentRunSummary) {
   } finally {
     logLoading.delete(run.id);
   }
+}
+
+/**
+ * Pair `tool_start`/`tool_end` events by `toolCallId` into resolved pills —
+ * same pairing logic as planning/stream.ts's foldMessages, but over the
+ * persisted event rows rather than WS frames.
+ */
+function foldToolEvents(events: ToolCallEvent[]): ToolCall[] {
+  const starts = new Map<string, string>(); // toolCallId → name
+  const result: ToolCall[] = [];
+  for (const e of events) {
+    if (e.kind === "tool_start") {
+      starts.set(e.toolCallId, e.name);
+    } else {
+      result.push({
+        toolCallId: e.toolCallId,
+        name: starts.get(e.toolCallId) ?? "tool",
+        status: e.ok ? "ok" : "error",
+      });
+      starts.delete(e.toolCallId);
+    }
+  }
+  for (const [id, name] of starts) {
+    result.push({ toolCallId: id, name, status: "running" });
+  }
+  return result;
 }
 
 /** The verdict badge's tone: PASS reads green, BLOCKED red, NEEDS_CHANGES neutral. */
@@ -232,6 +270,20 @@ onMounted(load);
         </button>
 
         <div v-if="expandedId === run.id" class="run-body">
+          <!-- Historical pills: completed stages only -- the running row
+               renders its live pills from state.liveTools instead. -->
+          <div v-if="run.id !== runningRunId && (eventsCache.get(run.id)?.length ?? 0) > 0" class="tool-row">
+            <span
+              v-for="call in eventsCache.get(run.id) ?? []"
+              :key="call.toolCallId"
+              class="tool-chip"
+              :data-status="call.status"
+            >
+              <span class="tool-dot" />
+              <span class="tool-name mono">{{ call.name }}</span>
+              <span class="tool-state">{{ call.status }}</span>
+            </span>
+          </div>
           <p v-if="logLoading.has(run.id)" class="log-note">Loading log…</p>
           <p v-else-if="logError.has(run.id)" class="banner banner-error" role="alert">
             {{ logError.get(run.id) }}
