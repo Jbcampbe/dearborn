@@ -81,7 +81,7 @@ function bounceIfAuth(err: unknown): boolean {
 }
 
 async function load() {
-  const token = auth.token;
+  const token = auth.accessToken;
   if (token === null) {
     return;
   }
@@ -141,7 +141,7 @@ function cancelEdit() {
 }
 
 async function save() {
-  const token = auth.token;
+  const token = auth.accessToken;
   const body = diffEpicEdits(baseline, draft);
   if (token === null || saveDisabled.value || Object.keys(body).length === 0) {
     return;

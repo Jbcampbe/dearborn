@@ -61,7 +61,7 @@ const editing = computed<SlotSetting | null>(
 );
 
 async function load() {
-  const token = auth.token;
+  const token = auth.accessToken;
   if (token === null) {
     return;
   }
@@ -103,7 +103,7 @@ function setSlots(items: SlotSetting[]) {
 watch(() => props.projectId, load);
 
 async function saveBaseBranch() {
-  const token = auth.token;
+  const token = auth.accessToken;
   if (token === null || baseBranchBusy.value) {
     return;
   }
@@ -130,7 +130,7 @@ async function saveBaseBranch() {
 }
 
 async function saveSlotFacets(slot: AgentSlot) {
-  const token = auth.token;
+  const token = auth.accessToken;
   if (token === null) {
     return;
   }
@@ -172,7 +172,7 @@ function closePromptEditor() {
 }
 
 async function savePrompt() {
-  const token = auth.token;
+  const token = auth.accessToken;
   const slot = editingSlot.value;
   if (token === null || slot === null || promptBusy.value) {
     return;
@@ -204,7 +204,7 @@ async function savePrompt() {
 }
 
 async function resetPrompt() {
-  const token = auth.token;
+  const token = auth.accessToken;
   const slot = editingSlot.value;
   if (token === null || slot === null || promptBusy.value) {
     return;

@@ -35,7 +35,7 @@ watch(
 );
 
 async function submit() {
-  const token = auth.token;
+  const token = auth.accessToken;
   const trimmed = title.value.trim();
   if (token === null || trimmed.length === 0 || busy.value) {
     return;

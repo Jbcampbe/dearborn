@@ -24,6 +24,9 @@ export default defineConfig({
       // Global agent settings (design doc §7). Top-level `/settings` — the
       // client route is singular `/agent-settings` so it does not clash here.
       "/settings": "http://127.0.0.1:8787",
+      // Auth surface: status probe, setup, login, refresh, logout. Public
+      // routes the SPA hits before it holds an access token.
+      "/auth": "http://127.0.0.1:8787",
       // WebSocket — planning `RunEvent` live stream (T-202/T-204). `ws:true`
       // makes the dev proxy forward the Upgrade handshake to the Rust server.
       "/ws": { target: "ws://127.0.0.1:8787", ws: true },

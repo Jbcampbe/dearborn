@@ -34,7 +34,7 @@ const defaultHarness = ref("");
 const customHarness = ref("");
 
 async function load() {
-  const token = auth.token;
+  const token = auth.accessToken;
   if (token === null) {
     return;
   }
@@ -120,7 +120,7 @@ function allModelKeys(): string[] {
 }
 
 async function save() {
-  const token = auth.token;
+  const token = auth.accessToken;
   if (token === null || busy.value) {
     return;
   }
@@ -207,7 +207,7 @@ onMounted(load);
               installed adapter
             </span>
           </label>
-          <label v-for="h in [...enabled].filter((x) => !SUPPORTED_HARNESSES.includes(x))" :key="h" class="toggle-row">
+          <label v-for="h in [...enabled].filter((x) => !(SUPPORTED_HARNESSES as readonly string[]).includes(x))" :key="h" class="toggle-row">
             <input
               type="checkbox"
               class="checkbox"

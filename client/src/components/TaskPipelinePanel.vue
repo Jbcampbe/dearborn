@@ -95,7 +95,7 @@ function bounceIfAuth(err: unknown): boolean {
 }
 
 async function load() {
-  const token = auth.token;
+  const token = auth.accessToken;
   if (token === null) {
     return;
   }
@@ -163,7 +163,7 @@ async function toggle(run: AgentRunSummary) {
   if (logCache.has(run.id) || logLoading.has(run.id)) {
     return;
   }
-  const token = auth.token;
+  const token = auth.accessToken;
   if (token === null) {
     return;
   }

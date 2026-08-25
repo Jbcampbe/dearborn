@@ -137,7 +137,7 @@ async function onLaneDrop(lane: TaskStatus, event: DragEvent) {
   event.preventDefault();
   const drag = dragPayload.value;
   onDragEnd();
-  const token = auth.token;
+  const token = auth.accessToken;
   if (drag === null || token === null || !canDropOnTaskLane(drag.status, lane)) {
     return;
   }
@@ -172,7 +172,7 @@ function bounceIfAuth(err: unknown): boolean {
 const busyIds = reactive(new Set<string>());
 
 async function retryCard(node: DagNode) {
-  const token = auth.token;
+  const token = auth.accessToken;
   if (token === null || busyIds.has(node.id)) {
     return;
   }
@@ -191,7 +191,7 @@ async function retryCard(node: DagNode) {
 }
 
 async function load() {
-  const token = auth.token;
+  const token = auth.accessToken;
   if (token === null) {
     return;
   }

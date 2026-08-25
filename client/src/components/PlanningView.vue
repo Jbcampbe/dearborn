@@ -98,7 +98,7 @@ function bounceIfAuth(err: unknown): boolean {
 }
 
 async function load() {
-  const token = auth.token;
+  const token = auth.accessToken;
   if (token === null) {
     return;
   }
@@ -131,7 +131,7 @@ async function load() {
 }
 
 async function send() {
-  const token = auth.token;
+  const token = auth.accessToken;
   const content = draft.value.trim();
   if (token === null || content.length === 0 || runInFlight.value || sending.value) {
     return;
@@ -156,7 +156,7 @@ async function send() {
 // Advance product → technical planning: the transcript continues on the same
 // sequence, and the composer flips to `phase: "technical"` (via `currentPhase`).
 async function advance() {
-  const token = auth.token;
+  const token = auth.accessToken;
   if (token === null || hasTechnical.value || advancing.value || runInFlight.value) {
     return;
   }
@@ -186,7 +186,7 @@ const breakDownDisabled = computed(
   () => advancing.value || runInFlight.value || breakingDown.value,
 );
 async function breakDown() {
-  const token = auth.token;
+  const token = auth.accessToken;
   if (token === null || !canBreakDown.value || breakDownDisabled.value) {
     return;
   }

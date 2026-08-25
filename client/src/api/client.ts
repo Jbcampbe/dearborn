@@ -31,15 +31,30 @@ export interface Collection<T> {
 }
 
 /**
- * Perform an authenticated JSON request and return the parsed body.
- *
- * Throws {@link ApiError} on any non-2xx response (or a network failure). A
- * `204 No Content` resolves to `undefined`.
+ * How the API layer reaches the auth store without importing it (a store →
+ * api → store import cycle). `main.ts` installs the real bridge at boot via
+ * {@link setAuthBridge}; until then 401s simply propagate as before.
  */
-export async function apiFetch<T>(
+export interface AuthBridge {
+  /** The current access token, or null when signed out. */
+  getAccessToken: () => string | null;
+  /** Refresh the access token. Concurrent callers share one request. */
+  refresh: () => Promise<void>;
+  /** Invoked once when a session is definitively dead — return to login. */
+  onAuthFailure: (message: string) => void;
+}
+
+let authBridge: AuthBridge | null = null;
+
+/** Install the auth bridge. Called once from `main.ts` at boot. */
+export function setAuthBridge(bridge: AuthBridge): void {
+  authBridge = bridge;
+}
+
+async function request<T>(
   path: string,
   token: string,
-  init: RequestInit = {},
+  init: RequestInit,
 ): Promise<T> {
   const headers = new Headers(init.headers);
   headers.set("Authorization", `Bearer ${token}`);
@@ -70,4 +85,52 @@ export async function apiFetch<T>(
   }
 
   return body as T;
+}
+
+/**
+ * Perform an authenticated JSON request and return the parsed body.
+ *
+ * On a `401`, runs the single refresh-and-retry: ask the auth bridge to
+ * refresh, then retry exactly once with the new token. If the refresh fails,
+ * notify {@link AuthBridge.onAuthFailure} (which returns the SPA to login)
+ * and rethrow the original {@link ApiError} — its `isAuth` flag still drives
+ * each calling component's existing error branch. A second `401` on the
+ * retry propagates directly; there is no loop.
+ *
+ * Throws {@link ApiError} on any non-2xx response (or a network failure). A
+ * `204 No Content` resolves to `undefined`.
+ */
+export async function apiFetch<T>(
+  path: string,
+  token: string,
+  init: RequestInit = {},
+): Promise<T> {
+  try {
+    return await request<T>(path, token, init);
+  } catch (cause) {
+    if (!(cause instanceof ApiError) || cause.status !== 401) {
+      throw cause;
+    }
+    const bridge = authBridge;
+    if (bridge === null) {
+      throw cause;
+    }
+    try {
+      await bridge.refresh();
+    } catch (refreshCause) {
+      bridge.onAuthFailure(
+        refreshCause instanceof Error
+          ? refreshCause.message
+          : String(refreshCause),
+      );
+      throw cause;
+    }
+    const freshToken = bridge.getAccessToken();
+    if (freshToken === null) {
+      bridge.onAuthFailure(cause.message);
+      throw cause;
+    }
+    // One retry only — `request` never recurses into this logic.
+    return request<T>(path, freshToken, init);
+  }
 }

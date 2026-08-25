@@ -16,7 +16,7 @@ const store = useProjectsStore();
 const route = useRoute();
 
 onMounted(async () => {
-  const token = auth.token;
+  const token = auth.accessToken;
   if (token === null || store.loaded) {
     return;
   }
