@@ -374,8 +374,10 @@ fn breakdown_tools_list_result() -> Value {
             {
                 "name": "link_dependency",
                 "description": "Add a dependency edge: `blocker_id` blocks `blocked_id` (the \
-                    blocker must finish before the blocked task can start). Both must be tasks \
-                    in THIS epic. Rejected if it would create a cycle.",
+                    blocker must finish before the blocked task can start). Both must be EXACT \
+                    task id strings as returned by `create_task` (copy them verbatim — never \
+                    invent short numbers or labels). Both must be tasks in THIS epic. Rejected \
+                    if it would create a cycle.",
                 "inputSchema": {
                     "type": "object",
                     "properties": {
@@ -496,7 +498,10 @@ async fn tool_create_task(
     .map_err(|e| format!("failed to create task: {e}"))?;
 
     // Optional `blocks`: existing task ids this new task blocks. Same-epic /
-    // cycle validation happens in `tasks::link_dependency`.
+    // cycle validation happens in `tasks::link_dependency`. A failed link is
+    // still a fatal tool error (the DAG is half-wired), but the message must
+    // make unmistakable that the task itself WAS created — otherwise the model
+    // retries `create_task` and duplicates the slice.
     let mut linked = 0usize;
     if let Some(blocks) = args.get("blocks").and_then(Value::as_array) {
         for entry in blocks {
@@ -505,8 +510,9 @@ async fn tool_create_task(
                     .await
                     .map_err(|e| {
                         format!(
-                            "task created ({}), but linking to {blocked_id} failed: {e}",
-                            task.id
+                            "task {} (\"{}\") WAS created — do NOT recreate it — but linking \
+                             it to {blocked_id} failed: {e}",
+                            task.id, task.title
                         )
                     })?;
                 linked += 1;
@@ -551,13 +557,29 @@ async fn tool_link_dependency(
 
     // Both endpoints must belong to the scoped epic (the agent cannot reach
     // across epics). `link_dependency` also re-checks same-epic + cycles.
+    // Rejections carry the *actual* ids of this epic's tasks so a model that
+    // invented short labels ("4") can self-correct in one retry instead of
+    // failing every remaining edge of the run.
     let conn = state.db.conn();
     for id in [blocker_id, blocked_id] {
-        let belongs = tasks::task_belongs_to_epic(conn, id, &scope.epic_id)
+        match tasks::task_epic(conn, id)
             .await
-            .map_err(|e| format!("failed to validate task {id}: {e}"))?;
-        if !belongs {
-            return Err(format!("task {id} is not part of this epic"));
+            .map_err(|e| format!("failed to validate task {id}: {e}"))?
+        {
+            None => {
+                return Err(format!(
+                    "task {id} does not exist. {}",
+                    epic_task_ids_hint(state, &scope.epic_id).await
+                ));
+            }
+            Some(Some(other)) if other != scope.epic_id => {
+                return Err(format!(
+                    "task {id} belongs to a different epic; use the exact ids \
+                     create_task returned. {}",
+                    epic_task_ids_hint(state, &scope.epic_id).await
+                ));
+            }
+            _ => {}
         }
     }
 
@@ -567,6 +589,29 @@ async fn tool_link_dependency(
 
     publish_dag(state, &scope.epic_id).await;
     Ok(format!("Linked {blocker_id} → {blocked_id}."))
+}
+
+/// A self-correction hint appended to `link_dependency` rejections: which task
+/// ids actually exist in this epic. Capped so a huge DAG can't blow up the
+/// tool output.
+async fn epic_task_ids_hint(state: &AppState, epic_id: &str) -> String {
+    const MAX_LISTED: usize = 40;
+    match tasks::list_tasks_for_epic(state.db.conn(), epic_id).await {
+        Ok(tasks) if tasks.is_empty() => {
+            "No tasks exist in this epic yet — create them with create_task first.".to_string()
+        }
+        Ok(tasks) => {
+            let mut ids: Vec<String> = tasks.iter().map(|t| t.id.clone()).collect();
+            let truncated = if ids.len() > MAX_LISTED {
+                ids.truncate(MAX_LISTED);
+                format!(" (first {MAX_LISTED})")
+            } else {
+                String::new()
+            };
+            format!("Tasks in this epic{truncated}: {}.", ids.join(", "))
+        }
+        Err(_) => "Use the exact task ids returned by create_task.".to_string(),
+    }
 }
 
 /// Build the epic's task DAG (`{ nodes, edges }`) — nodes carry computed
@@ -1446,7 +1491,58 @@ mod tests {
         .await;
         assert_eq!(body["result"]["isError"], true);
         let text = body["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("not part of this epic"), "got: {text}");
+        // Self-correctable: names the cross-epic task AND lists the valid ids.
+        assert!(text.contains("belongs to a different epic"), "got: {text}");
+        assert!(text.contains(&a.id), "hint lists in-epic ids, got: {text}");
+    }
+
+    /// A model inventing short labels ("4") instead of the ULIDs create_task
+    /// returned gets a rejection that lists THIS epic's actual ids — so one
+    /// retry with a real id succeeds instead of every remaining edge failing.
+    #[tokio::test]
+    async fn link_dependency_unknown_id_error_lists_the_epics_task_ids() {
+        let (state, app) = boot().await;
+        let (project_id, epic_id) = seed_epic(&state, None).await;
+        let guard = breakdown_cap(&state, &epic_id, &project_id);
+
+        let a = crate::tasks::create_task(state.db.conn(), &epic_id, &project_id, "A", None, None)
+            .await
+            .unwrap();
+        let b = crate::tasks::create_task(state.db.conn(), &epic_id, &project_id, "B", None, None)
+            .await
+            .unwrap();
+
+        // The exact failure shape from the field: ordinal labels as ids.
+        let (_status, body) = rpc(
+            &app,
+            guard.token(),
+            json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
+                   "params":{"name":"link_dependency",
+                              "arguments":{"blocker_id": "4", "blocked_id": "5"}}}),
+        )
+        .await;
+        assert_eq!(body["result"]["isError"], true);
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(text.contains("task 4 does not exist"), "got: {text}");
+        assert!(text.contains("Tasks in this epic"), "got: {text}");
+        assert!(text.contains(&a.id) && text.contains(&b.id), "got: {text}");
+
+        // An unknown id against an EMPTY epic says to create tasks first.
+        let (empty_project, empty_epic) = seed_epic(&state, None).await;
+        let guard_empty = breakdown_cap(&state, &empty_epic, &empty_project);
+        let (_status, body) = rpc(
+            &app,
+            guard_empty.token(),
+            json!({"jsonrpc":"2.0","id":2,"method":"tools/call",
+                   "params":{"name":"link_dependency",
+                              "arguments":{"blocker_id": "1", "blocked_id": "2"}}}),
+        )
+        .await;
+        let text = body["result"]["content"][0]["text"].as_str().unwrap();
+        assert!(
+            text.contains("No tasks exist in this epic yet"),
+            "got: {text}"
+        );
     }
 
     #[tokio::test]

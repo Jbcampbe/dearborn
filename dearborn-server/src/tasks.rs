@@ -1019,8 +1019,13 @@ pub async fn fetch_task(conn: &Connection, id: &str) -> AppResult<Option<Task>> 
 /// The `epic_id` of a task as a **double option**: outer `None` = the task
 /// does not exist; inner `None` = the task exists but is standalone (NULL
 /// epic). Keeping the two cases distinct lets callers reject standalone tasks
-/// with a clear `400` instead of a misleading `404`.
-async fn task_epic(conn: &Connection, task_id: &str) -> AppResult<Option<Option<String>>> {
+/// with a clear `400` instead of a misleading `404`. Also used by the MCP
+/// breakdown tools to give the agent a *self-correctable* rejection: "no such
+/// task" vs "belongs to another epic".
+pub(crate) async fn task_epic(
+    conn: &Connection,
+    task_id: &str,
+) -> AppResult<Option<Option<String>>> {
     let mut rows = conn
         .query("SELECT epic_id FROM task WHERE id = ?1", params![task_id])
         .await?;

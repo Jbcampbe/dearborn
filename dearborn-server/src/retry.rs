@@ -32,16 +32,11 @@
 use std::future::Future;
 use std::time::Duration;
 
-/// Total attempts made per wrapped operation (first try plus two retries).
-/// Bounded deliberately: the worker pipeline must fail fast enough for a
-/// human to re-drive it, while still riding out transient blips like the
-/// mid-run rate-limit seen in the incident.
-pub(crate) const MAX_ATTEMPTS: u32 = 10;
+/// Total attempts made per wrapped operation
+pub(crate) const MAX_ATTEMPTS: u32 = 100;
 
-/// The delay after attempt *N* is `BASE_DELAY * N`: 500 ms after the first
-/// failure, 1 s after the second. Short and linear — these retries exist for
-/// blips measured in milliseconds-to-seconds, not outages.
-pub(crate) const BASE_DELAY: Duration = Duration::from_millis(500);
+/// The delay after attempt *N* is `BASE_DELAY * N`
+pub(crate) const BASE_DELAY: Duration = Duration::from_millis(5000);
 
 /// Run `op` up to `attempts` times, retrying only when `is_transient`
 /// classifies the failure as likely to succeed on a later try.

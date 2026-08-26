@@ -27,6 +27,7 @@
 //! lane transition, exactly as ARCHITECTURE §11 requires.
 
 use std::collections::HashMap;
+use std::collections::HashSet;
 use std::path::PathBuf;
 use std::sync::mpsc::Receiver;
 
@@ -61,7 +62,10 @@ behavior (not layer-by-layer), and `acceptance` criteria. Create blockers BEFORE
 tasks that depend on them; when creating a task, you may pass `blocks` (ids of already- \
 created tasks this new task blocks) or wire edges afterward with `link_dependency`.
 - `link_dependency`: add a `blocker_id → blocked_id` edge (the blocker must finish first). \
-Both tasks must belong to this epic; cycles are rejected.
+Both tasks must belong to this epic; cycles are rejected. Use the EXACT task id strings that \
+`create_task` returned — copy them verbatim into `blocker_id`/`blocked_id`; never substitute \
+your own numbering or labels, which will be rejected. If a link is rejected, read the error's \
+list of valid task ids and retry with one of those.
 
 Work in dependency order. Do not modify the codebase, run commands, or change the epic's \
 status — creating tasks and linking dependencies is your entire surface. When the DAG is \
@@ -293,9 +297,7 @@ impl BreakdownOutcome {
                 ..
             } => self.session_id = Some(id.clone()),
             RunEvent::ToolStart {
-                tool_call_id,
-                name,
-                ..
+                tool_call_id, name, ..
             } => {
                 self.pending_tools
                     .insert(tool_call_id.clone(), name.clone());
@@ -419,32 +421,54 @@ pub fn spawn_breakdown(state: AppState, epic_id: String, guard: InflightGuard) {
             model: spawn_cfg.model.clone(),
         };
 
-        let rx = state.breakdown.run(req);
-        let hub = state.hub.clone();
-        let topic = format!("epic:{epic_id}");
+        let outcome = {
+            // Snapshot the epic's pre-existing task ids so a failed run can
+            // roll back exactly what IT created (see below) without touching
+            // tasks from earlier runs or manual edits.
+            let pre_existing: HashSet<String> = crate::tasks::list_tasks_for_epic(conn, &epic_id)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|t| t.id)
+                .collect();
 
-        // Drain the BLOCKING receiver off the async runtime, relaying live.
-        let drained = tokio::task::spawn_blocking(move || {
-            let mut outcome = BreakdownOutcome::default();
-            for event in rx {
-                let payload = serde_json::to_value(&event).unwrap_or(Value::Null);
-                hub.publish(&topic, crate::planning::ws_type(&event), payload);
-                outcome.absorb(&event);
+            let rx = state.breakdown.run(req);
+            let hub = state.hub.clone();
+            let topic = format!("epic:{epic_id}");
+            let epic_for_drain = epic_id.clone();
+            let conn_for_rollback = conn.clone();
+
+            // Drain the BLOCKING receiver off the async runtime, relaying live.
+            let drained = tokio::task::spawn_blocking(move || {
+                let mut outcome = BreakdownOutcome::default();
+                for event in rx {
+                    let payload = serde_json::to_value(&event).unwrap_or(Value::Null);
+                    hub.publish(&topic, crate::planning::ws_type(&event), payload);
+                    outcome.absorb(&event);
+                }
+                outcome
+            })
+            .await;
+
+            let outcome = match drained {
+                Ok(outcome) => outcome,
+                Err(_) => return, // blocking task panicked; nothing reliable to persist
+            };
+
+            // Roll back the failed run's PARTIAL DAG writes (see
+            // `rollback_partial_dag`).
+            if !outcome.failed_tool_calls.is_empty() {
+                rollback_partial_dag(&conn_for_rollback, &epic_for_drain, &pre_existing).await;
             }
+
             outcome
-        })
-        .await;
+        };
 
         // Agent has exited; the temp MCP config file is no longer needed. The
         // capability token is revoked when `_cap_guard` drops at task end.
         if let Some(path) = &mcp_config_path {
             let _ = tokio::fs::remove_file(path).await;
         }
-
-        let outcome = match drained {
-            Ok(outcome) => outcome,
-            Err(_) => return, // blocking task panicked; nothing reliable to persist
-        };
 
         // A Dearborn-scoped MCP tool failing means part of the task DAG may be
         // missing or half-wired — even though the model's closing summary will
@@ -484,7 +508,8 @@ pub fn spawn_breakdown(state: AppState, epic_id: String, guard: InflightGuard) {
                 .join(", ");
             log.push_str(&format!(
                 "\n\n[dearborn] breakdown aborted: {} Dearborn MCP tool call(s) failed ({}) — \
-                 the epic stays in `Planning` so breakdown can be re-run.",
+                 partial tasks created by this run were rolled back and the epic stays in \
+                 `Planning` so breakdown can be re-run.",
                 outcome.failed_tool_calls.len(),
                 failed
             ));
@@ -538,6 +563,32 @@ pub fn spawn_breakdown(state: AppState, epic_id: String, guard: InflightGuard) {
             crate::board::publish_board(&state, &epic.project_id).await;
         }
     });
+}
+
+/// Roll back a failed breakdown run's partial DAG writes. A failed scoped tool
+/// call means the task graph is incomplete, and a re-run would recreate every
+/// slice — leaving duplicates if the partial tasks stayed. Deleting exactly the
+/// ids this run added (`pre_existing` minus current) makes breakdown
+/// idempotently re-runnable while preserving pre-existing tasks and edges.
+async fn rollback_partial_dag(
+    conn: &libsql::Connection,
+    epic_id: &str,
+    pre_existing: &HashSet<String>,
+) {
+    match crate::tasks::list_tasks_for_epic(conn, epic_id).await {
+        Ok(current) => {
+            for task in current {
+                if !pre_existing.contains(&task.id) {
+                    if let Err(err) = crate::tasks::delete_task(conn, &task.id).await {
+                        tracing::warn!(epic = %epic_id, task = %task.id, error = %err,
+                            "breakdown rollback: failed to delete partial task");
+                    }
+                }
+            }
+        }
+        Err(err) => tracing::warn!(epic = %epic_id, error = %err,
+            "breakdown rollback: could not list tasks; partial DAG may remain"),
+    }
 }
 
 /// Assemble the plan (PRD) an epic hands the breakdown agent from its title +
@@ -992,13 +1043,67 @@ mod tests {
                 assert!(log.contains("database is locked"));
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "agent_run never landed");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "agent_run never landed"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
         // The epic never left Planning — breakdown is simply re-runnable.
-        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        let epic = fetch_epic(state.db.conn(), &epic_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(epic.status, "Planning");
+    }
+
+    /// A failed run's partial writes are rolled back: tasks created DURING the
+    /// run (ids absent from the pre-run snapshot) disappear along with their
+    /// edges, while pre-existing tasks — and the edges between them — survive.
+    #[tokio::test]
+    async fn rollback_partial_dag_deletes_only_tasks_created_by_the_failed_run() {
+        let (state, app) = app_with_breakdown(Arc::new(SilentBreakdownAgent)).await;
+        let project_id = seed_project(&app).await;
+        let epic_id = create_epic(&app, &project_id).await;
+        let conn = state.db.conn();
+
+        // Pre-existing state: one task from "before" plus an edge between two
+        // such tasks.
+        let old_a = crate::tasks::create_task(conn, &epic_id, &project_id, "old A", None, None)
+            .await
+            .unwrap();
+        let old_b = crate::tasks::create_task(conn, &epic_id, &project_id, "old B", None, None)
+            .await
+            .unwrap();
+        crate::tasks::link_dependency(conn, &old_a.id, &old_b.id)
+            .await
+            .unwrap();
+
+        // What a failed run added before tripping the guard.
+        let partial = crate::tasks::create_task(conn, &epic_id, &project_id, "partial", None, None)
+            .await
+            .unwrap();
+        crate::tasks::link_dependency(conn, &partial.id, &old_b.id)
+            .await
+            .unwrap();
+
+        let pre_existing: HashSet<String> =
+            [old_a.id.clone(), old_b.id.clone()].into_iter().collect();
+        rollback_partial_dag(conn, &epic_id, &pre_existing).await;
+
+        let remaining = crate::tasks::list_tasks_for_epic(conn, &epic_id)
+            .await
+            .unwrap();
+        let ids: Vec<&str> = remaining.iter().map(|t| t.id.as_str()).collect();
+        assert_eq!(ids, vec![old_a.id.as_str(), old_b.id.as_str()]);
+
+        // The partial task's edge is gone; the old edge survived.
+        let edges = crate::tasks::list_dependencies_for_epic(conn, &epic_id)
+            .await
+            .unwrap();
+        assert_eq!(edges.len(), 1);
+        assert_eq!(edges[0].blocker_id, old_a.id);
     }
 
     #[tokio::test]

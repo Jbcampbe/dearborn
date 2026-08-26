@@ -277,11 +277,7 @@ mod tests {
 
         {
             let db = Db::connect(path).await.unwrap();
-            let mut rows = db
-                .conn()
-                .query("PRAGMA journal_mode", ())
-                .await
-                .unwrap();
+            let mut rows = db.conn().query("PRAGMA journal_mode", ()).await.unwrap();
             let mode: String = rows.next().await.unwrap().unwrap().get(0).unwrap();
             assert_eq!(mode.to_lowercase(), "wal");
 
