@@ -11,6 +11,7 @@ import {
   type TaskStatus,
 } from "../api/tasks";
 import { TASK_LANES } from "../board/epicLanes";
+import AppIcon from "./AppIcon.vue";
 import AppModal from "./AppModal.vue";
 import ConfirmModal from "./ConfirmModal.vue";
 import TaskPipelinePanel from "./TaskPipelinePanel.vue";
@@ -193,6 +194,7 @@ async function confirmDelete() {
         :data-active="activeTab === 'details'"
         @click="activeTab = 'details'"
       >
+        <AppIcon name="pencil" :size="13" />
         Details
       </button>
       <button
@@ -201,6 +203,7 @@ async function confirmDelete() {
         :data-active="activeTab === 'pipeline'"
         @click="activeTab = 'pipeline'"
       >
+        <AppIcon name="layers" :size="13" />
         Pipeline
       </button>
     </nav>
@@ -348,12 +351,23 @@ async function confirmDelete() {
   margin-bottom: var(--spacing-16);
 }
 
+/* Same underline-tab look as EpicTabs.vue — the base reset (base.css) only
+   inherits font-family/color on buttons, so the UA background/border/padding
+   must be cleared explicitly or the tab renders as a boxed button. */
 .task-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
   padding: 6px 10px 8px;
   margin-bottom: -1px;
-  font-size: var(--text-caption);
-  color: var(--text-muted);
+  background: none;
+  border: none;
   border-bottom: 2px solid transparent;
+  font-size: var(--text-caption);
+  line-height: var(--leading-body-sm);
+  letter-spacing: var(--tracking-body-sm);
+  color: var(--text-muted);
+  cursor: pointer;
   transition:
     color var(--duration-fast) var(--ease-out),
     border-color var(--duration-fast) var(--ease-out);

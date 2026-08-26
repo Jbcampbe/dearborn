@@ -851,9 +851,7 @@ impl AgentStageOutcome {
             // prose); they accumulate here instead so they can land in
             // `agent_run_events` after the drain — see `tool_events`.
             RunEvent::ToolStart {
-                tool_call_id,
-                name,
-                ..
+                tool_call_id, name, ..
             } => self.tool_events.push(ToolEventRecord {
                 kind: "tool_start",
                 tool_call_id: tool_call_id.clone(),
@@ -861,9 +859,7 @@ impl AgentStageOutcome {
                 ok: None,
             }),
             RunEvent::ToolEnd {
-                tool_call_id,
-                ok,
-                ..
+                tool_call_id, ok, ..
             } => self.tool_events.push(ToolEventRecord {
                 kind: "tool_end",
                 tool_call_id: tool_call_id.clone(),

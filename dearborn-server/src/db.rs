@@ -682,7 +682,15 @@ mod tests {
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
 
-        for column in ["id", "agent_run_id", "kind", "tool_call_id", "name", "ok", "created_at"] {
+        for column in [
+            "id",
+            "agent_run_id",
+            "kind",
+            "tool_call_id",
+            "name",
+            "ok",
+            "created_at",
+        ] {
             let mut rows = db
                 .conn()
                 .query("PRAGMA table_info(agent_run_events)", ())

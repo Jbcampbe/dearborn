@@ -247,7 +247,12 @@ onMounted(load);
     </div>
 
     <ul v-else class="run-list">
-      <li v-for="run in state.runs" :key="run.id" class="run-row">
+      <li
+        v-for="run in state.runs"
+        :key="run.id"
+        class="run-row"
+        :data-expanded="expandedId === run.id"
+      >
         <button
           class="run-head"
           type="button"
@@ -341,29 +346,58 @@ onMounted(load);
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 2px;
 }
 
+/* Linear-style rows: flat against the modal surface — no border, no fill at
+   rest; a quiet wash on hover; the expanded row gets a hairline frame so the
+   log body reads as belonging to it. */
 .run-row {
-  border: 1px solid var(--border-hairline);
-  border-radius: var(--radius-cards);
-  background: rgba(255, 255, 255, 0.015);
+  border: 1px solid transparent;
+  border-radius: var(--radius-buttons);
   overflow: hidden;
+  transition:
+    background-color var(--duration-fast) var(--ease-out),
+    border-color var(--duration-fast) var(--ease-out);
 }
 
+.run-row:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.run-row[data-expanded="true"] {
+  background: rgba(255, 255, 255, 0.02);
+  border-color: var(--border-hairline);
+}
+
+.run-row[data-expanded="true"]:hover {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+/* `.run-head` is a plain <button> — base.css's reset only inherits
+   font-family/color, so without clearing the UA background/border here the
+   row renders with a gray buttonface fill (the washed-out look) and a UA
+   border ridge on hover. */
 .run-head {
   width: 100%;
   display: flex;
   align-items: center;
   gap: var(--spacing-8);
   padding: 8px var(--spacing-12);
+  background: none;
+  border: none;
+  border-radius: inherit;
   text-align: left;
+  font-size: var(--text-caption);
   color: var(--text-body);
   cursor: pointer;
 }
 
-.run-head:hover {
-  background: rgba(255, 255, 255, 0.03);
+/* Keep the focus ring inside the row's radius instead of an offset box
+   floating around it. */
+.run-head:focus-visible {
+  outline-offset: -2px;
+  border-radius: inherit;
 }
 
 .run-stage {
