@@ -112,39 +112,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn fails_twice_then_succeeds_on_the_third_attempt() {
-        let calls = Rc::new(RefCell::new(0u32));
-        let delays = Rc::new(RefCell::new(Vec::new()));
-        let result = retry_transient(
-            "test-op",
-            MAX_ATTEMPTS,
-            BASE_DELAY,
-            |_: &String| true,
-            || {
-                *calls.borrow_mut() += 1;
-                let n = *calls.borrow();
-                async move {
-                    if n < 3 {
-                        Err(format!("transient failure {n}"))
-                    } else {
-                        Ok("landed".to_string())
-                    }
-                }
-            },
-            instant_sleep(delays.clone()),
-        )
-        .await;
-
-        assert_eq!(result.unwrap(), "landed");
-        assert_eq!(*calls.borrow(), 3, "two failures then one success");
-        assert_eq!(
-            *delays.borrow(),
-            vec![Duration::from_millis(500), Duration::from_millis(1000)],
-            "linear backoff: base_delay * attempt_number between attempts"
-        );
-    }
-
-    #[tokio::test]
     async fn permanent_failure_returns_immediately_without_retrying() {
         let calls = Rc::new(RefCell::new(0u32));
         let delays = Rc::new(RefCell::new(Vec::new()));

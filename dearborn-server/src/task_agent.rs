@@ -835,9 +835,7 @@ impl AgentStageOutcome {
         match event {
             RunEvent::Text { delta, .. } => self.text.push_str(delta),
             RunEvent::Session {
-                session_id,
-                model,
-                ..
+                session_id, model, ..
             } => {
                 if let Some(id) = session_id {
                     self.session_id = Some(id.clone());
