@@ -1022,7 +1022,10 @@ pub async fn fetch_task(conn: &Connection, id: &str) -> AppResult<Option<Task>> 
 /// with a clear `400` instead of a misleading `404`. Also used by the MCP
 /// breakdown tools to give the agent a *self-correctable* rejection: "no such
 /// task" vs "belongs to another epic".
-pub(crate) async fn task_epic(conn: &Connection, task_id: &str) -> AppResult<Option<Option<String>>> {
+pub(crate) async fn task_epic(
+    conn: &Connection,
+    task_id: &str,
+) -> AppResult<Option<Option<String>>> {
     let mut rows = conn
         .query("SELECT epic_id FROM task WHERE id = ?1", params![task_id])
         .await?;

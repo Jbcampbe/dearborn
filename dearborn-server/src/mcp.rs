@@ -608,10 +608,7 @@ async fn epic_task_ids_hint(state: &AppState, epic_id: &str) -> String {
             } else {
                 String::new()
             };
-            format!(
-                "Tasks in this epic{truncated}: {}.",
-                ids.join(", ")
-            )
+            format!("Tasks in this epic{truncated}: {}.", ids.join(", "))
         }
         Err(_) => "Use the exact task ids returned by create_task.".to_string(),
     }
@@ -1542,7 +1539,10 @@ mod tests {
         )
         .await;
         let text = body["result"]["content"][0]["text"].as_str().unwrap();
-        assert!(text.contains("No tasks exist in this epic yet"), "got: {text}");
+        assert!(
+            text.contains("No tasks exist in this epic yet"),
+            "got: {text}"
+        );
     }
 
     #[tokio::test]

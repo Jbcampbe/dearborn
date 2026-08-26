@@ -297,9 +297,7 @@ impl BreakdownOutcome {
                 ..
             } => self.session_id = Some(id.clone()),
             RunEvent::ToolStart {
-                tool_call_id,
-                name,
-                ..
+                tool_call_id, name, ..
             } => {
                 self.pending_tools
                     .insert(tool_call_id.clone(), name.clone());
@@ -427,13 +425,12 @@ pub fn spawn_breakdown(state: AppState, epic_id: String, guard: InflightGuard) {
             // Snapshot the epic's pre-existing task ids so a failed run can
             // roll back exactly what IT created (see below) without touching
             // tasks from earlier runs or manual edits.
-            let pre_existing: HashSet<String> =
-                crate::tasks::list_tasks_for_epic(conn, &epic_id)
-                    .await
-                    .unwrap_or_default()
-                    .into_iter()
-                    .map(|t| t.id)
-                    .collect();
+            let pre_existing: HashSet<String> = crate::tasks::list_tasks_for_epic(conn, &epic_id)
+                .await
+                .unwrap_or_default()
+                .into_iter()
+                .map(|t| t.id)
+                .collect();
 
             let rx = state.breakdown.run(req);
             let hub = state.hub.clone();
@@ -1046,12 +1043,18 @@ mod tests {
                 assert!(log.contains("database is locked"));
                 break;
             }
-            assert!(tokio::time::Instant::now() < deadline, "agent_run never landed");
+            assert!(
+                tokio::time::Instant::now() < deadline,
+                "agent_run never landed"
+            );
             tokio::time::sleep(Duration::from_millis(10)).await;
         }
 
         // The epic never left Planning — breakdown is simply re-runnable.
-        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        let epic = fetch_epic(state.db.conn(), &epic_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(epic.status, "Planning");
     }
 
@@ -1085,9 +1088,8 @@ mod tests {
             .await
             .unwrap();
 
-        let pre_existing: HashSet<String> = [old_a.id.clone(), old_b.id.clone()]
-            .into_iter()
-            .collect();
+        let pre_existing: HashSet<String> =
+            [old_a.id.clone(), old_b.id.clone()].into_iter().collect();
         rollback_partial_dag(conn, &epic_id, &pre_existing).await;
 
         let remaining = crate::tasks::list_tasks_for_epic(conn, &epic_id)
