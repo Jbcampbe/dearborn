@@ -263,6 +263,9 @@ onMounted(load);
           <StatusIcon :status="run.status" :size="12" />
           <span class="run-stage">{{ stageLabel(run.stage) }}</span>
           <span class="run-attempt">{{ attemptLabel(run) }}</span>
+          <span v-if="run.actual_model" class="badge model" :title="`Model used: ${run.actual_model}`">
+            {{ run.actual_model }}
+          </span>
           <span
             v-if="run.verdict"
             class="badge"
@@ -409,6 +412,14 @@ onMounted(load);
 .run-attempt {
   font-size: var(--text-label);
   color: var(--text-muted);
+}
+
+/* The harness-reported actual model badge — muted mono so it reads as data,
+   not a status; hosted on the existing `.badge` token for tone/pad. It sits
+   right after the attempt label, before the spacer. */
+.badge.model {
+  font-family: var(--font-mono);
+  font-size: 10px;
 }
 
 .run-spacer {

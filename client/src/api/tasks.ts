@@ -195,6 +195,10 @@ export interface AgentRunSummary {
   status: string; // running | ok | error | timeout | cancelled
   verdict: string | null; // PASS | NEEDS_CHANGES | BLOCKED
   session_id: string | null;
+  /** The model the harness actually used (server's `agent_run.actual_model`),
+   *  reported by the harness's own session init — `null` when it never
+   *  reported one or the run predates the column. */
+  actual_model: string | null;
   started_at: number | null;
   ended_at: number | null;
   exit_code: number | null;

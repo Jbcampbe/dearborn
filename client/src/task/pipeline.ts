@@ -505,6 +505,7 @@ function applyStageChanged(state: PipelineState, p: StageChangedPayload): void {
       status: p.status,
       verdict: p.verdict ?? null,
       session_id: null,
+      actual_model: null,
       started_at: null,
       ended_at: now,
       exit_code: null,

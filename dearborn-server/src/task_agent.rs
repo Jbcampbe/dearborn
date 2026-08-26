@@ -762,6 +762,14 @@ pub struct AgentStageOutcome {
     pub text: String,
     /// The harness session id, if the CLI reported one.
     pub session_id: Option<String>,
+    /// The model the harness **actually** used, as reported by its own session
+    /// init (pi: `message_start`'s `provider/model`; Claude: `system/init`'s
+    /// `model`). This is the "what truly happened" model — distinct from the
+    /// configured T8 `model` that was passed to the CLI, which may differ when
+    /// no model was configured (CLI default) or the harness resolved an alias.
+    /// Captured in [`Self::absorb`] from `RunEvent::Session`; `None` when the
+    /// harness never reported one (e.g. a run that failed to emit a session).
+    pub model: Option<String>,
     pub exit_code: Option<i32>,
     pub cancelled: bool,
     /// T-543: `true` when this stage's `cancelled` came from
@@ -827,9 +835,19 @@ impl AgentStageOutcome {
         match event {
             RunEvent::Text { delta, .. } => self.text.push_str(delta),
             RunEvent::Session {
-                session_id: Some(id),
+                session_id,
+                model,
                 ..
-            } => self.session_id = Some(id.clone()),
+            } => {
+                if let Some(id) = session_id {
+                    self.session_id = Some(id.clone());
+                }
+                // The actual model (see the field's doc). Independent of
+                // session_id — either may be present or absent.
+                if let Some(m) = model {
+                    self.model = Some(m.clone());
+                }
+            }
             RunEvent::Error { message, .. } => {
                 self.errored = true;
                 // The log trail keeps every error verbatim (the row's `log`
@@ -1270,6 +1288,16 @@ pub async fn run_agent_stage(
     )
     .await
     .map_err(AgentStageError::Db)?;
+
+    // Persist the harness-reported actual model as a best-effort post-close
+    // write, mirroring `set_verdict`: the value only arrives from the drained
+    // `RunEvent::Session`, so it can't ride through `CloseStage` (which the
+    // drain-failure paths construct before any session exists) — the row is
+    // closed first, then this stamped. A failure here must never fail the
+    // stage; the configured T8 `model` column still records intent.
+    if let Some(actual_model) = outcome.model.as_deref() {
+        let _ = evidence::set_actual_model(conn, &stage_row.id, actual_model).await;
+    }
 
     Ok(outcome)
 }
@@ -2229,7 +2257,7 @@ mod tests {
             .db
             .conn()
             .query(
-                "SELECT harness, model, prompt_hash FROM agent_run \
+                "SELECT harness, model, prompt_hash, actual_model FROM agent_run \
                  WHERE task_id = 'task-1' AND stage = 'review'",
                 (),
             )
@@ -2244,6 +2272,13 @@ mod tests {
         assert_eq!(
             row.get::<Option<String>>(2).unwrap().as_deref(),
             Some(crate::agent_settings::prompt_hash("review prompt").as_str())
+        );
+        // The scripted session reports the harness's actual model, which must
+        // be stamped onto the closed row separately from the configured T8
+        // `model` (test-model above).
+        assert_eq!(
+            row.get::<Option<String>>(3).unwrap().as_deref(),
+            Some("scripted-model")
         );
         std::fs::remove_dir_all(&dir).ok();
     }
