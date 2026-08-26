@@ -70,7 +70,9 @@ pub fn rate_for(model: &str) -> Option<(f64, f64)> {
     let m = normalize_model(model);
     // Claude families: date-suffixed ids (`claude-sonnet-4-20250514`) share the
     // rate of their base model, hence prefix guards rather than exact matches.
-    if m.starts_with("claude-opus-3") || m.starts_with("claude-opus-4") || m.starts_with("claude-opus-5")
+    if m.starts_with("claude-opus-3")
+        || m.starts_with("claude-opus-4")
+        || m.starts_with("claude-opus-5")
     {
         return Some((15.0, 75.0));
     }
@@ -332,10 +334,7 @@ mod tests {
     use crate::planning::testing::SilentPlanningAgent;
     use crate::{app, Config, Db};
     use axum::body::Body;
-    use axum::http::{
-        header::AUTHORIZATION,
-        Request, StatusCode,
-    };
+    use axum::http::{header::AUTHORIZATION, Request, StatusCode};
     use serde_json::{json, Value as Json};
     use tower::ServiceExt;
 
@@ -361,7 +360,10 @@ mod tests {
 
     #[test]
     fn date_suffixed_claude_ids_share_their_base_models_rate() {
-        assert_eq!(rate_for("claude-sonnet-4-20250514"), rate_for("claude-sonnet-4"));
+        assert_eq!(
+            rate_for("claude-sonnet-4-20250514"),
+            rate_for("claude-sonnet-4")
+        );
         assert_eq!(
             rate_for("anthropic/claude-3-5-haiku-20241022"),
             rate_for("claude-3-5-haiku")
@@ -424,9 +426,13 @@ mod tests {
                     let db = crate::Db::connect(":memory:").await.unwrap();
                     db.run_migrations().await.unwrap();
                     let state = crate::AppState::new(crate::Config::for_test(), db);
-                    let user =
-                        crate::users::testing::seed_user(&state, "tester", crate::users::Role::Admin, true)
-                            .await;
+                    let user = crate::users::testing::seed_user(
+                        &state,
+                        "tester",
+                        crate::users::Role::Admin,
+                        true,
+                    )
+                    .await;
                     crate::sessions::testing::login_as(&state, &user).await
                 });
                 tx.send(token).expect("bearer receiver dropped");
@@ -457,10 +463,7 @@ mod tests {
     }
 
     /// Seed project → epic → task rows and return the ids.
-    async fn seed_project_epic_task(
-        state: &AppState,
-        project_id: &str,
-    ) -> (String, String) {
+    async fn seed_project_epic_task(state: &AppState, project_id: &str) -> (String, String) {
         let conn = state.db.conn();
         let epic_id = ulid::Ulid::new().to_string();
         let task_id = ulid::Ulid::new().to_string();
@@ -522,15 +525,19 @@ mod tests {
         match ended_at_ms {
             None => {} // left `running` on purpose
             Some(ms) => {
-                close_stage(conn, &handle, CloseStage {
-                    status,
-                    session_id: None,
-                    verdict: None,
-                    exit_code: Some(0),
-                    log: String::new(),
-                    input_tokens,
-                    output_tokens,
-                })
+                close_stage(
+                    conn,
+                    &handle,
+                    CloseStage {
+                        status,
+                        session_id: None,
+                        verdict: None,
+                        exit_code: Some(0),
+                        log: String::new(),
+                        input_tokens,
+                        output_tokens,
+                    },
+                )
                 .await
                 .unwrap();
                 // Stamp the deterministic ended_at after the fact so day
@@ -556,19 +563,91 @@ mod tests {
         let (epic_id, task_id) = seed_project_epic_task(&state, &project_id).await;
 
         // Contributes: implement @ claude-sonnet-5 on day A.
-        seed_run(&state, &epic_id, &task_id, "implement", Some(DAY_A_MS), "ok", Some(1_000_000), Some(500_000), Some("pi"), Some("anthropic/claude-sonnet-5")).await;
+        seed_run(
+            &state,
+            &epic_id,
+            &task_id,
+            "implement",
+            Some(DAY_A_MS),
+            "ok",
+            Some(1_000_000),
+            Some(500_000),
+            Some("pi"),
+            Some("anthropic/claude-sonnet-5"),
+        )
+        .await;
         // Contributes: review @ claude-sonnet-5 also on day A (same bucket).
-        seed_run(&state, &epic_id, &task_id, "review", Some(DAY_A_MS + 60_000), "ok", Some(300_000), Some(100_000), Some("pi"), Some("claude-sonnet-5")).await;
+        seed_run(
+            &state,
+            &epic_id,
+            &task_id,
+            "review",
+            Some(DAY_A_MS + 60_000),
+            "ok",
+            Some(300_000),
+            Some(100_000),
+            Some("pi"),
+            Some("claude-sonnet-5"),
+        )
+        .await;
         // Contributes: fix @ deepseek-r1 on day B.
-        seed_run(&state, &epic_id, &task_id, "fix", Some(DAY_B_MS), "ok", Some(2_000_000), Some(1_000_000), Some("pi"), Some("openrouter/deepseek/deepseek-r1")).await;
+        seed_run(
+            &state,
+            &epic_id,
+            &task_id,
+            "fix",
+            Some(DAY_B_MS),
+            "ok",
+            Some(2_000_000),
+            Some(1_000_000),
+            Some("pi"),
+            Some("openrouter/deepseek/deepseek-r1"),
+        )
+        .await;
         // Excluded: still running.
-        seed_run(&state, &epic_id, &task_id, "implement", None, "ok", Some(999_999), Some(999_999), Some("pi"), Some("claude-sonnet-5")).await;
+        seed_run(
+            &state,
+            &epic_id,
+            &task_id,
+            "implement",
+            None,
+            "ok",
+            Some(999_999),
+            Some(999_999),
+            Some("pi"),
+            Some("claude-sonnet-5"),
+        )
+        .await;
         // Excluded: closed unsuccessfully (error status, tokens stamped anyway).
-        seed_run(&state, &epic_id, &task_id, "implement", Some(DAY_A_MS), "error", Some(888_888), Some(888_888), Some("pi"), Some("claude-sonnet-5")).await;
+        seed_run(
+            &state,
+            &epic_id,
+            &task_id,
+            "implement",
+            Some(DAY_A_MS),
+            "error",
+            Some(888_888),
+            Some(888_888),
+            Some("pi"),
+            Some("claude-sonnet-5"),
+        )
+        .await;
         // Excluded: belongs to another project.
         let other = ulid::Ulid::new().to_string();
         let (other_epic, other_task) = seed_project_epic_task(&state, &other).await;
-        seed_run(&state, &other_epic, &other_task, "implement", Some(DAY_A_MS), "ok", Some(777_777), Some(777_777), Some("pi"), Some("claude-sonnet-5")).await;
+        seed_run(
+            &state,
+            &other_epic,
+            &other_task,
+            "implement",
+            Some(DAY_A_MS),
+            "ok",
+            Some(777_777),
+            Some(777_777),
+            Some("pi"),
+            Some("claude-sonnet-5"),
+        )
+        .await;
 
         let response = app
             .oneshot(get(&format!("/projects/{project_id}/cost")))
@@ -635,9 +714,33 @@ mod tests {
         let (epic_id, task_id) = seed_project_epic_task(&state, &project_id).await;
 
         // Unknown model with real tokens → null estimates, tokens intact.
-        seed_run(&state, &epic_id, &task_id, "implement", Some(DAY_A_MS), "ok", Some(50_000), Some(20_000), Some("pi"), Some("mystery-model-v99")).await;
+        seed_run(
+            &state,
+            &epic_id,
+            &task_id,
+            "implement",
+            Some(DAY_A_MS),
+            "ok",
+            Some(50_000),
+            Some(20_000),
+            Some("pi"),
+            Some("mystery-model-v99"),
+        )
+        .await;
         // NULL model entirely (pre-column row shape).
-        seed_run(&state, &epic_id, &task_id, "review", Some(DAY_B_MS), "ok", Some(10_000), Some(5_000), None, None).await;
+        seed_run(
+            &state,
+            &epic_id,
+            &task_id,
+            "review",
+            Some(DAY_B_MS),
+            "ok",
+            Some(10_000),
+            Some(5_000),
+            None,
+            None,
+        )
+        .await;
 
         let response = app
             .oneshot(get(&format!("/projects/{project_id}/cost")))
@@ -648,7 +751,8 @@ mod tests {
         for section in ["by_slot", "by_harness_model", "by_day"] {
             for row in cost[section].as_array().unwrap() {
                 assert_eq!(
-                    row["estimated_input_usd"], Json::Null,
+                    row["estimated_input_usd"],
+                    Json::Null,
                     "{section} row must have null estimates: {row}"
                 );
                 assert_eq!(row["estimated_output_usd"], Json::Null);
