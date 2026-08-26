@@ -12,12 +12,15 @@ import ProjectSettingsPanel from "./ProjectSettingsPanel.vue";
 import StatusIcon from "./StatusIcon.vue";
 import AppIcon from "./AppIcon.vue";
 
-// Project detail shell (T-104). Shows the project's identity + clone lifecycle,
-// the project's epics, and a single "+ New" menu with the two creation entry
-// points: **Epic** (T-204, creates an epic and drops the user into the
-// planning chat) and **Task** (a standalone to-do, created through the board's
-// TaskModal). "Re-clone" triggers a background `git fetch`; because the clone
-// settles asynchronously, the user reloads to watch pending → ready/error.
+// Project detail shell (T-104). Mirrors the epic-level tab layout:
+// **Overview** (default; identity + clone lifecycle, project metadata, and the
+// epic list — read-only, no create actions), **Board** (the kanban board plus
+// the single "+ New" menu with the two creation entry points: **Epic**
+// (T-204, creates an epic and drops the user into the planning chat) and
+// **Task** (a standalone to-do, created through the board's TaskModal)), and
+// **Agent settings**. "Re-clone" triggers a background `git fetch`; because
+// the clone settles asynchronously, the user reloads to watch pending →
+// ready/error.
 const props = defineProps<{ id: string }>();
 
 const auth = useAuthStore();
@@ -28,8 +31,9 @@ const error = ref<string | null>(null);
 const refreshing = ref(false);
 const epicModalOpen = ref(false);
 
-/** Which detail section is shown: the overview (default) or agent settings. */
-const tab = ref<"overview" | "settings">("overview");
+/** Which detail section is shown: the overview (default), the kanban board,
+ * or agent settings. */
+const tab = ref<"overview" | "board" | "settings">("overview");
 
 /** The board's exposed create-task opener (its TaskModal serves create + edit). */
 const kanban = ref<{ openCreateTask: () => void } | null>(null);
@@ -159,6 +163,13 @@ watch(
       </button>
       <button
         class="tab"
+        :class="{ active: tab === 'board' }"
+        @click="tab = 'board'"
+      >
+        Board
+      </button>
+      <button
+        class="tab"
         :class="{ active: tab === 'settings' }"
         @click="tab = 'settings'"
       >
@@ -167,18 +178,19 @@ watch(
       </button>
     </nav>
 
-    <div v-if="loading && tab === 'overview'" class="loading-stack" aria-label="Loading project">
+    <!-- The overview and board tabs both render from `project`, so their
+         loading/error states are shared; agent settings loads its own data. -->
+    <div v-if="loading && tab !== 'settings'" class="loading-stack" aria-label="Loading project">
       <div class="skeleton sk-title" />
       <div class="skeleton sk-block" />
       <div class="skeleton sk-block" />
     </div>
-    <p v-else-if="error && tab === 'overview'" class="banner banner-error" role="alert">{{ error }}</p>
+    <p v-else-if="error && tab !== 'settings'" class="banner banner-error" role="alert">{{ error }}</p>
 
     <template v-else-if="project">
-      <template v-if="tab === 'settings'">
-        <ProjectSettingsPanel :project-id="project.id" :key="project.id" />
-      </template>
-      <template v-else>
+      <!-- Overview tab (default): metadata → (cost-graph slot) → epic list.
+           Read-only by design — creation lives on the Board tab. ---------- -->
+      <template v-if="tab === 'overview'">
       <header class="head fade-in">
         <div class="head-main">
           <h1 class="page-title">{{ project.name }}</h1>
@@ -192,28 +204,6 @@ watch(
             <AppIcon name="refresh" :size="13" />
             {{ refreshing ? "Re-cloning…" : "Re-clone" }}
           </button>
-          <div ref="newMenuEl" class="new-menu">
-            <button
-              class="btn btn-primary"
-              aria-haspopup="menu"
-              :aria-expanded="newMenuOpen"
-              @click="toggleNewMenu"
-            >
-              <AppIcon name="plus" :size="13" />
-              New
-              <AppIcon name="chevron-down" :size="12" />
-            </button>
-            <div v-if="newMenuOpen" class="new-menu-pop" role="menu">
-              <button class="new-menu-item" role="menuitem" @click="chooseNewEpic">
-                <span class="new-menu-title">Epic</span>
-                <span class="new-menu-desc">Plan and break down a larger body of work</span>
-              </button>
-              <button class="new-menu-item" role="menuitem" @click="chooseNewTask">
-                <span class="new-menu-title">Task</span>
-                <span class="new-menu-desc">Small standalone to-do, straight to the board</span>
-              </button>
-            </div>
-          </div>
         </div>
       </header>
 
@@ -244,6 +234,11 @@ watch(
         </div>
       </section>
 
+      <!-- Slot for the cost graphs component (agent/harness/model usage
+           charts); it renders here, between the meta card and the epics.
+           Owned by a later task — not wired up yet. ----------------------- -->
+      <!-- <ProjectCostGraphs :project-id="project.id" /> -->
+
       <section class="epics">
         <div class="section-head">
           <h2>Epics</h2>
@@ -268,8 +263,42 @@ watch(
           </li>
         </ul>
       </section>
+      </template>
 
-      <ProjectKanbanView :id="project.id" ref="kanban" />
+      <!-- Board tab: the kanban board plus the "+ New" menu (Epic | Task).
+           The kanban is always mounted when this tab is active, so its
+           exposed `openCreateTask` is reachable from the menu. ----------- -->
+      <template v-else-if="tab === 'board'">
+        <div class="board-head fade-in">
+          <div ref="newMenuEl" class="new-menu">
+            <button
+              class="btn btn-primary"
+              aria-haspopup="menu"
+              :aria-expanded="newMenuOpen"
+              @click="toggleNewMenu"
+            >
+              <AppIcon name="plus" :size="13" />
+              New
+              <AppIcon name="chevron-down" :size="12" />
+            </button>
+            <div v-if="newMenuOpen" class="new-menu-pop" role="menu">
+              <button class="new-menu-item" role="menuitem" @click="chooseNewEpic">
+                <span class="new-menu-title">Epic</span>
+                <span class="new-menu-desc">Plan and break down a larger body of work</span>
+              </button>
+              <button class="new-menu-item" role="menuitem" @click="chooseNewTask">
+                <span class="new-menu-title">Task</span>
+                <span class="new-menu-desc">Small standalone to-do, straight to the board</span>
+              </button>
+            </div>
+          </div>
+        </div>
+
+        <ProjectKanbanView :id="project.id" ref="kanban" />
+      </template>
+
+      <template v-else>
+        <ProjectSettingsPanel :project-id="project.id" :key="project.id" />
       </template>
 
       <CreateEpicModal
@@ -350,6 +379,12 @@ watch(
   align-items: center;
   gap: var(--spacing-8);
   flex-shrink: 0;
+}
+
+.board-head {
+  display: flex;
+  justify-content: flex-end;
+  margin-bottom: var(--spacing-16);
 }
 
 .new-menu {
