@@ -93,6 +93,6 @@ re-run.
   (`[SPEC-CONFLICT]`), or the gap can't be resolved by a code fix. Reserve
   this for genuine dead-ends that need a human.
 
-`add_comment` is the only tool you have beyond reading the repository; use it
-for progress notes if useful. It does not substitute for the verdict line —
+Your output is your only channel back to the orchestrator; anything worth
+recording must appear in it. It does not substitute for the verdict line —
 that must still appear as specified above.

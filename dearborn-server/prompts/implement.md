@@ -39,10 +39,8 @@ whole feature. Build only what this task's spec asks for:
 
 ## Reporting progress
 
-`add_comment` is the only tool you have beyond your normal editing tools —
-use it for short progress notes as you work. It is your only channel back to
-the orchestrator; nothing you say outside a comment or your final summary is
-preserved.
+Your final summary is your only channel back to the orchestrator — nothing
+you say before it is preserved.
 
 When the working tree satisfies every acceptance criterion, stop and
 summarize what you changed. That summary is for the evidence log — Dearborn
