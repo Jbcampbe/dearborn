@@ -172,6 +172,182 @@ pub struct OpenedPr {
     pub number: i64,
 }
 
+/// [`GitHost::get_pull`]'s arguments.
+pub struct GetPullRequest<'a> {
+    pub repo_url: &'a str,
+    pub pat: Option<&'a str>,
+    pub number: i64,
+}
+
+/// [`GitHost::list_reviews`]'s arguments.
+pub struct ListReviewsRequest<'a> {
+    pub repo_url: &'a str,
+    pub pat: Option<&'a str>,
+    pub number: i64,
+}
+
+/// [`GitHost::list_review_comments`]'s arguments.
+pub struct ListReviewCommentsRequest<'a> {
+    pub repo_url: &'a str,
+    pub pat: Option<&'a str>,
+    pub number: i64,
+}
+
+/// [`GitHost::list_issue_comments`]'s arguments.
+pub struct ListIssueCommentsRequest<'a> {
+    pub repo_url: &'a str,
+    pub pat: Option<&'a str>,
+    pub number: i64,
+}
+
+/// [`GitHost::post_issue_comment`]'s arguments.
+pub struct PostIssueCommentRequest<'a> {
+    pub repo_url: &'a str,
+    pub pat: Option<&'a str>,
+    pub number: i64,
+    pub body: &'a str,
+}
+
+/// [`GitHost::reply_review_comment`]'s arguments.
+pub struct ReplyReviewCommentRequest<'a> {
+    pub repo_url: &'a str,
+    pub pat: Option<&'a str>,
+    pub number: i64,
+    /// The diff (review) comment id this reply is answering — GitHub REST
+    /// `POST .../pulls/{n}/comments`'s `in_reply_to` field.
+    pub in_reply_to_id: i64,
+    pub body: &'a str,
+}
+
+/// [`GitHost::list_review_threads`]'s arguments.
+pub struct ListReviewThreadsRequest<'a> {
+    pub repo_url: &'a str,
+    pub pat: Option<&'a str>,
+    pub number: i64,
+}
+
+/// [`GitHost::resolve_thread`]'s arguments.
+pub struct ResolveThreadRequest<'a> {
+    pub repo_url: &'a str,
+    pub pat: Option<&'a str>,
+    pub thread_id: &'a str,
+}
+
+/// Current state of a pull request, as the poller needs it for merge/close
+/// detection (see the epic plan §7) — `GET .../pulls/{n}`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PullState {
+    /// `true` iff the PR was merged. (Dearborn never merges; this is the
+    /// signal that the human did.)
+    pub merged: bool,
+    /// GitHub's raw PR lifecycle state: `"open"` or `"closed"`.
+    pub state: String,
+    /// The SHA at the head of the PR's branch — the post-work address the
+    /// poller uses to compute "Addressed in <commit>" replies. Sourced from
+    /// the `head.sha` field GitHub returns nested under `head`.
+    pub head_sha: String,
+}
+
+/// Serializes `PullState` to the same exact GitHub `GET .../pulls/{n}` shape
+/// its hand-written Deserialize reads: `head_sha` is emitted as the nested
+/// `head.sha` object (`{ merged, state, head: { sha } }`), so a struct always
+/// round-trips `true` ⇄ `true` through JSON.
+impl serde::Serialize for PullState {
+    fn serialize<S>(&self, s: S) -> Result<S::Ok, S::Error>
+    where
+        S: serde::Serializer,
+    {
+        use serde::ser::SerializeStruct;
+        let mut st = s.serialize_struct("PullState", 3)?;
+        st.serialize_field("merged", &self.merged)?;
+        st.serialize_field("state", &self.state)?;
+        st.serialize_field("head", &PullStateHead { sha: &self.head_sha })?;
+        st.end()
+    }
+}
+
+/// `PullState` is deserialized from GitHub's `GET .../pulls/{n}` shape, where
+/// the head SHA sits under a nested `head` object (`{ merged, state, head:
+/// { sha } }`). Implemented by hand (rather than derived) so `head_sha` maps
+/// to `head.sha`.
+impl<'de> serde::Deserialize<'de> for PullState {
+    fn deserialize<D>(d: D) -> Result<Self, D::Error>
+    where
+        D: serde::Deserializer<'de>,
+    {
+        #[derive(serde::Deserialize)]
+        struct Head {
+            sha: String,
+        }
+        #[derive(serde::Deserialize)]
+        struct Raw {
+            merged: bool,
+            state: String,
+            head: Head,
+        }
+        let raw = Raw::deserialize(d)?;
+        Ok(PullState {
+            merged: raw.merged,
+            state: raw.state,
+            head_sha: raw.head.sha,
+        })
+    }
+}
+
+#[derive(serde::Serialize)]
+struct PullStateHead<'a> {
+    sha: &'a str,
+}
+
+/// A formal PR review — `GET .../pulls/{n}/reviews`. `state` is GitHub's
+/// raw review classification (`APPROVED` / `CHANGES_REQUESTED` /
+/// `COMMENTED`); author identity is deliberately not captured here (the
+/// plan tracks identity in the DB instead — Decision 1).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct Review {
+    pub id: i64,
+    pub state: String,
+    pub body: String,
+    pub submitted_at: Option<String>,
+}
+
+/// A review (diff-line) comment — `GET .../pulls/{n}/comments`. These are the
+/// inline comments the poller replies-to-and-resolves for `dearborn:`-handled
+/// feedback. Field names match GitHub REST verbatim (snake_case).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct InlineComment {
+    pub id: i64,
+    pub body: String,
+    #[serde(rename = "in_reply_to_id")]
+    pub in_reply_to: Option<i64>,
+    #[serde(rename = "pull_request_review_id")]
+    pub pull_request_review_id: Option<i64>,
+    pub path: Option<String>,
+    pub line: Option<i64>,
+}
+
+/// A top-level (non-diff) PR comment — `GET .../issues/{n}/comments`. These
+/// have no resolvable thread, so the poller tracks their handled-state in the
+/// DB and replies via [`GitHost::post_issue_comment`].
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+pub struct IssueComment {
+    pub id: i64,
+    pub body: String,
+}
+
+/// A GraphQL review thread on a PR — `pullRequest.reviewThreads`. Inline
+/// feedback lives in threads; the poller replies in-thread and resolves the
+/// thread. `root_comment_id` is the id of the thread's foundational comment,
+/// used to correlate a [`InlineComment`] id with its thread (REST comments
+/// carry no thread id, so the join runs through the root comment).
+#[derive(Debug, Clone, PartialEq, Eq, serde::Deserialize, serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+pub struct Thread {
+    pub id: String,
+    pub is_resolved: bool,
+    pub root_comment_id: Option<String>,
+}
+
 /// The git-hosting seam (T-514, D15). See the module doc for the full
 /// rationale. Every method is network I/O (or, for [`GitHost::push`], a
 /// git-over-HTTPS shell-out) — none of it belongs on the hermetic-by-default
@@ -200,6 +376,59 @@ pub trait GitHost: Send + Sync {
     fn check_auth<'a>(
         &'a self,
         req: CheckAuthRequest<'a>,
+    ) -> BoxFuture<'a, Result<(), GitHostError>>;
+
+    /// Fetch a pull request's current lifecycle state (merged? open/closed?
+    /// head sha) — the poller's merge/close-detection read (plan §2).
+    fn get_pull<'a>(
+        &'a self,
+        req: GetPullRequest<'a>,
+    ) -> BoxFuture<'a, Result<PullState, GitHostError>>;
+
+    /// List the PR's formal reviews — `GET .../pulls/{n}/reviews`.
+    fn list_reviews<'a>(
+        &'a self,
+        req: ListReviewsRequest<'a>,
+    ) -> BoxFuture<'a, Result<Vec<Review>, GitHostError>>;
+
+    /// List the PR's diff-line (review) comments — `GET .../pulls/{n}/comments`.
+    fn list_review_comments<'a>(
+        &'a self,
+        req: ListReviewCommentsRequest<'a>,
+    ) -> BoxFuture<'a, Result<Vec<InlineComment>, GitHostError>>;
+
+    /// List the PR's top-level (issue) comments — `GET .../issues/{n}/comments`.
+    fn list_issue_comments<'a>(
+        &'a self,
+        req: ListIssueCommentsRequest<'a>,
+    ) -> BoxFuture<'a, Result<Vec<IssueComment>, GitHostError>>;
+
+    /// Post a top-level PR comment — `POST .../issues/{n}/comments`. Returns
+    /// the id GitHub assigned (the poller records it as `our_post` so it is
+    /// never reprocessed).
+    fn post_issue_comment<'a>(
+        &'a self,
+        req: PostIssueCommentRequest<'a>,
+    ) -> BoxFuture<'a, Result<i64, GitHostError>>;
+
+    /// Reply to a diff review comment (creating an inline thread reply) —
+    /// `POST .../pulls/{n}/comments` with `in_reply_to`. Returns the created
+    /// comment's id.
+    fn reply_review_comment<'a>(
+        &'a self,
+        req: ReplyReviewCommentRequest<'a>,
+    ) -> BoxFuture<'a, Result<i64, GitHostError>>;
+
+    /// List the PR's review threads (GraphQL `pullRequest.reviewThreads`).
+    fn list_review_threads<'a>(
+        &'a self,
+        req: ListReviewThreadsRequest<'a>,
+    ) -> BoxFuture<'a, Result<Vec<Thread>, GitHostError>>;
+
+    /// Resolve a review thread (GraphQL `resolveReviewThread` mutation).
+    fn resolve_thread<'a>(
+        &'a self,
+        req: ResolveThreadRequest<'a>,
     ) -> BoxFuture<'a, Result<(), GitHostError>>;
 }
 
@@ -254,10 +483,98 @@ fn repo_info_url(owner: &str, repo: &str) -> String {
     format!("{GITHUB_API_BASE}/repos/{owner}/{repo}")
 }
 
+/// `GET` target for a single pull request — merge/close detection. The base
+/// is a parameter so endpoint shape is unit-tested without I/O.
+fn pull_url_at(base: &str, owner: &str, repo: &str, number: i64) -> String {
+    format!("{base}/repos/{owner}/{repo}/pulls/{number}")
+}
+
+/// `GET` target for a PR's formal reviews.
+fn reviews_url_at(base: &str, owner: &str, repo: &str, number: i64) -> String {
+    format!("{base}/repos/{owner}/{repo}/pulls/{number}/reviews")
+}
+
+/// `GET`/`POST` target for a PR's diff (review) comments — listing and
+/// replying in an inline thread share this one endpoint.
+fn review_comments_url_at(base: &str, owner: &str, repo: &str, number: i64) -> String {
+    format!("{base}/repos/{owner}/{repo}/pulls/{number}/comments")
+}
+
+/// `GET`/`POST` target for a PR's top-level (issue) comments.
+fn issue_comments_url_at(base: &str, owner: &str, repo: &str, number: i64) -> String {
+    format!("{base}/repos/{owner}/{repo}/issues/{number}/comments")
+}
+
 /// The JSON body `POST .../pulls` expects. A pure function so the exact
 /// shape sent to GitHub is unit-tested without a network call.
 fn build_open_pr_json(title: &str, head: &str, base: &str, body: &str) -> serde_json::Value {
     serde_json::json!({ "title": title, "head": head, "base": base, "body": body })
+}
+
+/// The JSON body `POST .../pulls/{n}/comments` expects for an inline thread
+/// reply — `in_reply_to` is the diff-comment id being answered.
+fn build_reply_review_comment_json(in_reply_to_id: i64, body: &str) -> serde_json::Value {
+    serde_json::json!({ "in_reply_to": in_reply_to_id, "body": body })
+}
+
+/// The JSON body `POST .../issues/{n}/comments` expects for a top-level
+/// comment.
+fn build_issue_comment_json(body: &str) -> serde_json::Value {
+    serde_json::json!({ "body": body })
+}
+
+const GITHUB_GRAPHQL_BASE: &str = "https://api.github.com/graphql";
+
+/// The GraphQL query string listing a PR's review threads (fetching each
+/// thread's root comment so the seam can surface `root_comment_id`).
+const REVIEW_THREADS_QUERY: &str = r#"
+query($owner: String!, $repo: String!, $number: Int!) {
+  repository(owner: $owner, name: $repo) {
+    pullRequest(number: $number) {
+      reviewThreads(first: 100) {
+        nodes {
+          id
+          isResolved
+          comments(first: 1) {
+            nodes {
+              id
+            }
+          }
+        }
+      }
+    }
+  }
+}
+"#;
+
+/// The GraphQL mutation that resolves a single review thread by its GraphQL
+/// review-thread id.
+const RESOLVE_THREAD_MUTATION: &str = r#"
+mutation($threadId: ID!) {
+  resolveReviewThread(input: { threadId: $threadId }) {
+    thread {
+      id
+    }
+  }
+}
+"#;
+
+/// The `{ query, variables }` POST body for listing a PR's review threads. A
+/// pure function so the exact GraphQL request shape is unit-tested.
+fn review_threads_query_json(owner: &str, repo: &str, number: i64) -> serde_json::Value {
+    serde_json::json!({
+        "query": REVIEW_THREADS_QUERY,
+        "variables": { "owner": owner, "repo": repo, "number": number }
+    })
+}
+
+/// The `{ query, variables }` POST body for resolving one review thread. A
+/// pure function so the exact GraphQL mutation shape is unit-tested.
+fn resolve_thread_mutation_json(thread_id: &str) -> serde_json::Value {
+    serde_json::json!({
+        "query": RESOLVE_THREAD_MUTATION,
+        "variables": { "threadId": thread_id }
+    })
 }
 
 /// Turn a non-2xx GitHub response into a readable, redacted [`GitHostError`].
@@ -318,6 +635,34 @@ impl OpenPrAttemptErr {
     /// validation error): surface it immediately.
     fn permanent(err: GitHostError) -> OpenPrAttemptErr {
         OpenPrAttemptErr {
+            retryable: false,
+            err,
+        }
+    }
+}
+
+/// One classified attempt for the shared REST/GraphQL helpers — the same
+/// shape as [`OpenPrAttemptErr`], so the new read/write methods can run
+/// through the same [`crate::retry::retry_transient`] loop (`429`/`5xx`
+/// retried, everything else immediate) while keeping the already-redacted
+/// error on the surface.
+struct RestAttemptErr {
+    retryable: bool,
+    err: GitHostError,
+}
+
+impl std::fmt::Display for RestAttemptErr {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // The inner message is already redacted — log-safe through the retry
+        // loop's `error = %err` field, matching [`RestAttemptErr`] semantics.
+        f.write_str(&self.err.message)
+    }
+}
+
+impl RestAttemptErr {
+    /// A failure no amount of retrying can fix: surface it immediately.
+    fn permanent(err: GitHostError) -> RestAttemptErr {
+        RestAttemptErr {
             retryable: false,
             err,
         }
@@ -437,6 +782,83 @@ impl GithubHost {
             .await
             .map_err(|e| OpenPrAttemptErr::permanent(redacted_reqwest_err(&e, pat)))
     }
+
+    /// One REST/GraphQL attempt: send `request` (optionally carrying a JSON
+    /// body) and classify the outcome as success or retryable/permanent
+    /// failure. Shared by every new read/write seam method; the 429/5xx-vs-
+    /// everything-else classification matches [`GithubHost::post_open_pr_once`].
+    async fn send_rest_once(
+        &self,
+        method: reqwest::Method,
+        url: &str,
+        pat: Option<&str>,
+        json_body: Option<&serde_json::Value>,
+    ) -> Result<serde_json::Value, RestAttemptErr> {
+        let mut builder = self.authed(self.client.request(method, url), pat);
+        if let Some(body) = json_body {
+            builder = builder.json(body);
+        }
+        let resp = builder
+            .send()
+            .await
+            .map_err(|e| RestAttemptErr::permanent(redacted_reqwest_err(&e, pat)))?;
+        let status = resp.status();
+        if !status.is_success() {
+            let text = resp.text().await.unwrap_or_default();
+            let retryable = status.as_u16() == 429 || status.is_server_error();
+            return Err(RestAttemptErr {
+                retryable,
+                err: map_github_error(status.as_u16(), &text, pat),
+            });
+        }
+        resp.json()
+            .await
+            .map_err(|e| RestAttemptErr::permanent(redacted_reqwest_err(&e, pat)))
+    }
+
+    /// Run one REST operation with bounded transient retry and return the
+    /// parsed JSON body. `what` names the operation in log lines; `url` is
+    /// consumed so the closure can be `FnMut` across retries.
+    async fn send_rest(
+        &self,
+        what: &str,
+        method: reqwest::Method,
+        url: String,
+        pat: Option<&str>,
+        json_body: Option<serde_json::Value>,
+    ) -> Result<serde_json::Value, GitHostError> {
+        retry_transient(
+            what,
+            MAX_ATTEMPTS,
+            BASE_DELAY,
+            |failure: &RestAttemptErr| failure.retryable,
+            || self.send_rest_once(method.clone(), &url, pat, json_body.as_ref()),
+            |delay| tokio::time::sleep(delay),
+        )
+        .await
+        .map_err(|failure| failure.err)
+    }
+
+    /// One GraphQL round-trip with the same bounded transient retry as the
+    /// REST seam. `body` is the `{ query, variables }` envelope built by the
+    /// pure [`review_threads_query_json`]/[`resolve_thread_mutation_json`].
+    async fn post_graphql(
+        &self,
+        what: &str,
+        body: serde_json::Value,
+        pat: Option<&str>,
+    ) -> Result<serde_json::Value, GitHostError> {
+        retry_transient(
+            what,
+            MAX_ATTEMPTS,
+            BASE_DELAY,
+            |failure: &RestAttemptErr| failure.retryable,
+            || self.send_rest_once(reqwest::Method::POST, GITHUB_GRAPHQL_BASE, pat, Some(&body)),
+            |delay| tokio::time::sleep(delay),
+        )
+        .await
+        .map_err(|failure| failure.err)
+    }
 }
 
 impl Default for GithubHost {
@@ -483,6 +905,200 @@ impl GitHost for GithubHost {
             Ok(())
         })
     }
+
+    fn get_pull<'a>(
+        &'a self,
+        req: GetPullRequest<'a>,
+    ) -> BoxFuture<'a, Result<PullState, GitHostError>> {
+        Box::pin(async move {
+            let (owner, repo) = parse_owner_repo(req.repo_url)?;
+            let url = pull_url_at(GITHUB_API_BASE, &owner, &repo, req.number);
+            let value = self
+                .send_rest("get_pull", reqwest::Method::GET, url, req.pat, None)
+                .await?;
+            serde_json::from_value(value).map_err(|e| {
+                GitHostError::new(format!("GitHub pull response is not a PullState: {e}"))
+            })
+        })
+    }
+
+    fn list_reviews<'a>(
+        &'a self,
+        req: ListReviewsRequest<'a>,
+    ) -> BoxFuture<'a, Result<Vec<Review>, GitHostError>> {
+        Box::pin(async move {
+            let (owner, repo) = parse_owner_repo(req.repo_url)?;
+            let url = reviews_url_at(GITHUB_API_BASE, &owner, &repo, req.number);
+            let value = self
+                .send_rest("list_reviews", reqwest::Method::GET, url, req.pat, None)
+                .await?;
+            serde_json::from_value(value).map_err(|e| {
+                GitHostError::new(format!("GitHub reviews response is unexpected: {e}"))
+            })
+        })
+    }
+
+    fn list_review_comments<'a>(
+        &'a self,
+        req: ListReviewCommentsRequest<'a>,
+    ) -> BoxFuture<'a, Result<Vec<InlineComment>, GitHostError>> {
+        Box::pin(async move {
+            let (owner, repo) = parse_owner_repo(req.repo_url)?;
+            let url = review_comments_url_at(GITHUB_API_BASE, &owner, &repo, req.number);
+            let value = self
+                .send_rest(
+                    "list_review_comments",
+                    reqwest::Method::GET,
+                    url,
+                    req.pat,
+                    None,
+                )
+                .await?;
+            serde_json::from_value(value).map_err(|e| {
+                GitHostError::new(format!(
+                    "GitHub review-comments response is unexpected: {e}"
+                ))
+            })
+        })
+    }
+
+    fn list_issue_comments<'a>(
+        &'a self,
+        req: ListIssueCommentsRequest<'a>,
+    ) -> BoxFuture<'a, Result<Vec<IssueComment>, GitHostError>> {
+        Box::pin(async move {
+            let (owner, repo) = parse_owner_repo(req.repo_url)?;
+            let url = issue_comments_url_at(GITHUB_API_BASE, &owner, &repo, req.number);
+            let value = self
+                .send_rest(
+                    "list_issue_comments",
+                    reqwest::Method::GET,
+                    url,
+                    req.pat,
+                    None,
+                )
+                .await?;
+            serde_json::from_value(value).map_err(|e| {
+                GitHostError::new(format!("GitHub issue-comments response is unexpected: {e}"))
+            })
+        })
+    }
+
+    fn post_issue_comment<'a>(
+        &'a self,
+        req: PostIssueCommentRequest<'a>,
+    ) -> BoxFuture<'a, Result<i64, GitHostError>> {
+        Box::pin(async move {
+            let (owner, repo) = parse_owner_repo(req.repo_url)?;
+            let url = issue_comments_url_at(GITHUB_API_BASE, &owner, &repo, req.number);
+            let body = build_issue_comment_json(req.body);
+            let value = self
+                .send_rest(
+                    "post_issue_comment",
+                    reqwest::Method::POST,
+                    url,
+                    req.pat,
+                    Some(body),
+                )
+                .await?;
+            value
+                .get("id")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| GitHostError::new("GitHub issue-comment response is missing id"))
+        })
+    }
+
+    fn reply_review_comment<'a>(
+        &'a self,
+        req: ReplyReviewCommentRequest<'a>,
+    ) -> BoxFuture<'a, Result<i64, GitHostError>> {
+        Box::pin(async move {
+            let (owner, repo) = parse_owner_repo(req.repo_url)?;
+            let url = review_comments_url_at(GITHUB_API_BASE, &owner, &repo, req.number);
+            let body = build_reply_review_comment_json(req.in_reply_to_id, req.body);
+            let value = self
+                .send_rest(
+                    "reply_review_comment",
+                    reqwest::Method::POST,
+                    url,
+                    req.pat,
+                    Some(body),
+                )
+                .await?;
+            value
+                .get("id")
+                .and_then(|v| v.as_i64())
+                .ok_or_else(|| GitHostError::new("GitHub review-comment response is missing id"))
+        })
+    }
+
+    fn list_review_threads<'a>(
+        &'a self,
+        req: ListReviewThreadsRequest<'a>,
+    ) -> BoxFuture<'a, Result<Vec<Thread>, GitHostError>> {
+        Box::pin(async move {
+            let (owner, repo) = parse_owner_repo(req.repo_url)?;
+            let body = review_threads_query_json(&owner, &repo, req.number);
+            let value = self
+                .post_graphql("list_review_threads", body, req.pat)
+                .await?;
+            let nodes = value
+                .get("data")
+                .and_then(|d| d.get("repository"))
+                .and_then(|r| r.get("pullRequest"))
+                .and_then(|p| p.get("reviewThreads"))
+                .and_then(|t| t.get("nodes"))
+                .and_then(|n| n.as_array())
+                .ok_or_else(|| {
+                    GitHostError::new("GitHub reviewThreads response is missing nodes")
+                })?;
+            let mut threads = Vec::with_capacity(nodes.len());
+            for node in nodes {
+                let id = node
+                    .get("id")
+                    .and_then(|v| v.as_str())
+                    .ok_or_else(|| GitHostError::new("review-thread response is missing id"))?
+                    .to_string();
+                let is_resolved = node
+                    .get("isResolved")
+                    .and_then(|v| v.as_bool())
+                    .unwrap_or(false);
+                let root_comment_id = node
+                    .get("comments")
+                    .and_then(|c| c.get("nodes"))
+                    .and_then(|n| n.as_array())
+                    .and_then(|nodes| nodes.first())
+                    .and_then(|first| first.get("id"))
+                    .and_then(|v| v.as_str())
+                    .map(str::to_string);
+                threads.push(Thread {
+                    id,
+                    is_resolved,
+                    root_comment_id,
+                });
+            }
+            Ok(threads)
+        })
+    }
+
+    fn resolve_thread<'a>(
+        &'a self,
+        req: ResolveThreadRequest<'a>,
+    ) -> BoxFuture<'a, Result<(), GitHostError>> {
+        Box::pin(async move {
+            let body = resolve_thread_mutation_json(req.thread_id);
+            let value = self.post_graphql("resolve_thread", body, req.pat).await?;
+            // The mutation returns a top-level `errors` array (with `data`
+            // null/partial) on failure; any presence is an error. Passed
+            // through redaction to honor the module's discipline even though
+            // a GraphQL error body should never contain the token.
+            if value.get("errors").is_some() {
+                let raw = format!("resolveReviewThread returned GraphQL errors: {value}");
+                return Err(GitHostError::new(git::redact(&raw, req.pat)));
+            }
+            Ok(())
+        })
+    }
 }
 
 /// A fake [`GitHost`] reachable from every test in this crate **and** from
@@ -519,6 +1135,21 @@ pub mod testing {
     /// exercise real git plumbing throughout; only the GitHub HTTP calls
     /// (`open_pr`/`check_auth`) are faked, since those are the only ones that
     /// would otherwise need real network access to a real GitHub repo.
+    /// A recorded `post_issue_comment` call.
+    #[derive(Debug, Clone)]
+    pub struct RecordedPostIssueComment {
+        pub number: i64,
+        pub body: String,
+    }
+
+    /// A recorded `reply_review_comment` call.
+    #[derive(Debug, Clone)]
+    pub struct RecordedReplyReviewComment {
+        pub number: i64,
+        pub in_reply_to_id: i64,
+        pub body: String,
+    }
+
     pub struct FakeHost {
         open_pr_calls: Mutex<Vec<RecordedOpenPr>>,
         open_pr_failure: Option<String>,
@@ -529,6 +1160,24 @@ pub mod testing {
         /// git at all — see [`FakeHost::stub_push_success`].
         push_stub_success: bool,
         check_auth_failure: Option<String>,
+        // --- scripted read/PR-feedback state (the feedback model) ---------
+        pull_state: Mutex<Option<PullState>>,
+        reviews: Mutex<Vec<Review>>,
+        review_comments: Mutex<Vec<InlineComment>>,
+        issue_comments: Mutex<Vec<IssueComment>>,
+        threads: Mutex<Vec<Thread>>,
+        // --- call recorders for written feedback --------------------------
+        get_pull_calls: Mutex<Vec<i64>>,
+        list_reviews_calls: Mutex<Vec<i64>>,
+        list_review_comments_calls: Mutex<Vec<i64>>,
+        list_issue_comments_calls: Mutex<Vec<i64>>,
+        list_review_threads_calls: Mutex<Vec<i64>>,
+        resolve_thread_calls: Mutex<Vec<String>>,
+        post_issue_comment_calls: Mutex<Vec<RecordedPostIssueComment>>,
+        reply_review_comment_calls: Mutex<Vec<RecordedReplyReviewComment>>,
+        /// Next synthetic id handed back for a posted comment (monotonic so a
+        /// test posting several comments gets distinct ids to dedup on).
+        next_posted_id: Mutex<i64>,
     }
 
     impl FakeHost {
@@ -541,6 +1190,20 @@ pub mod testing {
                 push_failure: None,
                 push_stub_success: false,
                 check_auth_failure: None,
+                pull_state: Mutex::new(None),
+                reviews: Mutex::new(Vec::new()),
+                review_comments: Mutex::new(Vec::new()),
+                issue_comments: Mutex::new(Vec::new()),
+                threads: Mutex::new(Vec::new()),
+                get_pull_calls: Mutex::new(Vec::new()),
+                list_reviews_calls: Mutex::new(Vec::new()),
+                list_review_comments_calls: Mutex::new(Vec::new()),
+                list_issue_comments_calls: Mutex::new(Vec::new()),
+                list_review_threads_calls: Mutex::new(Vec::new()),
+                resolve_thread_calls: Mutex::new(Vec::new()),
+                post_issue_comment_calls: Mutex::new(Vec::new()),
+                reply_review_comment_calls: Mutex::new(Vec::new()),
+                next_posted_id: Mutex::new(10_000),
             }
         }
 
@@ -589,6 +1252,105 @@ pub mod testing {
         /// Every `open_pr` call this fake has received, in order.
         pub fn open_pr_calls(&self) -> Vec<RecordedOpenPr> {
             self.open_pr_calls
+                .lock()
+                .expect("FakeHost mutex poisoned")
+                .clone()
+        }
+
+        /// Script the PR lifecycle state [`GitHost::get_pull`] returns.
+        pub fn with_pull_state(self, state: PullState) -> FakeHost {
+            *self.pull_state.lock().expect("FakeHost mutex poisoned") = Some(state);
+            self
+        }
+
+        /// Script the formal reviews [`GitHost::list_reviews`] returns.
+        pub fn with_reviews(self, reviews: Vec<Review>) -> FakeHost {
+            *self.reviews.lock().expect("FakeHost mutex poisoned") = reviews;
+            self
+        }
+
+        /// Script the diff review comments [`GitHost::list_review_comments`]
+        /// returns.
+        pub fn with_review_comments(self, comments: Vec<InlineComment>) -> FakeHost {
+            *self
+                .review_comments
+                .lock()
+                .expect("FakeHost mutex poisoned") = comments;
+            self
+        }
+
+        /// Script the top-level issue comments [`GitHost::list_issue_comments`]
+        /// returns.
+        pub fn with_issue_comments(self, comments: Vec<IssueComment>) -> FakeHost {
+            *self.issue_comments.lock().expect("FakeHost mutex poisoned") = comments;
+            self
+        }
+
+        /// Script the review threads [`GitHost::list_review_threads`] returns.
+        pub fn with_threads(self, threads: Vec<Thread>) -> FakeHost {
+            *self.threads.lock().expect("FakeHost mutex poisoned") = threads;
+            self
+        }
+
+        /// Every `get_pull` call this fake has received (PR numbers), in order.
+        pub fn get_pull_calls(&self) -> Vec<i64> {
+            self.get_pull_calls
+                .lock()
+                .expect("FakeHost mutex poisoned")
+                .clone()
+        }
+
+        /// Every `list_reviews` call this fake has received (PR numbers).
+        pub fn list_reviews_calls(&self) -> Vec<i64> {
+            self.list_reviews_calls
+                .lock()
+                .expect("FakeHost mutex poisoned")
+                .clone()
+        }
+
+        /// Every `list_review_comments` call (PR numbers).
+        pub fn list_review_comments_calls(&self) -> Vec<i64> {
+            self.list_review_comments_calls
+                .lock()
+                .expect("FakeHost mutex poisoned")
+                .clone()
+        }
+
+        /// Every `list_issue_comments` call (PR numbers).
+        pub fn list_issue_comments_calls(&self) -> Vec<i64> {
+            self.list_issue_comments_calls
+                .lock()
+                .expect("FakeHost mutex poisoned")
+                .clone()
+        }
+
+        /// Every `list_review_threads` call (PR numbers).
+        pub fn list_review_threads_calls(&self) -> Vec<i64> {
+            self.list_review_threads_calls
+                .lock()
+                .expect("FakeHost mutex poisoned")
+                .clone()
+        }
+
+        /// Every `resolve_thread` call this fake has received (thread ids).
+        pub fn resolve_thread_calls(&self) -> Vec<String> {
+            self.resolve_thread_calls
+                .lock()
+                .expect("FakeHost mutex poisoned")
+                .clone()
+        }
+
+        /// Every `post_issue_comment` call, in order.
+        pub fn post_issue_comment_calls(&self) -> Vec<RecordedPostIssueComment> {
+            self.post_issue_comment_calls
+                .lock()
+                .expect("FakeHost mutex poisoned")
+                .clone()
+        }
+
+        /// Every `reply_review_comment` call, in order.
+        pub fn reply_review_comment_calls(&self) -> Vec<RecordedReplyReviewComment> {
+            self.reply_review_comment_calls
                 .lock()
                 .expect("FakeHost mutex poisoned")
                 .clone()
@@ -649,6 +1411,155 @@ pub mod testing {
                 let _ = req;
                 if let Some(message) = &self.check_auth_failure {
                     return Err(GitHostError::new(message.clone()));
+                }
+                Ok(())
+            })
+        }
+
+        fn get_pull<'a>(
+            &'a self,
+            req: GetPullRequest<'a>,
+        ) -> BoxFuture<'a, Result<PullState, GitHostError>> {
+            Box::pin(async move {
+                self.get_pull_calls
+                    .lock()
+                    .expect("FakeHost mutex poisoned")
+                    .push(req.number);
+                let fallback = PullState {
+                    merged: false,
+                    state: "open".to_string(),
+                    head_sha: "fake-head-sha".to_string(),
+                };
+                Ok(self
+                    .pull_state
+                    .lock()
+                    .expect("FakeHost mutex poisoned")
+                    .clone()
+                    .unwrap_or(fallback))
+            })
+        }
+
+        fn list_reviews<'a>(
+            &'a self,
+            req: ListReviewsRequest<'a>,
+        ) -> BoxFuture<'a, Result<Vec<Review>, GitHostError>> {
+            Box::pin(async move {
+                self.list_reviews_calls
+                    .lock()
+                    .expect("FakeHost mutex poisoned")
+                    .push(req.number);
+                Ok(self
+                    .reviews
+                    .lock()
+                    .expect("FakeHost mutex poisoned")
+                    .clone())
+            })
+        }
+
+        fn list_review_comments<'a>(
+            &'a self,
+            req: ListReviewCommentsRequest<'a>,
+        ) -> BoxFuture<'a, Result<Vec<InlineComment>, GitHostError>> {
+            Box::pin(async move {
+                self.list_review_comments_calls
+                    .lock()
+                    .expect("FakeHost mutex poisoned")
+                    .push(req.number);
+                Ok(self
+                    .review_comments
+                    .lock()
+                    .expect("FakeHost mutex poisoned")
+                    .clone())
+            })
+        }
+
+        fn list_issue_comments<'a>(
+            &'a self,
+            req: ListIssueCommentsRequest<'a>,
+        ) -> BoxFuture<'a, Result<Vec<IssueComment>, GitHostError>> {
+            Box::pin(async move {
+                self.list_issue_comments_calls
+                    .lock()
+                    .expect("FakeHost mutex poisoned")
+                    .push(req.number);
+                Ok(self
+                    .issue_comments
+                    .lock()
+                    .expect("FakeHost mutex poisoned")
+                    .clone())
+            })
+        }
+
+        fn post_issue_comment<'a>(
+            &'a self,
+            req: PostIssueCommentRequest<'a>,
+        ) -> BoxFuture<'a, Result<i64, GitHostError>> {
+            Box::pin(async move {
+                self.post_issue_comment_calls
+                    .lock()
+                    .expect("FakeHost mutex poisoned")
+                    .push(RecordedPostIssueComment {
+                        number: req.number,
+                        body: req.body.to_string(),
+                    });
+                let mut next = self.next_posted_id.lock().expect("FakeHost mutex poisoned");
+                *next += 1;
+                Ok(*next)
+            })
+        }
+
+        fn reply_review_comment<'a>(
+            &'a self,
+            req: ReplyReviewCommentRequest<'a>,
+        ) -> BoxFuture<'a, Result<i64, GitHostError>> {
+            Box::pin(async move {
+                self.reply_review_comment_calls
+                    .lock()
+                    .expect("FakeHost mutex poisoned")
+                    .push(RecordedReplyReviewComment {
+                        number: req.number,
+                        in_reply_to_id: req.in_reply_to_id,
+                        body: req.body.to_string(),
+                    });
+                let mut next = self.next_posted_id.lock().expect("FakeHost mutex poisoned");
+                *next += 1;
+                Ok(*next)
+            })
+        }
+
+        fn list_review_threads<'a>(
+            &'a self,
+            req: ListReviewThreadsRequest<'a>,
+        ) -> BoxFuture<'a, Result<Vec<Thread>, GitHostError>> {
+            Box::pin(async move {
+                self.list_review_threads_calls
+                    .lock()
+                    .expect("FakeHost mutex poisoned")
+                    .push(req.number);
+                Ok(self
+                    .threads
+                    .lock()
+                    .expect("FakeHost mutex poisoned")
+                    .clone())
+            })
+        }
+
+        fn resolve_thread<'a>(
+            &'a self,
+            req: ResolveThreadRequest<'a>,
+        ) -> BoxFuture<'a, Result<(), GitHostError>> {
+            Box::pin(async move {
+                self.resolve_thread_calls
+                    .lock()
+                    .expect("FakeHost mutex poisoned")
+                    .push(req.thread_id.to_string());
+                // Resolving a scripted thread flips its `is_resolved` so a
+                // subsequent `list_review_threads` reflects the resolution.
+                let mut threads = self.threads.lock().expect("FakeHost mutex poisoned");
+                for thread in threads.iter_mut() {
+                    if thread.id == req.thread_id {
+                        thread.is_resolved = true;
+                    }
                 }
                 Ok(())
             })
@@ -740,6 +1651,147 @@ mod tests {
         assert_eq!(body["head"], "dearborn/ship-it-abc123");
         assert_eq!(body["base"], "main");
         assert_eq!(body["body"], "the body");
+    }
+
+    // ---- feedback-seam endpoints + request shapes (pure, no network) -------
+
+    #[test]
+    fn pull_url_targets_the_named_pr() {
+        assert_eq!(
+            pull_url_at(GITHUB_API_BASE, "octocat", "Hello-World", 42),
+            "https://api.github.com/repos/octocat/Hello-World/pulls/42"
+        );
+    }
+
+    #[test]
+    fn review_urls_target_the_named_pr_reviews() {
+        assert_eq!(
+            reviews_url_at(GITHUB_API_BASE, "o", "r", 7),
+            "https://api.github.com/repos/o/r/pulls/7/reviews"
+        );
+        assert_eq!(
+            review_comments_url_at(GITHUB_API_BASE, "o", "r", 7),
+            "https://api.github.com/repos/o/r/pulls/7/comments"
+        );
+        assert_eq!(
+            issue_comments_url_at(GITHUB_API_BASE, "o", "r", 7),
+            "https://api.github.com/repos/o/r/issues/7/comments"
+        );
+    }
+
+    #[test]
+    fn reply_review_comment_json_carries_in_reply_to_and_body() {
+        let body = build_reply_review_comment_json(1234, "thanks!");
+        assert_eq!(body["in_reply_to"], 1234);
+        assert_eq!(body["body"], "thanks!");
+    }
+
+    #[test]
+    fn issue_comment_json_carries_just_the_body() {
+        let body = build_issue_comment_json("hello");
+        assert_eq!(body["body"], "hello");
+    }
+
+    #[test]
+    fn review_threads_graphql_query_is_well_formed() {
+        let req = review_threads_query_json("octocat", "Hello-World", 9);
+        let query = req["query"].as_str().expect("query string");
+        assert!(query.contains("reviewThreads"));
+        assert!(query.contains("isResolved"));
+        assert!(query.contains("repository(owner: $owner, name: $repo)"));
+        assert!(query.contains("pullRequest(number: $number)"));
+        assert_eq!(req["variables"]["owner"], "octocat");
+        assert_eq!(req["variables"]["repo"], "Hello-World");
+        assert_eq!(req["variables"]["number"], 9);
+    }
+
+    #[test]
+    fn resolve_thread_graphql_mutation_is_well_formed() {
+        let req = resolve_thread_mutation_json("thr-1");
+        let query = req["query"].as_str().expect("query string");
+        assert!(query.contains("resolveReviewThread"));
+        assert!(query.contains("threadId"));
+        assert_eq!(req["variables"]["threadId"], "thr-1");
+    }
+
+    // ---- (de)serialization of the feedback types ---------------------------
+
+    #[test]
+    fn pull_state_deserializes_githubs_nested_head_sha() {
+        let state: PullState = serde_json::from_value(serde_json::json!({
+            "merged": false,
+            "state": "open",
+            "head": { "sha": "deadbeef" }
+        }))
+        .unwrap();
+        assert!(!state.merged);
+        assert_eq!(state.state, "open");
+        assert_eq!(state.head_sha, "deadbeef");
+    }
+
+    #[test]
+    fn pull_state_round_trips_through_json() {
+        let state = PullState {
+            merged: true,
+            state: "closed".to_string(),
+            head_sha: "abc".to_string(),
+        };
+        let json = serde_json::to_value(&state).unwrap();
+        let back: PullState = serde_json::from_value(json).unwrap();
+        assert_eq!(state, back);
+    }
+
+    #[test]
+    fn review_deserializes_the_documented_rest_fields() {
+        let review: Review = serde_json::from_value(serde_json::json!({
+            "id": 11,
+            "state": "APPROVED",
+            "body": "looks good",
+            "submitted_at": "2024-01-01T00:00:00Z"
+        }))
+        .unwrap();
+        assert_eq!(review.id, 11);
+        assert_eq!(review.state, "APPROVED");
+        assert_eq!(review.body, "looks good");
+        assert_eq!(review.submitted_at.as_deref(), Some("2024-01-01T00:00:00Z"));
+    }
+
+    #[test]
+    fn inline_comment_deserializes_snake_case_rest_fields() {
+        let c: InlineComment = serde_json::from_value(serde_json::json!({
+            "id": 22,
+            "body": "/cc",
+            "in_reply_to_id": 5,
+            "pull_request_review_id": 6,
+            "path": "src/main.rs",
+            "line": 3
+        }))
+        .unwrap();
+        assert_eq!(c.id, 22);
+        assert_eq!(c.in_reply_to, Some(5));
+        assert_eq!(c.pull_request_review_id, Some(6));
+        assert_eq!(c.path.as_deref(), Some("src/main.rs"));
+        assert_eq!(c.line, Some(3));
+    }
+
+    #[test]
+    fn issue_comment_deserializes_id_and_body() {
+        let c: IssueComment =
+            serde_json::from_value(serde_json::json!({"id": 33, "body": "hi"})).unwrap();
+        assert_eq!(c.id, 33);
+        assert_eq!(c.body, "hi");
+    }
+
+    #[test]
+    fn thread_serializes_as_camel_case_like_graphql() {
+        let t = Thread {
+            id: "thr-1".to_string(),
+            is_resolved: true,
+            root_comment_id: Some("999".to_string()),
+        };
+        let json = serde_json::to_value(&t).unwrap();
+        assert_eq!(json["isResolved"], true);
+        assert_eq!(json["rootCommentId"], "999");
     }
 
     // ---- error mapping + redaction ------------------------------------------
