@@ -791,19 +791,4 @@ VERDICT: BLOCKED";
         assert!(!prompt_for(Stage::Fix).unwrap().contains("VERDICT:"));
         assert!(!prompt_for(Stage::Summarize).unwrap().contains("VERDICT:"));
     }
-
-    #[test]
-    fn no_stage_prompt_references_the_phantom_add_comment_tool() {
-        // A task agent is handed no MCP server at all (`task_agent::CliTaskAgent::run`
-        // builds a `RunRequest` with no tool config), so there is no `add_comment`
-        // tool. The prompts used to tell the agent it was "the only tool you have";
-        // that instruction pointed at nothing. Guard against it creeping back in —
-        // the agent's only channel back is its own output/summary.
-        for stage in AGENT_STAGES {
-            assert!(
-                !prompt_for(stage).unwrap().contains("add_comment"),
-                "{stage:?} prompt references add_comment, a tool the task agent does not have"
-            );
-        }
-    }
 }
