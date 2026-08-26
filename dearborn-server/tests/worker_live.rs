@@ -66,15 +66,14 @@
 //! claim/heartbeat pool around it). Faked: only
 //! [`dearborn_server::git_host::testing::FakeHost::open_pr`].
 //!
-//! ## Why the assertions read the *bare origin*, not the (by-then-deleted) workspace
+//! ## Why the assertions read the *bare origin*
 //!
-//! A successful finalize deletes the epic workspace once the PR opens
-//! (T-511/T-514 — see `worker::finalize_epic`'s doc). By the time this test's
-//! call to `run_epic_pipeline` returns, the workspace directory the agent
-//! actually wrote into is already gone — that's real, intended production
-//! behavior, not a test artifact to work around. The strongest surviving
+//! A successful finalize retains the epic workspace (the post-PR-review loop
+//! needs the branch for feedback rounds), so the working tree still exists
+//! when this test's `run_epic_pipeline` returns. The strongest surviving
 //! evidence that the real agent modified the *working tree*, that Dearborn
-//! *committed* it, and that it was *pushed*, is the git history of the bare
+//! *committed* it, and that it was *pushed*, is still the git history of the
+//! bare
 //! origin: `git show <branch>:HELLO.md` can only return the requested
 //! content if a real Write actually landed on disk in the workspace, was
 //! staged, committed, and the resulting object made it across the (real,
@@ -216,9 +215,10 @@ async fn live_implement_writes_commits_pushes_to_bare_origin_and_opens_a_fake_pr
 
     // ---- assertions ----
 
-    // 1. The epic reached Completed — `finalize_epic` only sets this after a
-    //    real push *and* a successful `open_pr` (T-514: never on a bare-DAG
-    //    completion alone). Anything else (still `InProgress`, or `Blocked`
+    // 1. The epic reached InReview — `finalize_epic` only lands it there
+    //    after a real push *and* a successful `open_pr` (T-514: never on a
+    //    bare-DAG completion alone). Anything else (still `InProgress`, or
+    //    `Blocked`
     //    with a `blocked_reason`) means either the live agent misbehaved or
     //    Dearborn's plumbing around it did — surface the reason plainly
     //    rather than a bare `assert_eq` failure.
@@ -233,8 +233,8 @@ async fn live_implement_writes_commits_pushes_to_bare_origin_and_opens_a_fake_pr
     let epic_status: String = row.get(0).unwrap();
     let blocked_reason: Option<String> = row.get(1).unwrap();
     assert_eq!(
-        epic_status, "Completed",
-        "epic must reach Completed via a real push + (faked) PR; got status={epic_status} \
+        epic_status, "InReview",
+        "epic must reach InReview via a real push + (faked) PR; got status={epic_status} \
          blocked_reason={blocked_reason:?}"
     );
 
@@ -253,7 +253,8 @@ async fn live_implement_writes_commits_pushes_to_bare_origin_and_opens_a_fake_pr
     //    the §2.8 subject, and it was pushed to the bare origin — read back
     //    from the bare origin itself (see the module doc's "why the bare
     //    origin, not the workspace" section for why this is the right vantage
-    //    point given the workspace is deleted by the time we get here).
+    //    point (the workspace is retained) for why this is the right vantage
+    //    point for the pushed-branch evidence.
     let branch = workspace::epic_branch_name(EPIC_TITLE, &epic_id);
     let subjects = git_capture(&bare_dir, &["log", "--reverse", "--format=%s", &branch]).await;
     let subjects: Vec<&str> = subjects.lines().collect();

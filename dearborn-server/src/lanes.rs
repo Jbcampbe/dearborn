@@ -1,9 +1,10 @@
 //! Epic lane transitions (T-401).
 //!
-//! Epics move between lanes (`Planning | Ready | InProgress | Completed |
-//! Cancelled | Blocked`) via `POST /epics/:id/lane`. Not every transition is
-//! permitted: breakdown owns `Planning → Ready`, and the executor worker pool
-//! ([`crate::worker`], T-510) owns `InProgress → Completed`. This module
+//! Epics move between lanes (`Planning | Ready | InProgress | InReview |
+//! Completed | Cancelled | Blocked`) via `POST /epics/:id/lane`. Not every
+//! transition is permitted: breakdown owns `Planning → Ready`, and the
+//! executor worker pool ([`crate::worker`], T-510) owns `InProgress →
+//! InReview` (finalize opens the PR). This module
 //! encodes the permitted transition table and rejects everything else as
 //! `409 conflict`, so the kanban's lane-move control can never put an epic in
 //! an illegal state.
@@ -105,8 +106,9 @@ fn validate_lane(lane: &str) -> AppResult<()> {
 /// - `Completed → (none)` — terminal
 /// - `Cancelled → (none)` — terminal
 ///
-/// `Planning → Ready` is owned by breakdown; `InProgress → Completed` is
-/// owned by the executor worker pool ([`crate::worker`], T-510). Both are
+/// `Planning → Ready` is owned by breakdown; `InProgress → InReview` is
+/// owned by the executor worker pool ([`crate::worker`], T-510) — the
+/// manual endpoint never moves an epic into `InReview` itself. Both are
 /// rejected here. `InReview` is the "factory done, waiting on the human"
 /// lane (epic §4): `InProgress → InReview` (worker finalize), `InReview →
 /// InProgress` (poller when feedback spawns work) and `InReview → Completed`
@@ -225,7 +227,7 @@ pub async fn set_epic_lane(
     // the enqueue explicit — "the enqueue sets epic.status='InProgress' and
     // leaves lease_owner NULL"), then wake an idle worker. This handler never
     // spawns anything itself (D2) — a long-lived worker loop in the pool
-    // claims the epic (§2.4) and drives it to Completed; progress streams
+    // claims the epic (§2.4) and drives it to InReview; progress streams
     // over WS via dag_updated / epic_updated / board_updated. The HTTP
     // response is still the updated epic — the claim/run happens in the pool.
     if epic.status == "Ready" && target == "InProgress" {
