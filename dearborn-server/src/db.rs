@@ -73,6 +73,13 @@ const MIGRATIONS: &[Migration] = &[
         name: "0010_agent_run_actual_model",
         sql: include_str!("../migrations/0010_agent_run_actual_model.sql"),
     },
+    // Token columns for cost graphs. (The spec called this "0009", but that
+    // slot was already taken; it lands here as the next free version.)
+    Migration {
+        id: 11,
+        name: "0011_token_columns",
+        sql: include_str!("../migrations/0011_token_columns.sql"),
+    },
 ];
 
 /// Errors surfaced while opening the database or running migrations.
