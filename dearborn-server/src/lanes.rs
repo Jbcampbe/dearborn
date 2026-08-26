@@ -70,11 +70,15 @@ use crate::board;
 use crate::epics::{fetch_epic, Epic};
 use crate::{AppError, AppResult, AppState};
 
-/// The epic lane set (§2.2 stored values — no spaces: `InProgress`/`Completed`).
+/// The epic lane set (§2.2 stored values — no spaces: `InProgress`/`Completed`/`InReview`).
+/// `InReview` is the "factory done, waiting on the human reviewer" lane the
+/// post-PR review-poller owns (epic §4) — it sits between code-writing
+/// (`InProgress`) and the human-driven exits `Completed`/`Cancelled`.
 const VALID_LANES: &[&str] = &[
     "Planning",
     "Ready",
     "InProgress",
+    "InReview",
     "Completed",
     "Cancelled",
     "Blocked",
@@ -86,7 +90,7 @@ fn validate_lane(lane: &str) -> AppResult<()> {
         Ok(())
     } else {
         Err(AppError::BadRequest(format!(
-            "`status` must be one of Planning|Ready|InProgress|Completed|Cancelled|Blocked, got `{lane}`"
+            "`status` must be one of Planning|Ready|InProgress|InReview|Completed|Cancelled|Blocked, got `{lane}`"
         )))
     }
 }
@@ -97,17 +101,27 @@ fn validate_lane(lane: &str) -> AppResult<()> {
 /// - `Ready → InProgress, Cancelled`
 /// - `InProgress → Cancelled, Blocked`
 /// - `Blocked → Ready, Cancelled`
+/// - `InReview → Cancelled` (manual "human abandon", also poller-owned on close)
 /// - `Completed → (none)` — terminal
 /// - `Cancelled → (none)` — terminal
 ///
 /// `Planning → Ready` is owned by breakdown; `InProgress → Completed` is
 /// owned by the executor worker pool ([`crate::worker`], T-510). Both are
-/// rejected here.
+/// rejected here. `InReview` is the "factory done, waiting on the human"
+/// lane (epic §4): `InProgress → InReview` (worker finalize), `InReview →
+/// InProgress` (poller when feedback spawns work) and `InReview → Completed`
+/// (poller on merge) are all worker/poller-owned and so rejected from this
+/// manual endpoint; only `InReview → Cancelled` is also allowed manually, as
+/// the user-facing "abandon" action.
+///
+/// This table governs the lane-move endpoint only; the worker pool and the
+/// post-PR review-poller perform their own direct status writes outside it.
 fn transition_permitted(current: &str, target: &str) -> bool {
     match current {
         "Planning" => target == "Cancelled",
         "Ready" => target == "InProgress" || target == "Cancelled",
         "InProgress" => target == "Cancelled" || target == "Blocked",
+        "InReview" => target == "Cancelled",
         "Blocked" => target == "Ready" || target == "Cancelled",
         "Completed" | "Cancelled" => false, // terminal
         _ => false,
@@ -506,6 +520,103 @@ mod tests {
             .unwrap();
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(body_json(response).await["status"], "Ready");
+    }
+
+    /// Post-PR review loop (§4): `InReview` is the "factory done, waiting on
+    /// the human reviewer" lane. The only **manual** route out of it is
+    /// `InReview → Cancelled` (human abandon) — and it must publish like any
+    /// other successful transition.
+    #[tokio::test]
+    async fn in_review_to_cancelled_is_permitted() {
+        let (state, app) = test_app().await;
+        let project_id = seed_project(&state).await;
+        let epic_id = seed_epic(&state, &project_id, "InReview").await;
+
+        let mut epic_sub = state.hub.subscribe(&format!("epic:{epic_id}"));
+        let mut proj_sub = state.hub.subscribe(&format!("project:{project_id}"));
+
+        let response = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                &format!("/epics/{epic_id}/lane"),
+                Some(json!({ "status": "Cancelled" })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["status"], "Cancelled");
+
+        // epic_updated frame on epic:<id>.
+        let frame = epic_sub.recv().await.unwrap();
+        let v: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(v["type"], "epic_updated");
+        assert_eq!(v["payload"]["status"], "Cancelled");
+
+        // board_updated frame on project:<id>.
+        let frame = proj_sub.recv().await.unwrap();
+        let v: Value = serde_json::from_str(&frame).unwrap();
+        assert_eq!(v["type"], "board_updated");
+    }
+
+    /// §4: `InReview → InProgress` is poller-owned (feedback spawned work) and
+    /// must be rejected from the manual lane endpoint.
+    #[tokio::test]
+    async fn in_review_to_in_progress_is_rejected_409() {
+        let (state, app) = test_app().await;
+        let project_id = seed_project(&state).await;
+        let epic_id = seed_epic(&state, &project_id, "InReview").await;
+
+        let response = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                &format!("/epics/{epic_id}/lane"),
+                Some(json!({ "status": "InProgress" })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    /// §4: `InReview → Completed` is poller-owned (human merged the PR) — it
+    /// must NOT be reachable from the manual lane endpoint.
+    #[tokio::test]
+    async fn in_review_to_completed_is_rejected_409() {
+        let (state, app) = test_app().await;
+        let project_id = seed_project(&state).await;
+        let epic_id = seed_epic(&state, &project_id, "InReview").await;
+
+        let response = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                &format!("/epics/{epic_id}/lane"),
+                Some(json!({ "status": "Completed" })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+    }
+
+    /// §4: `InProgress → InReview` is worker-owned (finalize opens the PR) —
+    /// it must NOT be reachable from the manual lane endpoint.
+    #[tokio::test]
+    async fn in_progress_to_in_review_is_rejected_409() {
+        let (state, app) = test_app().await;
+        let project_id = seed_project(&state).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+
+        let response = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                &format!("/epics/{epic_id}/lane"),
+                Some(json!({ "status": "InReview" })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]

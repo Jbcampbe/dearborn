@@ -17,6 +17,9 @@ describe("permittedEpicTargets", () => {
     expect(permittedEpicTargets("Planning")).toEqual(["Cancelled"]);
     expect(permittedEpicTargets("Ready")).toEqual(["InProgress", "Cancelled"]);
     expect(permittedEpicTargets("InProgress")).toEqual(["Cancelled", "Blocked"]);
+    // §4: InReview can only move manually to Cancelled (human abandon);
+    // its exits to InProgress/Completed are owned by the review-poller.
+    expect(permittedEpicTargets("InReview")).toEqual(["Cancelled"]);
     expect(permittedEpicTargets("Blocked")).toEqual(["Ready", "Cancelled"]);
   });
 
@@ -56,6 +59,7 @@ describe("taskStatusForLane", () => {
   it("inverts the board's taskLane mapping", () => {
     expect(taskStatusForLane("Ready")).toBe("Todo");
     expect(taskStatusForLane("InProgress")).toBe("InProgress");
+    expect(taskStatusForLane("InReview")).toBe("InReview");
     expect(taskStatusForLane("Completed")).toBe("Done");
     expect(taskStatusForLane("Blocked")).toBe("Failed");
     expect(taskStatusForLane("Cancelled")).toBe("Cancelled");

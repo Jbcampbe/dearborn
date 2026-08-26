@@ -17,8 +17,14 @@
 
 import { apiFetch, type Collection } from "./client";
 
-/** Task lifecycle status (§2.2). Readiness is computed, not stored. */
-export type TaskStatus = "Todo" | "InProgress" | "Done" | "Failed" | "Cancelled";
+/** Task lifecycle status (§2.2). Readiness is computed, not stored. `InReview` is the §4 “factory done, waiting on the human reviewer” status — the standalone-task counterpart to an epic's `InReview` lane. */
+export type TaskStatus =
+  | "Todo"
+  | "InProgress"
+  | "InReview"
+  | "Done"
+  | "Failed"
+  | "Cancelled";
 
 /**
  * A task as returned by the API (`tasks.rs` `Task`). `failure_reason` is one

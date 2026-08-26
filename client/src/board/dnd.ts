@@ -15,6 +15,9 @@ export type DragKind = "epic" | "task";
  * Permitted epic `current → target` lane transitions. Must match the server
  * table in `dearborn-server/src/lanes.rs`: `Planning → Ready` is owned by
  * breakdown and `InProgress → Completed` by the worker, so neither is manual.
+ * `InReview` (the §4 "factory done, waiting on the human reviewer" lane) only
+ * moves manually to `Cancelled`; its other exits (`→ InProgress` on feedback,
+ * `→ Completed` on merge) are owned by the review-poller.
  * (Extracted from `ProjectKanbanView.vue` so the drag-and-drop rules and the
  * lane-move select share one source of truth.)
  */
@@ -22,6 +25,7 @@ export const EPIC_LANE_TRANSITIONS: Record<string, EpicLane[]> = {
   Planning: ["Cancelled"],
   Ready: ["InProgress", "Cancelled"],
   InProgress: ["Cancelled", "Blocked"],
+  InReview: ["Cancelled"],
   Blocked: ["Ready", "Cancelled"],
   Completed: [],
   Cancelled: [],
@@ -34,9 +38,10 @@ export function permittedEpicTargets(currentStatus: string): EpicLane[] {
 
 /**
  * The task status a project-board lane represents — the inverse of the view's
- * `taskLane()` mapping (Ready→Todo, InProgress→InProgress, Completed→Done,
- * Blocked→Failed, Cancelled→Cancelled). `Planning` has no task-status
- * equivalent (only epics plan), so it returns `null` and rejects task drops.
+ * `taskLane()` mapping (Ready→Todo, InProgress→InProgress, InReview→InReview,
+ * Completed→Done, Blocked→Failed, Cancelled→Cancelled). `Planning` has no
+ * task-status equivalent (only epics plan), so it returns `null` and rejects
+ * task drops.
  */
 export function taskStatusForLane(lane: EpicLane): TaskStatus | null {
   switch (lane) {
@@ -44,6 +49,8 @@ export function taskStatusForLane(lane: EpicLane): TaskStatus | null {
       return "Todo";
     case "InProgress":
       return "InProgress";
+    case "InReview":
+      return "InReview";
     case "Completed":
       return "Done";
     case "Blocked":
