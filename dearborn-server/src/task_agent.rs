@@ -828,6 +828,13 @@ pub struct AgentStageOutcome {
     /// once the drain completes. Empty when the stage never touched a
     /// tool, in which case zero rows are written.
     pub tool_events: Vec<ToolEventRecord>,
+    /// Cumulative input tokens the harness reported via `RunEvent::Usage`, if
+    /// any. Overwritten (not accumulated) on every `Usage` event: pi's usage
+    /// is cumulative for the whole run, so the last-seen value is the
+    /// authoritative total. `None` when the harness never reported usage.
+    pub input_tokens: Option<u64>,
+    /// See [`Self::input_tokens`].
+    pub output_tokens: Option<u64>,
 }
 
 impl AgentStageOutcome {
@@ -882,6 +889,20 @@ impl AgentStageOutcome {
                 name: String::new(),
                 ok: Some(*ok),
             }),
+            // Token accounting (cost-graph input). Overwrite, never
+            // accumulate — see `Self::input_tokens`' doc.
+            RunEvent::Usage {
+                input_tokens,
+                output_tokens,
+                ..
+            } => {
+                if input_tokens.is_some() {
+                    self.input_tokens = *input_tokens;
+                }
+                if output_tokens.is_some() {
+                    self.output_tokens = *output_tokens;
+                }
+            }
             _ => {}
         }
     }
@@ -1065,6 +1086,8 @@ pub async fn run_agent_stage(
                     verdict: None,
                     exit_code: None,
                     log: format!("failed to start agent stage: {err}"),
+                    input_tokens: None,
+                    output_tokens: None,
                 },
             )
             .await;
@@ -1243,6 +1266,8 @@ pub async fn run_agent_stage(
                     verdict: None,
                     exit_code: None,
                     log: message.clone(),
+                    input_tokens: None,
+                    output_tokens: None,
                 },
             )
             .await;
@@ -1282,6 +1307,8 @@ pub async fn run_agent_stage(
             verdict: None,
             exit_code: outcome.exit_code,
             log: outcome.text.clone(),
+            input_tokens: outcome.input_tokens,
+            output_tokens: outcome.output_tokens,
         },
     )
     .await
@@ -1940,6 +1967,39 @@ mod tests {
         // commit the work the agent actually completed.
         assert_eq!(outcome.status(), "ok");
         assert!(outcome.is_ok());
+    }
+
+    #[test]
+    fn usage_events_overwrite_not_accumulate() {
+        // pi's `UsageInfo` is cumulative for the whole run, so each `Usage`
+        // event replaces the running totals rather than adding to them — the
+        // last-seen value must be what survives into the close (and then
+        // `agent_run.input_tokens`/`output_tokens`). A partial event (one
+        // side absent) must not clobber a previously reported value.
+        let outcome = absorbed(&[
+            RunEvent::Usage {
+                run_id: "r".to_string(),
+                input_tokens: Some(100),
+                output_tokens: Some(20),
+                total_tokens: Some(120),
+            },
+            RunEvent::Usage {
+                run_id: "r".to_string(),
+                input_tokens: Some(300),
+                output_tokens: None,
+                total_tokens: Some(320),
+            },
+        ]);
+        assert_eq!(outcome.input_tokens, Some(300));
+        assert_eq!(outcome.output_tokens, Some(20));
+
+        // No usage events at all → stays None (e.g. a harness that doesn't
+        // report usage), so the columns close NULL.
+        let silent = absorbed(&[RunEvent::Started {
+            run_id: "r".to_string(),
+        }]);
+        assert_eq!(silent.input_tokens, None);
+        assert_eq!(silent.output_tokens, None);
     }
 
     #[test]

@@ -214,6 +214,13 @@ pub struct CloseStage {
     /// The raw (uncapped) log; [`close_stage`] applies [`cap_log`] itself so
     /// no caller has to remember to.
     pub log: String,
+    /// Cumulative token usage the harness reported for the run (cost-graph
+    /// input; see [`AgentRunSummary::input_tokens`]). Only a real agent stage
+    /// (`run_agent_stage`) ever has values — every other construction site
+    /// passes `None`, leaving the columns NULL for non-agent/error closes.
+    pub input_tokens: Option<u64>,
+    /// See [`CloseStage::input_tokens`].
+    pub output_tokens: Option<u64>,
 }
 
 /// Close a stage's row: cap the final log (D13), stamp `ended_at`, and write
@@ -228,7 +235,8 @@ pub async fn close_stage(
 ) -> Result<(), libsql::Error> {
     conn.execute(
         "UPDATE agent_run SET status = ?1, session_id = ?2, verdict = ?3, \
-         exit_code = ?4, log = ?5, ended_at = ?6 WHERE id = ?7",
+         exit_code = ?4, log = ?5, ended_at = ?6, input_tokens = ?7, \
+         output_tokens = ?8 WHERE id = ?9",
         params![
             close.status,
             close.session_id,
@@ -236,6 +244,8 @@ pub async fn close_stage(
             close.exit_code.map(|c| c as i64),
             cap_log(&close.log),
             now_ms(),
+            close.input_tokens.map(|t| t as i64),
+            close.output_tokens.map(|t| t as i64),
             handle.id.clone(),
         ],
     )
@@ -402,6 +412,8 @@ where
                     verdict: None,
                     exit_code: None,
                     log: err.to_string(),
+                    input_tokens: None,
+                    output_tokens: None,
                 },
             )
             .await;
@@ -418,6 +430,8 @@ where
                     verdict: None,
                     exit_code: None,
                     log: format!("stage panicked: {message}"),
+                    input_tokens: None,
+                    output_tokens: None,
                 },
             )
             .await;
@@ -551,6 +565,13 @@ pub struct AgentRunSummary {
     /// run predates the column. Distinct from the configured T8 `model` (not
     /// surfaced here), so a reader sees what truly ran, not what was intended.
     pub actual_model: Option<String>,
+    /// Cumulative input tokens the harness reported for the run (last-seen
+    /// `RunEvent::Usage` value — pi's usage is cumulative, so the final one
+    /// is the authoritative total). `None` when the harness never reported
+    /// usage or the run predates the column / closed without an agent stage.
+    pub input_tokens: Option<i64>,
+    /// See [`AgentRunSummary::input_tokens`].
+    pub output_tokens: Option<i64>,
     pub started_at: Option<i64>,
     pub ended_at: Option<i64>,
     pub exit_code: Option<i64>,
@@ -568,7 +589,8 @@ pub struct AgentRunDetail {
 /// Columns [`row_to_summary`] expects, in order. `GET /runs/{id}` appends
 /// `log` after these.
 const RUN_SUMMARY_COLUMNS: &str = "id, task_id, epic_id, stage, attempt, status, verdict, \
-     session_id, started_at, ended_at, exit_code, created_at, actual_model";
+     session_id, started_at, ended_at, exit_code, created_at, actual_model, \
+     input_tokens, output_tokens";
 
 fn row_to_summary(row: &Row) -> Result<AgentRunSummary, libsql::Error> {
     Ok(AgentRunSummary {
@@ -585,6 +607,8 @@ fn row_to_summary(row: &Row) -> Result<AgentRunSummary, libsql::Error> {
         exit_code: row.get(10)?,
         created_at: row.get(11)?,
         actual_model: row.get(12)?,
+        input_tokens: row.get(13)?,
+        output_tokens: row.get(14)?,
     })
 }
 
@@ -620,10 +644,11 @@ pub async fn fetch_run_detail(conn: &Connection, id: &str) -> AppResult<Option<A
     match rows.next().await? {
         Some(row) => {
             let summary = row_to_summary(&row)?;
-            // `RUN_SUMMARY_COLUMNS` (13 cols) precedes `log`, so `log` sits at
-            // index 13 — the same relative position `row_to_summary` relied
-            // on before `actual_model` was appended.
-            let log: String = row.get(13)?;
+            // `RUN_SUMMARY_COLUMNS` (15 cols) precedes `log`, so `log` sits at
+            // index 15 — the same relative position `row_to_summary` relied on
+            // before `actual_model`, then `input_tokens`/`output_tokens`, were
+            // appended.
+            let log: String = row.get(15)?;
             Ok(Some(AgentRunDetail { summary, log }))
         }
         None => Ok(None),
@@ -784,6 +809,8 @@ mod tests {
                 verdict: None,
                 exit_code: Some(0),
                 log: "done normally".to_string(),
+                input_tokens: None,
+                output_tokens: None,
             },
         )
         .await
@@ -954,6 +981,8 @@ mod tests {
                 verdict: Some("PASS".to_string()),
                 exit_code: Some(0),
                 log: "final output".to_string(),
+                input_tokens: None,
+                output_tokens: None,
             },
         )
         .await
@@ -996,6 +1025,8 @@ mod tests {
                 verdict: None,
                 exit_code: Some(0),
                 log: "findings...\nVERDICT: PASS".to_string(),
+                input_tokens: None,
+                output_tokens: None,
             },
         )
         .await
@@ -1043,6 +1074,8 @@ mod tests {
                     verdict: None,
                     exit_code: Some(0),
                     log: "all good".to_string(),
+                    input_tokens: None,
+                    output_tokens: None,
                 },
             ))
         })
@@ -1129,6 +1162,8 @@ mod tests {
                         verdict: None,
                         exit_code: None,
                         log: String::new(),
+                        input_tokens: None,
+                        output_tokens: None,
                     },
                 ))
             })
@@ -1340,6 +1375,8 @@ mod tests {
                 verdict: None,
                 exit_code: Some(0),
                 log: "impl done".to_string(),
+                input_tokens: None,
+                output_tokens: None,
             },
         )
         .await
@@ -1367,6 +1404,8 @@ mod tests {
                 verdict: Some("PASS".to_string()),
                 exit_code: Some(0),
                 log: "review done".to_string(),
+                input_tokens: None,
+                output_tokens: None,
             },
         )
         .await
@@ -1423,6 +1462,8 @@ mod tests {
                 verdict: None,
                 exit_code: Some(0),
                 log: "the full transcript".to_string(),
+                input_tokens: None,
+                output_tokens: None,
             },
         )
         .await

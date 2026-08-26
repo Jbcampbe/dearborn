@@ -2682,6 +2682,8 @@ async fn commit_if_dirty(
                 verdict: None,
                 exit_code: Some(0),
                 log: format!("commit {sha}: {subject}"),
+                input_tokens: None,
+                output_tokens: None,
             },
         )
         .await;
@@ -6067,6 +6069,8 @@ async fn close_push_stage(
             verdict: None,
             exit_code: if status == "ok" { Some(0) } else { None },
             log: log.to_string(),
+            input_tokens: None,
+            output_tokens: None,
         },
     )
     .await;

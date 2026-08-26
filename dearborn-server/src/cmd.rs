@@ -416,6 +416,8 @@ pub async fn run_stage_command(
                 verdict: None,
                 exit_code,
                 log,
+                input_tokens: None,
+                output_tokens: None,
             },
         ))
     })
