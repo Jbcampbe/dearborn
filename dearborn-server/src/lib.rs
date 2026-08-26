@@ -11,6 +11,7 @@ pub mod board;
 pub mod breakdown;
 pub mod cmd;
 pub mod config;
+pub mod cost;
 pub mod crypto;
 pub mod db;
 pub mod epics;
@@ -493,6 +494,7 @@ pub fn app(state: AppState) -> Router {
             axum::routing::post(projects::refresh_project),
         )
         .route("/projects/:id/board", get(board::get_board))
+        .route("/projects/:id/cost", get(cost::get_project_cost))
         .route(
             "/projects/:id/tasks",
             axum::routing::post(tasks::create_project_task),
