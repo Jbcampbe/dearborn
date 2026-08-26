@@ -94,6 +94,6 @@ anything else fails to parse, costs a wasted re-run, and delays the task.
   missing, or the problem is outside what a code change can resolve. Reserve
   this for genuine dead-ends that need a human.
 
-`add_comment` is the only tool you have beyond reading the repository; use it
-for progress notes if useful. It does not substitute for the verdict line —
+Your output is your only channel back to the orchestrator; anything worth
+recording must appear in it. It does not substitute for the verdict line —
 that must still appear as specified above.

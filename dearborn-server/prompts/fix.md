@@ -28,5 +28,5 @@ If you believe a piece of feedback is wrong, fix everything else and clearly
 explain your disagreement in your summary — the next review round will see
 it. Don't silently ignore feedback.
 
-`add_comment` is the only tool you have beyond your normal editing tools —
-use it for progress notes; it is your only channel back to the orchestrator.
+Your summary is your only channel back to the orchestrator — nothing you say
+before it is preserved.

@@ -791,12 +791,4 @@ VERDICT: BLOCKED";
         assert!(!prompt_for(Stage::Fix).unwrap().contains("VERDICT:"));
         assert!(!prompt_for(Stage::Summarize).unwrap().contains("VERDICT:"));
     }
-
-    #[test]
-    fn every_stage_prompt_mentions_add_comment_as_the_autonomous_tool_surface() {
-        // D7: the only MCP tool an autonomous task agent gets is `add_comment`.
-        for stage in AGENT_STAGES {
-            assert!(prompt_for(stage).unwrap().contains("add_comment"));
-        }
-    }
 }

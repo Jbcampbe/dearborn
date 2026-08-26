@@ -22,6 +22,3 @@ Do **not** emit a verdict line, a markdown heading, or anything besides the
 summary text itself. Dearborn inserts your output verbatim under its own
 "## Summary of changes" heading in the PR template — writing your own heading
 would duplicate it.
-
-`add_comment` is the only tool you have beyond reading the repository; use it
-for progress notes if you need them.
