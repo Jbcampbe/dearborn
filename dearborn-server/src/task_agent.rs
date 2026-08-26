@@ -732,6 +732,26 @@ impl Drop for CancelGuard {
     }
 }
 
+/// One tool call observed during a stage's `RunEvent` stream, accumulated
+/// by [`AgentStageOutcome::absorb`] so the stage's `agent_run_events` rows
+/// can be persisted after the drain finishes (best-effort — a persistence
+/// failure must never fail the stage itself). Mirrors the wire shape of
+/// [`RunEvent::ToolStart`] / [`RunEvent::ToolEnd`] minus run bookkeeping
+/// (`run_id`) and payloads we don't store (`input` / `output`).
+#[derive(Debug, Clone)]
+pub struct ToolEventRecord {
+    /// `"tool_start"` or `"tool_end"`, matching the WS frame type the
+    /// planning view already speaks.
+    pub kind: &'static str,
+    /// Harness id pairing a `tool_start` with its `tool_end`.
+    pub tool_call_id: String,
+    /// The tool's name (`"tool_start"` only; empty string for
+    /// `"tool_end"`, which carries `ok` instead).
+    pub name: String,
+    /// `None` for `tool_start`; `Some(ok)` for `tool_end`.
+    pub ok: Option<bool>,
+}
+
 /// What a completed (or failed) agent stage leaves behind for the caller
 /// (T-513's DAG walk) to act on — e.g. deciding whether `Fix` produced a
 /// diff, or handing `text` to [`crate::spec::parse_verdict`] for a review
@@ -742,6 +762,14 @@ pub struct AgentStageOutcome {
     pub text: String,
     /// The harness session id, if the CLI reported one.
     pub session_id: Option<String>,
+    /// The model the harness **actually** used, as reported by its own session
+    /// init (pi: `message_start`'s `provider/model`; Claude: `system/init`'s
+    /// `model`). This is the "what truly happened" model — distinct from the
+    /// configured T8 `model` that was passed to the CLI, which may differ when
+    /// no model was configured (CLI default) or the harness resolved an alias.
+    /// Captured in [`Self::absorb`] from `RunEvent::Session`; `None` when the
+    /// harness never reported one (e.g. a run that failed to emit a session).
+    pub model: Option<String>,
     pub exit_code: Option<i32>,
     pub cancelled: bool,
     /// T-543: `true` when this stage's `cancelled` came from
@@ -794,6 +822,12 @@ pub struct AgentStageOutcome {
     /// [`Default::default`] used only inside the drain closure before this
     /// field is populated.
     pub agent_run_id: String,
+    /// Every `ToolStart`/`ToolEnd` event seen in the stream, in arrival
+    /// order — recorded by [`AgentStageOutcome::absorb`] alongside `text`
+    /// so [`run_agent_stage`] can persist them into `agent_run_events`
+    /// once the drain completes. Empty when the stage never touched a
+    /// tool, in which case zero rows are written.
+    pub tool_events: Vec<ToolEventRecord>,
 }
 
 impl AgentStageOutcome {
@@ -801,9 +835,19 @@ impl AgentStageOutcome {
         match event {
             RunEvent::Text { delta, .. } => self.text.push_str(delta),
             RunEvent::Session {
-                session_id: Some(id),
+                session_id,
+                model,
                 ..
-            } => self.session_id = Some(id.clone()),
+            } => {
+                if let Some(id) = session_id {
+                    self.session_id = Some(id.clone());
+                }
+                // The actual model (see the field's doc). Independent of
+                // session_id — either may be present or absent.
+                if let Some(m) = model {
+                    self.model = Some(m.clone());
+                }
+            }
             RunEvent::Error { message, .. } => {
                 self.errored = true;
                 // The log trail keeps every error verbatim (the row's `log`
@@ -821,6 +865,25 @@ impl AgentStageOutcome {
                 self.exit_code = *exit_code;
                 self.cancelled = *cancelled;
             }
+            // Tool calls are kept out of `text` (the log trail stays pure
+            // prose); they accumulate here instead so they can land in
+            // `agent_run_events` after the drain — see `tool_events`.
+            RunEvent::ToolStart {
+                tool_call_id, name, ..
+            } => self.tool_events.push(ToolEventRecord {
+                kind: "tool_start",
+                tool_call_id: tool_call_id.clone(),
+                name: name.clone(),
+                ok: None,
+            }),
+            RunEvent::ToolEnd {
+                tool_call_id, ok, ..
+            } => self.tool_events.push(ToolEventRecord {
+                kind: "tool_end",
+                tool_call_id: tool_call_id.clone(),
+                name: String::new(),
+                ok: Some(*ok),
+            }),
             _ => {}
         }
     }
@@ -1206,6 +1269,10 @@ pub async fn run_agent_stage(
         outcome.cancelled = true;
     }
 
+    // Best-effort inside save_run_events itself: failures are logged there,
+    // never propagated, so the close_stage call below always runs regardless.
+    evidence::save_run_events(conn, &stage_row.id, &outcome.tool_events).await;
+
     evidence::close_stage(
         conn,
         &stage_row,
@@ -1221,6 +1288,16 @@ pub async fn run_agent_stage(
     )
     .await
     .map_err(AgentStageError::Db)?;
+
+    // Persist the harness-reported actual model as a best-effort post-close
+    // write, mirroring `set_verdict`: the value only arrives from the drained
+    // `RunEvent::Session`, so it can't ride through `CloseStage` (which the
+    // drain-failure paths construct before any session exists) — the row is
+    // closed first, then this stamped. A failure here must never fail the
+    // stage; the configured T8 `model` column still records intent.
+    if let Some(actual_model) = outcome.model.as_deref() {
+        let _ = evidence::set_actual_model(conn, &stage_row.id, actual_model).await;
+    }
 
     Ok(outcome)
 }
@@ -2180,7 +2257,7 @@ mod tests {
             .db
             .conn()
             .query(
-                "SELECT harness, model, prompt_hash FROM agent_run \
+                "SELECT harness, model, prompt_hash, actual_model FROM agent_run \
                  WHERE task_id = 'task-1' AND stage = 'review'",
                 (),
             )
@@ -2195,6 +2272,13 @@ mod tests {
         assert_eq!(
             row.get::<Option<String>>(2).unwrap().as_deref(),
             Some(crate::agent_settings::prompt_hash("review prompt").as_str())
+        );
+        // The scripted session reports the harness's actual model, which must
+        // be stamped onto the closed row separately from the configured T8
+        // `model` (test-model above).
+        assert_eq!(
+            row.get::<Option<String>>(3).unwrap().as_deref(),
+            Some("scripted-model")
         );
         std::fs::remove_dir_all(&dir).ok();
     }

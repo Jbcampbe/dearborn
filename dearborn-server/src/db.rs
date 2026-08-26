@@ -63,6 +63,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "0008_failure_detail",
         sql: include_str!("../migrations/0008_failure_detail.sql"),
     },
+    Migration {
+        id: 9,
+        name: "0009_agent_run_events",
+        sql: include_str!("../migrations/0009_agent_run_events.sql"),
+    },
+    Migration {
+        id: 10,
+        name: "0010_agent_run_actual_model",
+        sql: include_str!("../migrations/0010_agent_run_actual_model.sql"),
+    },
 ];
 
 /// Errors surfaced while opening the database or running migrations.
@@ -152,9 +162,9 @@ const BUSY_TIMEOUT_MS: i64 = 5000;
 /// every server write with `SQLITE_BUSY`, which is exactly how a breakdown run
 /// ended up silently creating zero tasks while reporting success (see
 /// [`crate::breakdown`] for the guard that makes such runs fail loudly now).
-/// Both pragmas are best-effort: WAL is meaningless for `":memory:"` databases
+/// All pragmas are best-effort: WAL is meaningless for `":memory:"` databases
 /// (the pragma reports `memory` rather than erroring), and a failure to set
-/// either one degrades to today's behavior rather than refusing to boot.
+/// any one degrades to today's behavior rather than refusing to boot.
 async fn apply_pragmas(conn: &Connection) {
     if let Err(err) = conn.execute_batch("PRAGMA journal_mode = WAL;").await {
         tracing::warn!(error = %err, "could not enable WAL journal mode");
@@ -164,6 +174,9 @@ async fn apply_pragmas(conn: &Connection) {
         .await
     {
         tracing::warn!(error = %err, "could not apply busy timeout");
+    }
+    if let Err(err) = conn.execute_batch("PRAGMA foreign_keys = ON;").await {
+        tracing::warn!(error = %err, "could not enable foreign key enforcement");
     }
 }
 
@@ -665,5 +678,61 @@ mod tests {
         for suffix in ["", "-shm", "-wal"] {
             let _ = std::fs::remove_file(format!("{path}{suffix}"));
         }
+    }
+
+    /// Migration `0009_agent_run_events` creates the table and composite index,
+    /// and FK enforcement (via `PRAGMA foreign_keys = ON`) rejects orphan rows.
+    #[tokio::test]
+    async fn migration_0009_creates_agent_run_events_table_and_index() {
+        let db = Db::connect(":memory:").await.unwrap();
+        db.run_migrations().await.unwrap();
+
+        for column in [
+            "id",
+            "agent_run_id",
+            "kind",
+            "tool_call_id",
+            "name",
+            "ok",
+            "created_at",
+        ] {
+            let mut rows = db
+                .conn()
+                .query("PRAGMA table_info(agent_run_events)", ())
+                .await
+                .unwrap();
+            let mut found = false;
+            while let Some(row) = rows.next().await.unwrap() {
+                if row.get::<String>(1).unwrap() == column {
+                    found = true;
+                    break;
+                }
+            }
+            assert!(found, "missing column agent_run_events.{column}");
+        }
+
+        let mut rows = db
+            .conn()
+            .query(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_agent_run_events_run'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(
+            rows.next().await.unwrap().is_some(),
+            "missing index: idx_agent_run_events_run"
+        );
+
+        // FK enforcement: inserting an event with a non-existent agent_run_id must fail.
+        let err = db
+            .conn()
+            .execute(
+                "INSERT INTO agent_run_events (id, agent_run_id, kind, tool_call_id, name, created_at) \
+                 VALUES ('ev-1', 'nonexistent-run', 'tool_start', 'tc-1', 'bash', 1)",
+                (),
+            )
+            .await;
+        assert!(err.is_err(), "FK violation should be rejected");
     }
 }

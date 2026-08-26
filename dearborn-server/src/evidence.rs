@@ -335,6 +335,28 @@ pub async fn set_verdict(
     Ok(())
 }
 
+/// Set `agent_run.actual_model` on an **already-closed** row — the model the
+/// harness *actually used*, as reported by its `RunEvent::Session` (pi:
+/// `provider/model`; Claude: `system/init`'s `model`). Shares the
+/// [`set_verdict`] shape for the same reason: the value only arrives after
+/// the stage's `RunEvent`s have been drained, by which time
+/// [`crate::task_agent::run_agent_stage`] has already called [`close_stage`],
+/// so this is a plain, independent `UPDATE` by row id rather than a field on
+/// [`CloseStage`]. Best-effort at the call site (a failure is logged, never
+/// fails the stage) — the configured T8 `model` column still records intent.
+pub async fn set_actual_model(
+    conn: &Connection,
+    run_id: &str,
+    model: &str,
+) -> Result<(), libsql::Error> {
+    conn.execute(
+        "UPDATE agent_run SET actual_model = ?1 WHERE id = ?2",
+        params![model, run_id],
+    )
+    .await?;
+    Ok(())
+}
+
 /// Run `body` against an already-[`open_stage`]d stage, guaranteeing
 /// [`close_stage`] is called **exactly once** no matter how `body` exits: it
 /// completes, it returns `Err`, or it panics. This is the AC's "a stage that
@@ -418,6 +440,94 @@ fn panic_message(payload: &(dyn std::any::Any + Send)) -> String {
     }
 }
 
+// ---- tool-event rows (agent_run_events) ------------------------------------
+
+/// Insert one `agent_run_events` row per entry in `events`, in arrival order.
+/// Called best-effort after the stage drain — a failure here must never fail
+/// the stage itself, so errors are logged and swallowed instead of returned.
+/// An empty `events` slice is a no-op: zero rows are inserted without error,
+/// satisfying the "a stage with no tool calls inserts zero rows" AC.
+pub async fn save_run_events(
+    conn: &Connection,
+    run_id: &str,
+    events: &[crate::task_agent::ToolEventRecord],
+) {
+    for ev in events {
+        let id = ulid::Ulid::new().to_string();
+        if let Err(e) = conn
+            .execute(
+                "INSERT INTO agent_run_events \
+                 (id, agent_run_id, kind, tool_call_id, name, ok, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    id,
+                    run_id,
+                    ev.kind,
+                    ev.tool_call_id.clone(),
+                    ev.name.clone(),
+                    ev.ok.map(|b| b as i64),
+                    now_ms(),
+                ],
+            )
+            .await
+        {
+            tracing::warn!(run_id = %run_id, error = %e, "failed to persist tool event");
+        }
+    }
+}
+
+/// One `agent_run_events` row as returned by [`list_run_events`] — the same
+/// JSON shape the planning transcript uses for tool rows (`toolCallId` camel-
+/// cased on the wire), so a client can pair starts/ends with the identical
+/// logic it already speaks.
+#[derive(Debug, Clone, Serialize)]
+pub struct RunEventRow {
+    pub kind: String,
+    #[serde(rename = "toolCallId")]
+    pub tool_call_id: String,
+    pub name: String,
+    pub ok: Option<bool>,
+}
+
+/// All `agent_run_events` rows for one run, in insertion order: `created_at`
+/// first (matching the `(agent_run_id, created_at)` index), `rowid` as the
+/// tiebreak — two events minted in the same millisecond would otherwise have
+/// an arbitrary relative order, and `rowid` always increases with insertion.
+pub async fn list_run_events(
+    conn: &Connection,
+    run_id: &str,
+) -> Result<Vec<RunEventRow>, libsql::Error> {
+    let mut rows = conn
+        .query(
+            "SELECT kind, tool_call_id, name, ok FROM agent_run_events \
+             WHERE agent_run_id = ?1 ORDER BY created_at ASC, rowid ASC",
+            params![run_id],
+        )
+        .await?;
+    let mut items = Vec::new();
+    while let Some(row) = rows.next().await? {
+        items.push(RunEventRow {
+            kind: row.get(0)?,
+            tool_call_id: row.get(1)?,
+            name: row.get(2)?,
+            ok: row.get::<Option<i64>>(3)?.map(|v| v != 0),
+        });
+    }
+    Ok(items)
+}
+
+/// `GET /runs/{id}/events` — one run's tool-call timeline, in insertion
+/// order. Auth comes from the shared bearer `require_auth` middleware layer
+/// (like every other protected route), not a per-handler extractor.
+pub async fn list_run_events_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+) -> AppResult<Json<Vec<RunEventRow>>> {
+    let conn = state.db.conn();
+    let events = list_run_events(conn, &id).await?;
+    Ok(Json(events))
+}
+
 // ---- REST: task stage history + one stage's log (§2.5) ---------------------
 
 /// One `agent_run` row as returned by `GET /tasks/{id}/runs` — **without**
@@ -436,6 +546,11 @@ pub struct AgentRunSummary {
     pub status: String,
     pub verdict: Option<String>,
     pub session_id: Option<String>,
+    /// The model the harness actually used for this run, as reported by its
+    /// `RunEvent::Session` — `None` when the harness never reported one or the
+    /// run predates the column. Distinct from the configured T8 `model` (not
+    /// surfaced here), so a reader sees what truly ran, not what was intended.
+    pub actual_model: Option<String>,
     pub started_at: Option<i64>,
     pub ended_at: Option<i64>,
     pub exit_code: Option<i64>,
@@ -453,7 +568,7 @@ pub struct AgentRunDetail {
 /// Columns [`row_to_summary`] expects, in order. `GET /runs/{id}` appends
 /// `log` after these.
 const RUN_SUMMARY_COLUMNS: &str = "id, task_id, epic_id, stage, attempt, status, verdict, \
-     session_id, started_at, ended_at, exit_code, created_at";
+     session_id, started_at, ended_at, exit_code, created_at, actual_model";
 
 fn row_to_summary(row: &Row) -> Result<AgentRunSummary, libsql::Error> {
     Ok(AgentRunSummary {
@@ -469,6 +584,7 @@ fn row_to_summary(row: &Row) -> Result<AgentRunSummary, libsql::Error> {
         ended_at: row.get(9)?,
         exit_code: row.get(10)?,
         created_at: row.get(11)?,
+        actual_model: row.get(12)?,
     })
 }
 
@@ -504,7 +620,10 @@ pub async fn fetch_run_detail(conn: &Connection, id: &str) -> AppResult<Option<A
     match rows.next().await? {
         Some(row) => {
             let summary = row_to_summary(&row)?;
-            let log: String = row.get(12)?;
+            // `RUN_SUMMARY_COLUMNS` (13 cols) precedes `log`, so `log` sits at
+            // index 13 — the same relative position `row_to_summary` relied
+            // on before `actual_model` was appended.
+            let log: String = row.get(13)?;
             Ok(Some(AgentRunDetail { summary, log }))
         }
         None => Ok(None),
@@ -1033,6 +1152,86 @@ mod tests {
         );
         assert!(row.log.contains("stage panicked"));
         assert!(row.summary.ended_at.is_some());
+    }
+
+    // ---- tool-event rows (agent_run_events) -------------------------------
+
+    #[tokio::test]
+    async fn save_and_list_run_events_round_trip_in_insertion_order() {
+        let db = seeded_db().await;
+        let conn = db.conn();
+        let handle = open_stage(
+            conn,
+            OpenStage {
+                task_id: Some("task-1"),
+                epic_id: Some("epic-1"),
+                stage: "implement",
+                attempt: 1,
+                harness: None,
+                model: None,
+                prompt_hash: None,
+            },
+        )
+        .await
+        .unwrap();
+
+        // An empty slice inserts nothing and is not an error.
+        save_run_events(conn, &handle.id, &[]).await;
+        assert!(list_run_events(conn, &handle.id).await.unwrap().is_empty());
+
+        use crate::task_agent::ToolEventRecord;
+        save_run_events(
+            conn,
+            &handle.id,
+            &[
+                ToolEventRecord {
+                    kind: "tool_start",
+                    tool_call_id: "call-1".to_string(),
+                    name: "read".to_string(),
+                    ok: None,
+                },
+                ToolEventRecord {
+                    kind: "tool_end",
+                    tool_call_id: "call-1".to_string(),
+                    name: String::new(),
+                    ok: Some(true),
+                },
+                ToolEventRecord {
+                    kind: "tool_start",
+                    tool_call_id: "call-2".to_string(),
+                    name: "edit".to_string(),
+                    ok: None,
+                },
+            ],
+        )
+        .await;
+
+        let events = list_run_events(conn, &handle.id).await.unwrap();
+        assert_eq!(events.len(), 3);
+        assert_eq!(events[0].kind, "tool_start");
+        assert_eq!(events[0].tool_call_id, "call-1");
+        assert_eq!(events[0].name, "read");
+        assert_eq!(events[0].ok, None);
+        assert_eq!(events[1].kind, "tool_end");
+        assert_eq!(events[1].ok, Some(true));
+        assert_eq!(events[2].name, "edit");
+
+        // Rows for a *different* run don't leak in.
+        let other = open_stage(
+            conn,
+            OpenStage {
+                task_id: Some("task-1"),
+                epic_id: Some("epic-1"),
+                stage: "review",
+                attempt: 1,
+                harness: None,
+                model: None,
+                prompt_hash: None,
+            },
+        )
+        .await
+        .unwrap();
+        assert!(list_run_events(conn, &other.id).await.unwrap().is_empty());
     }
 
     // ---- REST: GET /tasks/{id}/runs, GET /runs/{id} ------------------------

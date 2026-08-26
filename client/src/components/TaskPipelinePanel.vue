@@ -2,8 +2,9 @@
 import { computed, onBeforeUnmount, onMounted, reactive, ref, watch } from "vue";
 
 import { useAuthStore } from "../stores/auth";
+import { renderMarkdown } from "../lib/markdown";
 import { ApiError } from "../api/client";
-import { getRunLog, getTaskRuns, type AgentRunDetail, type AgentRunSummary } from "../api/tasks";
+import { getRunEvents, getRunLog, getTaskRuns, type AgentRunDetail, type AgentRunSummary, type ToolCallEvent } from "../api/tasks";
 import {
   attemptLabel,
   durationLabel,
@@ -17,6 +18,7 @@ import {
   stageLabel,
   verdictLabel,
   type PipelineState,
+  type ToolCall,
 } from "../task/pipeline";
 import { usePipelineStream, type PipelineStream, type StreamStatus } from "../task/usePipelineStream";
 import AppIcon from "./AppIcon.vue";
@@ -59,6 +61,11 @@ onBeforeUnmount(() => stream?.close());
 const expandedId = ref<string | null>(null);
 /** Per-run full-log cache, keyed by `agent_run.id` — fetched once per row. */
 const logCache = reactive(new Map<string, AgentRunDetail>());
+/**
+ * Per-run historical tool-call pills, keyed by `agent_run.id` — folded from
+ * `GET /runs/{id}/events` on expand, fetched once per row alongside the log.
+ */
+const eventsCache = reactive(new Map<string, ToolCall[]>());
 const logLoading = reactive(new Set<string>());
 const logError = reactive(new Map<string, string>());
 
@@ -103,6 +110,7 @@ async function load() {
   error.value = null;
   expandedId.value = null;
   logCache.clear();
+  eventsCache.clear();
   logLoading.clear();
   logError.clear();
 
@@ -167,6 +175,11 @@ async function toggle(run: AgentRunSummary) {
   if (token === null) {
     return;
   }
+  // Historical pills are best-effort: a failed events fetch must not affect
+  // the log below it, so swallow everything except an auth bounce.
+  void getRunEvents(token, run.id)
+    .then((events) => eventsCache.set(run.id, foldToolEvents(events)))
+    .catch(() => {});
   logLoading.add(run.id);
   logError.delete(run.id);
   try {
@@ -180,6 +193,32 @@ async function toggle(run: AgentRunSummary) {
   } finally {
     logLoading.delete(run.id);
   }
+}
+
+/**
+ * Pair `tool_start`/`tool_end` events by `toolCallId` into resolved pills —
+ * same pairing logic as planning/stream.ts's foldMessages, but over the
+ * persisted event rows rather than WS frames.
+ */
+function foldToolEvents(events: ToolCallEvent[]): ToolCall[] {
+  const starts = new Map<string, string>(); // toolCallId → name
+  const result: ToolCall[] = [];
+  for (const e of events) {
+    if (e.kind === "tool_start") {
+      starts.set(e.toolCallId, e.name);
+    } else {
+      result.push({
+        toolCallId: e.toolCallId,
+        name: starts.get(e.toolCallId) ?? "tool",
+        status: e.ok ? "ok" : "error",
+      });
+      starts.delete(e.toolCallId);
+    }
+  }
+  for (const [id, name] of starts) {
+    result.push({ toolCallId: id, name, status: "running" });
+  }
+  return result;
 }
 
 /** The verdict badge's tone: PASS reads green, BLOCKED red, NEEDS_CHANGES neutral. */
@@ -208,7 +247,12 @@ onMounted(load);
     </div>
 
     <ul v-else class="run-list">
-      <li v-for="run in state.runs" :key="run.id" class="run-row">
+      <li
+        v-for="run in state.runs"
+        :key="run.id"
+        class="run-row"
+        :data-expanded="expandedId === run.id"
+      >
         <button
           class="run-head"
           type="button"
@@ -219,6 +263,9 @@ onMounted(load);
           <StatusIcon :status="run.status" :size="12" />
           <span class="run-stage">{{ stageLabel(run.stage) }}</span>
           <span class="run-attempt">{{ attemptLabel(run) }}</span>
+          <span v-if="run.actual_model" class="badge model" :title="`Model used: ${run.actual_model}`">
+            {{ run.actual_model }}
+          </span>
           <span
             v-if="run.verdict"
             class="badge"
@@ -232,16 +279,53 @@ onMounted(load);
         </button>
 
         <div v-if="expandedId === run.id" class="run-body">
+          <!-- Live pills: the currently-running stage renders directly from
+               state.liveTools, which applyPipelineFrame keeps in sync as
+               tool_start/tool_end frames stream over the WebSocket. -->
+          <div v-if="run.id === runningRunId && state.liveTools.length > 0" class="tool-row">
+            <span
+              v-for="call in state.liveTools"
+              :key="call.toolCallId"
+              class="tool-chip"
+              :data-status="call.status"
+            >
+              <span class="tool-dot" />
+              <span class="tool-name mono">{{ call.name }}</span>
+              <span class="tool-state">{{ call.status }}</span>
+            </span>
+          </div>
+          <!-- Historical pills: completed stages only -- fetched on expand
+               from GET /runs/{id}/events (see toggle()). -->
+          <div v-if="run.id !== runningRunId && (eventsCache.get(run.id)?.length ?? 0) > 0" class="tool-row">
+            <span
+              v-for="call in eventsCache.get(run.id) ?? []"
+              :key="call.toolCallId"
+              class="tool-chip"
+              :data-status="call.status"
+            >
+              <span class="tool-dot" />
+              <span class="tool-name mono">{{ call.name }}</span>
+              <span class="tool-state">{{ call.status }}</span>
+            </span>
+          </div>
           <p v-if="logLoading.has(run.id)" class="log-note">Loading log…</p>
           <p v-else-if="logError.has(run.id)" class="banner banner-error" role="alert">
             {{ logError.get(run.id) }}
           </p>
           <template v-else-if="expandedSegments">
-            <pre v-if="expandedSegments.head" class="log mono">{{ expandedSegments.head }}</pre>
+            <div
+              v-if="expandedSegments.head"
+              class="log-md md"
+              v-html="renderMarkdown(expandedSegments.head)"
+            />
             <p v-if="expandedSegments.tail !== null" class="log-elided">
               Log elided — exceeded 256 KB; showing head + tail
             </p>
-            <pre v-if="expandedSegments.tail" class="log mono">{{ expandedSegments.tail }}</pre>
+            <div
+              v-if="expandedSegments.tail"
+              class="log-md md"
+              v-html="renderMarkdown(expandedSegments.tail)"
+            />
             <p v-if="!expandedSegments.head && expandedSegments.tail === null" class="log-note">
               No output.
             </p>
@@ -265,29 +349,58 @@ onMounted(load);
   padding: 0;
   display: flex;
   flex-direction: column;
-  gap: 6px;
+  gap: 2px;
 }
 
+/* Linear-style rows: flat against the modal surface — no border, no fill at
+   rest; a quiet wash on hover; the expanded row gets a hairline frame so the
+   log body reads as belonging to it. */
 .run-row {
-  border: 1px solid var(--border-hairline);
-  border-radius: var(--radius-cards);
-  background: rgba(255, 255, 255, 0.015);
+  border: 1px solid transparent;
+  border-radius: var(--radius-buttons);
   overflow: hidden;
+  transition:
+    background-color var(--duration-fast) var(--ease-out),
+    border-color var(--duration-fast) var(--ease-out);
 }
 
+.run-row:hover {
+  background: rgba(255, 255, 255, 0.04);
+}
+
+.run-row[data-expanded="true"] {
+  background: rgba(255, 255, 255, 0.02);
+  border-color: var(--border-hairline);
+}
+
+.run-row[data-expanded="true"]:hover {
+  background: rgba(255, 255, 255, 0.02);
+}
+
+/* `.run-head` is a plain <button> — base.css's reset only inherits
+   font-family/color, so without clearing the UA background/border here the
+   row renders with a gray buttonface fill (the washed-out look) and a UA
+   border ridge on hover. */
 .run-head {
   width: 100%;
   display: flex;
   align-items: center;
   gap: var(--spacing-8);
   padding: 8px var(--spacing-12);
+  background: none;
+  border: none;
+  border-radius: inherit;
   text-align: left;
+  font-size: var(--text-caption);
   color: var(--text-body);
   cursor: pointer;
 }
 
-.run-head:hover {
-  background: rgba(255, 255, 255, 0.03);
+/* Keep the focus ring inside the row's radius instead of an offset box
+   floating around it. */
+.run-head:focus-visible {
+  outline-offset: -2px;
+  border-radius: inherit;
 }
 
 .run-stage {
@@ -298,7 +411,15 @@ onMounted(load);
 
 .run-attempt {
   font-size: var(--text-label);
-  color: var(--text-faint);
+  color: var(--text-muted);
+}
+
+/* The harness-reported actual model badge — muted mono so it reads as data,
+   not a status; hosted on the existing `.badge` token for tone/pad. It sits
+   right after the attempt label, before the spacer. */
+.badge.model {
+  font-family: var(--font-mono);
+  font-size: 10px;
 }
 
 .run-spacer {
@@ -317,7 +438,7 @@ onMounted(load);
 
 .run-duration {
   font-size: var(--text-label);
-  color: var(--text-faint);
+  color: var(--text-muted);
   white-space: nowrap;
   min-width: 5em;
   text-align: right;
@@ -328,7 +449,10 @@ onMounted(load);
   border-top: 1px solid var(--border-hairline);
 }
 
-.log {
+/* Rendered stage-log markdown — same container as the old `.log` <pre>, but
+   flowing text (no `white-space: pre-wrap`, no monospace): `.md` (ui.css)
+   handles code blocks/spans with its own monospace styling. */
+.log-md {
   margin: var(--spacing-8) 0 0;
   padding: var(--spacing-8) var(--spacing-12);
   background: var(--surface-void);
@@ -336,8 +460,6 @@ onMounted(load);
   border-radius: var(--radius-buttons);
   max-height: 320px;
   overflow: auto;
-  white-space: pre-wrap;
-  word-break: break-word;
   font-size: 12px;
   line-height: 1.55;
   color: var(--text-body);
