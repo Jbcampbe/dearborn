@@ -6,6 +6,7 @@ import { ApiError } from "../api/client";
 import { getProject, refreshProject, type Project } from "../api/projects";
 import { listEpics, type Epic } from "../api/epics";
 import CloneStatusBadge from "./CloneStatusBadge.vue";
+import ProjectCostGraphs from "./ProjectCostGraphs.vue";
 import ProjectKanbanView from "./ProjectKanbanView.vue";
 import CreateEpicModal from "./CreateEpicModal.vue";
 import ProjectSettingsPanel from "./ProjectSettingsPanel.vue";
@@ -234,10 +235,9 @@ watch(
         </div>
       </section>
 
-      <!-- Slot for the cost graphs component (agent/harness/model usage
-           charts); it renders here, between the meta card and the epics.
-           Owned by a later task — not wired up yet. ----------------------- -->
-      <!-- <ProjectCostGraphs :project-id="project.id" /> -->
+      <!-- Cost graphs (agent/harness/model usage charts), between the meta
+           card and the epic list — summary context, read-only. ------------ -->
+      <ProjectCostGraphs :project-id="project.id" />
 
       <section class="epics">
         <div class="section-head">
