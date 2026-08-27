@@ -16,6 +16,8 @@ const MAP: Record<string, { glyph: Glyph; tone: Tone }> = {
   Planning: { glyph: "dashed", tone: "violet" },
   Ready: { glyph: "hollow", tone: "neutral" },
   InProgress: { glyph: "half", tone: "teal" },
+  // InReview: work pushed, PR open — waiting on the human reviewer (§4).
+  InReview: { glyph: "half", tone: "violet" },
   Completed: { glyph: "check", tone: "green" },
   Cancelled: { glyph: "cancel", tone: "dim" },
   Blocked: { glyph: "octagon", tone: "red" },

@@ -47,6 +47,17 @@ export function canCancelEpic(epic: Pick<Epic, "status">): boolean {
   return epic.status === "InProgress";
 }
 
+/**
+ * Whether a card shows its PR link (`PR #N`, opening the stored `pr_url` in a
+ * new tab). The §4 review loop means `pr_url` is attached when the item lands
+ * in `InReview` (PR open, waiting on the human) and stays attached through
+ * `Completed`/`Done` (merged) — the link is shown in both cases and hidden
+ * whenever the item has no `pr_url` yet (or is Blocked/Cancelled).
+ */
+export function showPrLink(status: string, prUrl: string | null | undefined): boolean {
+  return (status === "InReview" || status === "Completed" || status === "Done") && !!prUrl;
+}
+
 /** The action a rejected control call is described relative to. */
 export type ControlAction = "retry" | "run" | "cancel";
 
