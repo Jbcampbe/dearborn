@@ -43,10 +43,21 @@
 //!    + `base_sha` in `pr_feedback` (`in_progress`), flips the epic to
 //!    `InProgress` + `notify_waiters()`; a standalone change amends the task's
 //!    own spec, records `base_sha` + `in_progress`, and flips the task to
-//!    `InProgress`. Both post an interim "Picked up — implementing." reply
+//!    `InProgress`. Both post the interim "Picked up — implementing." reply
 //!    without resolving. The worker pool then runs the work and finalize pushes
-//!    the same branch back to `InReview`. An open PR stays `InReview` until the
-//!    feedback spawns work, and its workspace stays retained.
+//!    the same branch back to `InReview`.
+//! 3. **Close the loop after work lands** (AC #5): once the item is back in
+//!    `InReview`, any `pr_feedback` row in `state='in_progress'` whose spawned
+//!    work has completed and whose branch `head_sha` (via [`crate::git_host::
+//!    GitHost::get_pull`]) has advanced past the row's `base_sha` is answered
+//!    with the closing "Addressed in `<commit>`" reply (an in-thread reply +
+//!    `resolve_thread` for an inline row; an issue comment for a formal-review
+//!    body / top-level comment), the row moves to `state='addressed'`, and the
+//!    reply is recorded as an `our_post`. Already-addressed items are skipped on
+//!    subsequent polls; rows whose branch hasn't advanced stay `in_progress`.
+//!
+//!    An open PR stays `InReview` until the feedback spawns work or settles,
+//!    and its workspace stays retained.
 //!
 //! ## Per-item error boundary
 //!
@@ -614,12 +625,26 @@ fn provenance(kind: WorkKind, candidate: &Candidate) -> (Option<String>, Option<
 }
 
 /// The open-PR step-2 action (called from the `open` arm of the epic and task
-/// handlers): for each deduped actionable item, run the triage agent and act on
-/// an `QUESTION` classification (post a reply and record handled state). A
-/// `CHANGE` is deliberately left alone — spawning tasks belongs to a later task
-/// of the post-PR feedback loop (§6.4). An item's triage/reply is isolated so
-/// one failure can't stall the other items or the rest of the poll.
-async fn handle_open_feedback(state: &AppState, candidate: &Candidate, kind: WorkKind) {
+/// handlers): first [`close_the_loop`] answers any `in_progress` change whose
+/// spawned work has landed (AC #5), then for each deduped actionable item run
+/// the triage agent and act on the classification — a `QUESTION` posts a reply
+/// and records handled state; a `CHANGE` (AC #4) hands work back to the
+/// existing pipeline via [`handle_change`]. An item's triage/reply is isolated
+/// so one failure can't stall the other items or the rest of the poll. `head_sha`
+/// is the current PR-branch HEAD from [`crate::git_host::GitHost::get_pull`];
+/// it is the post-work address that proves an `in_progress` row's branch
+/// advanced past its `base_sha`.
+async fn handle_open_feedback(
+    state: &AppState,
+    candidate: &Candidate,
+    kind: WorkKind,
+    head_sha: &str,
+) {
+    // Close the loop first: address any landed change requests before fetching
+    // so their rows move to `addressed` and drop out of the actionable set via
+    // `known.handled` on the same poll.
+    close_the_loop(state, candidate, head_sha).await;
+
     match fetch_actionable(state, candidate).await {
         Ok(items) => {
             if items.is_empty() {
@@ -642,6 +667,318 @@ async fn handle_open_feedback(state: &AppState, candidate: &Candidate, kind: Wor
                 "review poll: could not fetch actionable feedback for open PR"
             );
         }
+    }
+}
+
+/// One `pr_feedback` row in `state='in_progress'` — a change request whose
+/// spawned work may have landed and now needs the closing "Addressed in
+/// `<commit>`" reply (AC #5). Carries everything the closing pass needs to
+/// prove completion and post/resolve.
+#[derive(Debug, Clone)]
+struct InProgressRow {
+    id: String,
+    epic_id: Option<String>,
+    task_id: Option<String>,
+    source_kind: String,
+    github_id: i64,
+    thread_id: Option<String>,
+    spawned_task_ids: Option<String>,
+    base_sha: Option<String>,
+}
+
+/// Load every `state='in_progress'` row for one PR — the change requests whose
+/// spawned work may have landed and needs the closing reply. A read failure is
+/// logged and yields an empty vec so one bad candidate can't stall the rest of
+/// the poll.
+async fn load_in_progress_rows(state: &AppState, pr_number: i64) -> Vec<InProgressRow> {
+    let mut out = Vec::new();
+    let mut rows = match state
+        .db
+        .conn()
+        .query(
+            "SELECT id, epic_id, task_id, source_kind, github_id, thread_id, \
+             spawned_task_ids, base_sha FROM pr_feedback \
+             WHERE pr_number = ?1 AND state = 'in_progress'",
+            params![pr_number],
+        )
+        .await
+    {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(
+                error = %err,
+                pr = pr_number,
+                "review poll: failed to read in_progress pr_feedback rows"
+            );
+            return out;
+        }
+    };
+    while let Some(row) = rows.next().await.transpose() {
+        let row = match row {
+            Ok(row) => row,
+            Err(_) => continue,
+        };
+        let id: String = match row.get(0) {
+            Ok(id) => id,
+            Err(_) => continue,
+        };
+        let epic_id: Option<String> = row.get(1).unwrap_or(None);
+        let task_id: Option<String> = row.get(2).unwrap_or(None);
+        let source_kind: String = match row.get(3) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let github_id: i64 = match row.get(4) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let thread_id: Option<String> = row.get(5).unwrap_or(None);
+        let spawned_task_ids: Option<String> = row.get(6).unwrap_or(None);
+        let base_sha: Option<String> = row.get(7).unwrap_or(None);
+        out.push(InProgressRow {
+            id,
+            epic_id,
+            task_id,
+            source_kind,
+            github_id,
+            thread_id,
+            spawned_task_ids,
+            base_sha,
+        });
+    }
+    out
+}
+
+/// The db-backed close-the-loop pass (AC #5): for each `in_progress` row whose
+/// spawned work has completed (`spawned_work_complete`) and whose branch HEAD
+/// has advanced past the stored `base_sha` (`get_pull`'s `head_sha`), post the
+/// closing "Addressed in `<commit>`" reply, resolve the inline row's thread,
+/// move the source row to `state='addressed'`, and record the reply id as an
+/// `our_post`. Rows whose head hasn't advanced (or whose work isn't complete)
+/// are left `in_progress`; an already-addressed row is never reprocessed. Each
+/// row is isolated — one row's failure can't stall the others or the poll.
+async fn close_the_loop(state: &AppState, candidate: &Candidate, head_sha: &str) {
+    for row in load_in_progress_rows(state, candidate.pr_number).await {
+        if !spawned_work_complete(state, &row).await {
+            continue;
+        }
+        let Some(base_sha) = row.base_sha.as_deref() else {
+            // No base to prove advancement against; leave it in_progress.
+            continue;
+        };
+        if head_sha == base_sha {
+            // The branch hasn't advanced past the point work was picked up.
+            tracing::debug!(
+                id = %candidate.id,
+                pr = %candidate.pr_number,
+                row = %row.id,
+                "review poll: in_progress row's branch has not advanced; leaving in_progress"
+            );
+            continue;
+        }
+
+        // `<commit>` is the post-work branch HEAD (`get_pull`'s head_sha).
+        let commit = head_sha;
+        let reply_body = format!("Addressed in {commit}");
+        let Some(reply_id) = post_closing_reply(state, candidate, &row, &reply_body).await else {
+            continue;
+        };
+
+        mark_addressed(state, candidate, &row).await;
+        record_our_post(state, candidate, candidate_kind_for(&row), reply_id).await;
+        tracing::info!(
+            id = %candidate.id,
+            pr = %candidate.pr_number,
+            row = %row.id,
+            kind = %row.source_kind,
+            github_id = row.github_id,
+            commit = %commit,
+            "review poll: change work landed; posted \"Addressed in <commit>\" and marked addressed"
+        );
+    }
+}
+
+/// Map a `pr_feedback` change row's provenance to the kind it was recorded
+/// under, so its `our_post` row keeps the same `epic_id`/`task_id` shape.
+fn candidate_kind_for(row: &InProgressRow) -> WorkKind {
+    if row.task_id.is_some() && row.epic_id.is_none() {
+        WorkKind::Task
+    } else {
+        WorkKind::Epic
+    }
+}
+
+/// Whether an `in_progress` row's spawned work has completed: an epic change's
+/// `spawned_task_ids` must all be `Done` (the DAG walk drives them there before
+/// the epic can come back to `InReview`); a standalone change spawned no tasks,
+/// and its own task returning to `InReview` is the completion signal. A row we
+/// can't verify as complete is treated as not-yet (stays `in_progress`).
+async fn spawned_work_complete(state: &AppState, row: &InProgressRow) -> bool {
+    // A standalone (option-C) change spawned no tasks — completion is its own
+    // task coming back to `InReview`.
+    if row.spawned_task_ids.is_none() {
+        return task_status_is(state, row.task_id.as_deref(), "InReview").await;
+    }
+
+    let ids: Vec<String> = row
+        .spawned_task_ids
+        .as_deref()
+        .and_then(|s| serde_json::from_str(s).ok())
+        .unwrap_or_default();
+    if ids.is_empty() {
+        // A change row with no spawned task ids is not verifiable; stay
+        // in_progress until the record is consistent.
+        return false;
+    }
+    for id in &ids {
+        if !task_status_is(state, Some(id.as_str()), "Done").await {
+            return false;
+        }
+    }
+    true
+}
+
+/// True iff a task row exists and its status equals `wanted`; false on any
+/// missing row / read failure (so callers conservatively stay `in_progress`).
+async fn task_status_is(state: &AppState, task_id: Option<&str>, wanted: &str) -> bool {
+    let Some(task_id) = task_id else {
+        return false;
+    };
+    let Ok(mut rows) = state
+        .db
+        .conn()
+        .query("SELECT status FROM task WHERE id = ?1", params![task_id])
+        .await
+    else {
+        return false;
+    };
+    match rows.next().await {
+        Ok(Some(row)) => row.get::<String>(0).ok().as_deref() == Some(wanted),
+        _ => false,
+    }
+}
+
+/// Post the closing "Addressed in `<commit>`" reply for one row (AC #5),
+/// routed exactly like a question's reply: an issue comment for a formal-review
+/// body / top-level comment, an in-thread reply + `resolve_thread` for an
+/// inline comment. Returns the created reply's GitHub id on success, `None` on
+/// any failure (logged — the row is left `in_progress` to be retried next
+/// poll).
+async fn post_closing_reply(
+    state: &AppState,
+    candidate: &Candidate,
+    row: &InProgressRow,
+    body: &str,
+) -> Option<i64> {
+    let repo_url = load_repo_url(state, &candidate.project_id).await.ok()?;
+    let pat = load_decrypted_pat(state, &candidate.project_id)
+        .await
+        .map_err(|err| GitHostError::new(format!("failed to load project PAT: {err}")))
+        .ok()
+        .flatten();
+    let pat = pat.as_deref();
+
+    let reply_id = match FeedbackKind::from_source_kind(&row.source_kind) {
+        Some(FeedbackKind::Review) | Some(FeedbackKind::IssueComment) => {
+            match state
+                .git_host
+                .post_issue_comment(PostIssueCommentRequest {
+                    repo_url: &repo_url,
+                    pat,
+                    number: candidate.pr_number,
+                    body,
+                })
+                .await
+            {
+                Ok(id) => id,
+                Err(err) => {
+                    tracing::warn!(
+                        id = %candidate.id,
+                        pr = %candidate.pr_number,
+                        error = %err,
+                        "review poll: failed to post closing top-level reply"
+                    );
+                    return None;
+                }
+            }
+        }
+        Some(FeedbackKind::ReviewComment) => match state
+            .git_host
+            .reply_review_comment(ReplyReviewCommentRequest {
+                repo_url: &repo_url,
+                pat,
+                number: candidate.pr_number,
+                in_reply_to_id: row.github_id,
+                body,
+            })
+            .await
+        {
+            Ok(id) => id,
+            Err(err) => {
+                tracing::warn!(
+                    id = %candidate.id,
+                    pr = %candidate.pr_number,
+                    github_id = row.github_id,
+                    error = %err,
+                    "review poll: failed to post closing inline reply"
+                );
+                return None;
+            }
+        },
+        None => {
+            tracing::warn!(
+                id = %candidate.id,
+                pr = %candidate.pr_number,
+                source_kind = %row.source_kind,
+                "review poll: skipping closing reply for unrecognized source_kind"
+            );
+            return None;
+        }
+    };
+
+    // Resolve the inline row's thread so the resolved-thread guard also skips
+    // it next poll. Best-effort: the DB addressed state is authoritative.
+    if let Some(thread_id) = row.thread_id.as_deref() {
+        if let Err(err) = state
+            .git_host
+            .resolve_thread(ResolveThreadRequest {
+                repo_url: &repo_url,
+                pat,
+                thread_id,
+            })
+            .await
+        {
+            tracing::warn!(
+                id = %candidate.id,
+                pr = %candidate.pr_number,
+                thread_id = thread_id,
+                error = %err,
+                "review poll: failed to resolve inline thread after addressing"
+            );
+        }
+    }
+
+    Some(reply_id)
+}
+
+/// Move an `in_progress` row to `state='addressed'` after its closing reply
+/// landed. Fenced on `state='in_progress'` so a race/retry is a no-op rather
+/// than re-answering.
+async fn mark_addressed(state: &AppState, candidate: &Candidate, row: &InProgressRow) {
+    let now = now_ms();
+    let res = state.db.conn().execute(
+        "UPDATE pr_feedback SET state = 'addressed', updated_at = ?1 \
+         WHERE id = ?2 AND state = 'in_progress'",
+        params![now, row.id.clone()],
+    );
+    if let Err(err) = res.await {
+        tracing::error!(
+            id = %candidate.id,
+            pr = %candidate.pr_number,
+            row = %row.id,
+            error = %err,
+            "review poll: failed to mark change row addressed"
+        );
     }
 }
 
@@ -1446,7 +1783,7 @@ async fn apply_epic_pull_state(state: &AppState, candidate: &Candidate, pull: &P
                 epic = %candidate.id,
                 "review poll: PR still open; fetching actionable feedback"
             );
-            handle_open_feedback(state, candidate, WorkKind::Epic).await;
+            handle_open_feedback(state, candidate, WorkKind::Epic, &pull.head_sha).await;
             return;
         }
         (false, other) => {
@@ -1513,7 +1850,7 @@ async fn apply_task_pull_state(state: &AppState, candidate: &Candidate, pull: &P
                 task = %candidate.id,
                 "review poll: PR still open; fetching actionable feedback"
             );
-            handle_open_feedback(state, candidate, WorkKind::Task).await;
+            handle_open_feedback(state, candidate, WorkKind::Task, &pull.head_sha).await;
             return;
         }
         (false, other) => {
@@ -2787,5 +3124,287 @@ mod tests {
             ("issue_comment", 300, Some("change_request"), "in_progress")
         );
         assert!(spawned.is_none(), "a standalone change spawns no tasks");
+    }
+
+    // ---- close the loop: "Addressed in <commit>" after work lands (AC #5) --
+
+    /// Seed an epic-owned task already in `Done` (the completed change work
+    /// whose `pr_feedback` row we then close the loop on). Returns its id.
+    async fn seed_done_task(state: &AppState, project_id: &str, epic_id: &str) -> String {
+        let id = ulid::Ulid::new().to_string();
+        let now = now_ms();
+        state
+            .db
+            .conn()
+            .execute(
+                "INSERT INTO task (id, epic_id, project_id, title, status, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, 'change task', 'Done', ?4, ?4)",
+                params![id.clone(), epic_id, project_id, now],
+            )
+            .await
+            .unwrap();
+        id
+    }
+
+    /// Seed a `state='in_progress'` change-request row against an already-open
+    /// PR, as `handle_change`'s `record_change_in_progress` would have left it.
+    #[allow(clippy::too_many_arguments)]
+    async fn seed_in_progress_row(
+        state: &AppState,
+        pr_number: i64,
+        project_id: &str,
+        epic_id: Option<&str>,
+        task_id: Option<&str>,
+        source_kind: &str,
+        github_id: i64,
+        thread_id: Option<&str>,
+        spawned: Option<&str>,
+        base_sha: Option<&str>,
+    ) {
+        let id = ulid::Ulid::new().to_string();
+        let now = now_ms();
+        state
+            .db
+            .conn()
+            .execute(
+                "INSERT INTO pr_feedback \
+                 (id, project_id, epic_id, task_id, pr_number, source_kind, github_id, thread_id, \
+                  classification, state, spawned_task_ids, base_sha, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'change_request', 'in_progress', ?9, ?10, ?11, ?11)",
+                params![
+                    id,
+                    project_id,
+                    epic_id,
+                    task_id,
+                    pr_number,
+                    source_kind,
+                    github_id,
+                    thread_id,
+                    spawned,
+                    base_sha,
+                    now
+                ],
+            )
+            .await
+            .unwrap();
+    }
+
+    #[tokio::test]
+    async fn addressed_epic_change_posts_issue_reply_and_marks_addressed() {
+        // AC #5 (top-level): after the spawned change task lands, a `dearborn:`
+        // issue-comment change is answered with an "Addressed in <commit>"
+        // issue-comment reply, its row moves to `addressed`, and an `our_post`
+        // is recorded — and it is not reprocessed on the next poll.
+        let env = make_env_with(FakeHost::new().with_pull_state(PullState {
+            merged: false,
+            state: "open".to_string(),
+            head_sha: "new-head-abc".to_string(),
+        }))
+        .await;
+        let project = seed_project(&env.state, "https://github.com/o/r").await;
+        let epic = seed_in_review_epic(&env.state, &project, 7, "addressed loop").await;
+        let task_id = seed_done_task(&env.state, &project, &epic).await;
+        seed_in_progress_row(
+            &env.state,
+            7,
+            &project,
+            Some(&epic),
+            None,
+            "issue_comment",
+            300,
+            None,
+            Some(&format!("[\"{task_id}\"]")),
+            Some("old-base"),
+        )
+        .await;
+
+        review_tick(&env.state).await;
+
+        // The addressed reply is a top-level issue comment carrying the post-work
+        // branch HEAD as <commit>, and the change row moves to `addressed`.
+        let posts = env.fake.post_issue_comment_calls();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].body, "Addressed in new-head-abc");
+        assert!(env.fake.reply_review_comment_calls().is_empty());
+        assert!(env.fake.resolve_thread_calls().is_empty());
+
+        let rows = feedback_rows(&env.state, 7).await;
+        assert!(rows.contains(&("issue_comment".to_string(), 300, "addressed".to_string())));
+        // The created reply id is recorded as our_post.
+        assert!(rows.contains(&("our_post".to_string(), 10_001, "handled_reply".to_string())));
+
+        // The addressed row's spawned task stays Done; the epic stays InReview.
+        assert_eq!(epic_status(&env.state, &epic).await, "InReview");
+
+        // Second poll: the addressed item is skipped (DB handled set) — no
+        // duplicate "Addressed in" reply.
+        review_tick(&env.state).await;
+        assert_eq!(
+            env.fake.post_issue_comment_calls().len(),
+            1,
+            "an addressed change must not be re-answered"
+        );
+    }
+
+    #[tokio::test]
+    async fn addressed_inline_change_replies_in_thread_and_resolves() {
+        // AC #5 (inline): an inline change whose work landed gets an in-thread
+        // "Addressed in <commit>" reply, its thread resolved, its row moved to
+        // `addressed`, and an our_post recorded.
+        let env = make_env_with(FakeHost::new().with_pull_state(PullState {
+            merged: false,
+            state: "open".to_string(),
+            head_sha: "new-head-inline".to_string(),
+        }))
+        .await;
+        let project = seed_project(&env.state, "https://github.com/o/r").await;
+        let epic = seed_in_review_epic(&env.state, &project, 8, "inline addressed").await;
+        let task_id = seed_done_task(&env.state, &project, &epic).await;
+        seed_in_progress_row(
+            &env.state,
+            8,
+            &project,
+            Some(&epic),
+            None,
+            "review_comment",
+            200,
+            Some("thr-1"),
+            Some(&format!("[\"{task_id}\"]")),
+            Some("old-base"),
+        )
+        .await;
+
+        review_tick(&env.state).await;
+
+        let replies = env.fake.reply_review_comment_calls();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].in_reply_to_id, 200);
+        assert_eq!(replies[0].body, "Addressed in new-head-inline");
+        assert_eq!(env.fake.resolve_thread_calls(), vec!["thr-1"]);
+        assert!(env.fake.post_issue_comment_calls().is_empty());
+
+        let rows = feedback_rows(&env.state, 8).await;
+        assert!(rows
+            .iter()
+            .any(|(k, id, s)| k == "review_comment" && *id == 200 && s == "addressed"));
+        assert!(rows
+            .iter()
+            .any(|(k, id, s)| k == "our_post" && *id == 10_001 && s == "handled_reply"));
+    }
+
+    #[tokio::test]
+    async fn addressed_standalone_change_posts_reply_and_marks_addressed() {
+        // AC #5 (standalone, option C): a standalone change spawned no tasks;
+        // completion is its own task coming back to `InReview`. Once its branch
+        // advances, the closing reply is posted and the row moves to `addressed`.
+        let env = make_env_with(FakeHost::new().with_pull_state(PullState {
+            merged: false,
+            state: "open".to_string(),
+            head_sha: "new-head-task".to_string(),
+        }))
+        .await;
+        let project = seed_project(&env.state, "https://github.com/o/r").await;
+        let task = seed_in_review_task(&env.state, &project, 9, "standalone addressed").await;
+        seed_in_progress_row(
+            &env.state,
+            9,
+            &project,
+            None,
+            Some(&task),
+            "issue_comment",
+            300,
+            None,
+            None,
+            Some("old-base"),
+        )
+        .await;
+
+        review_tick(&env.state).await;
+
+        let posts = env.fake.post_issue_comment_calls();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].body, "Addressed in new-head-task");
+        let rows = feedback_rows(&env.state, 9).await;
+        assert!(rows.contains(&("issue_comment".to_string(), 300, "addressed".to_string())));
+    }
+
+    #[tokio::test]
+    async fn not_advanced_row_stays_in_progress() {
+        // AC: rows whose branch has NOT advanced past base_sha are left
+        // in_progress — no closing reply is posted.
+        let env = make_env_with(FakeHost::new().with_pull_state(PullState {
+            merged: false,
+            state: "open".to_string(),
+            head_sha: "same-head".to_string(),
+        }))
+        .await;
+        let project = seed_project(&env.state, "https://github.com/o/r").await;
+        let epic = seed_in_review_epic(&env.state, &project, 10, "not advanced").await;
+        let task_id = seed_done_task(&env.state, &project, &epic).await;
+        seed_in_progress_row(
+            &env.state,
+            10,
+            &project,
+            Some(&epic),
+            None,
+            "issue_comment",
+            300,
+            None,
+            Some(&format!("[\"{task_id}\"]")),
+            Some("same-head"),
+        )
+        .await;
+
+        review_tick(&env.state).await;
+
+        assert!(env.fake.post_issue_comment_calls().is_empty());
+        let rows = feedback_rows(&env.state, 10).await;
+        assert!(rows.contains(&("issue_comment".to_string(), 300, "in_progress".to_string())));
+    }
+
+    #[tokio::test]
+    async fn incomplete_spawned_work_stays_in_progress() {
+        // AC: rows whose spawned work is NOT complete (a spawned task still
+        // active) are left in_progress even if the head advanced.
+        let env = make_env_with(FakeHost::new().with_pull_state(PullState {
+            merged: false,
+            state: "open".to_string(),
+            head_sha: "new-head".to_string(),
+        }))
+        .await;
+        let project = seed_project(&env.state, "https://github.com/o/r").await;
+        let epic = seed_in_review_epic(&env.state, &project, 11, "incomplete work").await;
+        // Seed the spawned task still in-progress (not Done) so completion fails.
+        let task_id = ulid::Ulid::new().to_string();
+        let now = now_ms();
+        env.state
+            .db
+            .conn()
+            .execute(
+                "INSERT INTO task (id, epic_id, project_id, title, status, created_at, updated_at) \
+                 VALUES (?1, ?2, ?3, 'active task', 'InProgress', ?4, ?4)",
+                params![task_id.clone(), epic.clone(), project.clone(), now],
+            )
+            .await
+            .unwrap();
+        seed_in_progress_row(
+            &env.state,
+            11,
+            &project,
+            Some(&epic),
+            None,
+            "issue_comment",
+            300,
+            None,
+            Some(&format!("[\"{task_id}\"]")),
+            Some("old-base"),
+        )
+        .await;
+
+        review_tick(&env.state).await;
+
+        assert!(env.fake.post_issue_comment_calls().is_empty());
+        let rows = feedback_rows(&env.state, 11).await;
+        assert!(rows.contains(&("issue_comment".to_string(), 300, "in_progress".to_string())));
     }
 }

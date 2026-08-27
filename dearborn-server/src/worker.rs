@@ -5398,8 +5398,10 @@ async fn finalize_epic(
     // A feedback re-run already has a recorded PR (set on the first
     // finalize): reuse it — push only — rather than opening a duplicate.
     let existing_pr = epic.pr_url.as_ref().and_then(|url| {
-        epic.pr_number
-            .map(|number| crate::git_host::OpenedPr { url: url.clone(), number })
+        epic.pr_number.map(|number| crate::git_host::OpenedPr {
+            url: url.clone(),
+            number,
+        })
     });
     let first_open = existing_pr.is_none();
 
@@ -5528,8 +5530,10 @@ async fn finalize_task(
 
     // A feedback re-run already has a recorded PR: reuse it — push only.
     let existing_pr = task.pr_url.as_ref().and_then(|url| {
-        task.pr_number
-            .map(|number| crate::git_host::OpenedPr { url: url.clone(), number })
+        task.pr_number.map(|number| crate::git_host::OpenedPr {
+            url: url.clone(),
+            number,
+        })
     });
     let first_open = existing_pr.is_none();
 
@@ -9030,13 +9034,25 @@ mod tests {
 
         // First finalize (directly, like `failed_open_pr...`): open the PR,
         // land in InReview, retain the workspace.
-        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        let epic = fetch_epic(state.db.conn(), &epic_id)
+            .await
+            .unwrap()
+            .unwrap();
         let dag = compute_dag(state.db.conn(), &epic_id).await.unwrap();
         finalize_epic(&state, &epic_id, &epic, &dag, &ws, &LeaseHandle::new()).await;
 
-        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
-        assert_eq!(epic.status, "InReview", "first finalize lands the epic in InReview");
-        let pr_url = epic.pr_url.clone().expect("first finalize must record a PR url");
+        let epic = fetch_epic(state.db.conn(), &epic_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            epic.status, "InReview",
+            "first finalize lands the epic in InReview"
+        );
+        let pr_url = epic
+            .pr_url
+            .clone()
+            .expect("first finalize must record a PR url");
         assert_eq!(
             fake.open_pr_calls().len(),
             1,
@@ -9062,7 +9078,10 @@ mod tests {
 
         // Second finalize (re-run): push only — no duplicate open_pr, the
         // recorded PR is preserved, and it returns to InReview.
-        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
+        let epic = fetch_epic(state.db.conn(), &epic_id)
+            .await
+            .unwrap()
+            .unwrap();
         assert_eq!(
             epic.pr_url.as_deref(),
             Some(pr_url.as_str()),
@@ -9071,8 +9090,14 @@ mod tests {
         let dag = compute_dag(state.db.conn(), &epic_id).await.unwrap();
         finalize_epic(&state, &epic_id, &epic, &dag, &ws, &LeaseHandle::new()).await;
 
-        let epic = fetch_epic(state.db.conn(), &epic_id).await.unwrap().unwrap();
-        assert_eq!(epic.status, "InReview", "the re-run returns the epic to InReview");
+        let epic = fetch_epic(state.db.conn(), &epic_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            epic.status, "InReview",
+            "the re-run returns the epic to InReview"
+        );
         assert_eq!(epic.pr_url.as_deref(), Some(pr_url.as_str()));
         assert_eq!(
             fake.open_pr_calls().len(),

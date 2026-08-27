@@ -261,7 +261,12 @@ impl serde::Serialize for PullState {
         let mut st = s.serialize_struct("PullState", 3)?;
         st.serialize_field("merged", &self.merged)?;
         st.serialize_field("state", &self.state)?;
-        st.serialize_field("head", &PullStateHead { sha: &self.head_sha })?;
+        st.serialize_field(
+            "head",
+            &PullStateHead {
+                sha: &self.head_sha,
+            },
+        )?;
         st.end()
     }
 }

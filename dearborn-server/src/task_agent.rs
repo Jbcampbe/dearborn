@@ -1660,7 +1660,12 @@ mod tests {
 
     #[test]
     fn review_verify_complete_summarize_and_triage_are_ask_mode_and_deny_edit_tools() {
-        for stage in [Stage::Review, Stage::VerifyComplete, Stage::Summarize, Stage::Triage] {
+        for stage in [
+            Stage::Review,
+            Stage::VerifyComplete,
+            Stage::Summarize,
+            Stage::Triage,
+        ] {
             assert_eq!(stage.run_mode(), Some(RunMode::Ask), "{stage:?}");
             assert!(stage.denies_edit_tools(), "{stage:?}");
         }
