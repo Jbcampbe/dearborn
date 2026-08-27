@@ -23,7 +23,9 @@ export type EpicStatus = "Planning" | string;
  * `Completed` — `null` until then. `blocked_reason` is one of the
  * MILESTONE_2 §2.3 reason strings whenever `status === "Blocked"` (T-540)
  * and `null` on every other transition, including a manual recovery via
- * `POST /tasks/{id}/retry` (T-541), which clears it.
+ * `POST /tasks/{id}/retry` (T-541), which clears it. `failure_detail` is the
+ * human-readable companion to `blocked_reason` (Rec 5): the redacted,
+ * length-capped agent error text that makes a Blocked epic triageable.
  */
 export interface Epic {
   id: string;
@@ -36,6 +38,7 @@ export interface Epic {
   pr_url: string | null;
   pr_number: number | null;
   blocked_reason: string | null;
+  failure_detail: string | null;
   created_at: number;
   updated_at: number;
 }

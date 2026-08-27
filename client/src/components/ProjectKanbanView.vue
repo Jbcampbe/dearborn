@@ -412,6 +412,9 @@ onMounted(load);
             <p v-if="epic.status === 'Blocked' && describeFailureReason(epic.blocked_reason)" class="card-reason">
               {{ describeFailureReason(epic.blocked_reason) }}
             </p>
+            <p v-if="epic.status === 'Blocked' && epic.failure_detail" class="card-detail">
+              {{ epic.failure_detail }}
+            </p>
             <div v-if="progressOf(epic.id)" class="card-progress">
               <span class="progress-track">
                 <span
@@ -485,6 +488,9 @@ onMounted(load);
             <span class="card-title">{{ task.title }}</span>
             <p v-if="task.status === 'Failed' && describeFailureReason(task.failure_reason)" class="card-reason">
               {{ describeFailureReason(task.failure_reason) }}
+            </p>
+            <p v-if="task.status === 'Failed' && task.failure_detail" class="card-detail">
+              {{ task.failure_detail }}
             </p>
             <div class="card-foot">
               <span class="badge">
@@ -666,6 +672,16 @@ onMounted(load);
   font-size: var(--text-label);
   color: var(--color-coral-red);
   line-height: 1.4;
+}
+
+.card-detail {
+  font-size: var(--text-label);
+  color: var(--text-faint);
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 5.6em; /* ~4 lines */
+  overflow: hidden;
 }
 
 .control-btn {

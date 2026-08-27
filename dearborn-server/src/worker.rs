@@ -4652,10 +4652,10 @@ struct FailureContext<'a> {
     epic_id: Option<&'a str>,
     task_id: Option<&'a str>,
     reason: FailureReason,
-    /// Human-readable detail for the `tracing::warn!` line only — §2.3's
-    /// reasons are the persisted, structured vocabulary; `message` never
-    /// itself lands in a column (mirrors every pre-T-540 failure helper's
-    /// own `message` parameter).
+    /// Human-readable detail persisted as `failure_detail` (Rec 5) and logged
+    /// via `tracing::warn!`. Redacted and length-capped by [`fail_item`] before
+    /// it lands in the column. §2.3's structured vocabulary lives in `reason`;
+    /// `message` is the free-text companion that makes a failure triageable.
     message: &'a str,
     push: PushIntent<'a>,
 }
@@ -5079,10 +5079,23 @@ async fn route_stage_failure(
     } else if outcome.cancelled {
         handle_cancelled_task(state, epic_id, task_id).await;
     } else {
-        let err_text = outcome
-            .last_error_message
-            .as_deref()
-            .unwrap_or(&outcome.text);
+        // Prefer the last Error-event message (most specific), then the
+        // full agent output (less specific but still real signal), then a
+        // synthesized fallback when the agent produced no output at all —
+        // a silent crash or startup failure where the exit code is the
+        // only available diagnostic.
+        let no_output_fallback: String;
+        let err_text: &str = if let Some(msg) = outcome.last_error_message.as_deref() {
+            msg
+        } else if !outcome.text.is_empty() {
+            &outcome.text
+        } else {
+            no_output_fallback = match outcome.exit_code {
+                Some(code) => format!("{message} (exit code {code}, no output captured)"),
+                None => format!("{message} (no output captured)"),
+            };
+            &no_output_fallback
+        };
         let (reason, detail_message) =
             if classify_transient_provider && is_transient_provider_error(err_text) {
                 tracing::warn!(
@@ -5100,7 +5113,12 @@ async fn route_stage_failure(
                     err_text,
                 )
             } else {
-                (FailureReason::AgentError, message)
+                // Use the actual agent error text rather than the caller's fixed
+                // label — the outcome text is what makes an AgentError triageable
+                // (the fixed label "implement stage did not complete successfully"
+                // tells the user nothing they couldn't already infer from the
+                // blocked_reason / failure_reason column itself).
+                (FailureReason::AgentError, err_text)
             };
         fail_item(
             state,

@@ -100,6 +100,7 @@ const REASON_TEXT: Record<string, string> = {
   timeout: "An agent stage timed out",
   cancelled: "Cancelled",
   pr_failed: "Push or PR creation failed",
+  provider_rate_limited: "Provider rate limit hit during implementation",
 };
 
 export function describeFailureReason(reason: string | null | undefined): string | null {
