@@ -226,11 +226,38 @@ pub async fn refresh_repo(
         pat,
     )
     .await?;
-    let reset_target = match base {
-        Some(branch) => format!("origin/{branch}"),
-        None => "origin/HEAD".to_string(),
+    // Switch to the base branch (not just reset the working tree) so that
+    // a subsequent `clone_local` inherits the correct `origin/HEAD`. A bare
+    // `git reset --hard` moves the current branch's tip but never changes
+    // which branch is checked out, so a canonical left on a previous epic's
+    // branch would propagate that branch name into every new workspace clone.
+    let (checkout_branch, checkout_target) = match base {
+        Some(branch) => (branch.to_string(), format!("origin/{branch}")),
+        None => {
+            let symref = run_git_capture(
+                &["symbolic-ref", "refs/remotes/origin/HEAD"],
+                Some(dest),
+                pat,
+            )
+            .await?;
+            const PREFIX: &str = "refs/remotes/origin/";
+            let branch = symref
+                .strip_prefix(PREFIX)
+                .ok_or_else(|| {
+                    GitError::new(format!(
+                        "origin/HEAD points outside {PREFIX}: {symref}"
+                    ))
+                })?
+                .to_string();
+            (branch, "origin/HEAD".to_string())
+        }
     };
-    run_git(&["reset", "--hard", &reset_target], Some(dest), pat).await?;
+    run_git(
+        &["checkout", "-B", &checkout_branch, &checkout_target],
+        Some(dest),
+        pat,
+    )
+    .await?;
     Ok(())
 }
 
@@ -636,6 +663,50 @@ mod tests {
         assert!(!err.message.is_empty());
         assert!(!err.message.contains(pat));
         assert!(!err.message.contains("ghp_"));
+    }
+
+    /// `refresh_repo` must check out the base branch, not just reset to it.
+    /// A bare `git reset --hard` leaves the canonical on whatever branch it was
+    /// on previously; a subsequent `clone_local` would then inherit that stale
+    /// branch as `origin/HEAD`, causing `origin_default_branch` to return the
+    /// wrong base at finalize time and produce a GitHub 422 "base: invalid".
+    #[tokio::test]
+    async fn refresh_repo_checks_out_the_base_branch_not_just_resets_it() {
+        let remote = temp_repo_dir("rr-remote");
+        init_repo(&remote).await;
+
+        // First canonical clone — starts on main.
+        let canonical = temp_repo_dir("rr-canonical");
+        clone_repo(&remote.to_string_lossy(), None, &canonical)
+            .await
+            .unwrap();
+
+        // Simulate a previous epic leaving the canonical on a stale branch.
+        checkout_new_branch(&canonical, "dearborn/old-epic").await.unwrap();
+        assert_eq!(current_branch(&canonical).await.unwrap(), "dearborn/old-epic");
+
+        // refresh_repo with no explicit base must switch back to main.
+        refresh_repo(&remote.to_string_lossy(), None, &canonical, None)
+            .await
+            .unwrap();
+        assert_eq!(
+            current_branch(&canonical).await.unwrap(),
+            "main",
+            "canonical must be on main after refresh, not on the stale epic branch"
+        );
+
+        // A workspace cloned from this canonical must inherit main as origin/HEAD.
+        let workspace = temp_repo_dir("rr-workspace");
+        clone_local(&canonical, &workspace).await.unwrap();
+        assert_eq!(
+            origin_default_branch(&workspace).await.unwrap(),
+            "main",
+            "workspace clone must resolve main as origin/HEAD, not the stale epic branch"
+        );
+
+        let _ = std::fs::remove_dir_all(&remote);
+        let _ = std::fs::remove_dir_all(&canonical);
+        let _ = std::fs::remove_dir_all(&workspace);
     }
 
     /// `origin_default_branch` reads the branch a fresh clone checked out from,

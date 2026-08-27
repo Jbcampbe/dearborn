@@ -310,6 +310,9 @@ onMounted(load);
               <p v-if="n.status === 'Failed' && describeFailureReason(n.failure_reason)" class="card-reason">
                 {{ describeFailureReason(n.failure_reason) }}
               </p>
+              <p v-if="n.status === 'Failed' && n.failure_detail" class="card-detail">
+                {{ n.failure_detail }}
+              </p>
               <div v-if="canRetryTask(n)" class="card-foot">
                 <button
                   class="btn btn-sm btn-ghost control-btn"
@@ -471,6 +474,16 @@ onMounted(load);
   font-size: var(--text-label);
   color: var(--color-coral-red);
   line-height: 1.4;
+}
+
+.card-detail {
+  font-size: var(--text-label);
+  color: var(--text-faint);
+  line-height: 1.4;
+  white-space: pre-wrap;
+  word-break: break-word;
+  max-height: 5.6em; /* ~4 lines */
+  overflow: hidden;
 }
 
 .card-foot {
