@@ -353,7 +353,8 @@ pub fn slot_requires_mcp(slot: AgentSlot) -> bool {
         | AgentSlot::Fix
         | AgentSlot::Review
         | AgentSlot::VerifyComplete
-        | AgentSlot::Summarize => false,
+        | AgentSlot::Summarize
+        | AgentSlot::Triage => false,
     }
 }
 
@@ -694,6 +695,7 @@ pub fn default_prompt(slot: AgentSlot) -> &'static str {
         AgentSlot::Summarize => {
             prompt_for(Stage::Summarize).expect("Stage::Summarize always has a prompt")
         }
+        AgentSlot::Triage => prompt_for(Stage::Triage).expect("Stage::Triage always has a prompt"),
     }
 }
 
@@ -712,7 +714,7 @@ async fn ensure_project(db: &Db, project_id: &str) -> AppResult<()> {
     Ok(())
 }
 
-/// `GET /projects/{id}/agent-settings` — all eight slots in canonical order,
+/// `GET /projects/{id}/agent-settings` — all nine slots in canonical order,
 /// each with its raw overrides and resolved effective config.
 pub async fn get_project_agent_settings(
     State(state): State<AppState>,
@@ -1488,7 +1490,7 @@ mod tests {
             assert!(harness_supports_slot("claude", slot), "{slot}");
             assert!(!harness_supports_slot(PI_HARNESS_ID, slot), "{slot}");
         }
-        // The five task stages act only on their workspace, so both harnesses
+        // The six task stages act only on their workspace, so both harnesses
         // run them.
         for slot in [
             AgentSlot::Implement,
@@ -1496,6 +1498,7 @@ mod tests {
             AgentSlot::Review,
             AgentSlot::VerifyComplete,
             AgentSlot::Summarize,
+            AgentSlot::Triage,
         ] {
             assert!(!slot_requires_mcp(slot), "{slot}");
             assert!(harness_supports_slot("claude", slot), "{slot}");
@@ -1696,7 +1699,7 @@ mod tests {
     }
 
     /// The editor-prefill contract: `default_prompt` is non-empty for all
-    /// eight slots and byte-identical to the constant each spawn site uses
+    /// nine slots and byte-identical to the constant each spawn site uses
     /// (no duplication, no drift between API and spawn path).
     #[tokio::test]
     async fn every_slot_serves_its_compiled_default_prompt() {
@@ -1717,6 +1720,7 @@ mod tests {
                 prompt_for(Stage::VerifyComplete).unwrap(),
             ),
             (AgentSlot::Summarize, prompt_for(Stage::Summarize).unwrap()),
+            (AgentSlot::Triage, prompt_for(Stage::Triage).unwrap()),
         ];
         for (slot, text) in expected {
             assert!(!text.trim().is_empty());
@@ -1745,7 +1749,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_agent_settings_lists_all_eight_slots_with_effective_values() {
+    async fn get_agent_settings_lists_all_nine_slots_with_effective_values() {
         let (app, _state) = test_app().await;
         let project = create_project(&app).await;
 
@@ -1761,7 +1765,7 @@ mod tests {
         assert_eq!(got.status(), StatusCode::OK);
         let body = body_json(got).await;
         let items = body["items"].as_array().unwrap();
-        assert_eq!(items.len(), 8, "the closed slot vocabulary, all present");
+        assert_eq!(items.len(), 9, "the closed slot vocabulary, all present");
         let slot_keys: Vec<&str> = items.iter().map(|i| i["slot"].as_str().unwrap()).collect();
         assert_eq!(
             slot_keys,
@@ -1773,7 +1777,8 @@ mod tests {
                 "fix",
                 "review",
                 "verify_complete",
-                "summarize"
+                "summarize",
+                "triage"
             ]
         );
         // No overrides yet: raw facets null, effective resolves to the seed.
