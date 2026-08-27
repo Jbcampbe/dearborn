@@ -446,6 +446,26 @@ pub fn assemble_fix_prompt_text(base: &str, feedback: &str) -> String {
     format!("{base}\n\n---\n\n## Feedback\n\n{feedback}")
 }
 
+/// Assemble the `Triage` stage's prompt for one piece of PR feedback: the
+/// stage's instructions (`prompts/triage.md`) followed by a `## Feedback to
+/// triage` block carrying the single item being classified, then the D8
+/// context block ([`crate::spec::build_context`]). Unlike [`assemble_prompt`]
+/// (instruction then context, no item-specific block), the triage stage also
+/// interleaves the feedback under its own explicit heading, because that
+/// feedback and not the surrounding context is what the agent is classifying
+/// (the epic/task context remains background so the classification is
+/// grounded in the actual code). The override-aware variant takes the
+/// resolved instruction text via `base` (T6); composition order is
+/// instruction → feedback block → context block.
+pub fn assemble_triage_prompt_text(
+    base: &str,
+    feedback: &str,
+    context: &crate::spec::TaskContext,
+) -> String {
+    let context_block = crate::spec::build_context(context);
+    format!("{base}\n\n---\n\n## Feedback to triage\n\n{feedback}\n\n---\n\n{context_block}")
+}
+
 /// The seam that makes task-stage runs hermetically testable (mirrors
 /// [`crate::planning::PlanningAgent`] / [`crate::breakdown::BreakdownAgent`]).
 ///
@@ -1768,6 +1788,35 @@ mod tests {
         assert!(assemble_prompt(Stage::Commit, &ctx).is_none());
     }
 
+    #[test]
+    fn assemble_triage_prompt_text_interleaves_feedback_between_instructions_and_context() {
+        // The triage prompt must carry the item's feedback under its own
+        // heading, sandwiched between the stage instructions and the D8
+        // context block — the feedback, not the background, is what's being
+        // classified.
+        let ctx = crate::spec::TaskContext {
+            spec: crate::spec::SpecFields {
+                title: "Do the thing",
+                description: Some("desc"),
+                acceptance: Some("acc"),
+            },
+            epic: None,
+            siblings: &[],
+            base_sha: None,
+        };
+        let base = crate::spec::prompt_for(Stage::Triage).expect("triage has a prompt");
+        let assembled = assemble_triage_prompt_text(base, "dearborn: why?", &ctx);
+
+        // Order: instructions, then the feedback block, then the context block.
+        let inst = assembled.find(base).unwrap();
+        let feedback = assembled.find("## Feedback to triage").unwrap();
+        let body = assembled.find("dearborn: why?").unwrap();
+        let context = assembled.find("Do the thing").unwrap();
+        assert!(inst < feedback && feedback < body && body < context);
+        // The pure instruction text (the `prompt_hash` input) is untouched.
+        assert!(assembled.starts_with(base));
+    }
+
     // ---- the handle is returned, not dropped ---------------------------
 
     #[test]
@@ -2975,8 +3024,7 @@ mod tests {
     async fn triage_stage_run_records_agent_run_row_via_evidence_helpers() {
         let state = test_state().await;
         let agent = ScriptedTaskAgent::new().script(Stage::Triage, ScriptedRun::default());
-        let dir =
-            std::env::temp_dir().join(format!("dearborn-triage-stage-{}", ulid::Ulid::new()));
+        let dir = std::env::temp_dir().join(format!("dearborn-triage-stage-{}", ulid::Ulid::new()));
         std::fs::create_dir_all(&dir).unwrap();
 
         let outcome = run_agent_stage(
@@ -3014,7 +3062,11 @@ mod tests {
             )
             .await
             .unwrap();
-        let row = rows.next().await.unwrap().expect("a triage row was written");
+        let row = rows
+            .next()
+            .await
+            .unwrap()
+            .expect("a triage row was written");
         assert_eq!(row.get::<String>(0).unwrap(), "triage");
         assert_eq!(row.get::<String>(1).unwrap(), "ok");
         assert_eq!(row.get::<i64>(2).unwrap(), 2);

@@ -29,13 +29,17 @@
 //!    - **Never merged**: no code path in this module (or anywhere in the
 //!      crate) calls a merge API. [`crate::git_host::GitHost`] has no merge
 //!      method — exactly what AC #8 asserts.
-//! 2. **Feedback fetch → actionable filter** (§6.2): on an open PR, fetch the
-//!    reviews / review-comments / issue-comments / review-threads via the
-//!    [`crate::git_host::GitHost`] seam, load what this PR already has recorded
-//!    in `pr_feedback`, and compute the **deduped actionable set** — see
-//!    [`compute_actionable`]. The poller only *computes the list* here; it does
-//!    **not** act on it (triage + reply + spawn-work belong to later tasks), so
-//!    an open PR still stays `InReview` and its workspace stays retained.
+//! 2. **Feedback fetch → actionable filter → triage + question-reply**
+//!    (§6.2/§6.4): on an open PR, fetch the reviews / review-comments /
+//!    issue-comments / review-threads via the [`crate::git_host::GitHost`]
+//!    seam, load what this PR already has recorded in `pr_feedback`, compute
+//!    the **deduped actionable set** (see [`compute_actionable`]), then run the
+//!    `Triage` agent stage over each item. A `QUESTION` gets a posted reply
+//!    (issue comment for a review body / top-level comment; in-thread reply +
+//!    thread resolution for an inline comment) and is marked handled in
+//!    `pr_feedback` (`handled_reply` + `our_post`), so the next poll skips it.
+//!    A `CHANGE` is left for the spawn-work task that follows. An open PR
+//!    stays `InReview` and its workspace stays retained.
 //!
 //! ## Per-item error boundary
 //!
@@ -58,10 +62,12 @@ use libsql::params;
 use crate::epics::fetch_epic;
 use crate::git_host::{
     GetPullRequest, GitHostError, InlineComment, IssueComment, ListIssueCommentsRequest,
-    ListReviewCommentsRequest, ListReviewThreadsRequest, ListReviewsRequest, PullState, Review,
+    ListReviewCommentsRequest, ListReviewThreadsRequest, ListReviewsRequest,
+    PostIssueCommentRequest, PullState, ReplyReviewCommentRequest, ResolveThreadRequest, Review,
     Thread,
 };
 use crate::projects::load_decrypted_pat;
+use crate::task_agent::{AgentStageOutcome, AgentStageParams, TaskRunRequest};
 use crate::tasks::fetch_task;
 use crate::workspace::{epic_workspace_path, task_workspace_path};
 use crate::AppState;
@@ -325,8 +331,9 @@ impl FeedbackKind {
 /// - anything that is our own tracked post, already handled, or whose inline
 ///   thread `is_resolved` is omitted.
 ///
-/// It carries the raw identity plus the thread links the (later) triage/action
-/// pipeline needs to reply and resolve. Nothing is acted on yet.
+/// It carries the raw identity plus the thread links the triage/action step
+/// ([`handle_open_feedback`]) needs to reply and resolve. The filter itself
+/// never acts on an item — this is the passive, pure dedup result.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActionableItem {
     /// Which feedback kind owns this item (`pr_feedback.source_kind`).
@@ -522,7 +529,7 @@ async fn load_known_feedback(state: &AppState, pr_number: i64) -> KnownFeedback 
 /// Fetch a candidate's open-PR feedback via the [`crate::git_host::GitHost`]
 /// seam and compute the deduped actionable list (§6.2). This is the read+filter
 /// step only — it never writes anything (no replies, no merge, no workspace
-/// change); triage and action belong to later tasks. A host failure returns
+/// change); the caller triages and acts on the result. A host failure returns
 /// `Err` (caller isolates it); a `pr_feedback` read error degrades to an empty
 /// [`KnownFeedback`] harmlessly.
 async fn fetch_actionable(
@@ -579,11 +586,33 @@ async fn fetch_actionable(
     ))
 }
 
+/// Which `InReview` row a [`Candidate`] was queried from — the post-PR
+/// feedback loop targets epics and standalone tasks alike, but the triage
+/// context, the `pr_feedback.epic_id`/`task_id` provenance, and the workspace
+/// the triage agent runs in all differ by kind.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum WorkKind {
+    Epic,
+    Task,
+}
+
+/// The `(epic_id, task_id)` provenance columns a feedback state row records:
+/// exactly one is set, matching the candidate's kind (the `pr_feedback`
+/// invariant — see the migration's doc).
+fn provenance(kind: WorkKind, candidate: &Candidate) -> (Option<String>, Option<String>) {
+    match kind {
+        WorkKind::Epic => (Some(candidate.id.clone()), None),
+        WorkKind::Task => (None, Some(candidate.id.clone())),
+    }
+}
+
 /// The open-PR step-2 action (called from the `open` arm of the epic and task
-/// handlers): compute the actionable list and log it. Nothing is written — the
-/// item stays `InReview` — and failures are isolated so one bad PR can't stall
-/// the rest of the poll.
-async fn handle_open_feedback(state: &AppState, candidate: &Candidate) {
+/// handlers): for each deduped actionable item, run the triage agent and act on
+/// an `QUESTION` classification (post a reply and record handled state). A
+/// `CHANGE` is deliberately left alone — spawning tasks belongs to a later task
+/// of the post-PR feedback loop (§6.4). An item's triage/reply is isolated so
+/// one failure can't stall the other items or the rest of the poll.
+async fn handle_open_feedback(state: &AppState, candidate: &Candidate, kind: WorkKind) {
     match fetch_actionable(state, candidate).await {
         Ok(items) => {
             if items.is_empty() {
@@ -594,14 +623,7 @@ async fn handle_open_feedback(state: &AppState, candidate: &Candidate) {
                 );
             } else {
                 for item in &items {
-                    tracing::info!(
-                        id = %candidate.id,
-                        pr = %candidate.pr_number,
-                        kind = ?item.kind,
-                        github_id = item.github_id,
-                        thread_id = item.thread_id.as_deref().unwrap_or(""),
-                        "review poll: actionable feedback"
-                    );
+                    act_on_item(state, candidate, kind, item).await;
                 }
             }
         }
@@ -613,6 +635,398 @@ async fn handle_open_feedback(state: &AppState, candidate: &Candidate) {
                 "review poll: could not fetch actionable feedback for open PR"
             );
         }
+    }
+}
+
+/// Triage one actionable item and act on the outcome: run the `Triage` agent
+/// stage (in the candidate's retained workspace, with the item's text passed
+/// as the feedback and the item's epic/task context as background), parse its
+/// classification, and handle a `QUESTION`. A `CHANGE` (spawn-work, a later
+/// task) and an unparseable/failed run (retriable next poll) are logged and
+/// left unhandled — no state is written, so nothing is skipped.
+async fn act_on_item(
+    state: &AppState,
+    candidate: &Candidate,
+    kind: WorkKind,
+    item: &ActionableItem,
+) {
+    let outcome = match run_triage(state, candidate, kind, item).await {
+        Some(outcome) => outcome,
+        None => {
+            tracing::warn!(
+                id = %candidate.id,
+                pr = %candidate.pr_number,
+                kind = ?item.kind,
+                github_id = item.github_id,
+                "review poll: triage run failed for item; leaving it unhandled"
+            );
+            return;
+        }
+    };
+    let text = outcome.text;
+    match crate::spec::parse_triage(&text) {
+        Some(crate::spec::Triage::Question { reply }) => {
+            tracing::info!(
+                id = %candidate.id,
+                pr = %candidate.pr_number,
+                kind = ?item.kind,
+                github_id = item.github_id,
+                "review poll: triaged as question; posting reply"
+            );
+            handle_question(state, candidate, kind, item, &reply).await;
+        }
+        Some(crate::spec::Triage::Change { .. }) => {
+            tracing::info!(
+                id = %candidate.id,
+                pr = %candidate.pr_number,
+                kind = ?item.kind,
+                github_id = item.github_id,
+                "review poll: triaged as change request; spawning work is a later task, leaving unhandled"
+            );
+        }
+        None => {
+            tracing::warn!(
+                id = %candidate.id,
+                pr = %candidate.pr_number,
+                kind = ?item.kind,
+                github_id = item.github_id,
+                "review poll: triage output failed to parse as a classification"
+            );
+        }
+    }
+}
+
+/// Run the `Triage` agent stage once for one actionable item, returning its
+/// outcome on the happy path. Resolves the triage slot's live spawn config
+/// (T6/T7), assembles the item's prompt (feedback + [`crate::spec::TaskContext`]
+/// background), and runs it in the candidate's retained workspace `cwd`. `None`
+/// on any non-happy path (config resolution failure, missing epic/task row, a
+/// stage run that wasn't cleanly `ok`) — the caller logs and leaves unhandled.
+async fn run_triage(
+    state: &AppState,
+    candidate: &Candidate,
+    kind: WorkKind,
+    item: &ActionableItem,
+) -> Option<AgentStageOutcome> {
+    let project_id = &candidate.project_id;
+    let default = crate::spec::prompt_for(crate::task_agent::Stage::Triage)
+        .expect("Stage::Triage always has a prompt");
+    let slot = crate::agent_slot::AgentSlot::from_stage(crate::task_agent::Stage::Triage)
+        .expect("Stage::Triage maps to an agent slot");
+    let cfg = match crate::agent_settings::spawn_config(&state.db, project_id, slot, default).await
+    {
+        Ok(cfg) => cfg,
+        Err(err) => {
+            tracing::warn!(
+                id = %candidate.id,
+                error = %err,
+                "review poll: could not resolve triage agent settings"
+            );
+            return None;
+        }
+    };
+
+    let conn = state.db.conn();
+    let (
+        title,
+        description,
+        acceptance,
+        product_ctx,
+        technical_ctx,
+        epic_id,
+        task_id,
+        workspace_path,
+    ) = match kind {
+        WorkKind::Epic => {
+            let epic = match fetch_epic(conn, &candidate.id).await {
+                Ok(Some(epic)) => epic,
+                _ => {
+                    tracing::warn!(id = %candidate.id, "review poll: epic row missing for triage");
+                    return None;
+                }
+            };
+            (
+                epic.title.clone(),
+                epic.description.clone(),
+                None,
+                epic.product_context.clone(),
+                epic.technical_context.clone(),
+                Some(candidate.id.clone()),
+                None,
+                epic_workspace_path(&state.config.clone_root, &candidate.id),
+            )
+        }
+        WorkKind::Task => {
+            let task = match fetch_task(conn, &candidate.id).await {
+                Ok(Some(task)) => task,
+                _ => {
+                    tracing::warn!(id = %candidate.id, "review poll: task row missing for triage");
+                    return None;
+                }
+            };
+            (
+                task.title.clone(),
+                task.description.clone(),
+                task.acceptance.clone(),
+                None,
+                None,
+                None,
+                Some(candidate.id.clone()),
+                task_workspace_path(&state.config.clone_root, &candidate.id),
+            )
+        }
+    };
+
+    let _ = std::fs::create_dir_all(&workspace_path);
+    let acceptance = acceptance.as_deref();
+    let context = crate::spec::TaskContext {
+        spec: crate::spec::SpecFields {
+            title: &title,
+            description: description.as_deref(),
+            acceptance,
+        },
+        epic: match kind {
+            WorkKind::Epic => Some(crate::spec::EpicContext {
+                title: &title,
+                description: description.as_deref(),
+                product_context: product_ctx.as_deref(),
+                technical_context: technical_ctx.as_deref(),
+            }),
+            WorkKind::Task => None,
+        },
+        siblings: &[],
+        base_sha: None,
+    };
+    let prompt = crate::task_agent::assemble_triage_prompt_text(&cfg.prompt, &item.body, &context);
+
+    let run_id = ulid::Ulid::new().to_string();
+    let outcome = crate::task_agent::run_agent_stage(
+        state,
+        &*state.task_agent,
+        AgentStageParams {
+            task_id: task_id.as_deref(),
+            epic_id: epic_id.as_deref(),
+            attempt: 1,
+        },
+        TaskRunRequest {
+            run_id,
+            stage: crate::task_agent::Stage::Triage,
+            prompt,
+            cwd: workspace_path,
+            harness: cfg.harness,
+            model: cfg.model,
+            prompt_hash: cfg.prompt_hash,
+        },
+    )
+    .await;
+
+    match outcome {
+        Ok(outcome) if outcome.is_ok() => Some(outcome),
+        _ => {
+            tracing::warn!(
+                id = %candidate.id,
+                pr = %candidate.pr_number,
+                kind = ?item.kind,
+                github_id = item.github_id,
+                "review poll: triage agent run did not report ok"
+            );
+            None
+        }
+    }
+}
+
+/// Post the triaged reply for a `QUESTION` item and record the handled state
+/// (`handled_reply` for the source item + an `our_post` row for the created
+/// reply id), so the next poll skips it. Reply routing: a review's summary
+/// body and a top-level issue comment get a top-level issue comment; an inline
+/// review comment gets an in-thread reply and its (resolvable) thread resolved.
+/// A post or resolve failure is logged and leaves the item unhandled — the
+/// next poll will re-triage and retry (and the idempotent state writes are
+/// `INSERT OR IGNORE`, so a crash between post and record can't error out).
+async fn handle_question(
+    state: &AppState,
+    candidate: &Candidate,
+    kind: WorkKind,
+    item: &ActionableItem,
+    reply: &str,
+) {
+    let repo_url = match load_repo_url(state, &candidate.project_id).await {
+        Ok(url) => url,
+        Err(err) => {
+            tracing::warn!(
+                id = %candidate.id,
+                pr = %candidate.pr_number,
+                error = %err,
+                "review poll: could not load repo url to post reply"
+            );
+            return;
+        }
+    };
+    let pat = load_decrypted_pat(state, &candidate.project_id)
+        .await
+        .map_err(|err| GitHostError::new(format!("failed to load project PAT: {err}")))
+        .ok()
+        .flatten();
+    let pat = pat.as_deref();
+
+    let reply_id = match item.kind {
+        FeedbackKind::Review | FeedbackKind::IssueComment => {
+            match state
+                .git_host
+                .post_issue_comment(PostIssueCommentRequest {
+                    repo_url: &repo_url,
+                    pat,
+                    number: candidate.pr_number,
+                    body: reply,
+                })
+                .await
+            {
+                Ok(id) => id,
+                Err(err) => {
+                    tracing::warn!(
+                        id = %candidate.id,
+                        pr = %candidate.pr_number,
+                        error = %err,
+                        "review poll: failed to post top-level reply"
+                    );
+                    return;
+                }
+            }
+        }
+        FeedbackKind::ReviewComment => {
+            match state
+                .git_host
+                .reply_review_comment(ReplyReviewCommentRequest {
+                    repo_url: &repo_url,
+                    pat,
+                    number: candidate.pr_number,
+                    in_reply_to_id: item.github_id,
+                    body: reply,
+                })
+                .await
+            {
+                Ok(id) => id,
+                Err(err) => {
+                    tracing::warn!(
+                        id = %candidate.id,
+                        pr = %candidate.pr_number,
+                        error = %err,
+                        "review poll: failed to post inline reply"
+                    );
+                    return;
+                }
+            }
+        }
+    };
+
+    // Resolve the inline thread (when the item has one) so the resolved-thread
+    // guard also skips it on the next poll. Best-effort: the DB `handled_reply`
+    // row below is the authoritative skip; a resolve failure is logged, not fatal.
+    if let Some(thread_id) = item.thread_id.as_deref() {
+        if let Err(err) = state
+            .git_host
+            .resolve_thread(ResolveThreadRequest {
+                repo_url: &repo_url,
+                pat,
+                thread_id,
+            })
+            .await
+        {
+            tracing::warn!(
+                id = %candidate.id,
+                pr = %candidate.pr_number,
+                thread_id = thread_id,
+                error = %err,
+                "review poll: failed to resolve inline thread after replying"
+            );
+        }
+    }
+
+    record_handled_reply(state, candidate, kind, item).await;
+    record_our_post(state, candidate, kind, reply_id).await;
+}
+
+/// Record the `pr_feedback` `handled_reply` row for a triaged-and-replied
+/// source item: identity is DB-tracked (Decision 1), so once this lands the
+/// next poll's [`load_known_feedback`] puts `(kind, id)` in `known.handled` and
+/// [`compute_actionable`] skips it. `INSERT OR IGNORE` keeps the record
+/// idempotent across a crash/retry (the unique index is on
+/// `(pr_number, source_kind, github_id)`).
+async fn record_handled_reply(
+    state: &AppState,
+    candidate: &Candidate,
+    kind: WorkKind,
+    item: &ActionableItem,
+) {
+    let (epic_id, task_id) = provenance(kind, candidate);
+    let now = now_ms();
+    let id = ulid::Ulid::new().to_string();
+    let res = state
+        .db
+        .conn()
+        .execute(
+            "INSERT OR IGNORE INTO pr_feedback \
+             (id, project_id, epic_id, task_id, pr_number, source_kind, github_id, thread_id, \
+              classification, state, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'question', 'handled_reply', ?9, ?9)",
+            params![
+                id,
+                candidate.project_id.clone(),
+                epic_id,
+                task_id,
+                candidate.pr_number,
+                item.kind.as_source_kind(),
+                item.github_id,
+                item.thread_id.as_deref(),
+                now
+            ],
+        )
+        .await;
+    if let Err(err) = res {
+        tracing::error!(
+            id = %candidate.id,
+            pr = %candidate.pr_number,
+            error = %err,
+            "review poll: failed to record handled_reply"
+        );
+    }
+}
+
+/// Record the `our_post` row for the reply the factory just created (its
+/// source_kind `our_post` id is the GitHub id handed back by the posting
+/// call), so [`load_known_feedback`] adds it to `our_comment_ids` and the next
+/// poll never treats Dearborn's own reply as feedback. Idempotent `INSERT OR
+/// IGNORE`; the `epic_id`/`task_id` provenance matches the item's kind.
+async fn record_our_post(state: &AppState, candidate: &Candidate, kind: WorkKind, reply_id: i64) {
+    let (epic_id, task_id) = provenance(kind, candidate);
+    let now = now_ms();
+    let id = ulid::Ulid::new().to_string();
+    let res = state
+        .db
+        .conn()
+        .execute(
+            "INSERT OR IGNORE INTO pr_feedback \
+             (id, project_id, epic_id, task_id, pr_number, source_kind, github_id, thread_id, \
+              classification, state, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, 'our_post', ?6, NULL, NULL, 'handled_reply', ?7, ?7)",
+            params![
+                id,
+                candidate.project_id.clone(),
+                epic_id,
+                task_id,
+                candidate.pr_number,
+                reply_id,
+                now
+            ],
+        )
+        .await;
+    if let Err(err) = res {
+        tracing::error!(
+            id = %candidate.id,
+            pr = %candidate.pr_number,
+            error = %err,
+            "review poll: failed to record our_post"
+        );
     }
 }
 
@@ -629,7 +1043,7 @@ async fn apply_epic_pull_state(state: &AppState, candidate: &Candidate, pull: &P
                 epic = %candidate.id,
                 "review poll: PR still open; fetching actionable feedback"
             );
-            handle_open_feedback(state, candidate).await;
+            handle_open_feedback(state, candidate, WorkKind::Epic).await;
             return;
         }
         (false, other) => {
@@ -696,7 +1110,7 @@ async fn apply_task_pull_state(state: &AppState, candidate: &Candidate, pull: &P
                 task = %candidate.id,
                 "review poll: PR still open; fetching actionable feedback"
             );
-            handle_open_feedback(state, candidate).await;
+            handle_open_feedback(state, candidate, WorkKind::Task).await;
             return;
         }
         (false, other) => {
@@ -817,7 +1231,7 @@ mod tests {
     use crate::git_host::testing::FakeHost;
     use crate::git_host::{self, GitHost};
     use crate::planning::testing::SilentPlanningAgent;
-    use crate::task_agent::testing::ScriptedTaskAgent;
+    use crate::task_agent::testing::{ScriptedRun, ScriptedTaskAgent};
     use crate::Db;
 
     struct TestEnv {
@@ -843,6 +1257,30 @@ mod tests {
             Arc::new(SilentPlanningAgent),
             Arc::new(SilentBreakdownAgent),
             Arc::new(ScriptedTaskAgent::new()),
+            host,
+        )
+    }
+
+    /// Like [`make_env_with_host`] but with an explicitly scripted task agent
+    /// (the triage tests need to pin the triage agent's reply).
+    async fn make_env_with_host_and_agent(
+        host: Arc<dyn GitHost>,
+        clone_root: PathBuf,
+        agent: Arc<ScriptedTaskAgent>,
+    ) -> AppState {
+        let db = Db::connect(":memory:").await.unwrap();
+        db.run_migrations().await.unwrap();
+        std::fs::create_dir_all(&clone_root).unwrap();
+
+        let mut config = Config::for_test();
+        config.clone_root = clone_root.to_string_lossy().into_owned();
+
+        AppState::with_all_agents_and_host(
+            config,
+            db,
+            Arc::new(SilentPlanningAgent),
+            Arc::new(SilentBreakdownAgent),
+            agent,
             host,
         )
     }
@@ -1517,5 +1955,164 @@ mod tests {
         let items = compute_actionable(&reviews, &review_comments, &issue_comments, &[], &known);
         let ids: Vec<(FeedbackKind, i64)> = items.iter().map(|i| (i.kind, i.github_id)).collect();
         assert_eq!(ids, vec![(FeedbackKind::ReviewComment, 200)]);
+    }
+
+    // ---- triage + question reply (this task: act on actionable items) ----
+
+    /// The (source_kind, github_id, state) triples recorded for one PR in
+    /// `pr_feedback`.
+    async fn feedback_rows(state: &AppState, pr_number: i64) -> Vec<(String, i64, String)> {
+        let mut out = Vec::new();
+        let mut rows = state
+            .db
+            .conn()
+            .query(
+                "SELECT source_kind, github_id, state FROM pr_feedback WHERE pr_number = ?1",
+                params![pr_number],
+            )
+            .await
+            .unwrap();
+        while let Some(row) = rows.next().await.unwrap() {
+            out.push((
+                row.get(0).unwrap(),
+                row.get(1).unwrap(),
+                row.get(2).unwrap(),
+            ));
+        }
+        out
+    }
+
+    /// A triage agent scripted to answer a question.
+    fn triage_question(reply: &str) -> ScriptedRun {
+        ScriptedRun {
+            text: vec![format!("TRIAGE: QUESTION\n{reply}")],
+            ..ScriptedRun::default()
+        }
+    }
+
+    #[tokio::test]
+    async fn triaged_top_level_question_posts_reply_and_marks_handled() {
+        // AC: a `dearborn:` top-level issue comment classified as a question
+        // gets a posted top-level reply, a handled_reply row, an our_post row,
+        // and is not reprocessed on the next poll.
+        let fake = Arc::new(
+            FakeHost::new()
+                .with_pull_state(open())
+                .with_issue_comments(vec![git_host::IssueComment {
+                    id: 300,
+                    body: "dearborn: what does this function do?".into(),
+                }]),
+        );
+        let agent = ScriptedTaskAgent::new().script(
+            crate::task_agent::Stage::Triage,
+            triage_question("Great question — this covers the empty case too."),
+        );
+        let clone_root =
+            std::env::temp_dir().join(format!("dearborn-review-q-{}", ulid::Ulid::new()));
+        let state = make_env_with_host_and_agent(
+            Arc::clone(&fake) as Arc<dyn GitHost>,
+            clone_root,
+            Arc::new(agent),
+        )
+        .await;
+
+        let project = seed_project(&state, "https://github.com/o/r").await;
+        let epic = seed_in_review_epic(&state, &project, 7, "question loop").await;
+
+        review_tick(&state).await;
+
+        // A top-level question item gets a top-level issue-comment reply.
+        let posts = fake.post_issue_comment_calls();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(
+            posts[0].body,
+            "Great question — this covers the empty case too."
+        );
+        assert!(fake.reply_review_comment_calls().is_empty());
+
+        // handled_reply for the source item + our_post for the created reply id.
+        let rows = feedback_rows(&state, 7).await;
+        assert!(rows.contains(&(
+            "issue_comment".to_string(),
+            300,
+            "handled_reply".to_string()
+        )));
+        assert!(rows.contains(&("our_post".to_string(), 10_001, "handled_reply".to_string())));
+
+        // The second poll must not reprocess the handled item (DB skip).
+        review_tick(&state).await;
+        assert_eq!(
+            fake.post_issue_comment_calls().len(),
+            1,
+            "a handled question must not be replied to twice"
+        );
+        let _ = epic;
+    }
+
+    #[tokio::test]
+    async fn triaged_inline_question_replies_in_thread_resolves_and_marks_handled() {
+        // AC (inline routing): a `dearborn:` inline review comment classified
+        // as a question gets an in-thread reply, its thread resolved, a
+        // handled_reply row, an our_post row, and is not reprocessed on the
+        // next poll (DB + resolved-thread guards both skip it).
+        let fake = Arc::new(
+            FakeHost::new()
+                .with_pull_state(open())
+                .with_review_comments(vec![git_host::InlineComment {
+                    id: 200,
+                    body: "dearborn: how is this populated?".into(),
+                    in_reply_to: None,
+                    pull_request_review_id: None,
+                    path: None,
+                    line: None,
+                }])
+                .with_threads(vec![git_host::Thread {
+                    id: "thr-1".into(),
+                    is_resolved: false,
+                    root_comment_id: Some("200".into()),
+                }]),
+        );
+        let agent = ScriptedTaskAgent::new().script(
+            crate::task_agent::Stage::Triage,
+            triage_question("It's populated lazily on first access."),
+        );
+        let clone_root =
+            std::env::temp_dir().join(format!("dearborn-review-inline-{}", ulid::Ulid::new()));
+        let state = make_env_with_host_and_agent(
+            Arc::clone(&fake) as Arc<dyn GitHost>,
+            clone_root,
+            Arc::new(agent),
+        )
+        .await;
+
+        let project = seed_project(&state, "https://github.com/o/r").await;
+        let epic = seed_in_review_epic(&state, &project, 7, "inline q").await;
+
+        review_tick(&state).await;
+
+        let replies = fake.reply_review_comment_calls();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].in_reply_to_id, 200);
+        assert_eq!(replies[0].body, "It's populated lazily on first access.");
+        // Inline items reply in-thread and resolve the thread.
+        assert_eq!(fake.resolve_thread_calls(), vec!["thr-1"]);
+
+        let rows = feedback_rows(&state, 7).await;
+        assert!(rows
+            .iter()
+            .any(|(k, id, s)| k == "review_comment" && *id == 200 && s == "handled_reply"));
+        assert!(rows
+            .iter()
+            .any(|(k, id, s)| k == "our_post" && *id == 10_001 && s == "handled_reply"));
+
+        // Second poll: handled in the DB and the thread resolved on the host —
+        // no duplicate reply.
+        review_tick(&state).await;
+        assert_eq!(
+            fake.reply_review_comment_calls().len(),
+            1,
+            "a handled inline question must not be replied to twice"
+        );
+        let _ = epic;
     }
 }
