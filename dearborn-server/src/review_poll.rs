@@ -13,28 +13,29 @@
 //! flow needs to hand work back to the leased pool it will flip the item to
 //! `InProgress` and notify [`crate::worker`]; this task's step never does.
 //!
-//! ## This task's scope: step 1 — merge / close detection only (§7)
+//! ## This task's scope: merge/close detection + feedback fetch & filter (§5–§7)
 //!
-//! This module currently implements the *first* step of per-PR processing,
-//! and nothing more. For each candidate PR it runs `get_pull` and reacts to
-//! **merge/close** state:
+//! Each per-PR pass runs two steps:
 //!
-//! - `merged` → the epic moves to `Completed` (a standalone task to `Done`),
-//!   the board is republished, and the workspace is **deleted now** (the
-//!   exit from `InReview` — §7 makes merge/close the only place a retained
-//!   workspace is torn down). No further work.
-//! - `state == "closed" && !merged` → the item moves to `Cancelled` and the
-//!   workspace is deleted.
-//! - `state == "open"` → the item is **left untouched** by this step; it
-//!   stays `InReview` so the feedback steps (later tasks) own it next.
-//! - **Never merged**: no code path in this module (or anywhere in the
-//!   crate) calls a merge API. [`crate::git_host::GitHost`] has no merge
-//!   method, and this module only ever *reads* pull state via `get_pull` —
-//!   which is exactly what AC #8 asserts.
-//!
-//! The feedback fetch → triage → act pipeline (§6) is owned by *later*
-//! tasks; on an open PR this module deliberately does nothing so it stays
-//! out of their territory.
+//! 1. **Merge / close detection** (§7, AC #7/#8): `get_pull` and react to
+//!    lifecycle state.
+//!    - `merged` → the epic moves to `Completed` (a standalone task to `Done`),
+//!      the board is republished, and the workspace is **deleted now** (the
+//!      exit from `InReview` — §7 makes merge/close the only place a retained
+//!      workspace is torn down). No further work.
+//!    - `state == "closed" && !merged` → the item moves to `Cancelled` and the
+//!      workspace is deleted.
+//!    - `state == "open"` → proceed to step 2.
+//!    - **Never merged**: no code path in this module (or anywhere in the
+//!      crate) calls a merge API. [`crate::git_host::GitHost`] has no merge
+//!      method — exactly what AC #8 asserts.
+//! 2. **Feedback fetch → actionable filter** (§6.2): on an open PR, fetch the
+//!    reviews / review-comments / issue-comments / review-threads via the
+//!    [`crate::git_host::GitHost`] seam, load what this PR already has recorded
+//!    in `pr_feedback`, and compute the **deduped actionable set** — see
+//!    [`compute_actionable`]. The poller only *computes the list* here; it does
+//!    **not** act on it (triage + reply + spawn-work belong to later tasks), so
+//!    an open PR still stays `InReview` and its workspace stays retained.
 //!
 //! ## Per-item error boundary
 //!
@@ -49,12 +50,17 @@
 //! [`crate::worker::spawn_pool`], with the poll interval read from
 //! `crate::config::ExecutorConfig::review_poll_interval_secs`.
 
+use std::collections::HashSet;
 use std::time::Duration;
 
 use libsql::params;
 
 use crate::epics::fetch_epic;
-use crate::git_host::{GetPullRequest, GitHostError, PullState};
+use crate::git_host::{
+    GetPullRequest, GitHostError, InlineComment, IssueComment, ListIssueCommentsRequest,
+    ListReviewCommentsRequest, ListReviewThreadsRequest, ListReviewsRequest, PullState, Review,
+    Thread,
+};
 use crate::projects::load_decrypted_pat;
 use crate::tasks::fetch_task;
 use crate::workspace::{epic_workspace_path, task_workspace_path};
@@ -270,10 +276,350 @@ async fn get_pull_state(
         .await
 }
 
+/// The GitHub entity a piece of feedback is backed as. Maps 1:1 to
+/// `pr_feedback.source_kind` (`'review'` / `'review_comment'` /
+/// `'issue_comment'`). Identity is DB-tracked (Decision 1) — the kind plus
+/// the GitHub id together identify a feedback item in the dedup skip-sets.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+pub enum FeedbackKind {
+    /// A formal review (body = the review summary). In scope regardless of
+    /// state; its inline comments are in scope too (emitted as
+    /// `review_comment` items tagged with `review_id`).
+    Review,
+    /// A diff (review) comment — inline, possibly under a formal review.
+    ReviewComment,
+    /// A top-level PR (issue) comment.
+    IssueComment,
+}
+
+impl FeedbackKind {
+    /// The `pr_feedback.source_kind` this kind records as.
+    pub fn as_source_kind(&self) -> &'static str {
+        match self {
+            FeedbackKind::Review => "review",
+            FeedbackKind::ReviewComment => "review_comment",
+            FeedbackKind::IssueComment => "issue_comment",
+        }
+    }
+
+    /// Inverse of [`FeedbackKind::as_source_kind`]; `None` for unknown strings.
+    fn from_source_kind(s: &str) -> Option<FeedbackKind> {
+        match s {
+            "review" => Some(FeedbackKind::Review),
+            "review_comment" => Some(FeedbackKind::ReviewComment),
+            "issue_comment" => Some(FeedbackKind::IssueComment),
+            _ => None,
+        }
+    }
+}
+
+/// One piece of newly-discovered, **actionable** human feedback on a PR. The
+/// [`compute_actionable`] filter guarantees:
+/// - a formal review is always reported regardless of its state (its body,
+///   plus its inline comments as separate `review_comment` items tagged with
+///   `review_id`);
+/// - a standalone (non-review) review comment is reported only when its body
+///   starts with `dearborn:`;
+/// - a top-level issue comment is reported only when its body starts with
+///   `dearborn:`;
+/// - anything that is our own tracked post, already handled, or whose inline
+///   thread `is_resolved` is omitted.
+///
+/// It carries the raw identity plus the thread links the (later) triage/action
+/// pipeline needs to reply and resolve. Nothing is acted on yet.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ActionableItem {
+    /// Which feedback kind owns this item (`pr_feedback.source_kind`).
+    pub kind: FeedbackKind,
+    /// The GitHub id of the review / comment.
+    pub github_id: i64,
+    /// The text to triage (review body or comment body).
+    pub body: String,
+    /// The review this item belongs to, when it is an inline comment under a
+    /// formal review (`pull_request_review_id`); `None` otherwise.
+    pub review_id: Option<i64>,
+    /// The GraphQL thread id for an inline (review-comment) item; `None` for
+    /// reviews and top-level issue comments (no resolvable thread).
+    pub thread_id: Option<String>,
+}
+
+/// Everything a PR already has on record in `pr_feedback` so the loop can
+/// skip items that must not be reprocessed (identity is DB-tracked, §6.3).
+#[derive(Debug, Default)]
+pub struct KnownFeedback {
+    /// GitHub ids of comments/reviews Dearborn itself posted (`source_kind =
+    /// 'our_post'`). A fetched item with one of these ids is our own reply /
+    /// post, never feedback to act on.
+    pub our_comment_ids: HashSet<i64>,
+    /// `(kind, github_id)` identities already recorded as handled (`state` =
+    /// `'handled_reply'` / `'addressed'`).
+    pub handled: HashSet<(FeedbackKind, i64)>,
+}
+
+/// True iff `body` starts with the `dearborn:` activation prefix (leading
+/// whitespace tolerated). The convention that turns a standalone comment into
+/// actionable feedback (Decision 3, §6.2).
+fn starts_with_dearborn(body: &str) -> bool {
+    body.trim_start().starts_with("dearborn:")
+}
+
+/// The pure actionable-item filter (epic plan §6.2): given everything the
+/// GitHost fetched for one PR plus what the PR already has on record, return
+/// the deduped list of feedback the factory should consider acting on. No I/O
+/// — fully unit-testable.
+///
+/// Inclusion rules:
+/// - every formal review, regardless of state — body + inline comments;
+/// - `dearborn:`-prefixed standalone review comments and issue comments.
+/// Exclusion rules (in order):
+/// - our own tracked post (id in `known.our_comment_ids`);
+/// - already handled (`(kind, id)` in `known.handled`);
+/// - any inline item whose thread `is_resolved`.
+pub fn compute_actionable(
+    reviews: &[Review],
+    review_comments: &[InlineComment],
+    issue_comments: &[IssueComment],
+    threads: &[Thread],
+    known: &KnownFeedback,
+) -> Vec<ActionableItem> {
+    let mut out = Vec::new();
+
+    let review_ids: HashSet<i64> = reviews.iter().map(|r| r.id).collect();
+
+    // 1. Every formal review, any state — its body, in scope regardless of its
+    //    own content. Its inline comments are emitted below as review_comment
+    //    items tagged with their review_id.
+    for review in reviews {
+        if known.our_comment_ids.contains(&review.id)
+            || known.handled.contains(&(FeedbackKind::Review, review.id))
+        {
+            continue;
+        }
+        out.push(ActionableItem {
+            kind: FeedbackKind::Review,
+            github_id: review.id,
+            body: review.body.clone(),
+            review_id: None,
+            thread_id: None,
+        });
+    }
+
+    // Inline threads: map each thread's root comment id -> thread (so a
+    // review comment can be correlated to its thread + `is_resolved`). GitHub
+    // REST comment ids and GraphQL root comment ids are the same integer.
+    let thread_by_root: std::collections::HashMap<i64, &Thread> = threads
+        .iter()
+        .filter_map(|t| {
+            t.root_comment_id
+                .as_ref()
+                .and_then(|r| r.parse::<i64>().ok())
+                .map(|n| (n, t))
+        })
+        .collect();
+
+    // 2. Diff (review) comments — inline feedback.
+    for comment in review_comments {
+        let thread = thread_by_root.get(&comment.id).copied();
+        let resolved = thread.map(|t| t.is_resolved).unwrap_or(false);
+        // In scope when it belongs to a formal review (review in scope), else
+        // only when `dearborn:`-prefixed.
+        let within_review = comment
+            .pull_request_review_id
+            .map_or(false, |rid| review_ids.contains(&rid));
+        let in_scope = within_review || starts_with_dearborn(&comment.body);
+        if !in_scope || resolved {
+            continue;
+        }
+        if known.our_comment_ids.contains(&comment.id)
+            || known
+                .handled
+                .contains(&(FeedbackKind::ReviewComment, comment.id))
+        {
+            continue;
+        }
+        out.push(ActionableItem {
+            kind: FeedbackKind::ReviewComment,
+            github_id: comment.id,
+            body: comment.body.clone(),
+            review_id: comment.pull_request_review_id,
+            thread_id: thread.map(|t| t.id.clone()),
+        });
+    }
+
+    // 3. Top-level issue comments — only the `dearborn:`-prefixed ones.
+    for comment in issue_comments {
+        if !starts_with_dearborn(&comment.body) {
+            continue;
+        }
+        if known.our_comment_ids.contains(&comment.id)
+            || known
+                .handled
+                .contains(&(FeedbackKind::IssueComment, comment.id))
+        {
+            continue;
+        }
+        out.push(ActionableItem {
+            kind: FeedbackKind::IssueComment,
+            github_id: comment.id,
+            body: comment.body.clone(),
+            review_id: None,
+            thread_id: None,
+        });
+    }
+
+    out
+}
+
+/// Load the dedup skip-sets for one PR from `pr_feedback`: which ids we posted
+/// ourselves (`our_post`) and which `(kind, id)` identities are already
+/// handled. A read failure is logged and yields an empty [`KnownFeedback`] so
+/// a single bad candidate can't stall the poll's other candidates.
+async fn load_known_feedback(state: &AppState, pr_number: i64) -> KnownFeedback {
+    let mut known = KnownFeedback::default();
+    let mut rows = match state
+        .db
+        .conn()
+        .query(
+            "SELECT source_kind, github_id, state FROM pr_feedback WHERE pr_number = ?1",
+            params![pr_number],
+        )
+        .await
+    {
+        Ok(rows) => rows,
+        Err(err) => {
+            tracing::warn!(error = %err, pr = pr_number, "review poll: failed to read pr_feedback");
+            return known;
+        }
+    };
+    while let Some(row) = rows.next().await.transpose() {
+        let row = match row {
+            Ok(row) => row,
+            Err(_) => continue,
+        };
+        let source_kind: String = match row.get(0) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let github_id: i64 = match row.get(1) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        let state: String = match row.get(2) {
+            Ok(v) => v,
+            Err(_) => continue,
+        };
+        if source_kind == "our_post" {
+            known.our_comment_ids.insert(github_id);
+        } else if state == "handled_reply" || state == "addressed" {
+            if let Some(kind) = FeedbackKind::from_source_kind(&source_kind) {
+                known.handled.insert((kind, github_id));
+            }
+        }
+    }
+    known
+}
+
+/// Fetch a candidate's open-PR feedback via the [`crate::git_host::GitHost`]
+/// seam and compute the deduped actionable list (§6.2). This is the read+filter
+/// step only — it never writes anything (no replies, no merge, no workspace
+/// change); triage and action belong to later tasks. A host failure returns
+/// `Err` (caller isolates it); a `pr_feedback` read error degrades to an empty
+/// [`KnownFeedback`] harmlessly.
+async fn fetch_actionable(
+    state: &AppState,
+    candidate: &Candidate,
+) -> Result<Vec<ActionableItem>, GitHostError> {
+    let repo_url = load_repo_url(state, &candidate.project_id).await?;
+    let pat = load_decrypted_pat(state, &candidate.project_id)
+        .await
+        .map_err(|err| GitHostError::new(format!("failed to load project PAT: {err}")))?
+        .as_deref()
+        .map(str::to_owned);
+
+    let reviews = state
+        .git_host
+        .list_reviews(ListReviewsRequest {
+            repo_url: &repo_url,
+            pat: pat.as_deref(),
+            number: candidate.pr_number,
+        })
+        .await?;
+    let review_comments = state
+        .git_host
+        .list_review_comments(ListReviewCommentsRequest {
+            repo_url: &repo_url,
+            pat: pat.as_deref(),
+            number: candidate.pr_number,
+        })
+        .await?;
+    let issue_comments = state
+        .git_host
+        .list_issue_comments(ListIssueCommentsRequest {
+            repo_url: &repo_url,
+            pat: pat.as_deref(),
+            number: candidate.pr_number,
+        })
+        .await?;
+    let threads = state
+        .git_host
+        .list_review_threads(ListReviewThreadsRequest {
+            repo_url: &repo_url,
+            pat: pat.as_deref(),
+            number: candidate.pr_number,
+        })
+        .await?;
+
+    let known = load_known_feedback(state, candidate.pr_number).await;
+    Ok(compute_actionable(
+        &reviews,
+        &review_comments,
+        &issue_comments,
+        &threads,
+        &known,
+    ))
+}
+
+/// The open-PR step-2 action (called from the `open` arm of the epic and task
+/// handlers): compute the actionable list and log it. Nothing is written — the
+/// item stays `InReview` — and failures are isolated so one bad PR can't stall
+/// the rest of the poll.
+async fn handle_open_feedback(state: &AppState, candidate: &Candidate) {
+    match fetch_actionable(state, candidate).await {
+        Ok(items) => {
+            if items.is_empty() {
+                tracing::debug!(
+                    id = %candidate.id,
+                    pr = %candidate.pr_number,
+                    "review poll: no actionable feedback on open PR"
+                );
+            } else {
+                for item in &items {
+                    tracing::info!(
+                        id = %candidate.id,
+                        pr = %candidate.pr_number,
+                        kind = ?item.kind,
+                        github_id = item.github_id,
+                        thread_id = item.thread_id.as_deref().unwrap_or(""),
+                        "review poll: actionable feedback"
+                    );
+                }
+            }
+        }
+        Err(err) => {
+            tracing::warn!(
+                id = %candidate.id,
+                pr = %candidate.pr_number,
+                error = %err,
+                "review poll: could not fetch actionable feedback for open PR"
+            );
+        }
+    }
+}
+
 /// Apply an epic's [`PullState`] (§7):
 /// - `merged` → `Completed` + board publish + delete workspace;
 /// - `state == "closed" && !merged` → `Cancelled` + delete workspace;
-/// - `state == "open"` → untouched (feedback steps, a later task, own it).
+/// - `state == "open"` → fetch+log actionable feedback (this task's step).
 async fn apply_epic_pull_state(state: &AppState, candidate: &Candidate, pull: &PullState) {
     let status = match (pull.merged, pull.state.as_str()) {
         (true, _) => "Completed",
@@ -281,8 +627,9 @@ async fn apply_epic_pull_state(state: &AppState, candidate: &Candidate, pull: &P
         (false, "open") => {
             tracing::debug!(
                 epic = %candidate.id,
-                "review poll: PR still open; leaving epic untouched for feedback"
+                "review poll: PR still open; fetching actionable feedback"
             );
+            handle_open_feedback(state, candidate).await;
             return;
         }
         (false, other) => {
@@ -339,7 +686,7 @@ async fn apply_epic_pull_state(state: &AppState, candidate: &Candidate, pull: &P
 }
 
 /// The standalone-task mirror of [`apply_epic_pull_state`]. `merged` →
-/// `Done`; `closed && !merged` → `Cancelled`; `open` → untouched.
+/// `Done`; `closed && !merged` → `Cancelled`; `open` → fetch+log feedback.
 async fn apply_task_pull_state(state: &AppState, candidate: &Candidate, pull: &PullState) {
     let status = match (pull.merged, pull.state.as_str()) {
         (true, _) => "Done",
@@ -347,8 +694,9 @@ async fn apply_task_pull_state(state: &AppState, candidate: &Candidate, pull: &P
         (false, "open") => {
             tracing::debug!(
                 task = %candidate.id,
-                "review poll: PR still open; leaving task untouched for feedback"
+                "review poll: PR still open; fetching actionable feedback"
             );
+            handle_open_feedback(state, candidate).await;
             return;
         }
         (false, other) => {
@@ -878,5 +1226,296 @@ mod tests {
             "Completed",
             "the other PR must still be processed despite the failing neighbour"
         );
+    }
+
+    // ---- the actionable-item filter (pure unit tests, §6.2) --------------
+
+    /// Build an empty [`KnownFeedback`] (fresh PR, nothing on record).
+    fn no_known() -> KnownFeedback {
+        KnownFeedback::default()
+    }
+
+    /// A review with a body + state (identity is DB-tracked, so only id/body
+    /// matter for the filter).
+    fn review(id: i64, body: &str) -> Review {
+        Review {
+            id,
+            state: "COMMENTED".into(),
+            body: body.into(),
+            submitted_at: None,
+        }
+    }
+
+    fn inline(id: i64, body: &str, review_id: Option<i64>) -> InlineComment {
+        InlineComment {
+            id,
+            body: body.into(),
+            in_reply_to: None,
+            pull_request_review_id: review_id,
+            path: None,
+            line: None,
+        }
+    }
+
+    /// A thread whose root is `root` (a review-comment id), with the given
+    /// resolution state.
+    fn thread(id: &str, root: i64, resolved: bool) -> Thread {
+        Thread {
+            id: id.into(),
+            is_resolved: resolved,
+            root_comment_id: Some(root.to_string()),
+        }
+    }
+
+    #[test]
+    fn formal_review_is_always_in_scope_regardless_of_state() {
+        // An Approve* and a CHANGES_REQUESTED* review with arbitrary bodies —
+        // both must be actionable; review *state* is irrelevant to scope (it
+        // only ever governs the never-performed merge).
+        let reviews = vec![
+            review(100, "looks good"),
+            review(101, "CHANGES_REQUESTED: please fix"),
+            review(102, ""), // empty body is still a formal review
+        ];
+        let items = compute_actionable(&reviews, &[], &[], &[], &no_known());
+        let kinds: Vec<(i64, String)> = items
+            .iter()
+            .map(|i| (i.github_id, i.body.clone()))
+            .collect();
+        assert_eq!(
+            kinds,
+            vec![
+                (100, "looks good".to_string()),
+                (101, "CHANGES_REQUESTED: please fix".to_string()),
+                (102, "".to_string()),
+            ]
+        );
+    }
+
+    #[test]
+    fn dearborn_prefixed_review_and_issue_comments_are_included() {
+        let review_comments = vec![inline(200, "dearborn: how does this work?", None)];
+        let issue_comments = vec![IssueComment {
+            id: 300,
+            body: "dearborn: fix the docs".into(),
+        }];
+        let items = compute_actionable(&[], &review_comments, &issue_comments, &[], &no_known());
+        let ids: Vec<(FeedbackKind, i64)> = items.iter().map(|i| (i.kind, i.github_id)).collect();
+        assert_eq!(
+            ids,
+            vec![
+                (FeedbackKind::ReviewComment, 200),
+                (FeedbackKind::IssueComment, 300),
+            ]
+        );
+    }
+
+    #[test]
+    fn non_prefixed_standalone_comments_are_excluded() {
+        // A standalone review comment and a top-level issue comment without the
+        // `dearborn:` convention are ignored.
+        let review_comments = vec![inline(210, "plain inline note", None)];
+        let issue_comments = vec![IssueComment {
+            id: 310,
+            body: "no prefix here".into(),
+        }];
+        let items = compute_actionable(&[], &review_comments, &issue_comments, &[], &no_known());
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn inline_comment_under_a_formal_review_is_in_scope_without_prefix() {
+        // An inline comment attached to a review is part of that review's
+        // scope — no `dearborn:` needed.
+        let reviews = vec![review(100, "")];
+        let review_comments = vec![inline(200, "change the timeout", Some(100))];
+        let items = compute_actionable(&reviews, &review_comments, &[], &[], &no_known());
+        let inline_item = items
+            .iter()
+            .find(|i| i.kind == FeedbackKind::ReviewComment)
+            .expect("an inline comment under a review is actionable even without a prefix");
+        assert_eq!(inline_item.review_id, Some(100));
+    }
+
+    #[test]
+    fn our_own_tracked_post_is_skipped() {
+        // A comment/review Dearborn itself posted (id on record as `our_post`)
+        // is never reprocessed.
+        let mut known = KnownFeedback::default();
+        known.our_comment_ids.insert(200);
+        known.our_comment_ids.insert(100);
+
+        let reviews = vec![review(100, "dearborn: our own review")];
+        let review_comments = vec![inline(200, "dearborn: our own comment", None)];
+        let items = compute_actionable(&reviews, &review_comments, &[], &[], &known);
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn already_handled_item_is_skipped() {
+        let mut known = KnownFeedback::default();
+        known.handled.insert((FeedbackKind::ReviewComment, 200));
+        known.handled.insert((FeedbackKind::IssueComment, 300));
+
+        let review_comments = vec![inline(200, "dearborn: already handled", None)];
+        let issue_comments = vec![IssueComment {
+            id: 300,
+            body: "dearborn: handled".into(),
+        }];
+        let items = compute_actionable(&[], &review_comments, &issue_comments, &[], &known);
+        assert!(items.is_empty());
+    }
+
+    #[test]
+    fn resolved_inline_thread_is_skipped() {
+        // A `dearborn:`-prefixed inline comment whose thread is_resolved is
+        // skipped; the unresolved one is still actionable.
+        let review_comments = vec![
+            inline(201, "dearborn: unresolved", None),
+            inline(202, "dearborn: resolved", None),
+        ];
+        let threads = vec![thread("thr-2", 202, true)];
+        let items = compute_actionable(&[], &review_comments, &[], &threads, &no_known());
+        let ids: Vec<i64> = items.iter().map(|i| i.github_id).collect();
+        assert_eq!(ids, vec![201]);
+    }
+
+    // ---- integration slice over FakeHost (scripted PR) -------------------
+
+    #[tokio::test]
+    async fn fetch_actionable_returns_expected_list_for_a_scripted_pr() {
+        // A realistic mixed PR: two formal reviews, a review-comment under one
+        // of them, a standalone `dearbon:` review-comment, a resolved-thread
+        // standalone, plus two top-level issue comments (one prefixed, one
+        // plain). The filter must yield exactly the dedupe actionable set.
+        let fake = FakeHost::new()
+            .with_pull_state(open())
+            .with_reviews(vec![
+                git_host::Review {
+                    id: 100,
+                    state: "APPROVED".into(),
+                    body: "looks good".into(),
+                    submitted_at: None,
+                },
+                git_host::Review {
+                    id: 101,
+                    state: "CHANGES_REQUESTED".into(),
+                    body: "please address this".into(),
+                    submitted_at: None,
+                },
+            ])
+            .with_review_comments(vec![
+                git_host::InlineComment {
+                    id: 201,
+                    body: "inline under review".into(),
+                    in_reply_to: None,
+                    pull_request_review_id: Some(100),
+                    path: None,
+                    line: None,
+                },
+                git_host::InlineComment {
+                    id: 202,
+                    body: "dearborn: standalone question".into(),
+                    in_reply_to: None,
+                    pull_request_review_id: None,
+                    path: None,
+                    line: None,
+                },
+                git_host::InlineComment {
+                    id: 203,
+                    body: "dearborn: resolved one".into(),
+                    in_reply_to: None,
+                    pull_request_review_id: None,
+                    path: None,
+                    line: None,
+                },
+            ])
+            .with_issue_comments(vec![
+                git_host::IssueComment {
+                    id: 300,
+                    body: "dearborn: top-level question".into(),
+                },
+                git_host::IssueComment {
+                    id: 301,
+                    body: "just a plain comment".into(),
+                },
+            ])
+            .with_threads(vec![
+                git_host::Thread {
+                    id: "thr-1".into(),
+                    is_resolved: false,
+                    root_comment_id: Some("201".into()),
+                },
+                git_host::Thread {
+                    id: "thr-3".into(),
+                    is_resolved: true,
+                    root_comment_id: Some("203".into()),
+                },
+            ]);
+
+        let env = make_env_with(fake).await;
+        let project = seed_project(&env.state, "https://github.com/o/r").await;
+        let epic = seed_in_review_epic(&env.state, &project, 7, "scripted feedback").await;
+
+        let items = fetch_actionable(
+            &env.state,
+            &Candidate {
+                id: epic.clone(),
+                project_id: project.clone(),
+                pr_number: 7,
+            },
+        )
+        .await
+        .unwrap();
+
+        let got: Vec<(FeedbackKind, i64, Option<i64>, Option<String>)> = items
+            .iter()
+            .map(|i| (i.kind, i.github_id, i.review_id, i.thread_id.clone()))
+            .collect();
+        assert_eq!(
+            got,
+            vec![
+                (FeedbackKind::Review, 100, None, None),
+                (FeedbackKind::Review, 101, None, None),
+                (
+                    FeedbackKind::ReviewComment,
+                    201,
+                    Some(100),
+                    Some("thr-1".to_string())
+                ),
+                (FeedbackKind::ReviewComment, 202, None, None),
+                (FeedbackKind::IssueComment, 300, None, None),
+            ]
+        );
+
+        // Same pair: every GitHost read fan was hit exactly once for this PR,
+        // and — this filter builds the dedup list only — no write calls.
+        assert_eq!(env.fake.list_reviews_calls(), vec![7]);
+        assert_eq!(env.fake.list_review_comments_calls(), vec![7]);
+        assert_eq!(env.fake.list_issue_comments_calls(), vec![7]);
+        assert_eq!(env.fake.list_review_threads_calls(), vec![7]);
+        assert!(env.fake.post_issue_comment_calls().is_empty());
+        assert!(env.fake.reply_review_comment_calls().is_empty());
+        assert!(env.fake.resolve_thread_calls().is_empty());
+    }
+
+    #[tokio::test]
+    async fn compute_actionable_skips_our_own_and_already_handled() {
+        // Pre-record handled / our-own rows for PR 7 in pr_feedback; the
+        // filter must drop those items on the next fetch.
+        let mut known = KnownFeedback::default();
+        known.handled.insert((FeedbackKind::Review, 100));
+        known.handled.insert((FeedbackKind::IssueComment, 300));
+        known.our_comment_ids.insert(300);
+
+        let reviews = vec![review(100, "handled review")];
+        let review_comments = vec![inline(200, "dearborn: q", None)];
+        let issue_comments = vec![IssueComment {
+            id: 300,
+            body: "dearborn: ours".into(),
+        }];
+        let items = compute_actionable(&reviews, &review_comments, &issue_comments, &[], &known);
+        let ids: Vec<(FeedbackKind, i64)> = items.iter().map(|i| (i.kind, i.github_id)).collect();
+        assert_eq!(ids, vec![(FeedbackKind::ReviewComment, 200)]);
     }
 }
