@@ -276,11 +276,34 @@ fn map_github_error(status: u16, body: &str, pat: Option<&str>) -> GitHostError 
     GitHostError::new(git::redact(&reason, pat))
 }
 
+/// Format one entry from GitHub's `errors` array. Entries come in two shapes:
+/// `{"message": "..."}` (free-text) and `{"field": "...", "code": "..."}` (structured).
+fn format_github_error_entry(entry: &serde_json::Value) -> String {
+    if let Some(msg) = entry.get("message").and_then(|v| v.as_str()) {
+        return msg.to_string();
+    }
+    let field = entry.get("field").and_then(|v| v.as_str()).unwrap_or("?");
+    let code = entry.get("code").and_then(|v| v.as_str()).unwrap_or("?");
+    format!("field '{field}': {code}")
+}
+
 /// Extract GitHub's `{"message": "..."}` field from an error body, if present
-/// and parseable.
+/// and parseable. Also appends any `errors[*].message` strings so 422
+/// "Validation Failed" responses surface their per-field detail rather than
+/// just the opaque top-level message.
 fn extract_message(body: &str) -> Option<String> {
     let value: serde_json::Value = serde_json::from_str(body).ok()?;
-    value.get("message")?.as_str().map(str::to_string)
+    let top = value.get("message")?.as_str()?;
+    let details: Vec<String> = value
+        .get("errors")
+        .and_then(|e| e.as_array())
+        .map(|arr| arr.iter().map(format_github_error_entry).collect())
+        .unwrap_or_default();
+    if details.is_empty() {
+        Some(top.to_string())
+    } else {
+        Some(format!("{top}: {}", details.join("; ")))
+    }
 }
 
 /// Redact a [`reqwest::Error`] before it becomes a [`GitHostError`] — its
@@ -424,6 +447,7 @@ impl GithubHost {
         let status = resp.status();
         if !status.is_success() {
             let text = resp.text().await.unwrap_or_default();
+            tracing::debug!(status = %status, body = %text, "open_pr: GitHub error response");
             // Clearly transient only: rate limiting and server-side errors.
             // A 4xx validation error (401/403/422 …) means our own request
             // cannot succeed however often we repeat it.
@@ -749,6 +773,32 @@ mod tests {
         let err = map_github_error(422, r#"{"message": "Validation Failed"}"#, None);
         assert!(err.message.contains("422"));
         assert!(err.message.contains("Validation Failed"));
+    }
+
+    #[test]
+    fn maps_a_github_422_errors_array_with_message_into_the_message() {
+        let body = r#"{"message":"Validation Failed","errors":[{"resource":"PullRequest","code":"custom","message":"No commits between main and my-feature"}]}"#;
+        let err = map_github_error(422, body, None);
+        assert!(err.message.contains("422"));
+        assert!(err.message.contains("Validation Failed"));
+        assert!(
+            err.message.contains("No commits between main and my-feature"),
+            "errors[].message must be appended: {}",
+            err.message
+        );
+    }
+
+    #[test]
+    fn maps_a_github_422_errors_array_with_field_code_into_the_message() {
+        let body = r#"{"message":"Validation Failed","errors":[{"resource":"PullRequest","field":"base","code":"invalid"}]}"#;
+        let err = map_github_error(422, body, None);
+        assert!(err.message.contains("422"));
+        assert!(err.message.contains("Validation Failed"));
+        assert!(
+            err.message.contains("base") && err.message.contains("invalid"),
+            "errors[].field/code must be appended: {}",
+            err.message
+        );
     }
 
     #[test]

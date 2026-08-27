@@ -5767,6 +5767,7 @@ async fn push_and_open_pr(
         },
     };
 
+    tracing::info!(head = %workspace.branch_name, base = %base, "open_pr: resolved head and base");
     let open_result = state
         .git_host
         .open_pr(OpenPrRequest {
