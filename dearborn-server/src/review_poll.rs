@@ -38,8 +38,15 @@
 //!    (issue comment for a review body / top-level comment; in-thread reply +
 //!    thread resolution for an inline comment) and is marked handled in
 //!    `pr_feedback` (`handled_reply` + `our_post`), so the next poll skips it.
-//!    A `CHANGE` is left for the spawn-work task that follows. An open PR
-//!    stays `InReview` and its workspace stays retained.
+//!    A `CHANGE` (AC #4) is handed back to the existing pipeline: an epic
+//!    change creates one linked `Todo` task per triaged spec, records their ids
+//!    + `base_sha` in `pr_feedback` (`in_progress`), flips the epic to
+//!    `InProgress` + `notify_waiters()`; a standalone change amends the task's
+//!    own spec, records `base_sha` + `in_progress`, and flips the task to
+//!    `InProgress`. Both post an interim "Picked up — implementing." reply
+//!    without resolving. The worker pool then runs the work and finalize pushes
+//!    the same branch back to `InReview`. An open PR stays `InReview` until the
+//!    feedback spawns work, and its workspace stays retained.
 //!
 //! ## Per-item error boundary
 //!
@@ -641,9 +648,10 @@ async fn handle_open_feedback(state: &AppState, candidate: &Candidate, kind: Wor
 /// Triage one actionable item and act on the outcome: run the `Triage` agent
 /// stage (in the candidate's retained workspace, with the item's text passed
 /// as the feedback and the item's epic/task context as background), parse its
-/// classification, and handle a `QUESTION`. A `CHANGE` (spawn-work, a later
-/// task) and an unparseable/failed run (retriable next poll) are logged and
-/// left unhandled — no state is written, so nothing is skipped.
+/// classification, and handle it. A `QUESTION` posts a reply and records
+/// handled state; a `CHANGE` (AC #4) hands work back to the existing pipeline
+/// ([`handle_change`]). An unparseable/failed run (retriable next poll) is
+/// logged and left unhandled — no state is written, so nothing is skipped.
 async fn act_on_item(
     state: &AppState,
     candidate: &Candidate,
@@ -675,14 +683,15 @@ async fn act_on_item(
             );
             handle_question(state, candidate, kind, item, &reply).await;
         }
-        Some(crate::spec::Triage::Change { .. }) => {
+        Some(crate::spec::Triage::Change { tasks }) => {
             tracing::info!(
                 id = %candidate.id,
                 pr = %candidate.pr_number,
                 kind = ?item.kind,
                 github_id = item.github_id,
-                "review poll: triaged as change request; spawning work is a later task, leaving unhandled"
+                "review poll: triaged as change request; handing work back to the pipeline"
             );
+            handle_change(state, candidate, kind, item, &tasks).await;
         }
         None => {
             tracing::warn!(
@@ -1026,6 +1035,400 @@ async fn record_our_post(state: &AppState, candidate: &Candidate, kind: WorkKind
             pr = %candidate.pr_number,
             error = %err,
             "review poll: failed to record our_post"
+        );
+    }
+}
+
+/// Handle a triaged `CHANGE` (epic plan §6.5, AC #4): hand the work back to
+/// the existing pipeline, routing by the candidate's kind.
+///
+/// In both cases an interim "Picked up — implementing." reply is posted first
+/// (routed exactly like [`handle_question`]'s reply: an in-thread reply for an
+/// inline comment, a top-level issue comment for a review body / issue
+/// comment), but the thread is **not** resolved — resolution belongs to the
+/// closing-the-loop half of the loop (a later task). The reply id is recorded
+/// as an `our_post` row so it is never reprocessed as feedback.
+///
+/// - **Epic**: capture the branch HEAD (`base_sha`), create one linked `Todo`
+///   task per triaged spec, record their ids + `base_sha` in `pr_feedback`
+///   (`state='in_progress'`), set the epic `InProgress`, publish the DAG +
+///   board, and `notify_waiters()` — the worker's DAG walk runs the new tasks
+///   and finalize pushes to the same branch/PR, returning the item to
+///   `InReview`.
+/// - **Standalone** (option C): amend the task's own spec (append the feedback
+///   to description/acceptance), record `base_sha` + `state='in_progress'`,
+///   set the task `InProgress` + notify (mirrors standalone retry-to-InProgress
+///   — the worker pool's `claim_task` picks `InProgress AND epic_id IS NULL`
+///   back up). No new tasks; a standalone never becomes an epic.
+async fn handle_change(
+    state: &AppState,
+    candidate: &Candidate,
+    kind: WorkKind,
+    item: &ActionableItem,
+    tasks: &[crate::spec::TriageTaskSpec],
+) {
+    // Post the interim reply before handing work back (best-effort: a post
+    // failure is logged and the work still proceeds — the reply is not a
+    // precondition for the pipeline, but the AC's "Picked up" trail is missed
+    // and logged if it fails).
+    let reply_id = post_interim_reply(state, candidate, item).await;
+    let base_sha = capture_base_sha(state, candidate, kind).await;
+
+    match kind {
+        WorkKind::Epic => {
+            spawn_epic_change_tasks(state, candidate, item, tasks, base_sha.as_deref()).await;
+        }
+        WorkKind::Task => {
+            amend_standalone_task(state, candidate, item, base_sha.as_deref()).await;
+        }
+    }
+
+    if let Some(reply_id) = reply_id {
+        record_our_post(state, candidate, kind, reply_id).await;
+    }
+}
+
+/// Post the interim "Picked up — implementing." reply for a triaged change
+/// item (AC #4): an in-thread reply for an inline comment, a top-level issue
+/// comment for a review body / top-level comment — the same routing
+/// [`handle_question`] uses, but with **no** thread resolution (the thread is
+/// resolved only when the addressing reply lands later). Returns the created
+/// reply id on success, `None` on any failure (logged — the caller still
+/// spawns the work).
+async fn post_interim_reply(
+    state: &AppState,
+    candidate: &Candidate,
+    item: &ActionableItem,
+) -> Option<i64> {
+    let repo_url = match load_repo_url(state, &candidate.project_id).await {
+        Ok(url) => url,
+        Err(err) => {
+            tracing::warn!(
+                id = %candidate.id,
+                pr = %candidate.pr_number,
+                error = %err,
+                "review poll: could not load repo url to post interim reply"
+            );
+            return None;
+        }
+    };
+    let pat = load_decrypted_pat(state, &candidate.project_id)
+        .await
+        .map_err(|err| GitHostError::new(format!("failed to load project PAT: {err}")))
+        .ok()
+        .flatten();
+    let pat = pat.as_deref();
+    let reply = "Picked up — implementing.";
+
+    match item.kind {
+        FeedbackKind::Review | FeedbackKind::IssueComment => {
+            match state
+                .git_host
+                .post_issue_comment(PostIssueCommentRequest {
+                    repo_url: &repo_url,
+                    pat,
+                    number: candidate.pr_number,
+                    body: reply,
+                })
+                .await
+            {
+                Ok(id) => Some(id),
+                Err(err) => {
+                    tracing::warn!(
+                        id = %candidate.id,
+                        pr = %candidate.pr_number,
+                        error = %err,
+                        "review poll: failed to post interim top-level reply"
+                    );
+                    None
+                }
+            }
+        }
+        FeedbackKind::ReviewComment => match state
+            .git_host
+            .reply_review_comment(ReplyReviewCommentRequest {
+                repo_url: &repo_url,
+                pat,
+                number: candidate.pr_number,
+                in_reply_to_id: item.github_id,
+                body: reply,
+            })
+            .await
+        {
+            Ok(id) => Some(id),
+            Err(err) => {
+                tracing::warn!(
+                    id = %candidate.id,
+                    pr = %candidate.pr_number,
+                    error = %err,
+                    "review poll: failed to post interim inline reply"
+                );
+                None
+            }
+        },
+    }
+}
+
+/// Capture the branch `HEAD` SHA the moment change-request work is picked up
+/// (`base_sha`, §6.5) — mirroring [`crate::worker`]'s own base-sha capture via
+/// `git::current_commit` against the item's retained workspace. `None` when the
+/// workspace has no readable HEAD (the `pr_feedback.base_sha` column is
+/// nullable; the closing-the-loop half of the loop uses it only to prove the
+/// branch advanced past this point, so a missing HEAD degrades to an empty
+/// base rather than failing the spawn).
+async fn capture_base_sha(
+    state: &AppState,
+    candidate: &Candidate,
+    kind: WorkKind,
+) -> Option<String> {
+    let workspace = match kind {
+        WorkKind::Epic => epic_workspace_path(&state.config.clone_root, &candidate.id),
+        WorkKind::Task => task_workspace_path(&state.config.clone_root, &candidate.id),
+    };
+    match crate::git::current_commit(&workspace).await {
+        Ok(sha) => Some(sha),
+        Err(err) => {
+            tracing::warn!(
+                id = %candidate.id,
+                pr = %candidate.pr_number,
+                error = %err,
+                "review poll: could not read workspace HEAD (base_sha stays null)"
+            );
+            None
+        }
+    }
+}
+
+/// The epic arm of [`handle_change`]: create one linked `Todo` task per
+/// triaged change spec, record the source item's `in_progress` row with the
+/// spawned task ids + `base_sha`, flip the epic to `InProgress`, publish the
+/// DAG + board, and `notify_waiters()` so the worker pool's DAG walk picks the
+/// new tasks up immediately.
+async fn spawn_epic_change_tasks(
+    state: &AppState,
+    candidate: &Candidate,
+    item: &ActionableItem,
+    tasks: &[crate::spec::TriageTaskSpec],
+    base_sha: Option<&str>,
+) {
+    if tasks.is_empty() {
+        return;
+    }
+    let conn = state.db.conn();
+    let mut spawned: Vec<String> = Vec::new();
+    for spec in tasks {
+        match crate::tasks::create_task(
+            conn,
+            &candidate.id,
+            &candidate.project_id,
+            &spec.title,
+            Some(&spec.spec),
+            None,
+        )
+        .await
+        {
+            Ok(task) => {
+                tracing::info!(
+                    task = %task.id,
+                    epic = %candidate.id,
+                    "review poll: created change task"
+                );
+                spawned.push(task.id);
+            }
+            Err(err) => {
+                tracing::error!(
+                    id = %candidate.id,
+                    pr = %candidate.pr_number,
+                    error = %err,
+                    "review poll: failed to create change task"
+                );
+            }
+        }
+    }
+
+    if spawned.is_empty() {
+        tracing::warn!(
+            id = %candidate.id,
+            pr = %candidate.pr_number,
+            "review poll: no change tasks created; leaving epic InReview"
+        );
+        return;
+    }
+
+    record_change_in_progress(
+        state,
+        candidate,
+        WorkKind::Epic,
+        item,
+        base_sha,
+        Some(&spawned),
+    )
+    .await;
+
+    let now = now_ms();
+    let affected = conn
+        .execute(
+            "UPDATE epic SET status = 'InProgress', updated_at = ?1 \
+             WHERE id = ?2 AND status = 'InReview'",
+            params![now, candidate.id.clone()],
+        )
+        .await;
+    match affected {
+        Ok(n) if n > 0 => {
+            tracing::info!(
+                epic = %candidate.id,
+                spawned = %spawned.len(),
+                "review poll: epic moved to InProgress for change work"
+            );
+            crate::mcp::publish_dag(state, &candidate.id).await;
+            crate::board::publish_board(state, &candidate.project_id).await;
+            state.notify.notify_waiters();
+        }
+        Ok(_) => {
+            tracing::debug!(
+                epic = %candidate.id,
+                "review poll: epic no longer InReview (something else moved it); spawned tasks stay Todo"
+            );
+        }
+        Err(err) => {
+            tracing::error!(
+                epic = %candidate.id,
+                error = %err,
+                "review poll: failed to move epic to InProgress"
+            );
+        }
+    }
+}
+
+/// The standalone (option C) arm of [`handle_change`]: amend the task's own
+/// spec by appending the feedback to its description and acceptance, record
+/// `base_sha` + `state='in_progress'`, flip the task to `InProgress`, publish
+/// the board, and `notify_waiters()` (mirrors standalone retry-to-InProgress;
+/// no new tasks are created).
+async fn amend_standalone_task(
+    state: &AppState,
+    candidate: &Candidate,
+    item: &ActionableItem,
+    base_sha: Option<&str>,
+) {
+    let conn = state.db.conn();
+    let task = match fetch_task(conn, &candidate.id).await {
+        Ok(Some(task)) => task,
+        _ => {
+            tracing::warn!(
+                id = %candidate.id,
+                "review poll: standalone task row missing for change"
+            );
+            return;
+        }
+    };
+
+    // Append the raw feedback to the task's own spec so the re-run sees it.
+    let feedback_block = format!("\n\n## Review feedback\n{}", item.body);
+    let new_description = task
+        .description
+        .as_deref()
+        .map(|d| format!("{d}{feedback_block}"))
+        .unwrap_or_else(|| item.body.clone());
+    let new_acceptance = task
+        .acceptance
+        .as_deref()
+        .map(|a| format!("{a}{feedback_block}"))
+        .unwrap_or_else(|| item.body.clone());
+
+    let now = now_ms();
+    let affected = conn
+        .execute(
+            "UPDATE task SET status = 'InProgress', description = ?1, acceptance = ?2, updated_at = ?3 \
+             WHERE id = ?4 AND epic_id IS NULL AND status = 'InReview'",
+            params![new_description, new_acceptance, now, candidate.id.clone()],
+        )
+        .await;
+    match affected {
+        Ok(n) if n > 0 => {
+            tracing::info!(
+                task = %candidate.id,
+                "review poll: standalone task moved to InProgress for change work"
+            );
+            record_change_in_progress(state, candidate, WorkKind::Task, item, base_sha, None).await;
+            crate::board::publish_board(state, &candidate.project_id).await;
+            state.notify.notify_waiters();
+        }
+        Ok(_) => {
+            tracing::debug!(
+                task = %candidate.id,
+                "review poll: standalone task no longer InReview (something else moved it); leaving as-is"
+            );
+        }
+        Err(err) => {
+            tracing::error!(
+                task = %candidate.id,
+                error = %err,
+                "review poll: failed to move standalone task to InProgress"
+            );
+        }
+    }
+}
+
+/// Record the `pr_feedback` `in_progress` row for a triaged change item: the
+/// source item's identity (`source_kind`/`github_id`/`thread_id`), its
+/// `classification='change_request'`, the spawned task-id JSON array (an epic
+/// change; `None` for a standalone), and the `base_sha` picked up. `INSERT OR
+/// IGNORE` keeps the record idempotent across a crash/retry (the unique index
+/// is on `(pr_number, source_kind, github_id)`), and once the item leaves
+/// `InReview` it is no longer a poll candidate until finalize returns it — the
+/// closing-the-loop task reads this row's `base_sha`/`spawned_task_ids` to post
+/// the "Addressed in <commit>" reply and flip it to `addressed`.
+async fn record_change_in_progress(
+    state: &AppState,
+    candidate: &Candidate,
+    kind: WorkKind,
+    item: &ActionableItem,
+    base_sha: Option<&str>,
+    spawned: Option<&[String]>,
+) {
+    let (epic_id, task_id) = provenance(kind, candidate);
+    let now = now_ms();
+    let id = ulid::Ulid::new().to_string();
+    let spawned_json = spawned
+        .map(serde_json::to_string)
+        .transpose()
+        .ok()
+        .flatten();
+    let (kind_str, github_id, thread_id) = (
+        item.kind.as_source_kind().to_string(),
+        item.github_id,
+        item.thread_id.clone(),
+    );
+    let res = state
+        .db
+        .conn()
+        .execute(
+            "INSERT OR IGNORE INTO pr_feedback \
+             (id, project_id, epic_id, task_id, pr_number, source_kind, github_id, thread_id, \
+              classification, state, spawned_task_ids, base_sha, created_at, updated_at) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 'change_request', 'in_progress', ?9, ?10, ?11, ?11)",
+            params![
+                id,
+                candidate.project_id.clone(),
+                epic_id,
+                task_id,
+                candidate.pr_number,
+                kind_str,
+                github_id,
+                thread_id,
+                spawned_json,
+                base_sha,
+                now
+            ],
+        )
+        .await;
+    if let Err(err) = res {
+        tracing::error!(
+            id = %candidate.id,
+            pr = %candidate.pr_number,
+            error = %err,
+            "review poll: failed to record change in_progress"
         );
     }
 }
@@ -1990,6 +2393,15 @@ mod tests {
         }
     }
 
+    /// A triage agent scripted to request a change (one or more `## Task:`
+    /// specs following the `TRIAGE: CHANGE` line).
+    fn triage_change(tasks: &str) -> ScriptedRun {
+        ScriptedRun {
+            text: vec![format!("TRIAGE: CHANGE\n{tasks}")],
+            ..ScriptedRun::default()
+        }
+    }
+
     #[tokio::test]
     async fn triaged_top_level_question_posts_reply_and_marks_handled() {
         // AC: a `dearborn:` top-level issue comment classified as a question
@@ -2114,5 +2526,266 @@ mod tests {
             "a handled inline question must not be replied to twice"
         );
         let _ = epic;
+    }
+
+    // ---- triaged change requests: spawn work, return to InProgress ----
+
+    /// The task rows created under `epic_id` (`title`, `status`).
+    async fn epic_tasks(state: &AppState, epic_id: &str) -> Vec<(String, String)> {
+        let mut out = Vec::new();
+        let mut rows = state
+            .db
+            .conn()
+            .query(
+                "SELECT title, status FROM task WHERE epic_id = ?1 ORDER BY position",
+                params![epic_id],
+            )
+            .await
+            .unwrap();
+        while let Some(row) = rows.next().await.unwrap() {
+            out.push((row.get(0).unwrap(), row.get(1).unwrap()));
+        }
+        out
+    }
+
+    /// The full `in_progress` feedback row for a given source github id on a
+    /// PR: (`source_kind`, `github_id`, `classification`, `state`,
+    /// `spawned_task_ids`, `base_sha`).
+    async fn in_progress_row(
+        state: &AppState,
+        pr_number: i64,
+        github_id: i64,
+    ) -> (
+        String,
+        i64,
+        Option<String>,
+        String,
+        Option<String>,
+        Option<String>,
+    ) {
+        let mut rows = state
+            .db
+            .conn()
+            .query(
+                "SELECT source_kind, github_id, classification, state, spawned_task_ids, base_sha \
+                 FROM pr_feedback WHERE pr_number = ?1 AND github_id = ?2 AND state = 'in_progress'",
+                params![pr_number, github_id],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        (
+            row.get(0).unwrap(),
+            row.get(1).unwrap(),
+            row.get(2).unwrap(),
+            row.get(3).unwrap(),
+            row.get(4).unwrap(),
+            row.get(5).unwrap(),
+        )
+    }
+
+    #[tokio::test]
+    async fn epic_change_request_spawns_tasks_in_progress_and_picks_up() {
+        // AC #4 (epic): a `dearborn:` top-level comment triaged as a change
+        // request creates the linked Todo task(s), records base_sha + spawned
+        // ids + in_progress, flips the epic to InProgress, and notifies the
+        // pool — plus a non-resolving "Picked up" reply.
+        let fake = Arc::new(
+            FakeHost::new()
+                .with_pull_state(open())
+                .with_issue_comments(vec![git_host::IssueComment {
+                    id: 300,
+                    body: "dearborn: please handle the empty branch".into(),
+                }]),
+        );
+        let agent = ScriptedTaskAgent::new().script(
+            crate::task_agent::Stage::Triage,
+            triage_change("## Task: Handle the empty branch\nGuard against an empty input early."),
+        );
+        let clone_root =
+            std::env::temp_dir().join(format!("dearborn-review-change-{}", ulid::Ulid::new()));
+        let state = make_env_with_host_and_agent(
+            Arc::clone(&fake) as Arc<dyn GitHost>,
+            clone_root,
+            Arc::new(agent),
+        )
+        .await;
+
+        let project = seed_project(&state, "https://github.com/o/r").await;
+        let epic = seed_in_review_epic(&state, &project, 7, "change loop").await;
+
+        review_tick(&state).await;
+
+        // The epic is flipped to InProgress (the worker pool owns it now).
+        assert_eq!(epic_status(&state, &epic).await, "InProgress");
+
+        // The triaged spec produced one linked Todo task under the epic.
+        let tasks = epic_tasks(&state, &epic).await;
+        assert_eq!(
+            tasks,
+            vec![("Handle the empty branch".to_string(), "Todo".to_string())]
+        );
+
+        // An interim "Picked up" reply is posted; the thread is not resolved.
+        let posts = fake.post_issue_comment_calls();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].body, "Picked up — implementing.");
+        assert!(fake.resolve_thread_calls().is_empty());
+
+        // The in_progress feedback row records base_sha + spawned ids, and the
+        // posted reply is recorded as an our_post.
+        let (kind, gid, class, state_, spawned, base) = in_progress_row(&state, 7, 300).await;
+        assert_eq!(
+            (kind.as_str(), gid, class.as_deref(), state_.as_str()),
+            ("issue_comment", 300, Some("change_request"), "in_progress")
+        );
+        let spawned: Vec<String> =
+            serde_json::from_str(&spawned.expect("epic change records spawned ids")).unwrap();
+        assert_eq!(spawned.len(), 1);
+        assert_eq!(tasks[0].0, "Handle the empty branch");
+        // base_sha is null here because the test seeds no real git workspace.
+        assert!(base.is_none());
+        let rows = feedback_rows(&state, 7).await;
+        assert!(rows.contains(&("our_post".to_string(), 10_001, "handled_reply".to_string())));
+    }
+
+    #[tokio::test]
+    async fn epic_inline_change_replies_in_thread_without_resolving() {
+        // AC #4 (inline routing): an inline change-request comment gets an
+        // in-thread "Picked up" reply but the thread is left unresolved, and
+        // work is spawned / the epic flips to InProgress regardless.
+        let fake = Arc::new(
+            FakeHost::new()
+                .with_pull_state(open())
+                .with_review_comments(vec![git_host::InlineComment {
+                    id: 200,
+                    body: "dearborn: refactor this helper".into(),
+                    in_reply_to: None,
+                    pull_request_review_id: None,
+                    path: None,
+                    line: None,
+                }])
+                .with_threads(vec![git_host::Thread {
+                    id: "thr-9".into(),
+                    is_resolved: false,
+                    root_comment_id: Some("200".into()),
+                }]),
+        );
+        let agent = ScriptedTaskAgent::new().script(
+            crate::task_agent::Stage::Triage,
+            triage_change("## Task: Refactor helper\nExtract the duplicated logic."),
+        );
+        let clone_root = std::env::temp_dir().join(format!(
+            "dearborn-review-inline-change-{}",
+            ulid::Ulid::new()
+        ));
+        let state = make_env_with_host_and_agent(
+            Arc::clone(&fake) as Arc<dyn GitHost>,
+            clone_root,
+            Arc::new(agent),
+        )
+        .await;
+
+        let project = seed_project(&state, "https://github.com/o/r").await;
+        let epic = seed_in_review_epic(&state, &project, 8, "inline change").await;
+
+        review_tick(&state).await;
+
+        // In-thread "Picked up" reply, no resolution.
+        let replies = fake.reply_review_comment_calls();
+        assert_eq!(replies.len(), 1);
+        assert_eq!(replies[0].in_reply_to_id, 200);
+        assert_eq!(replies[0].body, "Picked up — implementing.");
+        assert!(
+            fake.resolve_thread_calls().is_empty(),
+            "thread must stay unresolved"
+        );
+
+        assert_eq!(epic_status(&state, &epic).await, "InProgress");
+        assert_eq!(epic_tasks(&state, &epic).await.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn standalone_change_request_amends_spec_in_progress_no_new_tasks() {
+        // AC #4 (standalone, option C): a change request amends the task's own
+        // spec (appends feedback), flips the task to InProgress, notifies, and
+        // creates no new tasks — with a non-resolving "Picked up" reply.
+        let fake = Arc::new(
+            FakeHost::new()
+                .with_pull_state(open())
+                .with_issue_comments(vec![git_host::IssueComment {
+                    id: 300,
+                    body: "dearborn: add input validation".into(),
+                }]),
+        );
+        let agent = ScriptedTaskAgent::new().script(
+            crate::task_agent::Stage::Triage,
+            triage_change("## Task: Add validation\nReject invalid inputs before processing."),
+        );
+        let clone_root =
+            std::env::temp_dir().join(format!("dearborn-review-task-change-{}", ulid::Ulid::new()));
+        let state = make_env_with_host_and_agent(
+            Arc::clone(&fake) as Arc<dyn GitHost>,
+            clone_root,
+            Arc::new(agent),
+        )
+        .await;
+
+        let project = seed_project(&state, "https://github.com/o/r").await;
+        let task = seed_in_review_task(&state, &project, 9, "parse").await;
+        // Seed a description so the amendment appends to it.
+        state
+            .db
+            .conn()
+            .execute(
+                "UPDATE task SET description = 'Parse the payload.', acceptance = 'Parses ok.' WHERE id = ?1",
+                params![task.clone()],
+            )
+            .await
+            .unwrap();
+
+        review_tick(&state).await;
+
+        // The standalone task flips to InProgress (worker pool claims it next).
+        assert_eq!(task_status(&state, &task).await, "InProgress");
+
+        // Its spec was amended with the feedback.
+        let mut rows = state
+            .db
+            .conn()
+            .query(
+                "SELECT description, acceptance FROM task WHERE id = ?1",
+                params![task.clone()],
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().unwrap();
+        let desc: String = row.get(0).unwrap();
+        let acc: String = row.get(1).unwrap();
+        assert!(desc.contains("Parse the payload."));
+        assert!(desc.contains("Review feedback"));
+        assert!(desc.contains("dearborn: add input validation"));
+        assert!(acc.contains("Review feedback"));
+
+        // No new task was created (an Option-C standalone never becomes an epic).
+        let mut rows = state
+            .db
+            .conn()
+            .query("SELECT COUNT(*) FROM task WHERE epic_id IS NOT NULL", ())
+            .await
+            .unwrap();
+        let epic_owned: i64 = rows.next().await.unwrap().unwrap().get(0).unwrap();
+        assert_eq!(epic_owned, 0);
+
+        // Interim reply + in_progress row (no spawned ids) + our_post.
+        let posts = fake.post_issue_comment_calls();
+        assert_eq!(posts.len(), 1);
+        assert_eq!(posts[0].body, "Picked up — implementing.");
+        let (kind, gid, class, state_, spawned, _base) = in_progress_row(&state, 9, 300).await;
+        assert_eq!(
+            (kind.as_str(), gid, class.as_deref(), state_.as_str()),
+            ("issue_comment", 300, Some("change_request"), "in_progress")
+        );
+        assert!(spawned.is_none(), "a standalone change spawns no tasks");
     }
 }
