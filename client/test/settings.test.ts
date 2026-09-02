@@ -33,7 +33,7 @@ function makeView(overrides: Partial<SlotSetting> = {}): SlotSetting {
 }
 
 describe("AGENT_SLOTS", () => {
-  it("lists exactly the eight server slots in canonical order", () => {
+  it("lists exactly the nine server slots in canonical order", () => {
     expect(AGENT_SLOTS).toEqual([
       "planning_product",
       "planning_technical",
@@ -43,6 +43,7 @@ describe("AGENT_SLOTS", () => {
       "review",
       "verify_complete",
       "summarize",
+      "triage",
     ]);
   });
 

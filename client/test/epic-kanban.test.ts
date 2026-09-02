@@ -43,13 +43,13 @@ describe("tasksByStatus", () => {
     expect(lanes.Cancelled).toEqual([]);
   });
 
-  it("returns all five lanes (even when empty) so the kanban has a stable column order", () => {
+  it("returns all six lanes (even when empty) so the kanban has a stable column order", () => {
     const lanes = tasksByStatus([]);
     for (const lane of TASK_LANES) {
       expect(lanes[lane.key]).toEqual([]);
     }
     expect(Object.keys(lanes).sort()).toEqual(
-      ["Todo", "InProgress", "Done", "Failed", "Cancelled"].sort(),
+      ["Todo", "InProgress", "InReview", "Done", "Failed", "Cancelled"].sort(),
     );
   });
 

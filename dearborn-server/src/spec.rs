@@ -365,6 +365,157 @@ pub fn parse_verdict(output: &str) -> Option<Verdict> {
     last
 }
 
+// ---- Triage classification (post-PR feedback loop, epic plan §6.4) -------
+
+/// One task spec emitted by a `TRIAGE: CHANGE` — a title plus the free-form
+/// spec body that becomes the task's description/acceptance. Deliberately
+/// just a title + blob rather than structured `description`/`acceptance`
+/// fields: the acting task that turns a triaged change into real tasks owns
+/// whatever split (if any) it wants, and this module's job stops at cleanly
+/// framing the agent's specs so they never get lost or merged.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::module_name_repetitions)]
+pub struct TriageTaskSpec {
+    /// The `## Task: <title>` heading text, trimmed of surrounding whitespace.
+    pub title: String,
+    /// Everything after the `## Task:` heading until the next heading (or end
+    /// of output), trimmed. Non-empty for a well-formed spec body.
+    pub spec: String,
+}
+
+/// The classification of one piece of PR feedback (epic plan §6.4): either a
+/// question the agent will answer directly, or a change request that spawns
+/// one or more tasks.
+#[derive(Debug, Clone, PartialEq, Eq)]
+#[allow(clippy::module_name_repetitions)]
+pub enum Triage {
+    /// `TRIAGE: QUESTION` — post `reply` directly to the reviewer; no code
+    /// change.
+    Question {
+        /// The reply body — everything after the `TRIAGE: QUESTION` line.
+        reply: String,
+    },
+    /// `TRIAGE: CHANGE` — create one linked task per entry in `tasks`.
+    Change {
+        /// One or more task specs; a well-formed change always has at least
+        /// one (`parse_triage` returns `None` when a `CHANGE` yields none).
+        tasks: Vec<TriageTaskSpec>,
+    },
+}
+
+/// The triage classification kind named on a `TRIAGE:` line.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TriageLine {
+    Question,
+    Change,
+}
+
+/// Parse a single candidate `TRIAGE:` line's token. Anchored to the start of
+/// the line (no leading whitespace), case-sensitive (`QUESTION`, not
+/// `question`), tolerant of trailing whitespace, and rejecting any trailing
+/// words after the token — the same contract as [`parse_verdict`]'s line
+/// matching. `None` when the line is not a valid triage classification.
+fn parse_triage_line(line: &str) -> Option<TriageLine> {
+    let rest = line.strip_prefix("TRIAGE:")?;
+    match rest.trim() {
+        "QUESTION" => Some(TriageLine::Question),
+        "CHANGE" => Some(TriageLine::Change),
+        _ => None,
+    }
+}
+
+/// Parse an agent's raw triage output into a [`Triage`] classification,
+/// mirroring [`parse_verdict`]'s **last-line-wins** contract: the *last*
+/// matching `^TRIAGE:\s*(QUESTION|CHANGE)\s*$` line decides the outcome, and
+/// earlier mentions (in the triage note's prose, or a stale classification
+/// mid-output) are deliberately overridable by a later, real one.
+///
+/// The classification's payload is everything **after** the winning line:
+/// the full reply body for `QUESTION`, or one-or-more `## Task: <title>`
+/// specs for `CHANGE`. Returns `None` for malformed/no-verdict input (no
+/// `TRIAGE:` line at all; an unknown token; an indented or mid-sentence
+/// mention; a `CHANGE` that yields no task specs — a change request with
+/// nothing to change is not a usable classification).
+pub fn parse_triage(output: &str) -> Option<Triage> {
+    // Find the last valid classification line and its position.
+    let mut winning: Option<(usize, TriageLine)> = None;
+    for (idx, raw) in output.lines().enumerate() {
+        // Tolerate a stray CR from CRLF line endings.
+        let line = raw.strip_suffix('\r').unwrap_or(raw);
+        if let Some(kind) = parse_triage_line(line) {
+            winning = Some((idx, kind));
+        }
+    }
+    let (winning_line, kind) = winning?;
+
+    // The payload is the raw text after the winning line, trimmed of the
+    // leading/trailing blank space (interior indentation preserved).
+    let body = output
+        .lines()
+        .skip(winning_line + 1)
+        .collect::<Vec<_>>()
+        .join("\n");
+    let body = body.trim();
+
+    match kind {
+        TriageLine::Question => Some(Triage::Question {
+            reply: body.to_string(),
+        }),
+        TriageLine::Change => {
+            let tasks = parse_change_tasks(body);
+            if tasks.is_empty() {
+                None
+            } else {
+                Some(Triage::Change { tasks })
+            }
+        }
+    }
+}
+
+/// Split a `CHANGE` payload's text into one [`TriageTaskSpec`] per `## Task:
+/// <title>` heading, in order. Anything before the first heading is ignored;
+/// each spec's body runs from after its heading until the next heading (or
+/// end of input), trimmed. Headings with an empty/whitespace-only title are
+/// not treated as headings at all.
+fn parse_change_tasks(body: &str) -> Vec<TriageTaskSpec> {
+    let mut specs = Vec::new();
+    let mut title: Option<String> = None;
+    let mut buf: Vec<&str> = Vec::new();
+    for line in body.lines() {
+        if let Some(t) = task_heading(line) {
+            if let Some(prev) = title.take() {
+                specs.push(TriageTaskSpec {
+                    title: prev,
+                    spec: buf.join("\n").trim().to_string(),
+                });
+            }
+            title = Some(t.to_string());
+            buf.clear();
+        } else if title.is_some() {
+            buf.push(line);
+        }
+    }
+    if let Some(prev) = title.take() {
+        specs.push(TriageTaskSpec {
+            title: prev,
+            spec: buf.join("\n").trim().to_string(),
+        });
+    }
+    specs
+}
+
+/// Parse a `## Task: <title>` heading; `None` unless the line starts with the
+/// exact `## Task:` prefix and has a non-empty trimmed title.
+fn task_heading(line: &str) -> Option<&str> {
+    let title = line.strip_prefix("## Task:")?;
+    let title = title.trim();
+    if title.is_empty() {
+        None
+    } else {
+        Some(title)
+    }
+}
+
 // ---- prompts (D6/D7/D9 content, `include_str!`-compiled) ------------------
 
 use crate::task_agent::Stage;
@@ -374,6 +525,7 @@ const FIX_PROMPT: &str = include_str!("../prompts/fix.md");
 const REVIEW_PROMPT: &str = include_str!("../prompts/review.md");
 const VERIFY_COMPLETE_PROMPT: &str = include_str!("../prompts/verify_complete.md");
 const SUMMARIZE_PROMPT: &str = include_str!("../prompts/summarize.md");
+const TRIAGE_PROMPT: &str = include_str!("../prompts/triage.md");
 
 /// The static prompt text for an agent stage — `include_str!`-compiled into
 /// the binary at build time (D6), so fetching it is pure (no filesystem read
@@ -389,6 +541,7 @@ pub fn prompt_for(stage: Stage) -> Option<&'static str> {
         Stage::Review => Some(REVIEW_PROMPT),
         Stage::VerifyComplete => Some(VERIFY_COMPLETE_PROMPT),
         Stage::Summarize => Some(SUMMARIZE_PROMPT),
+        Stage::Triage => Some(TRIAGE_PROMPT),
         Stage::Setup | Stage::Preflight | Stage::TestGate | Stage::Commit | Stage::Push => None,
     }
 }
@@ -746,13 +899,14 @@ VERDICT: BLOCKED";
 
     // ---- prompts -----------------------------------------------------
 
-    /// Every agent stage, for tests that iterate over all five.
-    const AGENT_STAGES: [Stage; 5] = [
+    /// Every agent stage, for tests that iterate over all six.
+    const AGENT_STAGES: [Stage; 6] = [
         Stage::Implement,
         Stage::Fix,
         Stage::Review,
         Stage::VerifyComplete,
         Stage::Summarize,
+        Stage::Triage,
     ];
 
     #[test]
@@ -790,5 +944,133 @@ VERDICT: BLOCKED";
         assert!(!prompt_for(Stage::Implement).unwrap().contains("VERDICT:"));
         assert!(!prompt_for(Stage::Fix).unwrap().contains("VERDICT:"));
         assert!(!prompt_for(Stage::Summarize).unwrap().contains("VERDICT:"));
+    }
+    #[test]
+    fn triage_prompt_states_the_triage_contract_and_review_verify_do_not() {
+        // The triage stage alone emits TRIAGE: lines; the three prior
+        // Ask-mode stages (review/verify_complete/summarize) must not — a
+        // cheap guard against a copy-paste mistake.
+        assert!(prompt_for(Stage::Triage).unwrap().contains("TRIAGE:"));
+        assert!(!prompt_for(Stage::Review).unwrap().contains("TRIAGE:"));
+        assert!(!prompt_for(Stage::VerifyComplete)
+            .unwrap()
+            .contains("TRIAGE:"));
+        assert!(!prompt_for(Stage::Summarize).unwrap().contains("TRIAGE:"));
+    }
+
+    // ---- parse_triage ---------------------------------------------------
+
+    #[test]
+    fn triage_question_parses_the_reply_body() {
+        let output = "\
+The reviewer asks whether the empty list short-circuits: it does not.
+TRIAGE: QUESTION
+Yes, `parse()` returns an empty vec for an empty input rather than
+short-circuiting; callers treat that as nothing to do.
+The guard lives in `worker.rs`.";
+        match parse_triage(output) {
+            Some(Triage::Question { reply }) => {
+                assert!(reply.contains("empty vec"));
+                assert!(reply.contains("worker.rs"));
+                assert!(!reply.contains("TRIAGE:"));
+            }
+            other => panic!("expected Question, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn triage_change_parses_a_single_task_spec() {
+        let output = "\
+The reviewer wants the empty-list path covered by a guard.
+TRIAGE: CHANGE
+## Task: Guard the empty input path
+Add an early-return guard in `worker.rs` when the input list is
+empty, and test it returns the empty result without touching the DB.
+Verify with `cargo test`.";
+        match parse_triage(output) {
+            Some(Triage::Change { tasks }) => {
+                assert_eq!(tasks.len(), 1);
+                assert_eq!(tasks[0].title, "Guard the empty input path");
+                assert!(tasks[0].spec.contains("early-return guard"));
+                assert!(tasks[0].spec.contains("cargo test"));
+            }
+            other => panic!("expected Change, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn triage_change_parses_multiple_task_specs_in_order() {
+        let output = "\
+Two concrete changes requested.
+TRIAGE: CHANGE
+## Task: Fix the formatting
+The date column overflows on narrow screens; clamp the width.
+## Task: Add a retry test
+Cover the retry-on-429 path with a unit test asserting the backoff.
+Verify via `cargo test`.";
+        match parse_triage(output) {
+            Some(Triage::Change { tasks }) => {
+                assert_eq!(tasks.len(), 2);
+                assert_eq!(tasks[0].title, "Fix the formatting");
+                assert!(tasks[0].spec.contains("clamp the width"));
+                assert_eq!(tasks[1].title, "Add a retry test");
+                assert!(tasks[1].spec.contains("backoff"));
+            }
+            other => panic!("expected Change, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn triage_last_line_wins() {
+        let output = "\
+On reflection this needs code changes.
+TRIAGE: QUESTION
+Looks fine to me.
+Actually it is a bug.
+TRIAGE: CHANGE
+## Task: Fix the null deref
+Guard against the null scope before dereferencing in `git.rs`.
+## Task: Add a regression test
+Assert a null scope returns a clear error, not a panic.";
+        match parse_triage(output) {
+            Some(Triage::Change { tasks }) => {
+                assert_eq!(tasks.len(), 2);
+                assert_eq!(tasks[0].title, "Fix the null deref");
+            }
+            other => panic!("expected the later CHANGE to win, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn triage_last_line_wins_reverse_question_wins_over_earlier_change() {
+        let output = "\
+TRIAGE: CHANGE
+## Task: Redo the parser
+Rewrite it.
+But rereading, this is just a question.
+TRIAGE: QUESTION
+Got it — right-clicking the cell copies the raw value.";
+        match parse_triage(output) {
+            Some(Triage::Question { reply }) => {
+                assert!(reply.contains("right-clicking"));
+            }
+            other => panic!("expected the later QUESTION to win, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn triage_absent_or_malformed_input_returns_none() {
+        assert_eq!(parse_triage("Just some notes, no classification."), None);
+        assert_eq!(parse_triage("TRIAGE: MAYBE"), None);
+        assert_eq!(parse_triage("TRIAGE: PASS"), None);
+        assert_eq!(parse_triage("triage: question"), None);
+        assert_eq!(parse_triage("    TRIAGE: QUESTION\nreply"), None);
+        assert_eq!(
+            parse_triage("The agent's TRIAGE: CHANGE appeared mid-sentence."),
+            None
+        );
+        assert_eq!(parse_triage("TRIAGE: QUESTION because reasons"), None);
+        assert_eq!(parse_triage("TRIAGE: CHANGE\nNo tasks spelled out."), None);
+        assert_eq!(parse_triage("TRIAGE: CHANGE\n## Task:   \nspec"), None);
     }
 }

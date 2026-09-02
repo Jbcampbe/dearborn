@@ -274,6 +274,11 @@ pub enum Stage {
     /// The PR body's "Summary of changes" section; failure is non-fatal.
     /// Agent, `RunMode::Ask` (+ denied edit tools).
     Summarize,
+    /// Classify one piece of PR feedback (the post-PR-review feedback loop,
+    /// epic plan §6.4): a `QUESTION` (agent posts a direct reply, no code
+    /// change) vs. a `CHANGE` (one or more task specs to spawn as work on the
+    /// PR branch). Agent, `RunMode::Ask` (+ denied edit tools).
+    Triage,
 }
 
 impl Stage {
@@ -293,6 +298,7 @@ impl Stage {
             Stage::Commit => "commit",
             Stage::Push => "push",
             Stage::Summarize => "summarize",
+            Stage::Triage => "triage",
         }
     }
 
@@ -310,7 +316,9 @@ impl Stage {
     pub fn run_mode(self) -> Option<RunMode> {
         match self {
             Stage::Implement | Stage::Fix => Some(RunMode::Edit),
-            Stage::Review | Stage::VerifyComplete | Stage::Summarize => Some(RunMode::Ask),
+            Stage::Review | Stage::VerifyComplete | Stage::Summarize | Stage::Triage => {
+                Some(RunMode::Ask)
+            }
             Stage::Setup | Stage::Preflight | Stage::TestGate | Stage::Commit | Stage::Push => None,
         }
     }
@@ -322,7 +330,7 @@ impl Stage {
     pub fn denies_edit_tools(self) -> bool {
         matches!(
             self,
-            Stage::Review | Stage::VerifyComplete | Stage::Summarize
+            Stage::Review | Stage::VerifyComplete | Stage::Summarize | Stage::Triage
         )
     }
 }
@@ -436,6 +444,26 @@ pub fn assemble_fix_prompt(feedback: &str) -> String {
 /// base produces byte-for-byte today's output.
 pub fn assemble_fix_prompt_text(base: &str, feedback: &str) -> String {
     format!("{base}\n\n---\n\n## Feedback\n\n{feedback}")
+}
+
+/// Assemble the `Triage` stage's prompt for one piece of PR feedback: the
+/// stage's instructions (`prompts/triage.md`) followed by a `## Feedback to
+/// triage` block carrying the single item being classified, then the D8
+/// context block ([`crate::spec::build_context`]). Unlike [`assemble_prompt`]
+/// (instruction then context, no item-specific block), the triage stage also
+/// interleaves the feedback under its own explicit heading, because that
+/// feedback and not the surrounding context is what the agent is classifying
+/// (the epic/task context remains background so the classification is
+/// grounded in the actual code). The override-aware variant takes the
+/// resolved instruction text via `base` (T6); composition order is
+/// instruction → feedback block → context block.
+pub fn assemble_triage_prompt_text(
+    base: &str,
+    feedback: &str,
+    context: &crate::spec::TaskContext,
+) -> String {
+    let context_block = crate::spec::build_context(context);
+    format!("{base}\n\n---\n\n## Feedback to triage\n\n{feedback}\n\n---\n\n{context_block}")
 }
 
 /// The seam that makes task-stage runs hermetically testable (mirrors
@@ -1619,6 +1647,7 @@ mod tests {
         assert_eq!(Stage::Commit.as_str(), "commit");
         assert_eq!(Stage::Push.as_str(), "push");
         assert_eq!(Stage::Summarize.as_str(), "summarize");
+        assert_eq!(Stage::Triage.as_str(), "triage");
     }
 
     #[test]
@@ -1630,8 +1659,13 @@ mod tests {
     }
 
     #[test]
-    fn review_verify_complete_and_summarize_are_ask_mode_and_deny_edit_tools() {
-        for stage in [Stage::Review, Stage::VerifyComplete, Stage::Summarize] {
+    fn review_verify_complete_summarize_and_triage_are_ask_mode_and_deny_edit_tools() {
+        for stage in [
+            Stage::Review,
+            Stage::VerifyComplete,
+            Stage::Summarize,
+            Stage::Triage,
+        ] {
             assert_eq!(stage.run_mode(), Some(RunMode::Ask), "{stage:?}");
             assert!(stage.denies_edit_tools(), "{stage:?}");
         }
@@ -1656,6 +1690,7 @@ mod tests {
             Stage::Review,
             Stage::VerifyComplete,
             Stage::Summarize,
+            Stage::Triage,
         ] {
             assert!(stage.is_agent_stage(), "{stage:?}");
         }
@@ -1756,6 +1791,35 @@ mod tests {
 
         assert!(assemble_prompt(Stage::Setup, &ctx).is_none());
         assert!(assemble_prompt(Stage::Commit, &ctx).is_none());
+    }
+
+    #[test]
+    fn assemble_triage_prompt_text_interleaves_feedback_between_instructions_and_context() {
+        // The triage prompt must carry the item's feedback under its own
+        // heading, sandwiched between the stage instructions and the D8
+        // context block — the feedback, not the background, is what's being
+        // classified.
+        let ctx = crate::spec::TaskContext {
+            spec: crate::spec::SpecFields {
+                title: "Do the thing",
+                description: Some("desc"),
+                acceptance: Some("acc"),
+            },
+            epic: None,
+            siblings: &[],
+            base_sha: None,
+        };
+        let base = crate::spec::prompt_for(Stage::Triage).expect("triage has a prompt");
+        let assembled = assemble_triage_prompt_text(base, "dearborn: why?", &ctx);
+
+        // Order: instructions, then the feedback block, then the context block.
+        let inst = assembled.find(base).unwrap();
+        let feedback = assembled.find("## Feedback to triage").unwrap();
+        let body = assembled.find("dearborn: why?").unwrap();
+        let context = assembled.find("Do the thing").unwrap();
+        assert!(inst < feedback && feedback < body && body < context);
+        // The pure instruction text (the `prompt_hash` input) is untouched.
+        assert!(assembled.starts_with(base));
     }
 
     // ---- the handle is returned, not dropped ---------------------------
@@ -2953,5 +3017,69 @@ mod tests {
                 _ => return frames,
             }
         }
+    }
+
+    // ---- Triage: evidence recording (this slice's AC) --------------------
+
+    /// A triage stage run records its `agent_run` row via the same
+    /// evidence open/close helpers every other stage uses — the acceptance
+    /// criterion "a triage stage run records an agent_run row via the
+    /// evidence helpers".
+    #[tokio::test]
+    async fn triage_stage_run_records_agent_run_row_via_evidence_helpers() {
+        let state = test_state().await;
+        let agent = ScriptedTaskAgent::new().script(Stage::Triage, ScriptedRun::default());
+        let dir = std::env::temp_dir().join(format!("dearborn-triage-stage-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&dir).unwrap();
+
+        let outcome = run_agent_stage(
+            &state,
+            &agent,
+            AgentStageParams {
+                task_id: Some("task-1"),
+                epic_id: Some("epic-1"),
+                attempt: 2,
+            },
+            TaskRunRequest {
+                run_id: "run-triage".to_string(),
+                stage: Stage::Triage,
+                prompt: crate::spec::prompt_for(Stage::Triage)
+                    .expect("Stage::Triage always has a prompt")
+                    .to_string(),
+                cwd: dir.clone(),
+                harness: "claude".to_string(),
+                model: None,
+                prompt_hash: "triage-prompt-hash".to_string(),
+            },
+        )
+        .await
+        .expect("a scripted triage stage must succeed");
+        assert!(outcome.is_ok());
+
+        // The evidence row was recorded for the triage stage, closed `ok`.
+        let mut rows = state
+            .db
+            .conn()
+            .query(
+                "SELECT stage, status, attempt, task_id, epic_id FROM agent_run \
+                 WHERE stage = 'triage'",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows
+            .next()
+            .await
+            .unwrap()
+            .expect("a triage row was written");
+        assert_eq!(row.get::<String>(0).unwrap(), "triage");
+        assert_eq!(row.get::<String>(1).unwrap(), "ok");
+        assert_eq!(row.get::<i64>(2).unwrap(), 2);
+        assert_eq!(row.get::<String>(3).unwrap(), "task-1");
+        assert_eq!(
+            row.get::<Option<String>>(4).unwrap().as_deref(),
+            Some("epic-1")
+        );
+        std::fs::remove_dir_all(&dir).ok();
     }
 }

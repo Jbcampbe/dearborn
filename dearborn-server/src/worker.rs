@@ -224,19 +224,22 @@
 //!    concurrently" (§2.3) discipline the M1 stub already had, just now
 //!    guarding a much more expensive step.
 //!
-//! ### `Completed` only after a real PR opens (T-514)
+//! ### `InReview` only after a real PR opens (T-514)
 //!
-//! Unlike the M1 stub, this walk does not set `epic.status = 'Completed'`
-//! the moment the DAG goes fully `Done` — [`finalize_epic`] does, and only
-//! after the epic's branch has been pushed **and** a PR has actually opened
-//! (D1). An epic whose DAG is fully `Done` but has not yet been pushed/PR'd
-//! is not "done" in any sense a human watching the board should trust, so
+//! Unlike the M1 stub, this walk does not land the epic in `InReview` the
+//! moment the DAG goes fully `Done` — [`finalize_epic`] does, and only after
+//! the epic's branch has been pushed **and** a PR has actually opened (D1).
+//! In the post-PR-review loop `InReview` is the factory-done-waiting-on-the-
+//! human state; `Completed` is reached only from `InReview`, on a human
+//! merge, by a later poller task. An epic whose DAG is fully `Done` but has
+//! not yet been pushed/PR'd is not "in review" in any sense a human watching
+//! the board should trust, so
 //! the walk calls straight into [`finalize_epic`] the moment it observes
 //! `all_done` (still holding the lease, still `InProgress`) rather than
 //! stopping and leaving that step for something else to notice later. See
 //! [`finalize_epic`]'s own doc for the push/PR sequence, the `pr_failed`
 //! failure path, and why this also closes the re-claim spin a fully-`Done`-
-//! but-still-`InProgress` epic would otherwise cause (T-513 left exactly
+//! but-still-`InProgress` epic would otherwise cause (T513 left exactly
 //! that gap open, by design, for this task to close).
 //!
 //! ### Failure and cancellation both stop the walk the same way
@@ -1234,7 +1237,7 @@
 //!
 //! ### One PR-opening core, two finalizers
 //!
-//! [`push_and_open_pr`] is [`finalize_epic`]'s pre-T-551 push/open-PR
+//! [`push_and_ensure_pr`] is [`finalize_epic`]'s pre-T-551 push/open-PR
 //! sequence, factored out so [`finalize_task`] calls the identical code
 //! rather than a copy. What's left in each caller is only what genuinely
 //! differs: which row's checklist builds the PR body
@@ -1369,14 +1372,14 @@
 //! (T-562's own territory, not this task's — its deps are T-512/T-514 only).
 //! Noted here rather than quietly worked around.
 //!
-//! ### Ordering: the summary runs *before* `push_and_open_pr`, on purpose
+//! ### Ordering: the summary runs *before* `push_and_ensure_pr`, on purpose
 //!
 //! [`crate::git_host::GitHost`] (T-514) has `push`/`open_pr`/`check_auth` —
 //! no "edit an already-opened PR's body." That means the summary text has to
 //! exist **before** `open_pr` is called; there is no later point to patch it
 //! in. [`finalize_epic`]/[`finalize_task`] both call [`run_epic_summary`]/
 //! [`run_task_summary`] first, build the full body via `pr::build_pr_body`,
-//! *then* call [`push_and_open_pr`] — never the other way around.
+//! *then* call [`push_and_ensure_pr`] — never the other way around.
 //!
 //! The consequence flagged in this task's own brief: a summarize run that
 //! hangs burns the full `DEARBORN_AGENT_STAGE_TIMEOUT_SECS` **before** the PR
@@ -1429,7 +1432,7 @@
 //!
 //! D16 draws no epic/standalone distinction, and `finalize_task` already
 //! mirrors `finalize_epic` in every other respect (T-551's "one core, two
-//! thin callers" shape, `push_and_open_pr` chief among them) — treating the
+//! thin callers" shape, `push_and_ensure_pr` chief among them) — treating the
 //! summary as epic-only would have been the one place that symmetry broke
 //! for no stated reason. [`run_task_summary`] is the standalone mirror of
 //! [`run_epic_summary`]: the task's own [`spec::SpecFields`] stand in for the
@@ -5352,14 +5355,17 @@ async fn run_preflight(
     }
 }
 
-/// Finalize a fully-`Done` epic (T-514, D1): push the branch, open the PR,
-/// persist its identity, flip the epic to `Completed`, delete the workspace,
-/// and publish. This is the **only** place `epic.status` ever becomes
+/// Finalize a fully-`Done` epic (T-514, D1): push the branch and open a PR
+/// (or, on a feedback re-run, push only and reuse the recorded PR), persist
+/// its identity, flip the epic to `InReview`, retain the workspace, and
+/// publish. This is the **only** place `epic.status` ever becomes
 /// `Completed` — see the module doc's "`Completed` only after a real PR
-/// opens" section for why that transition waits this long.
+/// opens" section for why that transition waits this long. (In the
+/// post-PR-review flow `Completed` is reached only from `InReview` on a
+/// human merge — this finalize step lands in `InReview`, not `Completed`.)
 ///
 /// A failed push or a failed `open_pr` routes the epic to
-/// `Blocked(pr_failed)` (never `Completed`) via [`fail_item`] — the same
+/// `Blocked(pr_failed)` (never `Completed`/`InReview`) via [`fail_item`] — the same
 /// T-540 router, same workspace-retained/lease-released contract every other
 /// failure path in this module already uses, called here with
 /// `PushIntent::Skip` (this function *is* the push — see [`PushIntent::Skip`]'s
@@ -5371,7 +5377,7 @@ async fn run_preflight(
 /// plus a full message in evidence mirrors exactly how `setup_failed` splits
 /// reason-code vs. captured-output between the epic row and `agent_run`.
 ///
-/// Either exit (`Completed` or `Blocked(pr_failed)`) moves the epic out of
+/// Either exit (`InReview` or `Blocked(pr_failed)`) moves the epic out of
 /// `InProgress`, so [`claim_epic`]'s predicate excludes it from then on —
 /// this is what closes the re-claim spin T-513 deliberately left open (its
 /// module doc says so): before this function existed, a fully-`Done` epic
@@ -5379,11 +5385,11 @@ async fn run_preflight(
 /// and re-walk it in a tight loop forever. Now every path out of a
 /// fully-`Done` DAG ends in a terminal-for-the-queue status.
 ///
-/// ## Shared with [`finalize_task`] (T-551): [`push_and_open_pr`]
+/// ## Shared with [`finalize_task`] (T-551): [`push_and_ensure_pr`]
 ///
 /// The project/PAT load, the single `Stage::Push` evidence row, the push
 /// itself, and the `open_pr` call — every step through "the PR now exists on
-/// GitHub" — is factored into [`push_and_open_pr`], the one place that
+/// GitHub" — is factored into [`push_and_ensure_pr`], the one place that
 /// sequence is written. This function (and [`finalize_task`], the standalone
 /// mirror) calls it once with its own title/body and `epic_id`/`task_id`
 /// pair, then does only what's left that genuinely differs: which row's
@@ -5403,16 +5409,27 @@ async fn finalize_epic(
     let items = build_task_checklist(conn, epic_id, dag).await;
     // T-560: best-effort — see `run_epic_summary`'s own doc for why this can
     // never fail this function, and the module doc's own T-560 section for
-    // why it runs *before* `push_and_open_pr` rather than after.
+    // why it runs *before* `push_and_ensure_pr` rather than after.
     let summary = run_epic_summary(state, epic_id, epic, dag, workspace, lease).await;
     let body = pr::build_pr_body(epic.description.as_deref(), &items, summary.as_deref());
 
-    let Some(opened) = push_and_open_pr(
+    // A feedback re-run already has a recorded PR (set on the first
+    // finalize): reuse it — push only — rather than opening a duplicate.
+    let existing_pr = epic.pr_url.as_ref().and_then(|url| {
+        epic.pr_number.map(|number| crate::git_host::OpenedPr {
+            url: url.clone(),
+            number,
+        })
+    });
+    let first_open = existing_pr.is_none();
+
+    let Some(opened) = push_and_ensure_pr(
         state,
         Some(epic_id),
         None,
         &epic.project_id,
         workspace,
+        existing_pr.as_ref(),
         lease,
         &title,
         &body,
@@ -5432,13 +5449,26 @@ async fn finalize_epic(
     }
 
     let now = now_ms();
-    let affected = conn
-        .execute(
-            "UPDATE epic SET status = 'Completed', pr_url = ?1, pr_number = ?2, updated_at = ?3 \
+
+    // Land the epic in `InReview` (not `Completed`) with the PR attached —
+    // the PR link/number are set only on the first open (`first_open`); on a
+    // feedback re-run the recorded PR is preserved (we only push). The
+    // workspace is *retained* so feedback rounds can reuse the branch.
+    let affected = if first_open {
+        conn.execute(
+            "UPDATE epic SET status = 'InReview', pr_url = ?1, pr_number = ?2, updated_at = ?3 \
              WHERE id = ?4 AND status = 'InProgress'",
             params![opened.url.clone(), opened.number, now, epic_id],
         )
-        .await;
+        .await
+    } else {
+        conn.execute(
+            "UPDATE epic SET status = 'InReview', updated_at = ?1 \
+             WHERE id = ?2 AND status = 'InProgress'",
+            params![now, epic_id],
+        )
+        .await
+    };
 
     match affected {
         Ok(n) if n > 0 => {
@@ -5449,13 +5479,8 @@ async fn finalize_epic(
                     .publish(&format!("epic:{epic_id}"), "epic_updated", payload);
                 board::publish_board(state, &updated.project_id).await;
             }
-            if let Err(err) = workspace::delete_workspace(&workspace.workspace_path).await {
-                tracing::warn!(
-                    epic = %epic_id,
-                    error = %err,
-                    "finalize: failed to delete workspace after the PR opened (retained on disk; not fatal — the PR already opened successfully)"
-                );
-            }
+            // The workspace is deliberately retained (not deleted) so
+            // feedback rounds can reuse the same branch and update the PR.
         }
         Ok(_) => {
             tracing::warn!(
@@ -5476,33 +5501,30 @@ async fn finalize_epic(
 }
 
 /// The claimed-**standalone-task** counterpart to [`finalize_epic`] (T-551):
-/// push the branch, open the PR, persist `pr_url`/`pr_number` on the *task*
-/// row (there is no epic row for a standalone claim), publish, and delete
-/// the workspace. Shares [`push_and_open_pr`]'s push/open-PR core with
-/// `finalize_epic` — see that function's own doc — rather than duplicating
-/// it; the only things that differ are the title/body construction (one
-/// task, not a checklist over a DAG — [`build_standalone_checklist`]) and
-/// the terminal write below.
+/// push the branch, open a PR on the first finalize (or, on a feedback
+/// re-run, push only and reuse the recorded PR), persist `pr_url`/
+/// `pr_number` on the *task* row (there is no epic row for a standalone
+/// claim), land it in `InReview`, retain the workspace, and publish. Shares
+/// [`push_and_ensure_pr`]'s push/ensure-PR core with `finalize_epic` — see
+/// that function's own doc — rather than duplicating it; the only things
+/// that differ are the title/body construction (one task, not a checklist
+/// over a DAG — [`build_standalone_checklist`]) and the terminal write
+/// below.
 ///
-/// ## `Done`, not `Completed` (T-551 judgment call)
+/// ## `InReview`, not `Done` (post-PR-review loop)
 ///
-/// An epic's terminal success state is a status *distinct* from any of its
-/// tasks' own (`Completed` vs. each task's own `Done`) because the epic is a
-/// genuinely separate row tracking a genuinely separate thing: "has this
-/// epic's PR opened," independent of "are all its tasks Done" (the two can
-/// transiently disagree — the DAG can read fully `Done` for a heartbeat
-/// before `finalize_epic` gets to run). A standalone task has no second row:
-/// [`process_one_task`]'s own step 6 already left `task.status = 'Done'`
-/// before this function is ever called, and `task`'s status enum (`Todo |
-/// InProgress | Done | Failed | Cancelled` — `tasks.rs`'s own doc) has no
-/// `Completed` value to move to in the first place. `Done` **is** the
-/// task's terminal success state, exactly as it already is for every
-/// epic-owned task; opening the PR does not change what "done" means for a
-/// standalone task, it just adds where to find the PR. The persisting
-/// `UPDATE` below is fenced on `WHERE status = 'Done'` (mirroring
-/// `finalize_epic`'s own `WHERE status = 'InProgress'` fence) so a race with,
-/// say, a retry landing at exactly the wrong instant is a no-op rather than a
-/// clobber.
+/// Before the post-PR-review loop a standalone task's terminal success
+/// state was its own `Done` (set by [`process_one_task`]'s step 6 while it
+/// is just reporting "all tasks are done"). Now that the PR's opened,
+/// `Done` would mean the factory never tracked the human review phase — a
+/// standalone task has no second row, so its PR lifecycle lives on the
+/// *task* row itself (epic-owned tasks keep `Done`; the epic row carries
+/// `InReview`). Finalize therefore moves the standalone task to `InReview`
+/// — its "factory done, waiting on the human reviewer" state — mirroring
+/// the epic path. The persisting `UPDATE` is fenced on `WHERE status =
+/// 'Done'` (mirroring `finalize_epic`'s own `WHERE status = 'InProgress'`
+/// fence) so a race with, say, a retry landing at exactly the wrong instant
+/// is a no-op rather than a clobber.
 async fn finalize_task(
     state: &AppState,
     task_id: &str,
@@ -5524,12 +5546,22 @@ async fn finalize_task(
     let summary = run_task_summary(state, task_id, task, workspace, lease).await;
     let body = pr::build_pr_body(task.description.as_deref(), &items, summary.as_deref());
 
-    let Some(opened) = push_and_open_pr(
+    // A feedback re-run already has a recorded PR: reuse it — push only.
+    let existing_pr = task.pr_url.as_ref().and_then(|url| {
+        task.pr_number.map(|number| crate::git_host::OpenedPr {
+            url: url.clone(),
+            number,
+        })
+    });
+    let first_open = existing_pr.is_none();
+
+    let Some(opened) = push_and_ensure_pr(
         state,
         None,
         Some(task_id),
         &task.project_id,
         workspace,
+        existing_pr.as_ref(),
         lease,
         &title,
         &body,
@@ -5544,24 +5576,32 @@ async fn finalize_task(
     }
 
     let now = now_ms();
-    let affected = conn
-        .execute(
-            "UPDATE task SET pr_url = ?1, pr_number = ?2, updated_at = ?3 \
+
+    // Land the standalone task in `InReview` (its PR lifecycle lives on the
+    // task row) rather than leaving it `Done` — the PR link/number are set
+    // only on the first open; a feedback re-run just pushes and returns to
+    // `InReview`. The workspace is retained for feedback rounds.
+    let affected = if first_open {
+        conn.execute(
+            "UPDATE task SET status = 'InReview', pr_url = ?1, pr_number = ?2, updated_at = ?3 \
              WHERE id = ?4 AND status = 'Done'",
             params![opened.url.clone(), opened.number, now, task_id],
         )
-        .await;
+        .await
+    } else {
+        conn.execute(
+            "UPDATE task SET status = 'InReview', updated_at = ?1 \
+             WHERE id = ?2 AND status = 'Done'",
+            params![now, task_id],
+        )
+        .await
+    };
 
     match affected {
         Ok(n) if n > 0 => {
             board::publish_board(state, &task.project_id).await;
-            if let Err(err) = workspace::delete_workspace(&workspace.workspace_path).await {
-                tracing::warn!(
-                    task = %task_id,
-                    error = %err,
-                    "finalize: failed to delete workspace after the PR opened (retained on disk; not fatal — the PR already opened successfully)"
-                );
-            }
+            // The workspace is deliberately retained (not deleted) so
+            // feedback rounds can reuse the same branch and update the PR.
         }
         Ok(_) => {
             tracing::warn!(
@@ -5581,32 +5621,41 @@ async fn finalize_task(
     }
 }
 
-/// The shared push+open_pr core [`finalize_epic`]/[`finalize_task`] (T-551)
+/// The shared push+ensure-PR core [`finalize_epic`]/[`finalize_task`] (T-551)
 /// both call: load the project + PAT, open a single `Stage::Push` evidence
-/// row spanning both network operations (§2.2 has one `push` stage, no
-/// separate "open PR" entry), push `workspace`'s branch, then open a PR
-/// titled `title` with body `body`. Every failure routes through
-/// [`fail_item`] with [`FailureReason::PrFailed`] and `PushIntent::Skip` —
-/// this function *is* the push, so routing back through `fail_item`'s own
-/// push step would either push nothing new (the project/PAT load failures,
-/// which happen before any push is even attempted) or push a second,
-/// redundant time (the push-itself-failed/open-PR-failed cases, each of
-/// which already recorded its own evidence via [`close_push_stage`]
-/// immediately before the call) — see [`PushIntent::Skip`]'s own doc.
-/// `epic_id`/`task_id` are threaded straight into `FailureContext` and the
-/// evidence row exactly as the caller's own shape dictates: `Some(epic_id),
-/// None` for an epic, `None, Some(task_id)` for a standalone task. Returns
-/// the opened PR on success; `None` on any failure (already routed to
+/// row spanning the push (and, on the item's first finalize, the `open_pr`)
+/// network operations (§2.2 has one `push` stage, no separate "open PR"
+/// entry), push `workspace`'s branch, then **conditionally** open a PR
+/// titled `title` with body `body`. `existing_pr` carries the item's
+/// already-recorded PR (from a prior finalize) when one exists: a feedback
+/// re-run always pushes — which updates the existing PR in place — and
+/// returns `existing_pr` unchanged instead of calling `open_pr` again (a
+/// second `open_pr` on the same head branch would create a duplicate). Only
+/// when `existing_pr` is `None` (first finalize) does it open a PR. Every
+/// failure routes through [`fail_item`] with [`FailureReason::PrFailed`]
+/// and `PushIntent::Skip` — this function *is* the push, so routing back
+/// through `fail_item`'s own push step would either push nothing new (the
+/// project/PAT load failures, which happen before any push is even
+/// attempted) or push a second, redundant time (the
+/// push-itself-failed/open-PR-failed cases, each of which already recorded
+/// its own evidence via [`close_push_stage`] immediately before the call) —
+/// see [`PushIntent::Skip`]'s own doc. `epic_id`/`task_id` are threaded
+/// straight into `FailureContext` and the evidence row exactly as the
+/// caller's own shape dictates: `Some(epic_id), None` for an epic, `None,
+/// Some(task_id)` for a standalone task. Returns the PR to persist — the
+/// freshly-opened one on a first finalize, or `existing_pr` unchanged on a
+/// re-run — on success; `None` on any failure (already routed to
 /// `Failed`/`Blocked` by the time this returns) — the caller's only job on
 /// `None` is to `return`, exactly like every other failure exit in this
 /// module.
 #[allow(clippy::too_many_arguments)]
-async fn push_and_open_pr(
+async fn push_and_ensure_pr(
     state: &AppState,
     epic_id: Option<&str>,
     task_id: Option<&str>,
     project_id: &str,
     workspace: &ProvisionedWorkspace,
+    existing_pr: Option<&crate::git_host::OpenedPr>,
     lease: &LeaseHandle,
     title: &str,
     body: &str,
@@ -5714,8 +5763,27 @@ async fn push_and_open_pr(
         return None;
     }
 
-    // Resolve the PR's base branch (design doc §5) *before* opening the push
-    // evidence row, so a resolution failure routes through the same
+    // A feedback re-run already has a recorded PR: pushing the same head
+    // branch is enough — GitHub updates the existing PR in place — and
+    // re-opening it here would create a duplicate. Open a PR only on the
+    // item's *first* finalize (`existing_pr` is `None`); the caller passes
+    // the recorded PR so the pushed round-trip returns it unchanged.
+    if let Some(existing) = existing_pr {
+        close_push_stage(
+            conn,
+            &stage_handle,
+            "ok",
+            &format!(
+                "pushed {} to origin; updated existing PR #{} ({})",
+                workspace.branch_name, existing.number, existing.url
+            ),
+        )
+        .await;
+        return Some(existing.clone());
+    }
+
+    // Resolve the PR's base branch (design doc §5) *before* opening the PR,
+    // so a resolution failure routes through the same
     // `pr_failed` path with its own readable evidence. Chain: the recorded
     // explicit base (the epic's provision-time snapshot, or — standalone
     // tasks having no per-item record by design — the project default), else
@@ -5829,7 +5897,7 @@ async fn push_and_open_pr(
 // `Stage::Summarize` run through `run_agent_stage` and its outcome is turned
 // into `Option<String>`, shared by [`run_epic_summary`] (epic-scoped) and
 // [`run_task_summary`] (standalone-task-scoped) exactly the way
-// [`push_and_open_pr`] is shared by [`finalize_epic`]/[`finalize_task`] —
+// [`push_and_ensure_pr`] is shared by [`finalize_epic`]/[`finalize_task`] —
 // only the [`spec::TaskContext`] fed in (and how the "what's the base commit
 // to diff from" question is answered) differs between the two.
 
@@ -6455,7 +6523,7 @@ mod tests {
     /// uses have no PAT and no real network) + open-PR (faked) both succeed
     /// deterministically: every pre-existing T-513 test in this module that
     /// drives a walk to completion now also exercises T-514's finalize step,
-    /// which is why several of them assert `Completed` (not `InProgress`)
+    /// which is why several of them assert `InReview` (not `InProgress`)
     /// below — that assertion changed *because* T-514 landed, not because
     /// this test scaffolding changed independently of it.
     async fn test_app_with_task_agent(task_agent: Arc<dyn TaskAgent>) -> (AppState, axum::Router) {
@@ -6737,12 +6805,12 @@ mod tests {
     // (covered separately below). Since T-514, a full walk's finalize step
     // pushes the branch (real, local — `FakeHost::push` delegates to the
     // genuine `git::push_branch`) and opens a (faked) PR, so the epic now
-    // reaches `Completed`, not the `InProgress`-forever state T-513 alone
+    // reaches `InReview`, not the `InProgress`-forever state T-513 alone
     // left it in (see `finalize_epic`'s doc for why that transition waits
     // this long, and `enqueue_via_lane_drives_dag_to_done` below for the
-    // dedicated proof that a `Completed` epic is never re-claimed).
+    // dedicated proof that an `InReview` epic is never re-claimed).
 
-    /// Linear DAG (A → B → C): after the walk, all Done, epic Completed.
+    /// Linear DAG (A → B → C): after the walk, all Done, epic InReview.
     ///
     /// The dependency ORDER is respected implicitly: B can only become ready
     /// after A is Done (its only blocker), and C after B. So asserting the
@@ -6771,14 +6839,14 @@ mod tests {
         assert_eq!(statuses["C"], "Done");
         assert_eq!(
             epic_status(&state, &epic_id).await,
-            "Completed",
-            "T-514's finalize step must complete the epic once every task is Done"
+            "InReview",
+            "T-514's finalize step must land the epic in InReview once every task is Done"
         );
         cleanup_clone_root(&state, &project_id, &[&epic_id]);
     }
 
     /// Branching DAG (A blocks B and C; B and C both block D): all Done,
-    /// epic Completed.
+    /// epic InReview.
     #[tokio::test]
     async fn branching_dag_walks_every_task_to_done_epic_completes() {
         let (state, _app) = test_app().await;
@@ -6803,7 +6871,7 @@ mod tests {
         assert_eq!(statuses["B"], "Done");
         assert_eq!(statuses["C"], "Done");
         assert_eq!(statuses["D"], "Done");
-        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        assert_eq!(epic_status(&state, &epic_id).await, "InReview");
         cleanup_clone_root(&state, &project_id, &[&epic_id]);
     }
 
@@ -6820,7 +6888,7 @@ mod tests {
 
         run_epic_pipeline(state.clone(), epic_id.clone()).await;
 
-        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        assert_eq!(epic_status(&state, &epic_id).await, "InReview");
         cleanup_clone_root(&state, &project_id, &[&epic_id]);
     }
 
@@ -6845,7 +6913,7 @@ mod tests {
     }
 
     /// No sibling InProgress invariant: after a full run, the final state is
-    /// consistent — all Done, none InProgress, epic Completed. The walk
+    /// consistent — all Done, none InProgress, epic InReview. The walk
     /// serializes by construction (one ready task at a time); this
     /// final-state assertion confirms it. See
     /// `implement_stage_never_observes_a_sibling_in_progress` below for a
@@ -6868,7 +6936,7 @@ mod tests {
         assert_eq!(statuses["A"], "Done");
         assert_eq!(statuses["B"], "Done");
         assert!(statuses.values().all(|s| s != "InProgress"));
-        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        assert_eq!(epic_status(&state, &epic_id).await, "InReview");
         cleanup_clone_root(&state, &project_id, &[&epic_id]);
     }
 
@@ -7504,7 +7572,7 @@ mod tests {
     /// bounded call (never `worker_loop`'s continuously-draining inner loop —
     /// see `run_standalone_pipeline_inner`'s doc for why that distinction
     /// matters): the epic here has no ready task, so `run_claimed_epic`'s own
-    /// walk finalizes it as `Completed` immediately, proving the *real*
+    /// walk finalizes it as `InReview` immediately, proving the *real*
     /// dispatch function — the one `worker_loop` actually calls — makes the
     /// same choice `claim_next`'s own direct test already proved the query
     /// makes.
@@ -7518,11 +7586,11 @@ mod tests {
 
         try_claim_and_run(&state, "worker").await;
 
-        // The epic (no tasks at all) went straight to Completed via
+        // The epic (no tasks at all) went straight to InReview via
         // finalize_epic; the standalone task was never touched at all — not
         // claimed (no lease) and not even re-fetched into `InProgress`'s
         // sibling states, still exactly the `InProgress` this test seeded.
-        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        assert_eq!(epic_status(&state, &epic_id).await, "InReview");
         let (owner, _) = task_lease(&state, &task_id).await;
         assert!(
             owner.is_none(),
@@ -7687,9 +7755,9 @@ mod tests {
 
         gate.release();
 
-        // All 3 epics eventually reach Completed (bounded poll; the released
+        // All 3 epics eventually reach InReview (bounded poll; the released
         // bodies run their tasks to Done, then T-514's finalize step pushes
-        // + opens a (faked) PR and flips each epic to Completed — the freed
+        // + opens a (faked) PR and flips each epic to InReview — the freed
         // workers pick up the 3rd along the way).
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
@@ -7698,11 +7766,11 @@ mod tests {
                 epic_status(&state, &epic_b).await,
                 epic_status(&state, &epic_c).await,
             );
-            if statuses.0 == "Completed" && statuses.1 == "Completed" && statuses.2 == "Completed" {
+            if statuses.0 == "InReview" && statuses.1 == "InReview" && statuses.2 == "InReview" {
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
-                panic!("not all epics reached Completed in time: {statuses:?}");
+                panic!("not all epics reached InReview in time: {statuses:?}");
             }
             tokio::time::sleep(Duration::from_millis(5)).await;
         }
@@ -7720,16 +7788,16 @@ mod tests {
     /// Enqueue writes the contract shape: hitting `POST /epics/:id/lane
     /// { status: "InProgress" }` on a Ready epic with a task, with a worker
     /// pool running, drives the DAG to Done and then (T-514) all the way to
-    /// `Completed` — push (real, local, via `FakeHost::push` delegating to
+    /// `InReview` — push (real, local, via `FakeHost::push` delegating to
     /// `git::push_branch`) + a faked PR, `pr_url`/`pr_number` persisted and
-    /// returned by `GET /epics/{id}`, and the workspace deleted. This is the
+    /// returned by `GET /epics/{id}`, and the workspace retained. This is the
     /// full happy-path end-to-end proof MILESTONE_2 T-514's AC asks for
     /// (`ScriptedTaskAgent` + `FakeHost` + the local git fixture, enqueue all
-    /// the way to a deleted workspace), plus the dedicated proof that the
-    /// re-claim spin T-513's module doc flagged is now closed: a `Completed`
-    /// epic is never claimable again, and a fresh pool notify leaves it
-    /// alone (see also `completed_epic_is_never_reclaimable` below for the
-    /// minimal, pipeline-independent version of the same claim).
+    /// the way to a retained InReview workspace), plus the dedicated proof
+    /// that the re-claim spin T-513's module doc flagged is now closed: an
+    /// `InReview` epic is never claimable again, and a fresh pool notify
+    /// leaves it alone (see also `completed_epic_is_never_reclaimable` below
+    /// for the minimal, pipeline-independent version of the same claim).
     #[tokio::test]
     async fn enqueue_via_lane_drives_dag_to_done_and_completes_with_pr() {
         let (state, app) = test_app().await;
@@ -7759,13 +7827,13 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(body_json(response).await["status"], "InProgress");
 
-        // Poll (bounded) until the epic reaches Completed — finalize runs
+        // Poll (bounded) until the epic reaches InReview — finalize runs
         // strictly after the DAG's last task-status write, in the same
         // pipeline body, so bounding on the epic's own terminal status (not
         // just the tasks') is what actually proves finalize ran.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            if epic_status(&state, &epic_id).await == "Completed" {
+            if epic_status(&state, &epic_id).await == "InReview" {
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
@@ -7790,7 +7858,7 @@ mod tests {
             .unwrap();
         assert_eq!(get_response.status(), StatusCode::OK);
         let epic_body = body_json(get_response).await;
-        assert_eq!(epic_body["status"], "Completed");
+        assert_eq!(epic_body["status"], "InReview");
         assert!(epic_body["pr_url"]
             .as_str()
             .expect("pr_url must be persisted and returned")
@@ -7800,28 +7868,20 @@ mod tests {
             "pr_number must be persisted and returned"
         );
 
-        // The workspace is deleted once the PR opens (T-511's delete_workspace,
-        // finally called) — bounded-poll rather than an immediate check:
-        // finalize commits `status = 'Completed'` and only *then* awaits the
-        // delete, so a concurrent reader can observe `Completed` a moment
-        // before the delete's own await resolves.
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            if !workspace_path.exists() {
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                panic!("the workspace must be deleted after a successful finalize");
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        // The workspace is retained (never deleted) once the PR opens — the
+        // post-PR-review loop needs the branch for feedback rounds, so
+        // finalize deliberately leaves it on disk.
+        assert!(
+            workspace_path.join(".git").exists(),
+            "the workspace must be retained (not deleted) after finalize lands the epic in InReview"
+        );
 
         // ---- the re-claim spin T-513 left behind is closed (T-514) ----
         //
         // T-513's module doc flagged this explicitly: a fully-Done-but-
         // still-InProgress epic would remain claimable, so the pool would
         // re-claim and re-walk it in a tight loop forever. Now that the epic
-        // is Completed, `claim_epic`'s own predicate (`status = 'InProgress'`)
+        // is InReview, `claim_epic`'s own predicate (`status = 'InProgress'`)
         // excludes it — proven directly, then again by observing the live
         // pool leave it untouched across a fresh notify.
         let direct_claim = claim_epic(state.db.conn(), "re-claim-prober", 30)
@@ -7829,20 +7889,20 @@ mod tests {
             .unwrap();
         assert!(
             direct_claim.is_none(),
-            "a Completed epic must never be claimable again"
+            "an InReview epic must never be claimable again"
         );
 
         state.notify.notify_waiters();
         tokio::time::sleep(Duration::from_millis(50)).await;
         assert_eq!(
             epic_status(&state, &epic_id).await,
-            "Completed",
-            "a Completed epic must not be disturbed by a fresh pool notify"
+            "InReview",
+            "an InReview epic must not be disturbed by a fresh pool notify"
         );
         let (lease_owner, lease_expires_at) = epic_lease(&state, &epic_id).await;
         assert!(
             lease_owner.is_none(),
-            "a Completed epic must never hold a lease"
+            "an InReview epic must never hold a lease"
         );
         assert!(lease_expires_at.is_none());
 
@@ -8175,7 +8235,7 @@ mod tests {
     }
 
     /// A green preflight is a no-op from the walk's point of view: the epic
-    /// still reaches `Completed` through the full pipeline (workspace →
+    /// still reaches `InReview` through the full pipeline (workspace →
     /// preflight → implement → commit → push → PR), and the preflight
     /// `agent_run` row records `status = "ok"`.
     #[tokio::test]
@@ -8193,7 +8253,7 @@ mod tests {
             .unwrap()
             .unwrap();
         assert_eq!(
-            epic.status, "Completed",
+            epic.status, "InReview",
             "a green preflight must let the rest of the pipeline run to completion"
         );
 
@@ -8234,7 +8294,7 @@ mod tests {
             .await
             .unwrap()
             .unwrap();
-        assert_eq!(epic.status, "Completed");
+        assert_eq!(epic.status, "InReview");
 
         let mut rows = state
             .db
@@ -8341,15 +8401,12 @@ mod tests {
         git_log_subjects_for_ref(dir, "HEAD").await
     }
 
-    /// Like [`git_log_subjects`] but against an explicit ref — since T-514,
-    /// a test that drives a walk all the way to `Completed` has its
-    /// workspace **deleted** by finalize once the PR opens (T-511's
-    /// `delete_workspace`, finally called), so a test that still wants to
-    /// see the exact commits (subjects, order, SHA) has to read them back
-    /// from wherever finalize actually pushed them — the `GitFixture`'s own
+    /// Like [`git_log_subjects`] but against an explicit ref. Since T-514,
+    /// finalize pushes the branch (and keeps the workspace for feedback
+    /// rounds), so a test that wants the exact commits (subjects, order, SHA)
+    /// reads them back from where the push landed — the `GitFixture`'s own
     /// directory, which doubles as the project's `repo_url`/canonical
-    /// checkout/origin all at once in these tests — on the epic's own
-    /// branch, rather than from the now-gone workspace directory.
+    /// checkout/origin all at once in these tests — on the epic's own branch.
     async fn git_log_subjects_for_ref(dir: &std::path::Path, git_ref: &str) -> Vec<String> {
         let output = tokio::process::Command::new("git")
             .args(["log", "--reverse", "--format=%s", git_ref])
@@ -8365,9 +8422,8 @@ mod tests {
     }
 
     /// `git rev-parse <git_ref>` in `dir`, trimmed — used the same way
-    /// [`git_log_subjects_for_ref`] is: reading a commit SHA back from
-    /// wherever the epic branch was actually pushed, once the workspace
-    /// itself is gone.
+    /// [`git_log_subjects_for_ref`] is: reading a commit SHA back from the
+    /// fixture on the epic branch where the push landed.
     async fn git_rev_parse(dir: &std::path::Path, git_ref: &str) -> String {
         let output = tokio::process::Command::new("git")
             .args(["rev-parse", git_ref])
@@ -8435,10 +8491,10 @@ mod tests {
         assert_eq!(statuses["A"], "Done");
         assert_eq!(statuses["B"], "Done");
         assert_eq!(statuses["C"], "Done");
-        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        assert_eq!(epic_status(&state, &epic_id).await, "InReview");
 
-        // The workspace is deleted post-finalize; read the pushed commits
-        // back from the fixture (the project's origin) on the epic branch.
+        // The workspace is retained post-finalize; read the pushed commits back
+        // from the fixture (the project's origin) on the epic branch.
         let branch = epic_branch_name_column(&state, &epic_id).await;
         let subjects = git_log_subjects_for_ref(&fixture.dir, &branch).await;
         assert_eq!(
@@ -8485,8 +8541,8 @@ mod tests {
 
         run_epic_pipeline(state.clone(), epic_id.clone()).await;
 
-        // The workspace is deleted post-finalize; read the pushed commits
-        // back from the fixture (the project's origin) on the epic branch.
+        // The workspace is retained post-finalize; read the pushed commits back
+        // from the fixture (the project's origin) on the epic branch.
         let branch = epic_branch_name_column(&state, &epic_id).await;
         let subjects = git_log_subjects_for_ref(&fixture.dir, &branch).await;
         assert_eq!(
@@ -8646,8 +8702,8 @@ mod tests {
         let statuses = task_statuses(&state, &epic_id).await;
         assert_eq!(statuses["A"], "Done", "a no-diff task is still left Done");
 
-        // The workspace is deleted post-finalize; read the pushed branch
-        // back from the fixture (the project's origin).
+        // The workspace is retained post-finalize; read the pushed branch back
+        // from the fixture (the project's origin).
         let branch = epic_branch_name_column(&state, &epic_id).await;
         let subjects = git_log_subjects_for_ref(&fixture.dir, &branch).await;
         assert_eq!(
@@ -8726,7 +8782,7 @@ mod tests {
 
         run_epic_pipeline(state.clone(), epic_id.clone()).await;
 
-        // The workspace is deleted post-finalize; read HEAD back from the
+        // The workspace is retained post-finalize; HEAD, read back from the
         // fixture (the project's origin) on the epic branch instead.
         let branch = epic_branch_name_column(&state, &epic_id).await;
         let head_sha = git_rev_parse(&fixture.dir, &branch).await;
@@ -8873,7 +8929,7 @@ mod tests {
 
         run_epic_pipeline(state.clone(), epic_id.clone()).await;
 
-        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        assert_eq!(epic_status(&state, &epic_id).await, "InReview");
 
         let branch = epic_branch_name_column(&state, &epic_id).await;
         let calls = fake.open_pr_calls();
@@ -8924,7 +8980,7 @@ mod tests {
 
         run_epic_pipeline(state.clone(), epic_id.clone()).await;
 
-        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        assert_eq!(epic_status(&state, &epic_id).await, "InReview");
         let calls = fake.open_pr_calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(
@@ -8962,7 +9018,7 @@ mod tests {
 
         run_standalone_pipeline(state.clone(), task_id.clone()).await;
 
-        assert_eq!(single_task_status(&state, &task_id).await, "Done");
+        assert_eq!(single_task_status(&state, &task_id).await, "InReview");
         let calls = fake.open_pr_calls();
         assert_eq!(calls.len(), 1);
         assert_eq!(
@@ -8973,7 +9029,109 @@ mod tests {
         cleanup_clone_root(&state, &project_id, &[]);
     }
 
-    /// `Completed` is set **only** after the PR opens: a `FakeHost` scripted
+    /// A feedback re-run reuses the recorded PR instead of opening a new one:
+    /// the first finalize pushes + opens exactly one PR and lands the epic in
+    /// `InReview` (workspace retained); once the (simulated) review poller
+    /// hands the epic back to `InProgress` with its existing `pr_url`, a
+    /// *second* finalize pushes only — `open_pr` is never called again — and
+    /// returns the epic to `InReview`, preserving the recorded PR and keeping
+    /// the workspace for further feedback rounds.
+    #[tokio::test]
+    async fn finalize_rerun_reuses_existing_pr_without_reopening() {
+        let fake = Arc::new(FakeHost::new());
+        let (state, _app) =
+            test_app_with_task_agent_and_host(Arc::new(ScriptedTaskAgent::new()), fake.clone())
+                .await;
+        let fixture = GitFixture::new().await;
+        let project_id = seed_project_with_workspace(&state, &fixture).await;
+        let epic_id = seed_epic(&state, &project_id, "InProgress").await;
+        seed_task(&state, &epic_id, &project_id, "A").await;
+
+        let ws = workspace::provision_epic_workspace(&state, &epic_id, &project_id)
+            .await
+            .expect("provisioning against the local fixture must succeed");
+
+        // First finalize (directly, like `failed_open_pr...`): open the PR,
+        // land in InReview, retain the workspace.
+        let epic = fetch_epic(state.db.conn(), &epic_id)
+            .await
+            .unwrap()
+            .unwrap();
+        let dag = compute_dag(state.db.conn(), &epic_id).await.unwrap();
+        finalize_epic(&state, &epic_id, &epic, &dag, &ws, &LeaseHandle::new()).await;
+
+        let epic = fetch_epic(state.db.conn(), &epic_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            epic.status, "InReview",
+            "first finalize lands the epic in InReview"
+        );
+        let pr_url = epic
+            .pr_url
+            .clone()
+            .expect("first finalize must record a PR url");
+        assert_eq!(
+            fake.open_pr_calls().len(),
+            1,
+            "exactly one open_pr on the first finalize"
+        );
+        let ws_path = workspace::epic_workspace_path(&state.config.clone_root, &epic_id);
+        assert!(
+            ws_path.join(".git").exists(),
+            "the workspace must be retained after the first finalize"
+        );
+
+        // Simulate the review poller handing feedback-induced work back to the
+        // worker pool: epic back to InProgress, carrying its existing PR.
+        state
+            .db
+            .conn()
+            .execute(
+                "UPDATE epic SET status = 'InProgress', updated_at = ?1 WHERE id = ?2",
+                params![now_ms(), epic_id.clone()],
+            )
+            .await
+            .unwrap();
+
+        // Second finalize (re-run): push only — no duplicate open_pr, the
+        // recorded PR is preserved, and it returns to InReview.
+        let epic = fetch_epic(state.db.conn(), &epic_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            epic.pr_url.as_deref(),
+            Some(pr_url.as_str()),
+            "the re-run sees the recorded PR and reuses it"
+        );
+        let dag = compute_dag(state.db.conn(), &epic_id).await.unwrap();
+        finalize_epic(&state, &epic_id, &epic, &dag, &ws, &LeaseHandle::new()).await;
+
+        let epic = fetch_epic(state.db.conn(), &epic_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            epic.status, "InReview",
+            "the re-run returns the epic to InReview"
+        );
+        assert_eq!(epic.pr_url.as_deref(), Some(pr_url.as_str()));
+        assert_eq!(
+            fake.open_pr_calls().len(),
+            1,
+            "a second finalize must NOT re-open the PR (no duplicate open_pr)"
+        );
+        assert!(
+            ws_path.join(".git").exists(),
+            "the workspace must be retained after the re-run"
+        );
+
+        cleanup_clone_root(&state, &project_id, &[&epic_id]);
+    }
+
+    /// `InReview` is set **only** after the PR opens: a `FakeHost` scripted
     /// to fail `open_pr` leaves the epic `Blocked(pr_failed)`, the workspace
     /// retained, and `pr_url`/`pr_number` unset — and the readable, redacted
     /// failure reason lands in the `Stage::Push` evidence row without ever
@@ -9398,7 +9556,7 @@ mod tests {
 
         run_epic_pipeline(state.clone(), epic_id.clone()).await;
 
-        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        assert_eq!(epic_status(&state, &epic_id).await, "InReview");
 
         let branch = epic_branch_name_column(&state, &epic_id).await;
         let subjects = git_log_subjects_for_ref(&fixture.dir, &branch).await;
@@ -9459,7 +9617,7 @@ mod tests {
 
         run_epic_pipeline(state.clone(), epic_id.clone()).await;
 
-        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        assert_eq!(epic_status(&state, &epic_id).await, "InReview");
 
         let rows = gate_and_fix_rows(&state, &a).await;
         assert_eq!(
@@ -9626,7 +9784,7 @@ mod tests {
 
         run_epic_pipeline(state.clone(), epic_id.clone()).await;
 
-        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        assert_eq!(epic_status(&state, &epic_id).await, "InReview");
 
         let runs = recorded.lock().unwrap();
         let implement_run = runs
@@ -9685,7 +9843,7 @@ mod tests {
 
         run_epic_pipeline(state.clone(), epic_id.clone()).await;
 
-        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        assert_eq!(epic_status(&state, &epic_id).await, "InReview");
 
         let rows = gate_and_fix_rows(&state, &a).await;
         assert!(
@@ -9722,7 +9880,7 @@ mod tests {
 
         run_epic_pipeline(state.clone(), epic_id.clone()).await;
 
-        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        assert_eq!(epic_status(&state, &epic_id).await, "InReview");
 
         let rows = gate_and_fix_rows(&state, &a).await;
         assert_eq!(rows, vec![("test_gate".to_string(), 0, "ok".to_string())]);
@@ -9886,7 +10044,7 @@ mod tests {
 
         let task = fetch_task_row(&state, &a).await;
         assert_eq!(task.0, "Done");
-        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        assert_eq!(epic_status(&state, &epic_id).await, "InReview");
 
         let rows = review_rows(&state, &a).await;
         assert_eq!(
@@ -9968,7 +10126,7 @@ mod tests {
 
         let task = fetch_task_row(&state, &a).await;
         assert_eq!(task.0, "Done");
-        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        assert_eq!(epic_status(&state, &epic_id).await, "InReview");
 
         let branch = epic_branch_name_column(&state, &epic_id).await;
         let subjects = git_log_subjects_for_ref(&fixture.dir, &branch).await;
@@ -10218,7 +10376,7 @@ mod tests {
         let mut task_sub = state.hub.subscribe(&format!("task:{a}"));
 
         run_epic_pipeline(state.clone(), epic_id.clone()).await;
-        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        assert_eq!(epic_status(&state, &epic_id).await, "InReview");
 
         let first = recv_stage_changed(&mut task_sub).await;
         assert_eq!(first["payload"]["stage"], "review");
@@ -10333,7 +10491,7 @@ mod tests {
         let mut epic_sub = state.hub.subscribe(&format!("epic:{epic_id}"));
 
         run_epic_pipeline(state.clone(), epic_id.clone()).await;
-        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        assert_eq!(epic_status(&state, &epic_id).await, "InReview");
 
         let task_frame = recv_stage_changed(&mut task_sub).await;
         assert_eq!(task_frame["topic"], format!("task:{a}"));
@@ -10373,7 +10531,7 @@ mod tests {
         let a = seed_task(&state, &epic_id, &project_id, "A").await;
 
         run_epic_pipeline(state.clone(), epic_id.clone()).await;
-        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        assert_eq!(epic_status(&state, &epic_id).await, "InReview");
 
         let response = app
             .oneshot(req("GET", &format!("/tasks/{a}/runs"), None))
@@ -10560,7 +10718,7 @@ mod tests {
 
         let task = fetch_task_row(&state, &a).await;
         assert_eq!(task.0, "Done");
-        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        assert_eq!(epic_status(&state, &epic_id).await, "InReview");
 
         let branch = epic_branch_name_column(&state, &epic_id).await;
         let subjects = git_log_subjects_for_ref(&fixture.dir, &branch).await;
@@ -10635,7 +10793,7 @@ mod tests {
 
         let task = fetch_task_row(&state, &a).await;
         assert_eq!(task.0, "Done");
-        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        assert_eq!(epic_status(&state, &epic_id).await, "InReview");
 
         // Exactly one commit lands — the fix's diff, using the SAME §2.8
         // `impl(...)` subject as an ordinary Stage::Implement commit would,
@@ -11393,7 +11551,7 @@ mod tests {
                 epic_status(&state, &epic1).await,
                 epic_status(&state, &epic2).await,
             );
-            if s1 == "Blocked" && s2 == "Completed" {
+            if s1 == "Blocked" && s2 == "InReview" {
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
@@ -11445,7 +11603,7 @@ mod tests {
                 epic_status(&state, &epic_a).await,
                 epic_status(&state, &epic_b).await,
             );
-            if sa == "Blocked" && sb == "Completed" {
+            if sa == "Blocked" && sb == "InReview" {
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
@@ -11540,7 +11698,7 @@ mod tests {
         // The retry succeeded, so nothing about this task looks failed.
         assert_eq!(fetch_task_row(&state, &task_id).await.0, "Done");
         assert_eq!(fetch_task_row(&state, &task_id).await.1, None);
-        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        assert_eq!(epic_status(&state, &epic_id).await, "InReview");
 
         // Exactly the two expected attempts, each under its own incremented
         // number: attempt 1 closed `error` (the 429), attempt 2 closed `ok`.
@@ -11895,7 +12053,7 @@ mod tests {
     // can prove is the AC that actually matters end to end: a real failure
     // driven through the walk, `retry`, and a **second** real walk that a
     // worker re-claims, re-attaches (dropping the failed attempt's dirty
-    // tree per T-511), and runs to `Completed` — with an edited spec (T-541's
+    // tree per T-511), and runs to `InReview` — with an edited spec (T-541's
     // `PATCH`-then-retry AC) reaching the re-run's own prompt. Per this
     // module's own T-522 note (`test_app`'s doc + the module-level guidance
     // that shipped with T-522), a two-walk test like this drives the pool via
@@ -11937,7 +12095,7 @@ mod tests {
     /// in order: the first failure lands exactly as T-540 promises; the PATCH
     /// + retry round-trip; the epic returns to the In Progress lane
     /// immediately (before the worker even wakes) and the board reflects it;
-    /// the second walk reaches `Completed`; the failed attempt's file was
+    /// the second walk reaches `InReview`; the failed attempt's file was
     /// never committed while the second attempt's file was; and the retried
     /// implement run's prompt carried the edited spec, not the original.
     #[tokio::test]
@@ -12040,7 +12198,7 @@ mod tests {
         // ---- the pool re-claims, re-attaches, and completes the walk ----
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            if epic_status(&state, &epic_id).await == "Completed" {
+            if epic_status(&state, &epic_id).await == "InReview" {
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
@@ -12056,7 +12214,7 @@ mod tests {
 
         // ---- the re-attach dropped the failed attempt's dirty tree ----
         //
-        // The workspace is deleted post-finalize (T-511/T-514), so read the
+        // The workspace is retained post-finalize (for feedback rounds), so read the
         // final committed tree back from the fixture (the project's origin)
         // on the epic's own branch.
         let branch = epic_branch_name_column(&state, &epic_id).await;
@@ -12256,7 +12414,7 @@ mod tests {
 
     /// The registry entry is removed on every exit path (this task's own
     /// AC), the successful-walk case: once a walk with no cancel at all
-    /// finishes (`Completed`), nothing is left behind in
+    /// finishes (`InReview`), nothing is left behind in
     /// `state.cancel_registry`.
     #[tokio::test]
     async fn cancel_registry_is_empty_after_a_normal_successful_walk() {
@@ -12270,7 +12428,7 @@ mod tests {
 
         run_epic_pipeline(state.clone(), epic_id.clone()).await;
 
-        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        assert_eq!(epic_status(&state, &epic_id).await, "InReview");
         assert!(
             state.cancel_registry.lock().unwrap().is_empty(),
             "the registry must be empty after every stage's guard has dropped"
@@ -12669,8 +12827,8 @@ mod tests {
     /// Mirrors `enqueue_via_lane_drives_dag_to_done_and_completes_with_pr`'s
     /// epic version one level flatter (no DAG, one task): preflight →
     /// implement → test gate → commit → review → push → PR, all the way to
-    /// `Done` with `pr_url`/`pr_number` persisted on the *task* row (there is
-    /// no epic) and the workspace deleted.
+    /// `InReview` with `pr_url`/`pr_number` persisted on the *task* row
+    /// (there is no epic) and the workspace retained.
     #[tokio::test]
     async fn standalone_task_happy_path_end_to_end_with_pr() {
         let agent = Arc::new(
@@ -12698,15 +12856,18 @@ mod tests {
         assert_eq!(response.status(), StatusCode::OK);
         assert_eq!(body_json(response).await["status"], "InProgress");
 
-        // Poll (bounded) until the task reaches Done.
+        // Poll (bounded) until the task reaches InReview — the standalone
+        // task's post-PR terminal success state (finalize pushes + opens the
+        // PR and lands it there, retaining the workspace for feedback
+        // rounds).
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         loop {
-            if single_task_status(&state, &task_id).await == "Done" {
+            if single_task_status(&state, &task_id).await == "InReview" {
                 break;
             }
             if tokio::time::Instant::now() >= deadline {
                 panic!(
-                    "worker pool never completed the standalone task in time: status={}",
+                    "worker pool never landed the standalone task in InReview in time: status={}",
                     single_task_status(&state, &task_id).await
                 );
             }
@@ -12714,8 +12875,8 @@ mod tests {
         }
 
         // pr_url/pr_number persisted and returned by GET /tasks/{id} — poll a
-        // little further since finalize's push/open_pr runs strictly after
-        // the task's own `Done` write, in the same pipeline body.
+        // little further since finalize's push/PR runs strictly after the
+        // task's own `Done` write, in the same pipeline body.
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
         let task_body = loop {
             let get_response = app
@@ -12733,7 +12894,7 @@ mod tests {
             }
             tokio::time::sleep(Duration::from_millis(10)).await;
         };
-        assert_eq!(task_body["status"], "Done");
+        assert_eq!(task_body["status"], "InReview");
         assert_eq!(task_body["epic_id"], Value::Null);
         assert!(task_body["pr_url"]
             .as_str()
@@ -12770,23 +12931,17 @@ mod tests {
             .unwrap()
             .iter()
             .find(|t| t["id"] == task_id.as_str())
-            .expect("the completed standalone task must appear on its project's board");
-        assert_eq!(board_task["status"], "Done");
+            .expect("the standalone task must appear on its project's board");
+        assert_eq!(board_task["status"], "InReview");
         assert_eq!(board_task["pr_url"], task_body["pr_url"]);
         assert_eq!(board_task["pr_number"], task_body["pr_number"]);
 
-        // The workspace is deleted once the PR opens (bounded-poll: finalize
-        // commits the PR fields and only *then* awaits the delete).
-        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
-        loop {
-            if !workspace_path.exists() {
-                break;
-            }
-            if tokio::time::Instant::now() >= deadline {
-                panic!("the workspace must be deleted after a successful finalize");
-            }
-            tokio::time::sleep(Duration::from_millis(10)).await;
-        }
+        // The workspace is retained (never deleted) once the PR opens — the
+        // post-PR-review loop needs the branch for feedback rounds.
+        assert!(
+            workspace_path.join(".git").exists(),
+            "the workspace must be retained (not deleted) after the standalone task lands in InReview"
+        );
 
         // Review ran exactly once (a first-try PASS) — the identical T-530
         // evidence trail an epic-owned task's review leaves.
@@ -12929,14 +13084,16 @@ mod tests {
         // and runs it a second time. The implement stage has nothing left
         // scripted (`ScriptedTaskAgent`'s unscripted default: exit 0, no
         // files), so this run produces no diff and routes through T-532's
-        // verify-complete (also unscripted -> default PASS), closing the task
-        // `Done` with zero new commits before finalize opens the PR.
+        // verify-complete (also unscripted -> default PASS), entering the
+        // pipeline's finalize step — which lands the standalone task in
+        // `InReview` (T-514/T-551: completion waits on the human PR review,
+        // never `Done`) — with zero new commits before it opens the PR.
         try_claim_and_run(&state, "worker-2").await;
 
         let task = fetch_task_row(&state, &task_id).await;
         assert_eq!(
-            task.0, "Done",
-            "the retried task must have actually resumed and completed"
+            task.0, "InReview",
+            "the retried task must have actually resumed and completed to InReview"
         );
         assert_eq!(task.1, None, "failure_reason must stay cleared");
 
@@ -13048,7 +13205,7 @@ mod tests {
 
         run_epic_pipeline(state.clone(), epic_id.clone()).await;
 
-        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        assert_eq!(epic_status(&state, &epic_id).await, "InReview");
         let calls = fake.open_pr_calls();
         assert_eq!(calls.len(), 1);
         assert!(calls[0].body.contains("## Summary of changes"));
@@ -13093,7 +13250,7 @@ mod tests {
 
         assert_eq!(
             epic_status(&state, &epic_id).await,
-            "Completed",
+            "InReview",
             "the PR must open even though the summary run itself failed"
         );
         let calls = fake.open_pr_calls();
@@ -13136,7 +13293,7 @@ mod tests {
 
         run_epic_pipeline(state.clone(), epic_id.clone()).await;
 
-        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        assert_eq!(epic_status(&state, &epic_id).await, "InReview");
         let calls = fake.open_pr_calls();
         assert_eq!(calls.len(), 1);
         assert!(!calls[0].body.contains("## Summary of changes"));
@@ -13176,7 +13333,7 @@ mod tests {
 
         run_epic_pipeline(state.clone(), epic_id.clone()).await;
 
-        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        assert_eq!(epic_status(&state, &epic_id).await, "InReview");
         let calls = fake.open_pr_calls();
         assert_eq!(calls.len(), 1);
         assert!(!calls[0].body.contains("## Summary of changes"));
@@ -13207,7 +13364,7 @@ mod tests {
 
         assert_eq!(
             epic_status(&state, &epic_id).await,
-            "Completed",
+            "InReview",
             "the PR must open even though the harness never spawned for the summary stage"
         );
         let calls = fake.open_pr_calls();
@@ -13263,7 +13420,7 @@ mod tests {
 
         assert_eq!(
             epic_status(&state, &epic_id).await,
-            "Completed",
+            "InReview",
             "the PR must open even though the summary run timed out"
         );
         let calls = fake.open_pr_calls();
@@ -13301,7 +13458,7 @@ mod tests {
 
         run_epic_pipeline(state.clone(), epic_id.clone()).await;
 
-        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        assert_eq!(epic_status(&state, &epic_id).await, "InReview");
         let calls = fake.open_pr_calls();
         assert_eq!(calls.len(), 1);
         assert!(calls[0].body.contains("## Review rounds"));
@@ -13332,7 +13489,7 @@ mod tests {
 
         run_epic_pipeline(state.clone(), epic_id.clone()).await;
 
-        assert_eq!(epic_status(&state, &epic_id).await, "Completed");
+        assert_eq!(epic_status(&state, &epic_id).await, "InReview");
         let calls = fake.open_pr_calls();
         assert_eq!(calls.len(), 1);
         assert!(calls[0].body.contains("## Verified already complete"));
@@ -13374,7 +13531,7 @@ mod tests {
 
         run_standalone_pipeline(state.clone(), task_id.clone()).await;
 
-        assert_eq!(single_task_status(&state, &task_id).await, "Done");
+        assert_eq!(single_task_status(&state, &task_id).await, "InReview");
         let calls = fake.open_pr_calls();
         assert_eq!(calls.len(), 1);
         assert!(calls[0].body.contains("## Summary of changes"));
@@ -13418,7 +13575,7 @@ mod tests {
 
         run_standalone_pipeline(state.clone(), task_id.clone()).await;
 
-        assert_eq!(single_task_status(&state, &task_id).await, "Done");
+        assert_eq!(single_task_status(&state, &task_id).await, "InReview");
         let calls = fake.open_pr_calls();
         assert_eq!(calls.len(), 1);
         assert!(!calls[0].body.contains("## Summary of changes"));

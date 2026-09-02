@@ -80,6 +80,15 @@ const MIGRATIONS: &[Migration] = &[
         name: "0011_token_columns",
         sql: include_str!("../migrations/0011_token_columns.sql"),
     },
+    // Post-PR feedback lifecycle storage — the `pr_feedback` table (epic plan
+    // §6.3). The spec named this "0011", but that slot was already taken by
+    // token_columns (itself re-slotted from a spec'd 0009); it lands here as
+    // the next free version, mirroring that precedent.
+    Migration {
+        id: 12,
+        name: "0012_pr_feedback",
+        sql: include_str!("../migrations/0012_pr_feedback.sql"),
+    },
 ];
 
 /// Errors surfaced while opening the database or running migrations.
@@ -741,5 +750,86 @@ mod tests {
             )
             .await;
         assert!(err.is_err(), "FK violation should be rejected");
+    }
+
+    /// Migration `0012_pr_feedback` creates the `pr_feedback` table with the
+    /// exact lifecycle schema the epic plan §6.3 spells out, plus the UNIQUE
+    /// identity index on `(pr_number, source_kind, github_id)` that makes
+    /// dedup work. (The spec called this migration "0011", but that slot was
+    /// already taken by token_columns; it lands here as 0012.)
+    #[tokio::test]
+    async fn migration_0012_creates_pr_feedback_table_and_unique_index() {
+        let db = Db::connect(":memory:").await.unwrap();
+        db.run_migrations().await.unwrap();
+
+        for column in [
+            "id",
+            "project_id",
+            "epic_id",
+            "task_id",
+            "pr_number",
+            "source_kind",
+            "github_id",
+            "thread_id",
+            "classification",
+            "state",
+            "spawned_task_ids",
+            "base_sha",
+            "created_at",
+            "updated_at",
+        ] {
+            let mut rows = db
+                .conn()
+                .query("PRAGMA table_info(pr_feedback)", ())
+                .await
+                .unwrap();
+            let mut found = false;
+            while let Some(row) = rows.next().await.unwrap() {
+                if row.get::<String>(1).unwrap() == column {
+                    found = true;
+                    break;
+                }
+            }
+            assert!(found, "missing column pr_feedback.{column}");
+        }
+
+        let mut rows = db
+            .conn()
+            .query(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_pr_feedback_ident'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(
+            rows.next().await.unwrap().is_some(),
+            "missing index: idx_pr_feedback_ident"
+        );
+
+        // The unique index is the dedup guarantee: the same
+        // (pr_number, source_kind, github_id) identity may only be stored once.
+        let now = now_ms();
+        db.conn()
+            .execute(
+                "INSERT INTO pr_feedback \
+                 (id, project_id, pr_number, source_kind, github_id, state, created_at, updated_at) \
+                 VALUES ('fb-1', 'p', 7, 'review_comment', 200, 'in_progress', ?1, ?1)",
+                libsql::params![now],
+            )
+            .await
+            .unwrap();
+        let dup = db
+            .conn()
+            .execute(
+                "INSERT INTO pr_feedback \
+                 (id, project_id, pr_number, source_kind, github_id, state, created_at, updated_at) \
+                 VALUES ('fb-2', 'p', 7, 'review_comment', 200, 'in_progress', ?1, ?1)",
+                libsql::params![now],
+            )
+            .await;
+        assert!(
+            dup.is_err(),
+            "duplicate (pr_number, source_kind, github_id) identity must be rejected"
+        );
     }
 }

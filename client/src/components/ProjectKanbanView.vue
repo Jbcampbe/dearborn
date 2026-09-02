@@ -22,6 +22,7 @@ import {
   describeControlError,
   describeFailureReason,
   prLabel,
+  showPrLink,
 } from "../board/controls";
 import AppIcon from "./AppIcon.vue";
 import StatusIcon from "./StatusIcon.vue";
@@ -40,8 +41,10 @@ import TaskModal from "./TaskModal.vue";
 // (`POST /tasks/{id}/retry`); a standalone `Todo` card gets a Run button
 // (`POST /tasks/{id}/run`); an `InProgress` epic card gets a Cancel button
 // (the existing `POST /epics/{id}/lane` → `Cancelled`, which T-542 wires to
-// an actual kill server-side — nothing new to call here). `Completed` epics
-// and `Done` standalone tasks with a `pr_url` get a PR link. Every control
+// an actual kill server-side — nothing new to call here). `Completed`/`Done`
+// and `InReview` epics/tasks with a `pr_url` get a PR link (the §4 review
+// loop attaches `pr_url` when the item lands in `InReview`, and it survives
+// through merge). Every control
 // only fires the request and reports a `409`/other failure via
 // `board/controls.ts`'s `describeControlError` — it never mutates local
 // state or refetches the board; the existing `board_updated`/`epic_updated`
@@ -81,6 +84,7 @@ const LANES: { key: EpicLane; label: string }[] = [
   { key: "Planning", label: "Planning" },
   { key: "Ready", label: "Ready" },
   { key: "InProgress", label: "In Progress" },
+  { key: "InReview", label: "In Review" },
   { key: "Completed", label: "Completed" },
   { key: "Cancelled", label: "Cancelled" },
   { key: "Blocked", label: "Blocked" },
@@ -96,6 +100,8 @@ function taskLane(task: Task): EpicLane {
       return "Ready";
     case "InProgress":
       return "InProgress";
+    case "InReview":
+      return "InReview";
     case "Done":
       return "Completed";
     case "Failed":
@@ -438,9 +444,9 @@ onMounted(load);
                 Board
               </RouterLink>
               <a
-                v-if="epic.status === 'Completed' && epic.pr_url"
+                v-if="showPrLink(epic.status, epic.pr_url)"
                 class="card-open pr-link"
-                :href="epic.pr_url"
+                :href="epic.pr_url!"
                 target="_blank"
                 rel="noopener noreferrer"
                 @click.stop
@@ -498,9 +504,9 @@ onMounted(load);
                 Task
               </span>
               <a
-                v-if="task.status === 'Done' && task.pr_url"
+                v-if="showPrLink(task.status, task.pr_url)"
                 class="card-open pr-link"
-                :href="task.pr_url"
+                :href="task.pr_url!"
                 target="_blank"
                 rel="noopener noreferrer"
                 @click.stop

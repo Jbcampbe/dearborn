@@ -14,7 +14,7 @@
 
 import { apiFetch, type Collection } from "./client";
 
-/** The eight agent slots, canonical order (server `AgentSlot::ALL`). */
+/** The nine agent slots, canonical order (server `AgentSlot::ALL`). */
 export const AGENT_SLOTS = [
   "planning_product",
   "planning_technical",
@@ -24,6 +24,7 @@ export const AGENT_SLOTS = [
   "review",
   "verify_complete",
   "summarize",
+  "triage",
 ] as const;
 
 /** One agent slot's stable snake_case key. */
@@ -47,7 +48,7 @@ export const MCP_CAPABLE_HARNESSES = ["claude"] as const;
 /**
  * The three slots whose agent calls *back* into Dearborn over MCP (planning
  * maintains the epic record and reads the clone; breakdown writes the task
- * DAG). Mirrors the server's `agent_settings::slot_requires_mcp` — the five
+ * DAG). Mirrors the server's `agent_settings::slot_requires_mcp` — the six
  * task-stage slots act only on their workspace and need nothing from us.
  */
 export const MCP_BOUND_SLOTS: readonly AgentSlot[] = [
@@ -238,4 +239,5 @@ export const SLOT_LABELS: Record<AgentSlot, string> = {
   review: "Review",
   verify_complete: "Verify complete",
   summarize: "Summarize",
+  triage: "PR triage",
 };

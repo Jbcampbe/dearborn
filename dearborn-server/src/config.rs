@@ -156,6 +156,12 @@ pub struct ExecutorConfig {
     /// (`DEARBORN_POLL_INTERVAL_MS`) — the backstop in case a notify is
     /// missed. Default `1500`ms. **Rejects `0`**: a 0ms poll is a busy-loop.
     pub poll_interval_ms: u64,
+    /// Interval between ticks of the single long-lived review-poller
+    /// (`DEARBORN_REVIEW_POLL_INTERVAL_SECS`), which scans `InReview` items
+    /// for PR merge/close state and (in later tasks) feedback. Default `60`
+    /// seconds. **Rejects `0`**: a 0-second poll is a busy-loop against the
+    /// database and the GitHub API.
+    pub review_poll_interval_secs: u64,
 }
 
 /// Errors that prevent the server from booting with a valid configuration.
@@ -229,6 +235,7 @@ const EXECUTOR_VAR_NAMES: &[&str] = &[
     "DEARBORN_VERDICT_RETRIES",
     "DEARBORN_IMPLEMENT_TRANSIENT_RETRIES",
     "DEARBORN_POLL_INTERVAL_MS",
+    "DEARBORN_REVIEW_POLL_INTERVAL_SECS",
 ];
 
 /// Environment variable names for every [`AuthConfig`] field, in declaration
@@ -289,6 +296,12 @@ fn executor_from(map: &HashMap<String, String>) -> ExecutorConfig {
             false,
         ),
         poll_interval_ms: parse_or_warn(map, "DEARBORN_POLL_INTERVAL_MS", 1500u64, true),
+        review_poll_interval_secs: parse_or_warn(
+            map,
+            "DEARBORN_REVIEW_POLL_INTERVAL_SECS",
+            60u64,
+            true,
+        ),
     }
 }
 
@@ -451,6 +464,7 @@ impl Config {
                 verdict_retries: 1,
                 implement_transient_retries: 1,
                 poll_interval_ms: 10,
+                review_poll_interval_secs: 60,
             },
         }
     }
@@ -527,6 +541,7 @@ mod tests {
             ("DEARBORN_VERDICT_RETRIES", "2"),
             ("DEARBORN_IMPLEMENT_TRANSIENT_RETRIES", "4"),
             ("DEARBORN_POLL_INTERVAL_MS", "2000"),
+            ("DEARBORN_REVIEW_POLL_INTERVAL_SECS", "90"),
         ]);
         let cfg = executor_from(&map);
         assert_eq!(cfg.worker_concurrency, 5);
@@ -539,6 +554,7 @@ mod tests {
         assert_eq!(cfg.verdict_retries, 2);
         assert_eq!(cfg.implement_transient_retries, 4);
         assert_eq!(cfg.poll_interval_ms, 2000);
+        assert_eq!(cfg.review_poll_interval_secs, 90);
     }
 
     #[test]
@@ -554,6 +570,7 @@ mod tests {
         assert_eq!(cfg.verdict_retries, 1);
         assert_eq!(cfg.implement_transient_retries, 1);
         assert_eq!(cfg.poll_interval_ms, 1500);
+        assert_eq!(cfg.review_poll_interval_secs, 60);
     }
 
     #[test]
@@ -569,6 +586,7 @@ mod tests {
             ("DEARBORN_VERDICT_RETRIES", "abc"),
             ("DEARBORN_IMPLEMENT_TRANSIENT_RETRIES", "abc"),
             ("DEARBORN_POLL_INTERVAL_MS", "abc"),
+            ("DEARBORN_REVIEW_POLL_INTERVAL_SECS", "abc"),
         ]);
         let cfg = executor_from(&map);
         let defaults = executor_from(&HashMap::new());
@@ -588,6 +606,10 @@ mod tests {
             defaults.implement_transient_retries
         );
         assert_eq!(cfg.poll_interval_ms, defaults.poll_interval_ms);
+        assert_eq!(
+            cfg.review_poll_interval_secs,
+            defaults.review_poll_interval_secs
+        );
     }
 
     #[test]
@@ -599,6 +621,7 @@ mod tests {
             ("DEARBORN_AGENT_STAGE_TIMEOUT_SECS", "0"),
             ("DEARBORN_CMD_TIMEOUT_SECS", "0"),
             ("DEARBORN_POLL_INTERVAL_MS", "0"),
+            ("DEARBORN_REVIEW_POLL_INTERVAL_SECS", "0"),
         ]);
         let cfg = executor_from(&map);
         assert_eq!(cfg.worker_concurrency, 2);
@@ -607,6 +630,7 @@ mod tests {
         assert_eq!(cfg.agent_stage_timeout_secs, 9000);
         assert_eq!(cfg.cmd_timeout_secs, 900);
         assert_eq!(cfg.poll_interval_ms, 1500);
+        assert_eq!(cfg.review_poll_interval_secs, 60);
     }
 
     #[test]
@@ -661,6 +685,7 @@ mod tests {
         assert_eq!(cfg.executor.heartbeat_secs, 5);
         assert_eq!(cfg.executor.agent_stage_timeout_secs, 10);
         assert_eq!(cfg.executor.cmd_timeout_secs, 10);
+        assert_eq!(cfg.executor.review_poll_interval_secs, 60);
         // Ralph-parity counts stay at real defaults even in test config.
         assert_eq!(cfg.executor.max_test_fix_attempts, 3);
         assert_eq!(cfg.executor.max_fix_rounds, 3);

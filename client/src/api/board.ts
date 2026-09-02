@@ -27,11 +27,12 @@ export interface Board {
   epic_progress: EpicProgress[];
 }
 
-/** The epic lane set (§2.2 stored values — no spaces). */
+/** The epic lane set (§2.2 stored values — no spaces). `InReview` is the “factory done, waiting on the human reviewer” lane (§4). */
 export type EpicLane =
   | "Planning"
   | "Ready"
   | "InProgress"
+  | "InReview"
   | "Completed"
   | "Cancelled"
   | "Blocked";

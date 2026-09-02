@@ -328,7 +328,19 @@ pub async fn task_belongs_to_epic(
 
 /// The permitted task lifecycle statuses (§2.2). Readiness is *computed* from
 /// deps, so `Todo` is the only status a not-yet-ready task holds.
-const VALID_STATUSES: &[&str] = &["Todo", "InProgress", "Done", "Failed", "Cancelled"];
+///
+/// `InReview` (epic §4) is the "factory done, waiting on the human reviewer"
+/// status, needed for **standalone** tasks whose PR lifecycle lives on the task
+/// row itself. Epic-owned tasks keep `Done` as their terminal status — the epic
+/// row carries `InReview` for those.
+const VALID_STATUSES: &[&str] = &[
+    "Todo",
+    "InProgress",
+    "InReview",
+    "Done",
+    "Failed",
+    "Cancelled",
+];
 
 /// Validate a status string against the §2.2 set, or `400 bad_request`.
 fn validate_status(status: &str) -> AppResult<()> {
@@ -336,7 +348,7 @@ fn validate_status(status: &str) -> AppResult<()> {
         Ok(())
     } else {
         Err(AppError::BadRequest(format!(
-            "`status` must be one of Todo|InProgress|Done|Failed|Cancelled, got `{status}`"
+            "`status` must be one of Todo|InProgress|InReview|Done|Failed|Cancelled, got `{status}`"
         )))
     }
 }
@@ -1543,6 +1555,29 @@ mod tests {
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
     }
 
+    /// §4: `InReview` is a valid stored task status (standalone-task PR
+    /// lifecycle sits on the task row). `PATCH` to it persists like any other
+    /// valid status, and `update_task`'s `validate_status` gate accepts it.
+    #[tokio::test]
+    async fn patch_task_accepts_in_review_status() {
+        let (state, app, project_id, epic_id) = seed_app().await;
+        let conn = state.db.conn();
+        let a = create_task(conn, &epic_id, &project_id, "A", None, None)
+            .await
+            .unwrap();
+
+        let response = app
+            .oneshot(req(
+                "PATCH",
+                &format!("/tasks/{}", a.id),
+                Some(json!({ "status": "InReview" })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        assert_eq!(body_json(response).await["status"], "InReview");
+    }
+
     #[tokio::test]
     async fn patch_task_updates_clears_and_rejects_bad_status() {
         let (state, app, _p, epic_id) = seed_app().await;
@@ -2105,7 +2140,7 @@ mod tests {
         let (state, app, project_id, epic_id) = seed_app().await;
         let conn = state.db.conn();
 
-        for status in ["Todo", "InProgress", "Done", "Cancelled"] {
+        for status in ["Todo", "InProgress", "InReview", "Done", "Cancelled"] {
             let t = create_task(conn, &epic_id, &project_id, status, None, None)
                 .await
                 .unwrap();

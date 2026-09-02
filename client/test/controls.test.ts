@@ -15,6 +15,7 @@ import {
   describeControlError,
   describeFailureReason,
   prLabel,
+  showPrLink,
 } from "../src/board/controls";
 
 function makeTask(overrides: Partial<Task> = {}): Task {
@@ -155,5 +156,30 @@ describe("prLabel", () => {
   it("falls back to a generic label without a number", () => {
     expect(prLabel(null)).toBe("View PR");
     expect(prLabel(undefined)).toBe("View PR");
+  });
+});
+
+describe("showPrLink", () => {
+  it("is true for an InReview item with a pr_url (§4: PR open, waiting on the human)", () => {
+    expect(showPrLink("InReview", "https://github.com/acme/demo/pull/7")).toBe(true);
+  });
+
+  it("stays true through merge (Completed / Done) — the link survives", () => {
+    expect(showPrLink("Completed", "https://github.com/acme/demo/pull/7")).toBe(true);
+    expect(showPrLink("Done", "https://github.com/acme/demo/pull/7")).toBe(true);
+  });
+
+  it("is hidden whenever pr_url is absent, whatever the status", () => {
+    expect(showPrLink("InReview", null)).toBe(false);
+    expect(showPrLink("InReview", undefined)).toBe(false);
+    expect(showPrLink("InReview", "")).toBe(false);
+    expect(showPrLink("Completed", null)).toBe(false);
+  });
+
+  it("is false for statuses that carry no PR", () => {
+    expect(showPrLink("InProgress", "https://x/pull/1")).toBe(false);
+    expect(showPrLink("Blocked", "https://x/pull/1")).toBe(false);
+    expect(showPrLink("Cancelled", "https://x/pull/1")).toBe(false);
+    expect(showPrLink("Todo", "https://x/pull/1")).toBe(false);
   });
 });

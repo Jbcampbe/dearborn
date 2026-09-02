@@ -19,6 +19,7 @@ export function tasksByStatus(nodes: DagNode[]): Record<TaskStatus, DagNode[]> {
   const lanes: Record<TaskStatus, DagNode[]> = {
     Todo: [],
     InProgress: [],
+    InReview: [],
     Done: [],
     Failed: [],
     Cancelled: [],
@@ -36,6 +37,7 @@ export function tasksByStatus(nodes: DagNode[]): Record<TaskStatus, DagNode[]> {
 export const TASK_LANES: { key: TaskStatus; label: string }[] = [
   { key: "Todo", label: "Todo" },
   { key: "InProgress", label: "In Progress" },
+  { key: "InReview", label: "In Review" },
   { key: "Done", label: "Done" },
   { key: "Failed", label: "Failed" },
   { key: "Cancelled", label: "Cancelled" },

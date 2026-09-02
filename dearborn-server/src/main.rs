@@ -1,6 +1,8 @@
 //! Dearborn server binary entrypoint.
 
-use dearborn_server::{app, evidence, init_tracing, worker, AppState, Config, Db, MasterKey};
+use dearborn_server::{
+    app, evidence, init_tracing, review_poll, worker, AppState, Config, Db, MasterKey,
+};
 
 #[tokio::main]
 async fn main() {
@@ -89,6 +91,13 @@ async fn main() {
     // drive leased epics for the life of the process. Handles are dropped —
     // the pool runs until the process exits.
     let _worker_handles = worker::spawn_pool(state.clone());
+
+    // Start the single review-poller (post-PR-review loop §5): a separate,
+    // single-sequential task (concurrency 1, no lease) that periodically scans
+    // `InReview` items for PR merge/close state (and, in later tasks,
+    // feedback). Handle is dropped — the poller runs for the life of the
+    // process, like the worker pool.
+    let _review_poller_handle = review_poll::spawn_review_poller(state.clone());
 
     tracing::info!(%addr, "dearborn-server listening on http://{addr}");
 

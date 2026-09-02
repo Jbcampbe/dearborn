@@ -37,6 +37,9 @@ pub enum AgentSlot {
     VerifyComplete,
     /// Task summary stage (feeds the PR body).
     Summarize,
+    /// PR-feedback triage stage (classifies one piece of review feedback as a
+    /// question vs. a change request).
+    Triage,
 }
 
 impl AgentSlot {
@@ -51,6 +54,7 @@ impl AgentSlot {
         AgentSlot::Review,
         AgentSlot::VerifyComplete,
         AgentSlot::Summarize,
+        AgentSlot::Triage,
     ];
 
     /// The stable snake_case wire/storage key.
@@ -64,6 +68,7 @@ impl AgentSlot {
             AgentSlot::Review => "review",
             AgentSlot::VerifyComplete => "verify_complete",
             AgentSlot::Summarize => "summarize",
+            AgentSlot::Triage => "triage",
         }
     }
 
@@ -87,6 +92,7 @@ impl AgentSlot {
             Stage::Review => Some(AgentSlot::Review),
             Stage::VerifyComplete => Some(AgentSlot::VerifyComplete),
             Stage::Summarize => Some(AgentSlot::Summarize),
+            Stage::Triage => Some(AgentSlot::Triage),
             Stage::Setup | Stage::Preflight | Stage::TestGate | Stage::Commit | Stage::Push => None,
         }
     }
@@ -151,9 +157,10 @@ mod tests {
                 AgentSlot::Review => {}
                 AgentSlot::VerifyComplete => {}
                 AgentSlot::Summarize => {}
+                AgentSlot::Triage => {}
             }
         }
-        assert_eq!(AgentSlot::ALL.len(), 8);
+        assert_eq!(AgentSlot::ALL.len(), 9);
     }
 
     #[test]
