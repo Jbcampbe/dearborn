@@ -9,6 +9,7 @@ pub mod agent_slot;
 pub mod auth;
 pub mod board;
 pub mod breakdown;
+pub mod capability;
 pub mod cmd;
 pub mod config;
 pub mod cost;
@@ -22,7 +23,6 @@ pub mod git_host;
 pub mod harness_pi;
 pub mod hub;
 pub mod lanes;
-pub mod mcp;
 pub mod planning;
 pub mod pr;
 pub mod projects;
@@ -57,7 +57,7 @@ pub use db::{Db, DbError};
 pub use error::{AppError, AppResult};
 pub use git_host::GitHost;
 pub use hub::Hub;
-pub use mcp::CapabilityStore;
+pub use capability::CapabilityStore;
 pub use planning::PlanningAgent;
 pub use task_agent::TaskAgent;
 
@@ -127,14 +127,15 @@ pub struct AppState {
     /// epic already in this set is ignored (its user message is still stored),
     /// so runs never interleave on `seq`/resume. See [`AppState::try_acquire_run`].
     pub inflight: Arc<Mutex<HashSet<String>>>,
-    /// Per-run MCP capability tokens (T-203). A planning run mints a token scoped
-    /// to one `(epic, phase, clone_path)`; the shelled-out agent authenticates its
-    /// `POST /mcp/:cap` calls with it. See [`crate::mcp`].
+    /// Per-run capability tokens. An agent run mints a token scoped to one
+    /// `(epic, project, phase, clone)`; the agent authenticates its `dearborn`
+    /// CLI calls with it as a bearer, and the token can act only on that epic
+    /// through the CLI's REST surface. See [`crate::capability`].
     pub caps: Arc<CapabilityStore>,
     /// Dearborn's own loopback origin (e.g. `http://127.0.0.1:8787`), used to
-    /// build the MCP config URL handed to the agent. Set once after the listener
-    /// binds (`main`, or the live test); `None` in unit tests that never spawn a
-    /// real agent, which disables MCP wiring for the run.
+    /// build the `--url` handed to the agent's `dearborn` CLI. Set once after
+    /// the listener binds (`main`, or the live test); `None` in unit tests that
+    /// never spawn a real agent, which disables CLI wiring for the run.
     pub advertised_base: Arc<Mutex<Option<String>>>,
     /// The worker pool's wake signal (D2, T-510). Anything that enqueues work —
     /// today, the `Ready → InProgress` lane transition — calls
@@ -336,7 +337,7 @@ impl AppState {
     }
 
     /// Record Dearborn's loopback origin (`http://host:port`) once the listener
-    /// is bound, so planning runs can build the agent's MCP config URL. Idempotent
+    /// is bound, so agent runs can build the `dearborn` CLI's `--url`. Idempotent
     /// last-write-wins.
     pub fn set_advertised_base(&self, base: impl Into<String>) {
         *self.advertised_base.lock().expect("base mutex poisoned") = Some(base.into());
@@ -457,10 +458,6 @@ pub fn app(state: AppState) -> Router {
     let public = Router::new()
         .route("/health", get(health))
         .route("/ws", get(ws::ws_handler))
-        // Dearborn's local MCP server for planning runs (T-203). Authed by the
-        // per-run capability token in the `:cap` path segment, NOT the browser
-        // bearer token — so it lives outside the bearer layer, like `/ws`.
-        .route("/mcp/:cap", axum::routing::post(mcp::mcp_endpoint))
         // First-launch claim, login, and session refresh. Unauthenticated by
         // necessity: these are how a caller *gets* a credential, so they
         // cannot sit behind one.
@@ -471,6 +468,10 @@ pub fn app(state: AppState) -> Router {
 
     let protected = Router::new()
         .route("/auth/me", get(sessions::me))
+        // The `dearborn` CLI's `scope` verb: names the bearer capability
+        // token's own epic/project/phase (a session token gets 403 here —
+        // see `capability::CapabilityActor`).
+        .route("/auth/capability", get(capability::whoami))
         .route("/auth/logout", axum::routing::post(sessions::logout))
         .route(
             "/auth/password",

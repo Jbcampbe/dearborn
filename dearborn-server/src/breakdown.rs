@@ -4,9 +4,10 @@
 //! broken into work. `POST /epics/:id/breakdown` runs a **single, non-interactive**
 //! agent that reads the epic's product + technical context and creates a graph of
 //! tasks (thin vertical slices / tracer bullets, per `references/prompts/to-tasks.md`)
-//! via the breakdown-phase MCP tools `create_task` / `link_dependency`
-//! ([`crate::mcp`]). When the run finishes, Dearborn moves the epic
-//! **Planning → Ready** and records the run in `agent_run`.
+//! via the harness-agnostic `dearborn` CLI's `task create` / `task link` verbs,
+//! authenticated by a per-run capability token ([`crate::capability`]). When the
+//! run finishes, Dearborn moves the epic **Planning → Ready** and records the run
+//! in `agent_run`.
 //!
 //! ## Relation to planning
 //!
@@ -16,14 +17,14 @@
 //! `spawn_blocking` and every event is relayed live to `epic:<id>` (reusing
 //! [`crate::planning::ws_type`]) — but the run is **one-shot**: no `resume`, no
 //! multi-turn, and it does **not** write to `transcript_message`. Its durable
-//! output is the task rows + edges the MCP tools persist, plus the `agent_run`
-//! evidence row and the `epic.status='Ready'` transition.
+//! output is the task rows + edges the CLI's REST verbs persist, plus the
+//! `agent_run` evidence row and the `epic.status='Ready'` transition.
 //!
 //! ## Determinism boundary
 //!
-//! The agent only ever creates tasks and links dependencies (its allow-list is
-//! [`crate::mcp::BREAKDOWN_ALLOWED_TOOLS`], scoped to this one epic by the
-//! capability token). Dearborn — not the agent — owns the `Planning → Ready`
+//! The agent only ever creates tasks and links dependencies (its surface is
+//! the scoped `dearborn` CLI, whose token grants exactly the two REST routes
+//! those verbs call). Dearborn — not the agent — owns the `Planning → Ready`
 //! lane transition, exactly as ARCHITECTURE §11 requires.
 
 use std::collections::HashMap;
@@ -56,20 +57,25 @@ through ALL integration layers end-to-end (schema, API, UI, tests), NOT a horizo
 slice of a single layer. A completed slice must be demoable or verifiable on its own. \
 Prefer many thin slices over few thick ones.
 
-Create the tasks using your tools:
-- `create_task`: create ONE task with a `title`, a `description` of the end-to-end \
-behavior (not layer-by-layer), and `acceptance` criteria. Create blockers BEFORE the \
-tasks that depend on them; when creating a task, you may pass `blocks` (ids of already- \
-created tasks this new task blocks) or wire edges afterward with `link_dependency`.
-- `link_dependency`: add a `blocker_id → blocked_id` edge (the blocker must finish first). \
-Both tasks must belong to this epic; cycles are rejected. Use the EXACT task id strings that \
-`create_task` returned — copy them verbatim into `blocker_id`/`blocked_id`; never substitute \
-your own numbering or labels, which will be rejected. If a link is rejected, read the error's \
-list of valid task ids and retry with one of those.
+Create the tasks with the Dearborn CLI (access block below; run it through your \
+shell tool):
+- `task create --title \"...\" --description \"...\" --acceptance \"...\"`: create ONE \
+task with a `title`, a `description` of the end-to-end behavior (not layer-by-layer), \
+and `acceptance` criteria. Create blockers BEFORE the tasks that depend on them; \
+when creating a task, you may pass `--blocks id1,id2` (ids of already-created tasks \
+this new task blocks) or wire edges afterward with `task link`.
+- `task link BLOCKER BLOCKED`: add a `BLOCKER → BLOCKED` edge (the blocker must \
+finish first). Both tasks must belong to this epic; cycles are rejected. Use the \
+EXACT task id strings that `task create` printed — copy them verbatim; never \
+substitute your own numbering or labels, which will be rejected. If a link is \
+rejected, read the error's list of valid task ids and retry with one of those.
+- `dag`: print the current task DAG (use it to verify your work).
 
-Work in dependency order. Do not modify the codebase, run commands, or change the epic's \
-status — creating tasks and linking dependencies is your entire surface. When the DAG is \
-complete, stop.";
+Every verb prints JSON on success and `dearborn: <error>` on failure.
+
+Work in dependency order. Do not modify the codebase or change the epic's status — \
+the ONLY shell commands you run are `dearborn` CLI calls; creating tasks and \
+linking dependencies is your entire surface. When the DAG is complete, stop.";
 
 // ---- the agent seam ------------------------------------------------------
 
@@ -85,9 +91,11 @@ pub struct BreakdownRunRequest {
     /// Working directory: the project's read-only clone (code grounding). `None`
     /// when the clone isn't ready — the run proceeds without code context.
     pub cwd: Option<PathBuf>,
-    /// MCP wiring (the breakdown tool surface). `None` disables tools (used only
-    /// when the clone/base URL is unavailable — the run then no-ops usefully).
-    pub mcp: Option<BreakdownMcp>,
+    /// Dearborn CLI wiring: the loopback base URL and the per-run capability
+    /// token, injected as a system-prompt access block. `None` disables the
+    /// CLI surface (used only when the clone/base URL is unavailable — the run
+    /// then no-ops usefully).
+    pub cli: Option<DearbornCli>,
     /// The breakdown instruction prompt — the slot's live-resolved effective
     /// text (T6): the project's override when set, else `BREAKDOWN_PROMPT`.
     pub system_prompt: String,
@@ -100,12 +108,34 @@ pub struct BreakdownRunRequest {
     pub model: Option<String>,
 }
 
-/// The MCP knobs [`spawn_breakdown`] hands the agent for the run.
-pub struct BreakdownMcp {
-    /// Path to the temp `--mcp-config` JSON naming Dearborn's http server.
-    pub config_path: PathBuf,
-    /// Value for `--allowedTools` — [`crate::mcp::BREAKDOWN_ALLOWED_TOOLS`].
-    pub allowed_tools: String,
+/// The Dearborn CLI knobs [`spawn_breakdown`] hands the agent for the run.
+pub struct DearbornCli {
+    /// Dearborn's loopback origin (e.g. `http://127.0.0.1:8787`) — the CLI's `--url`.
+    pub base_url: String,
+    /// The per-run capability token — the CLI's `--token`.
+    pub token: String,
+}
+
+/// The system-prompt access block injected when a run is wired to the
+/// `dearborn` CLI: how to authenticate (the per-run `--url`/`--token` pair,
+/// pre-scoped to this epic) and which verbs exist. The flags travel with every
+/// command — each shell invocation is a fresh process, so an `export` would not
+/// survive between the agent's tool calls.
+fn cli_access_block(cli: &DearbornCli) -> String {
+    format!(
+        "\nDearborn CLI access — call it through your shell tool exactly as shaped below \
+         (the `--url`/`--token` pair is already issued and scoped to THIS run; never \
+         modify or omit either):\n\
+         dearborn --url {url} --token {token} <verb>\n\
+         where <verb> is one of:\n\
+         - task create --title \"...\" [--description \"...\"] [--acceptance \"...\"] [--blocks id1,id2]\n\
+         - task link BLOCKER BLOCKED\n\
+         - dag\n\
+         Each verb prints JSON on success and `dearborn: <error>` on failure. `task create`'s \
+         JSON includes the new task's `id` — copy it verbatim into later edges.\n",
+        url = cli.base_url,
+        token = cli.token,
+    )
 }
 
 /// The seam that makes T-301 hermetically testable (mirrors
@@ -133,8 +163,9 @@ impl BreakdownAgent for ClaudeBreakdownAgent {
         // T7 spawn-validation, mirroring the planning agent's check: a harness
         // this slot cannot run surfaces loudly through the same synthetic
         // Error+Exited stream a spawn failure uses. Breakdown builds the task
-        // DAG through Dearborn's MCP tools (`create_task`/`link_dependency`),
-        // so an MCP-incapable harness is refused here just like an unknown one.
+        // DAG through the scoped `dearborn` CLI, and its runs are driven by
+        // the Claude Code adapter (see [`crate::agent_settings`]) — so a
+        // non-Claude harness is refused here just like an unknown one.
         const SLOT: AgentSlot = AgentSlot::Breakdown;
         if !crate::agent_settings::harness_supports_slot(&req.harness, SLOT) {
             let (tx, rx) = std::sync::mpsc::channel();
@@ -157,11 +188,15 @@ impl BreakdownAgent for ClaudeBreakdownAgent {
             "--append-system-prompt".to_string(),
             req.plan.clone(),
         ];
-        if let Some(mcp) = &req.mcp {
-            extra_args.push("--mcp-config".to_string());
-            extra_args.push(mcp.config_path.to_string_lossy().into_owned());
-            extra_args.push("--allowedTools".to_string());
-            extra_args.push(mcp.allowed_tools.clone());
+        if let Some(cli) = &req.cli {
+            // The scoped `dearborn` CLI is this run's only write surface: the
+            // access block tells the agent how to call it, and
+            // `bypassPermissions` keeps the shell invocations from stalling on
+            // approval prompts. Read-only w.r.t. the codebase is enforced by
+            // the prompt steering + the read-only clone as `cwd`, not by the
+            // mode.
+            extra_args.push("--append-system-prompt".to_string());
+            extra_args.push(cli_access_block(cli));
             extra_args.push("--permission-mode".to_string());
             extra_args.push("bypassPermissions".to_string());
         }
@@ -268,11 +303,13 @@ async fn technical_session_exists(state: &AppState, epic_id: &str) -> AppResult<
 
 // ---- run orchestration ---------------------------------------------------
 
-/// Prefix every Dearborn-scoped MCP tool name carries on the wire (see
-/// `crate::mcp`): `mcp__dearborn__create_task`, `mcp__dearborn__link_dependency`,
-/// `mcp__dearborn__read_codebase_context`. Harness-side tools (Read, Grep, …)
-/// don't match.
-const DEARBORN_MCP_PREFIX: &str = "mcp__dearborn__";
+/// Substring every `dearborn` CLI failure prints to stderr (`dearborn: <error>`;
+/// see [`crate::cli`]). A failed tool call whose output carries it is a failed
+/// DAG write, not harness-side noise: those are the calls the Planning → Ready
+/// guard exists for. (Until the CLI retirement these were `mcp__dearborn__*`
+/// tool names; shell-invoked CLI calls have no such name, so the *output*
+/// marker is the signature instead.)
+const DEARBORN_CLI_ERROR_MARKER: &str = "dearborn: ";
 
 /// What a drained breakdown run leaves behind, persisted after the stream ends.
 #[derive(Default)]
@@ -284,8 +321,8 @@ struct BreakdownOutcome {
     /// Tool calls started but not yet ended, by id — so a failed `ToolEnd` can
     /// be attributed to the tool that made it (`ToolEnd` carries only the id).
     pending_tools: HashMap<String, String>,
-    /// Dearborn-scoped MCP tools whose call ended not-ok, in failure order,
-    /// paired with whatever failure output the harness reported.
+    /// Dearborn CLI calls whose run ended not-ok, in failure order, paired
+    /// with whatever failure output the harness reported.
     failed_tool_calls: Vec<(String, String)>,
 }
 
@@ -309,14 +346,16 @@ impl BreakdownOutcome {
                 output,
                 ..
             } => {
-                // Only Dearborn-scoped MCP tool failures count: those are the
-                // writes behind the task DAG. A failed harness-side read
-                // (Read/Grep/…) can't leave the DAG half-written, and treating
-                // it as fatal would block runs over noise.
+                // Only `dearborn` CLI failures count: those are the writes
+                // behind the task DAG (identified by the CLI's stderr marker —
+                // shell-invoked calls carry no Dearborn tool *name*). A failed
+                // harness-side read (Read/Grep/…) can't leave the DAG
+                // half-written, and treating it as fatal would block runs over
+                // noise.
                 if let Some(name) = self.pending_tools.remove(tool_call_id) {
-                    if name.starts_with(DEARBORN_MCP_PREFIX) {
-                        self.failed_tool_calls
-                            .push((name, output.clone().unwrap_or_default()));
+                    let out = output.clone().unwrap_or_default();
+                    if out.contains(DEARBORN_CLI_ERROR_MARKER) {
+                        self.failed_tool_calls.push((name, out));
                     }
                 }
             }
@@ -349,14 +388,13 @@ pub fn spawn_breakdown(state: AppState, epic_id: String, guard: InflightGuard) {
             }
         };
 
-        // Mint an MCP capability for the breakdown tool surface, scoped to this
-        // (epic, project, clone). Held for the whole run; the temp config file is
-        // removed on completion. Falls back to a tool-less run if the clone/base
-        // URL is unavailable.
+        // Mint a capability scoped to this (epic, project, clone) — the token
+        // the agent's `dearborn` CLI calls authenticate with, and the only
+        // write surface the run has. Held for the whole run; revoked on drop.
+        // Falls back to a CLI-less run if the clone/base URL is unavailable.
         let mut cwd: Option<PathBuf> = None;
-        let mut mcp: Option<BreakdownMcp> = None;
-        let mut _cap_guard: Option<crate::mcp::CapabilityGuard> = None;
-        let mut mcp_config_path: Option<PathBuf> = None;
+        let mut cli: Option<DearbornCli> = None;
+        let mut _cap_guard: Option<crate::capability::CapabilityGuard> = None;
 
         let clone_path = get_epic_clone_path(conn, &epic_id).await.ok().flatten();
         let project_id = get_epic_project_id(conn, &epic_id)
@@ -384,39 +422,30 @@ pub fn spawn_breakdown(state: AppState, epic_id: String, guard: InflightGuard) {
         };
         match (clone_path, state.advertised_base()) {
             (Some(clone_path), Some(base)) => {
-                let clone_pb = PathBuf::from(&clone_path);
                 let cap = state.caps.mint(
                     epic_id.clone(),
                     project_id.clone(),
                     "breakdown".to_string(),
-                    clone_pb.clone(),
+                    PathBuf::from(&clone_path),
                 );
-                match crate::mcp::write_mcp_config(&base, cap.token()) {
-                    Ok(path) => {
-                        cwd = Some(clone_pb);
-                        mcp = Some(BreakdownMcp {
-                            config_path: path.clone(),
-                            allowed_tools: crate::mcp::BREAKDOWN_ALLOWED_TOOLS.to_string(),
-                        });
-                        mcp_config_path = Some(path);
-                        _cap_guard = Some(cap);
-                    }
-                    Err(err) => {
-                        tracing::warn!(epic = %epic_id, error = %err, "breakdown: MCP config write failed; running without tools");
-                    }
-                }
+                cwd = Some(PathBuf::from(&clone_path));
+                cli = Some(DearbornCli {
+                    base_url: base,
+                    token: cap.token().to_string(),
+                });
+                _cap_guard = Some(cap);
             }
             _ => {
-                tracing::debug!(epic = %epic_id, "breakdown: no ready clone or base URL; running without MCP");
+                tracing::debug!(epic = %epic_id, "breakdown: no ready clone or base URL; running without the dearborn CLI");
             }
         }
 
         let req = BreakdownRunRequest {
             run_id: ulid::Ulid::new().to_string(),
-            prompt: "Break this epic down into a task DAG using your tools.".to_string(),
+            prompt: "Break this epic down into a task DAG using the dearborn CLI.".to_string(),
             plan,
             cwd,
-            mcp,
+            cli,
             system_prompt: spawn_cfg.prompt,
             harness: spawn_cfg.harness.clone(),
             model: spawn_cfg.model.clone(),
@@ -465,33 +494,31 @@ pub fn spawn_breakdown(state: AppState, epic_id: String, guard: InflightGuard) {
             outcome
         };
 
-        // Agent has exited; the temp MCP config file is no longer needed. The
-        // capability token is revoked when `_cap_guard` drops at task end.
-        if let Some(path) = &mcp_config_path {
-            let _ = tokio::fs::remove_file(path).await;
-        }
+        // Agent has exited; the capability token is revoked when `_cap_guard`
+        // drops at the end of this task.
 
-        // A Dearborn-scoped MCP tool failing means part of the task DAG may be
+        // A `dearborn` CLI call failing means part of the task DAG may be
         // missing or half-wired — even though the model's closing summary will
         // happily claim success. (This exact shape happened for real: an
-        // external DB lock made every `create_task` fail mid-run, the model
+        // external DB lock made every task-create fail mid-run, the model
         // declared "All 12 tasks created" anyway, and only the run's *final*
         // writes — this agent_run row plus the Planning → Ready transition —
         // landed after the lock cleared. The result was a Ready epic with zero
-        // tasks that nothing would ever retry.) So: when a scoped tool failed,
-        // record the run as `error`, append why to its log, and leave the epic
-        // in `Planning` — where POST /epics/{id}/breakdown can simply re-run it.
+        // tasks that nothing would ever retry.) So: when a scoped CLI call
+        // failed, record the run as `error`, append why to its log, and leave
+        // the epic in `Planning` — where POST /epics/{id}/breakdown can simply
+        // re-run it.
         let dag_write_failed = !outcome.failed_tool_calls.is_empty();
         if dag_write_failed {
             tracing::error!(
                 epic = %epic_id,
                 failed_tools = ?outcome.failed_tool_calls,
-                "breakdown: Dearborn MCP tool call(s) failed; refusing Planning → Ready"
+                "breakdown: dearborn CLI call(s) failed; refusing Planning → Ready"
             );
         }
 
         // Record per-run evidence (the tasks/edges were persisted live by the
-        // MCP tools during the run), including which agent settings produced
+        // CLI's REST verbs during the run), including which agent settings produced
         // it (T8).
         let mut log = outcome.log;
         if dag_write_failed {
@@ -508,7 +535,7 @@ pub fn spawn_breakdown(state: AppState, epic_id: String, guard: InflightGuard) {
                 .collect::<Vec<_>>()
                 .join(", ");
             log.push_str(&format!(
-                "\n\n[dearborn] breakdown aborted: {} Dearborn MCP tool call(s) failed ({}) — \
+                "\n\n[dearborn] breakdown aborted: {} dearborn CLI call(s) failed ({}) — \
                  partial tasks created by this run were rolled back and the epic stays in \
                  `Planning` so breakdown can be re-run.",
                 outcome.failed_tool_calls.len(),
@@ -552,7 +579,7 @@ pub fn spawn_breakdown(state: AppState, epic_id: String, guard: InflightGuard) {
         }
 
         // Publish the final DAG and the updated epic so the client re-renders.
-        crate::mcp::publish_dag(&state, &epic_id).await;
+        crate::capability::publish_dag(&state, &epic_id).await;
         if let Ok(Some(epic)) = fetch_epic(conn, &epic_id).await {
             let payload = serde_json::to_value(&epic).unwrap_or(Value::Null);
             state
@@ -629,13 +656,13 @@ pub(crate) mod testing {
         pub run_id: String,
         pub prompt: String,
         pub plan: String,
-        pub had_mcp: bool,
+        pub had_cli: bool,
     }
 
     /// A [`BreakdownAgent`] that emits a failed harness-side read AND a failed
-    /// Dearborn MCP `create_task` call, then a confident closing summary and a
-    /// clean exit — the exact "model claims success, writes failed" shape the
-    /// Planning → Ready guard exists for.
+    /// `dearborn` CLI call, then a confident closing summary and a clean exit —
+    /// the exact "model claims success, writes failed" shape the Planning →
+    /// Ready guard exists for.
     pub struct FailedToolCallBreakdownAgent;
 
     impl BreakdownAgent for FailedToolCallBreakdownAgent {
@@ -665,11 +692,12 @@ pub(crate) mod testing {
                     ok: false,
                     output: None,
                 });
-                // The failed DAG write: must trip the guard.
+                // The failed DAG write: must trip the guard. Shell-invoked
+                // CLI calls surface as Bash with the CLI's stderr marker.
                 let _ = tx.send(RunEvent::ToolStart {
                     run_id: run_id.clone(),
                     tool_call_id: "t2".to_string(),
-                    name: format!("{DEARBORN_MCP_PREFIX}create_task"),
+                    name: "Bash".to_string(),
                     input: None,
                     tool_kind: harness::ToolKind::Other,
                 });
@@ -677,7 +705,7 @@ pub(crate) mod testing {
                     run_id: run_id.clone(),
                     tool_call_id: "t2".to_string(),
                     ok: false,
-                    output: Some("database is locked".to_string()),
+                    output: Some("dearborn: failed to create task: database is locked".to_string()),
                 });
                 // The model's (untrustworthy) closing summary.
                 let _ = tx.send(RunEvent::Text {
@@ -695,7 +723,7 @@ pub(crate) mod testing {
     }
 
     /// A scripted [`BreakdownAgent`] that, per run, invokes a caller-supplied
-    /// closure (to drive the MCP tools like a real agent would) and then emits
+    /// closure (to drive the `dearborn` CLI like a real agent would) and then emits
     /// Started → Session → Text* → Exited. Records each request.
     pub struct ScriptedBreakdownAgent {
         session_id: String,
@@ -723,7 +751,7 @@ pub(crate) mod testing {
                 run_id: req.run_id.clone(),
                 prompt: req.prompt.clone(),
                 plan: req.plan.clone(),
-                had_mcp: req.mcp.is_some(),
+                had_cli: req.cli.is_some(),
             });
 
             let (tx, rx) = std::sync::mpsc::channel();
@@ -756,11 +784,12 @@ pub(crate) mod testing {
         }
     }
 
-    /// A [`BreakdownAgent`] that creates a small fixed DAG by calling Dearborn's
-    /// own MCP endpoint (proving the end-to-end seam), driven by a callback the
-    /// test supplies. Kept minimal: it just emits a terminal stream; DAG creation
-    /// is done by the test directly against the store/endpoint so the engine's
-    /// completion path (Ready transition, agent_run, publishes) is exercised.
+    /// A [`BreakdownAgent`] that creates a small fixed DAG by calling Dearborn
+    /// through the `dearborn` CLI surface (proving the end-to-end seam), driven
+    /// by a callback the test supplies. Kept minimal: it just emits a terminal
+    /// stream; DAG creation is done by the test directly against the
+    /// store/endpoint so the engine's completion path (Ready transition,
+    /// agent_run, publishes) is exercised.
     pub struct SilentBreakdownAgent;
 
     impl BreakdownAgent for SilentBreakdownAgent {
@@ -989,7 +1018,7 @@ mod tests {
         assert!(runs[0].plan.contains("titled \"E\""));
     }
 
-    /// A Dearborn-scoped MCP tool call failing must abort the run: the epic
+    /// A dearborn CLI call failing must abort the run: the epic
     /// stays in `Planning` (re-triggerable), the evidence row closes as
     /// `error`, and the failure note names the failed tool. A failed
     /// harness-side read alone does NOT abort (the first scripted tool).
@@ -1020,7 +1049,7 @@ mod tests {
                 // in its log.
                 assert_eq!(row.get::<String>(0).unwrap(), "error");
                 let log: String = row.get(1).unwrap();
-                assert!(log.contains("create_task"));
+                assert!(log.contains("dearborn: failed to create task"));
                 assert!(log.contains("database is locked"));
                 break;
             }
@@ -1176,7 +1205,7 @@ mod tests {
             prompt: "break it down".to_string(),
             plan: "plan".to_string(),
             cwd: None,
-            mcp: None,
+            cli: None,
             system_prompt: BREAKDOWN_PROMPT.to_string(),
             harness: "codex".to_string(),
             model: None,
@@ -1198,16 +1227,16 @@ mod tests {
     }
 
     #[test]
-    fn breakdown_agent_rejects_a_spawnable_but_mcp_incapable_harness() {
-        // pi runs task stages fine, but breakdown writes the task DAG through
-        // Dearborn's MCP tools and pi has no MCP client.
+    fn breakdown_agent_rejects_a_spawnable_but_non_claude_harness() {
+        // pi runs task stages fine, but the breakdown engine is currently
+        // wired to the Claude Code adapter only.
         let agent = ClaudeBreakdownAgent::new();
         let rx = agent.run(BreakdownRunRequest {
             run_id: "run-pi".to_string(),
             prompt: "break it down".to_string(),
             plan: "plan".to_string(),
             cwd: None,
-            mcp: None,
+            cli: None,
             system_prompt: BREAKDOWN_PROMPT.to_string(),
             harness: crate::harness_pi::PI_HARNESS_ID.to_string(),
             model: None,
@@ -1216,7 +1245,10 @@ mod tests {
         match rx.iter().next().expect("an Error event must arrive") {
             RunEvent::Error { message, .. } => {
                 assert!(message.contains("pi"), "error names the harness: {message}");
-                assert!(message.contains("MCP"), "error says why: {message}");
+                assert!(
+                    message.contains("Claude Code"),
+                    "error says why: {message}"
+                );
                 assert!(
                     message.contains("breakdown"),
                     "error names the slot: {message}"

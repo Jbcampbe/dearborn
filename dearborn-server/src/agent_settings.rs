@@ -325,28 +325,29 @@ pub async fn harness_references(
 /// storable), the spawn path does not.
 pub const SUPPORTED_HARNESSES: &[&str] = &["claude", crate::harness_pi::PI_HARNESS_ID];
 
-/// The harnesses that can reach Dearborn's local MCP server ([`crate::mcp`]).
+/// The harness keys whose CLI currently drives the planning/breakdown engines.
 ///
-/// Only Claude Code speaks MCP among the CLIs Dearborn drives: pi has no MCP
-/// client at all (verified against the shipped CLI — no `--mcp-config`, no MCP
-/// transport). This is a **capability**, not a preference, which is why it is
-/// a list rather than a special case at each spawn site.
-pub const MCP_CAPABLE_HARNESSES: &[&str] = &["claude"];
+/// Those engines are implemented on the Claude Code adapter today, so only
+/// `claude` may run them — this is an **engine** capability, not a transport
+/// one: the `dearborn` CLI the slots call back through is harness-agnostic
+/// (any harness that can run a shell command can invoke it), and pi gains the
+/// planning/breakdown engines when they land. This is a capability list rather
+/// than a special case at each spawn site for the same reason as before.
+pub const PLANNING_CAPABLE_HARNESSES: &[&str] = &["claude"];
 
 /// Whether `harness` is one Dearborn can spawn at all.
 pub fn is_supported_harness(harness: &str) -> bool {
     SUPPORTED_HARNESSES.contains(&harness)
 }
 
-/// Whether a slot's run needs the agent to call *back* into Dearborn over MCP.
-///
-/// True for exactly the three planning-side slots: `planning_product` and
-/// `planning_technical` read the canonical clone through
-/// `read_codebase_context`; `breakdown` builds the task DAG through
-/// `create_task`/`link_dependency`. The five task-stage slots act on a
-/// checked-out workspace with the CLI's own file tools and never call home,
-/// so they impose no such requirement.
-pub fn slot_requires_mcp(slot: AgentSlot) -> bool {
+/// Whether a slot's run is implemented on the Claude Code adapter only (the
+/// three planning-side slots: `planning_product`, `planning_technical`, and
+/// `breakdown`). These slots call back into Dearborn through the harness-
+/// agnostic `dearborn` CLI — but their run engines themselves are Claude-
+/// Code-bound until the per-node engines land. The task-stage slots act on a
+/// checked-out workspace with the CLI's own file tools and run on every
+/// supported harness.
+pub fn slot_is_claude_only(slot: AgentSlot) -> bool {
     match slot {
         AgentSlot::PlanningProduct | AgentSlot::PlanningTechnical | AgentSlot::Breakdown => true,
         AgentSlot::Implement
@@ -358,18 +359,19 @@ pub fn slot_requires_mcp(slot: AgentSlot) -> bool {
     }
 }
 
-/// Whether `harness` can run `slot` — supported at all, and MCP-capable when
-/// the slot needs MCP. The single predicate every spawn site and the settings
-/// API validate against, so "which harness may run where" is stated once.
+/// Whether `harness` can run `slot` — supported at all, and Claude-bound-when-
+/// the-slot-is-Claude-bound. The single predicate every spawn site and the
+/// settings API validate against, so "which harness may run where" is stated
+/// once.
 pub fn harness_supports_slot(harness: &str, slot: AgentSlot) -> bool {
     is_supported_harness(harness)
-        && (!slot_requires_mcp(slot) || MCP_CAPABLE_HARNESSES.contains(&harness))
+        && (!slot_is_claude_only(slot) || PLANNING_CAPABLE_HARNESSES.contains(&harness))
 }
 
 /// The error message a spawn site (or the settings API) reports when
 /// [`harness_supports_slot`] says no. Written once so the planning, breakdown,
 /// and task-stage paths phrase the same refusal identically, and so the reason
-/// — unsupported vs. MCP-incapable — is never lost.
+/// — unsupported vs. Claude-Code-bound-slot — is never lost.
 pub fn unsupported_harness_message(harness: &str, slot: AgentSlot) -> String {
     if !is_supported_harness(harness) {
         format!(
@@ -378,9 +380,10 @@ pub fn unsupported_harness_message(harness: &str, slot: AgentSlot) -> String {
         )
     } else {
         format!(
-            "harness `{harness}` cannot run the `{slot}` slot: that slot calls back into \
-             Dearborn over MCP, and only {} can do that",
-            MCP_CAPABLE_HARNESSES.join(", ")
+            "harness `{harness}` cannot run the `{slot}` slot: that slot's run engine is \
+             currently wired to Claude Code only",
+            harness = harness,
+            slot = slot
         )
     }
 }
@@ -1477,16 +1480,16 @@ mod tests {
     // ---- harness/slot capability (pi) --------------------------------------
 
     #[test]
-    fn slot_capability_splits_the_mcp_bound_slots_from_the_task_stages() {
+    fn slot_capability_splits_the_claude_bound_slots_from_the_task_stages() {
         use crate::harness_pi::PI_HARNESS_ID;
 
-        // The three planning-side slots call back into Dearborn over MCP.
+        // The three planning-side slots run on the Claude Code adapter only.
         for slot in [
             AgentSlot::PlanningProduct,
             AgentSlot::PlanningTechnical,
             AgentSlot::Breakdown,
         ] {
-            assert!(slot_requires_mcp(slot), "{slot}");
+            assert!(slot_is_claude_only(slot), "{slot}");
             assert!(harness_supports_slot("claude", slot), "{slot}");
             assert!(!harness_supports_slot(PI_HARNESS_ID, slot), "{slot}");
         }
@@ -1500,7 +1503,7 @@ mod tests {
             AgentSlot::Summarize,
             AgentSlot::Triage,
         ] {
-            assert!(!slot_requires_mcp(slot), "{slot}");
+            assert!(!slot_is_claude_only(slot), "{slot}");
             assert!(harness_supports_slot("claude", slot), "{slot}");
             assert!(harness_supports_slot(PI_HARNESS_ID, slot), "{slot}");
         }
@@ -1510,7 +1513,7 @@ mod tests {
     }
 
     #[test]
-    fn the_refusal_message_distinguishes_unsupported_from_mcp_incapable() {
+    fn the_refusal_message_distinguishes_unsupported_from_claude_bound() {
         use crate::harness_pi::PI_HARNESS_ID;
 
         let unknown = unsupported_harness_message("codex", AgentSlot::Implement);
@@ -1519,7 +1522,7 @@ mod tests {
 
         let incapable = unsupported_harness_message(PI_HARNESS_ID, AgentSlot::Breakdown);
         assert!(!incapable.contains("unsupported"), "{incapable}");
-        assert!(incapable.contains("MCP"), "{incapable}");
+        assert!(incapable.contains("Claude Code"), "{incapable}");
         assert!(incapable.contains("breakdown"), "{incapable}");
     }
 
@@ -1540,7 +1543,7 @@ mod tests {
             .unwrap();
         assert_eq!(enable.status(), StatusCode::OK);
 
-        // pi on an MCP-bound slot: refused at configuration time.
+        // pi on a Claude-bound slot: refused at configuration time.
         let refused = app
             .clone()
             .oneshot(req(
@@ -1555,7 +1558,7 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .to_string();
-        assert!(message.contains("MCP"), "{message}");
+        assert!(message.contains("Claude Code"), "{message}");
 
         // The same harness on a task-stage slot is accepted.
         let ok = app
@@ -1596,7 +1599,7 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .to_string();
-        assert!(message.contains("MCP"), "{message}");
+        assert!(message.contains("Claude Code"), "{message}");
         assert!(message.contains("per slot"), "{message}");
     }
 

@@ -68,16 +68,16 @@ pub struct PlanningConfig {
     pub slot: crate::agent_slot::AgentSlot,
     /// Appended to the agent via `--append-system-prompt`; stable across turns.
     pub system_prompt: &'static str,
-    /// Whether this phase exposes Dearborn's planning MCP tools
-    /// (`read_codebase_context`) to the agent. When `true`, [`spawn_run`] mints a
-    /// capability token, wires `--mcp-config`/`--allowedTools`, and points `cwd`
-    /// at the project's read-only clone (T-203).
+    /// Whether this phase runs with the project's canonical clone as the
+    /// run's working directory, so the agent can ground its plan in the real
+    /// code with its own read-only file tools (the `read_codebase_context`
+    /// MCP tool this replaced was retired with the MCP server). When `true`,
+    /// [`spawn_run`] resolves the clone and points `cwd` at it.
     pub tools_enabled: bool,
 }
 
 /// Product-planning role (T-202/T-203). A conversational planner that may
-/// inspect the project's canonical clone (read-only) via
-/// `read_codebase_context`.
+/// inspect the project's canonical clone (read-only) with its native file tools.
 pub const PRODUCT_PLANNING: PlanningConfig = PlanningConfig {
     phase: "product",
     slot: crate::agent_slot::AgentSlot::PlanningProduct,
@@ -94,19 +94,19 @@ scope boundaries, and concrete acceptance criteria. Draw out ambiguity by asking
 one or two sharp questions at a time rather than interrogating. Do not design the \
 technical implementation — a separate technical-planning phase handles that later.
 
-You have one tool:
-- `read_codebase_context`: read-only access to the project's code (list \
-directories, read files) to ground the plan in what already exists.
+The project's canonical clone is your working directory: ground the plan in what \
+already exists by listing directories and reading the real code with your own \
+file tools.
 
-You must NOT modify the codebase, run commands, or change the epic's status or lane — \
-that tool is the entire surface you have. \
+You must NOT modify the codebase or change the epic's status or lane — reading \
+the code and conversing is your entire surface. \
 Be concise and conversational.";
 
 /// Technical-planning role (T-205). The second half of planning: given a
 /// product definition already agreed in the product phase, this planner works
-/// out *how* to build it. It has the same tool surface as product planning
-/// (`read_codebase_context`) and is steered to ground every decision in the
-/// real code.
+/// out *how* to build it. It has the same read-only code grounding as product
+/// planning (the canonical clone as cwd) and is steered to ground every
+/// decision in the real code.
 ///
 /// Each phase is its own harness session, so [`spawn_run`] seeds this run's
 /// continuity preamble with the epic it continues (see
@@ -125,14 +125,14 @@ architecture, the concrete files and modules to touch, data model / API changes,
 sequencing, and technical risks.
 
 Ground every decision in the ACTUAL code, not assumptions:
-- `read_codebase_context`: read-only access to the project's canonical clone \
-(list directories, read files). Inspect the real structure, existing patterns, \
-and the specific files your plan would change BEFORE proposing an approach. Quote \
-what you find.
+the project's canonical clone is your working directory — list directories and \
+read the real files with your own file tools. Inspect the existing structure, \
+existing patterns, and the specific files your plan would change BEFORE proposing \
+an approach. Quote what you find.
 
 Build on the product phase's decisions — do not re-open settled product decisions. \
-You must NOT modify the codebase, run commands, or change the epic's status or lane — \
-that tool is your entire surface. \
+You must NOT modify the codebase or change the epic's status or lane — \
+reading the code and conversing is your entire surface. \
 Be concise and conversational, asking one or two sharp questions at a time.";
 
 /// Resolve the [`PlanningConfig`] for a transcript phase, or `None` if the phase
@@ -193,19 +193,6 @@ pub struct PlanningRunRequest {
     /// here (e.g. the technical run receives the epic's title as continuity)
     /// so the run builds on it. `None` for the first phase, which has no prior.
     pub continuity: Option<String>,
-    /// MCP wiring for a tools-enabled phase (T-203). `None` for a plain
-    /// conversational run; `Some` adds `--mcp-config`/`--allowedTools`/
-    /// `--permission-mode bypassPermissions` so the agent can reach Dearborn's
-    /// local MCP server.
-    pub mcp: Option<McpRun>,
-}
-
-/// The MCP knobs [`spawn_run`] hands the agent for a tools-enabled planning turn.
-pub struct McpRun {
-    /// Path to the temp `--mcp-config` JSON file naming Dearborn's http server.
-    pub config_path: PathBuf,
-    /// Value for `--allowedTools` — the phase-scoped allow-list.
-    pub allowed_tools: String,
 }
 
 /// The seam that makes T-202 hermetically testable.
@@ -241,9 +228,9 @@ impl PlanningAgent for ClaudePlanningAgent {
         // a harness key this slot cannot run means settings were hand-edited
         // into a state the API refuses to create. Surface loudly through the
         // same synthetic Error+Exited stream a spawn failure uses — the trait's
-        // return type has no room for a `Result`. Planning is MCP-bound (the
-        // agent calls `read_codebase_context` back into Dearborn),
-        // so this rejects an MCP-incapable harness as well as an unknown one.
+        // return type has no room for a `Result`. Planning runs are driven by
+        // the Claude Code adapter (see [`crate::agent_settings`]), so this
+        // rejects a non-Claude harness as well as an unknown one.
         if !crate::agent_settings::harness_supports_slot(&req.harness, req.slot) {
             let (tx, rx) = std::sync::mpsc::channel();
             let _ = tx.send(RunEvent::Error {
@@ -269,25 +256,15 @@ impl PlanningAgent for ClaudePlanningAgent {
             extra_args.push("--append-system-prompt".to_string());
             extra_args.push(continuity.clone());
         }
-        // Tools-enabled phase (T-203): wire Dearborn's local MCP server exactly as
-        // the T-200 spike proved. Read-only is enforced by the allow-list (the
-        // codebase-read tool) + the read-only clone as `cwd`, NOT by `RunMode`.
-        if let Some(mcp) = &req.mcp {
-            extra_args.push("--mcp-config".to_string());
-            extra_args.push(mcp.config_path.to_string_lossy().into_owned());
-            extra_args.push("--allowedTools".to_string());
-            extra_args.push(mcp.allowed_tools.clone());
-            extra_args.push("--permission-mode".to_string());
-            extra_args.push("bypassPermissions".to_string());
-        }
 
         let request = RunRequest {
             run_id: req.run_id,
             prompt: req.prompt,
             cwd: req.cwd,
-            // Planning is a read-only discussion. NB: per the spike, `Ask` is not a
-            // read-only *guarantee* — that comes from tool-scoping + the read-only
-            // clone; the mode itself does not block edit tools.
+            // Planning is a read-only discussion; the agent reads the clone (its
+            // cwd) with its own file tools. NB: per the spike, `Ask` is not a
+            // read-only *guarantee* — read-only behavior comes from the prompt
+            // steering and the read-only clone, not from the mode.
             mode: RunMode::Ask,
             tuning: RunTuning {
                 extra_args,
@@ -409,8 +386,8 @@ pub fn spawn_run(
         // T6/T7: resolve this phase's live slot config at spawn time — the
         // project's system-prompt override when set, else the phase's compiled
         // default, plus the effective harness/model (design §9: read fresh per
-        // run, never cached). The epic's project id also feeds MCP scoping
-        // below.
+        // run, never cached). The epic's project id also feeds the settings
+        // resolution below.
         let slot = if config.phase == "product" {
             crate::agent_slot::AgentSlot::PlanningProduct
         } else {
@@ -436,68 +413,25 @@ pub fn spawn_run(
             }
         };
 
-        // For a tools-enabled phase, mint a per-run capability scoped to this
-        // (epic, phase, clone) and wire the MCP config. `_cap_guard` is held for
-        // the whole run so the token is revoked when the run ends; `mcp_config`
-        // is the temp file we remove on completion. Both stay `None` (plain
-        // conversational run) if the clone isn't ready or the base URL is unset.
-        let mut cwd: Option<PathBuf> = None;
-        let mut mcp: Option<McpRun> = None;
-        let mut _cap_guard: Option<crate::mcp::CapabilityGuard> = None;
-        let mut mcp_config_path: Option<PathBuf> = None;
-
-        if config.tools_enabled {
-            let clone_path = get_epic_clone_path(state.db.conn(), &epic_id)
+        // For a code-grounding phase, point the run at the project's canonical
+        // (read-only) clone so the agent reads the real code with its own file
+        // tools. No capability token is needed: planning converses and reads,
+        // and never calls back into Dearborn's REST API.
+        let cwd: Option<PathBuf> = if config.tools_enabled {
+            get_epic_clone_path(state.db.conn(), &epic_id)
                 .await
                 .ok()
-                .flatten();
-            match (clone_path, state.advertised_base()) {
-                (Some(clone_path), Some(base)) => {
-                    let clone_pb = PathBuf::from(&clone_path);
-                    // The scope needs the project (unused by planning's tools, but
-                    // part of the shared scope shape); fall back to empty if the
-                    // epic vanished, which only disables tools harmlessly.
-                    let scope_project_id = if project_id.is_empty() {
-                        get_epic_project_id(state.db.conn(), &epic_id)
-                            .await
-                            .ok()
-                            .flatten()
-                            .unwrap_or_default()
-                    } else {
-                        project_id.clone()
-                    };
-                    let guard = state.caps.mint(
-                        epic_id.clone(),
-                        scope_project_id,
-                        phase.clone(),
-                        clone_pb.clone(),
-                    );
-                    match crate::mcp::write_mcp_config(&base, guard.token()) {
-                        Ok(path) => {
-                            cwd = Some(clone_pb);
-                            mcp = Some(McpRun {
-                                config_path: path.clone(),
-                                allowed_tools: crate::mcp::PLANNING_ALLOWED_TOOLS.to_string(),
-                            });
-                            mcp_config_path = Some(path);
-                            _cap_guard = Some(guard);
-                        }
-                        Err(err) => {
-                            tracing::warn!(epic = %epic_id, error = %err, "MCP config write failed; running without tools");
-                        }
-                    }
-                }
-                _ => {
-                    tracing::debug!(epic = %epic_id, "tools-enabled phase without a ready clone or base URL; running without MCP");
-                }
-            }
-        }
+                .flatten()
+                .map(PathBuf::from)
+        } else {
+            None
+        };
 
         // Cross-phase continuity (T-205): a later phase is a separate harness
         // session, so it cannot see the earlier phase's conversation. Seed the
         // technical phase with the epic's title + product context so it builds on
-        // the product outcome (and, together with the read-only clone + MCP tools
-        // below, "has code-inspection context" per the T-205 AC).
+        // the product outcome (and, with the read-only clone as cwd, "has
+        // code-inspection context" per the T-205 AC).
         let continuity = if config.phase == "technical" {
             technical_continuity(state.db.conn(), &epic_id).await
         } else {
@@ -511,7 +445,6 @@ pub fn spawn_run(
             resume,
             system_prompt: spawn_cfg.prompt,
             continuity,
-            mcp,
             slot: config.slot,
             harness: spawn_cfg.harness.clone(),
             model: spawn_cfg.model.clone(),
@@ -534,12 +467,7 @@ pub fn spawn_run(
         })
         .await;
 
-        // The agent process has exited (the receiver hung up), so the MCP config
-        // temp file is no longer needed; the capability token is revoked when
-        // `_cap_guard` drops at the end of this task.
-        if let Some(path) = &mcp_config_path {
-            let _ = tokio::fs::remove_file(path).await;
-        }
+        // The agent process has exited (the receiver hung up).
 
         let outcome = match drained {
             Ok(outcome) => outcome,
@@ -1327,7 +1255,6 @@ mod tests {
             resume: None,
             system_prompt: "system".to_string(),
             continuity: None,
-            mcp: None,
             slot: PRODUCT_PLANNING.slot,
             harness: harness.to_string(),
             model: None,
@@ -1356,17 +1283,18 @@ mod tests {
     }
 
     #[test]
-    fn planning_agent_rejects_a_spawnable_but_mcp_incapable_harness() {
-        // pi is a fully supported harness for task stages, but planning calls
-        // back into Dearborn over MCP and pi has no MCP client — so it is
-        // refused here, and the message says which of the two reasons applies.
+    fn planning_agent_rejects_a_spawnable_but_non_claude_harness() {
+        // pi is a fully supported harness for task stages, but the planning
+        // engines are currently wired to the Claude Code adapter only — so a
+        // pi-configured planning run is refused here, and the message says
+        // which of the two reasons applies.
         let agent = ClaudePlanningAgent::new();
         let rx = agent.run(planning_req("run-pi", crate::harness_pi::PI_HARNESS_ID));
 
         match rx.iter().next().expect("an Error event must arrive") {
             RunEvent::Error { message, .. } => {
                 assert!(message.contains("pi"), "error names the harness: {message}");
-                assert!(message.contains("MCP"), "error says why: {message}");
+                assert!(message.contains("Claude Code"), "error says why: {message}");
                 assert!(
                     message.contains("planning_product"),
                     "error names the slot: {message}"

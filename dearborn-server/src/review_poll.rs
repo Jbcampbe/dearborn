@@ -1609,7 +1609,7 @@ async fn spawn_epic_change_tasks(
                 spawned = %spawned.len(),
                 "review poll: epic moved to InProgress for change work"
             );
-            crate::mcp::publish_dag(state, &candidate.id).await;
+            crate::capability::publish_dag(state, &candidate.id).await;
             crate::board::publish_board(state, &candidate.project_id).await;
             state.notify.notify_waiters();
         }

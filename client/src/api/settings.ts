@@ -39,17 +39,22 @@ export type AgentSlot = (typeof AGENT_SLOTS)[number];
 export const SUPPORTED_HARNESSES = ["claude", "pi"] as const;
 
 /**
- * Harnesses that can reach Dearborn's local MCP server. Mirrors the server's
- * `agent_settings::MCP_CAPABLE_HARNESSES`: only Claude Code speaks MCP among
- * the CLIs Dearborn drives — pi has no MCP client at all.
+ * Harnesses whose engine is currently wired to the Claude Code adapter.
+ * Mirrors the server's `agent_settings::PLANNING_CAPABLE_HARNESSES`: the
+ * planning/breakdown run engines are Claude-Code-bound today — the `dearborn`
+ * CLI those slots call back through is itself harness-agnostic, and pi gains
+ * the engines when they land.
  */
-export const MCP_CAPABLE_HARNESSES = ["claude"] as const;
+export const PLANNING_CAPABLE_HARNESSES = ["claude"] as const;
 
 /**
- * The three slots whose agent calls *back* into Dearborn over MCP (planning
- * maintains the epic record and reads the clone; breakdown writes the task
- * DAG). Mirrors the server's `agent_settings::slot_requires_mcp` — the six
- * task-stage slots act only on their workspace and need nothing from us.
+ * The three slots that are MCP-bound, i.e. bound to a harness that can speak
+ * Dearborn's tool protocol: planning maintains the epic record and reads the
+ * clone, breakdown writes the task DAG, and both call back into the server
+ * through tools. pi has no MCP client (see `dearborn-server/src/harness_pi.rs`),
+ * so the server's `agent_settings::slot_is_claude_only` currently admits only
+ * Claude here — the six task-stage slots act only on their workspace and run
+ * on every supported harness.
  */
 export const MCP_BOUND_SLOTS: readonly AgentSlot[] = [
   "planning_product",
@@ -70,7 +75,7 @@ export function harnessSupportsSlot(harness: string, slot: AgentSlot): boolean {
   }
   return (
     !MCP_BOUND_SLOTS.includes(slot) ||
-    (MCP_CAPABLE_HARNESSES as readonly string[]).includes(harness)
+    (PLANNING_CAPABLE_HARNESSES as readonly string[]).includes(harness)
   );
 }
 

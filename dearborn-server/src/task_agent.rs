@@ -1381,7 +1381,7 @@ const AGENT_TIMEOUT_KILL_GRACE_PERIOD: Duration = Duration::from_secs(5);
 // way, reachable from any unit test in this crate (including a future
 // `worker.rs` test module), but invisible to the separate `tests/*.rs`
 // integration-test crate — those drive the real `CliTaskAgent` instead
-// (see `tests/worker_live.rs`, T-515), the same way `tests/mcp_live.rs` /
+// (see `tests/worker_live.rs`, T-515), the same way the other `#[ignore]`d
 // `tests/ws.rs` already do for planning. If a later phase's integration test
 // genuinely needs the scripted fake, promoting this module to a plain `pub
 // mod` (dropping the `#[cfg(test)]`) is a one-line change; nothing in this
