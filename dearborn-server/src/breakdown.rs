@@ -270,7 +270,8 @@ async fn technical_session_exists(state: &AppState, epic_id: &str) -> AppResult<
 
 /// Prefix every Dearborn-scoped MCP tool name carries on the wire (see
 /// `crate::mcp`): `mcp__dearborn__create_task`, `mcp__dearborn__link_dependency`,
-/// `mcp__dearborn__update_epic`. Harness-side tools (Read, Grep, …) don't match.
+/// `mcp__dearborn__read_codebase_context`. Harness-side tools (Read, Grep, …)
+/// don't match.
 const DEARBORN_MCP_PREFIX: &str = "mcp__dearborn__";
 
 /// What a drained breakdown run leaves behind, persisted after the stream ends.
@@ -591,26 +592,16 @@ async fn rollback_partial_dag(
     }
 }
 
-/// Assemble the plan (PRD) an epic hands the breakdown agent from its title +
-/// product/technical context. `None` if the epic no longer exists.
+/// Assemble the plan (PRD) an epic hands the breakdown agent from its title.
+/// `None` if the epic no longer exists.
+///
+/// The old product/technical context sections are gone with their epic
+/// columns (wayfinder cutover): breakdown will read the living Document in a
+/// later epic task, so for now the plan carries the title only.
 async fn build_plan(state: &AppState, epic_id: &str) -> Option<String> {
     let epic = fetch_epic(state.db.conn(), epic_id).await.ok().flatten()?;
-    let product = epic
-        .product_context
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("(no product context recorded)");
-    let technical = epic
-        .technical_context
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("(no technical context recorded)");
     Some(format!(
-        "The epic to break down is titled \"{title}\".\n\n\
-         --- PRODUCT CONTEXT ---\n{product}\n--- END PRODUCT CONTEXT ---\n\n\
-         --- TECHNICAL CONTEXT ---\n{technical}\n--- END TECHNICAL CONTEXT ---",
+        "The epic to break down is titled \"{title}\".",
         title = epic.title,
     ))
 }
@@ -957,17 +948,6 @@ mod tests {
         let epic_id = create_epic(&app, &project_id).await;
         advance(&app, &epic_id).await;
 
-        // Seed some context so the plan is non-trivial.
-        state
-            .db
-            .conn()
-            .execute(
-                "UPDATE epic SET product_context = 'export feature', technical_context = 'axum route' WHERE id = ?1",
-                params![epic_id.clone()],
-            )
-            .await
-            .unwrap();
-
         let sub = state.hub.subscribe(&format!("epic:{epic_id}"));
 
         let response = trigger(&app, &epic_id).await;
@@ -1001,11 +981,12 @@ mod tests {
             Some("bd-sess")
         );
 
-        // The engine received the plan built from the epic's context.
+        // The engine received the plan built from the epic's context. After
+        // the wayfinder cutover the plan carries the epic's title (the living
+        // Document takes over as the PRD in a later task).
         let runs = recorded.lock().unwrap();
         assert_eq!(runs.len(), 1);
-        assert!(runs[0].plan.contains("export feature"));
-        assert!(runs[0].plan.contains("axum route"));
+        assert!(runs[0].plan.contains("titled \"E\""));
     }
 
     /// A Dearborn-scoped MCP tool call failing must abort the run: the epic
@@ -1180,15 +1161,6 @@ mod tests {
         let project_id = seed_project(&app).await;
         let epic_id = create_epic(&app, &project_id).await;
         advance(&app, &epic_id).await;
-        state
-            .db
-            .conn()
-            .execute(
-                "UPDATE epic SET product_context = 'A todo app', technical_context = 'Rust + libSQL' WHERE id = ?1",
-                params![epic_id.clone()],
-            )
-            .await
-            .unwrap();
         let response = trigger(&app, &epic_id).await;
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         assert_eq!(wait_for_status(&state, &epic_id, "Ready").await, "Ready");

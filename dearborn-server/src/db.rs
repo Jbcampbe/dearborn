@@ -89,6 +89,16 @@ const MIGRATIONS: &[Migration] = &[
         name: "0012_pr_feedback",
         sql: include_str!("../migrations/0012_pr_feedback.sql"),
     },
+    // Planning-map & living-document data model (epic "Wayfinder-Inspired
+    // Planning" §4): map_node, map_node_dependency, node_session, node_message,
+    // document, document_version, document_section, node_asset, the overhauled
+    // comment, and activity; the epic prose cutover adds destination/notes/
+    // not_yet_specified/out_of_scope and drops product_context/technical_context.
+    Migration {
+        id: 13,
+        name: "0013_planning_map_schema",
+        sql: include_str!("../migrations/0013_planning_map_schema.sql"),
+    },
 ];
 
 /// Errors surfaced while opening the database or running migrations.
@@ -830,6 +840,402 @@ mod tests {
         assert!(
             dup.is_err(),
             "duplicate (pr_number, source_kind, github_id) identity must be rejected"
+        );
+    }
+
+    /// Migration `0013_planning_map_schema` lands every planning-map table with
+    /// the exact schema the wayfinder epic plan §4 spells out: documented
+    /// columns, PKs, and FKs (FK enforcement via `PRAGMA foreign_keys = ON`
+    /// rejects orphan rows), plus the epic prose cutover — the four wayfinder
+    /// columns present, product_context/technical_context gone.
+    #[tokio::test]
+    async fn migration_0013_creates_planning_map_tables_and_epic_prose_cutover() {
+        let db = Db::connect(":memory:").await.unwrap();
+        db.run_migrations().await.unwrap();
+
+        // Every §4 table exists.
+        for table in [
+            "map_node",
+            "map_node_dependency",
+            "node_session",
+            "node_message",
+            "document",
+            "document_version",
+            "document_section",
+            "node_asset",
+            "comment",
+            "activity",
+        ] {
+            let mut rows = db
+                .conn()
+                .query(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name=?1",
+                    libsql::params![table],
+                )
+                .await
+                .unwrap();
+            assert!(
+                rows.next().await.unwrap().is_some(),
+                "missing table: {table}"
+            );
+        }
+
+        // Documented columns on each new table (PRAGMA table_info discipline:
+        // a column that merely fails to bind still shows up as missing).
+        let expected_columns: &[(&str, &[&str])] = &[
+            (
+                "map_node",
+                &[
+                    "id",
+                    "epic_id",
+                    "kind",
+                    "task_mode",
+                    "state",
+                    "title",
+                    "question",
+                    "gist",
+                    "out_of_scope_reason",
+                    "created_by",
+                    "resolved_by",
+                    "position_x",
+                    "position_y",
+                    "created_at",
+                    "updated_at",
+                ],
+            ),
+            ("map_node_dependency", &["blocker_id", "blocked_id"]),
+            (
+                "node_session",
+                &[
+                    "node_id",
+                    "harness_session_id",
+                    "status",
+                    "created_at",
+                    "updated_at",
+                ],
+            ),
+            (
+                "node_message",
+                &[
+                    "id",
+                    "node_id",
+                    "role",
+                    "actor_user_id",
+                    "content",
+                    "seq",
+                    "created_at",
+                ],
+            ),
+            (
+                "document",
+                &[
+                    "epic_id",
+                    "html",
+                    "version",
+                    "last_edited_by",
+                    "updated_at",
+                ],
+            ),
+            (
+                "document_version",
+                &[
+                    "epic_id",
+                    "version",
+                    "html",
+                    "editor_user_id",
+                    "node_id",
+                    "created_at",
+                ],
+            ),
+            (
+                "document_section",
+                &[
+                    "epic_id",
+                    "section_id",
+                    "title",
+                    "provenance",
+                    "last_edited_by",
+                    "version",
+                ],
+            ),
+            (
+                "node_asset",
+                &["id", "node_id", "mime", "bytes", "label", "created_at"],
+            ),
+            (
+                "comment",
+                &[
+                    "id",
+                    "epic_id",
+                    "thread_id",
+                    "anchor_kind",
+                    "anchor_id",
+                    "author_user_id",
+                    "is_agent",
+                    "body",
+                    "resolved",
+                    "promoted_node_id",
+                    "created_at",
+                ],
+            ),
+            (
+                "activity",
+                &[
+                    "id",
+                    "epic_id",
+                    "node_id",
+                    "actor_user_id",
+                    "action",
+                    "detail",
+                    "created_at",
+                ],
+            ),
+        ];
+        for (table, columns) in expected_columns {
+            let mut found: Vec<String> = Vec::new();
+            let mut rows = db
+                .conn()
+                .query(&format!("PRAGMA table_info({table})"), ())
+                .await
+                .unwrap();
+            while let Some(row) = rows.next().await.unwrap() {
+                found.push(row.get::<String>(1).unwrap());
+            }
+            for column in *columns {
+                assert!(
+                    found.iter().any(|f| f == column),
+                    "missing column {table}.{column} (have: {found:?})"
+                );
+            }
+        }
+
+        // The epic prose cutover: the four new columns exist; the two
+        // planning-context columns are gone.
+        let mut epic_columns = Vec::new();
+        let mut rows = db
+            .conn()
+            .query("PRAGMA table_info(epic)", ())
+            .await
+            .unwrap();
+        while let Some(row) = rows.next().await.unwrap() {
+            epic_columns.push(row.get::<String>(1).unwrap());
+        }
+        for column in [
+            "destination",
+            "notes",
+            "not_yet_specified",
+            "out_of_scope",
+        ] {
+            assert!(
+                epic_columns.iter().any(|c| c == column),
+                "missing epic.{column}"
+            );
+        }
+        assert!(
+            !epic_columns.iter().any(|c| c == "product_context"),
+            "epic.product_context must be dropped"
+        );
+        assert!(
+            !epic_columns.iter().any(|c| c == "technical_context"),
+            "epic.technical_context must be dropped"
+        );
+
+        // Composite PKs: duplicate map_node_dependency edges and duplicate
+        // (epic_id, version) document rows are rejected.
+        db.conn()
+            .execute(
+                "INSERT INTO project (id, name, repo_url, created_at, updated_at) \
+                 VALUES ('p', 'P', 'https://example.com/p.git', 1, 1)",
+                (),
+            )
+            .await
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO epic (id, project_id, title, created_at, updated_at) \
+                 VALUES ('e', 'p', 'E', 1, 1)",
+                (),
+            )
+            .await
+            .unwrap();
+        let node_row = |id: &str, epic_id: &str| {
+            format!(
+                "INSERT INTO map_node (id, epic_id, kind, state, title, created_at, updated_at) \
+                 VALUES ('{id}', '{epic_id}', 'grilling', 'open', 'T', 1, 1)"
+            )
+        };
+        db.conn()
+            .execute(&node_row("n1", "e"), ())
+            .await
+            .unwrap();
+        db.conn()
+            .execute(&node_row("n2", "e"), ())
+            .await
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO map_node_dependency (blocker_id, blocked_id) VALUES ('n1', 'n2')",
+                (),
+            )
+            .await
+            .unwrap();
+        let dup_edge = db
+            .conn()
+            .execute(
+                "INSERT INTO map_node_dependency (blocker_id, blocked_id) VALUES ('n1', 'n2')",
+                (),
+            )
+            .await;
+        assert!(dup_edge.is_err(), "duplicate dependency edge must be rejected");
+
+        db.conn()
+            .execute(
+                "INSERT INTO document (epic_id, html, version, updated_at) \
+                 VALUES ('e', '<p>x</p>', 1, 1)",
+                (),
+            )
+            .await
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO document_version (epic_id, version, html, created_at) \
+                 VALUES ('e', 1, '<p>x</p>', 1)",
+                (),
+            )
+            .await
+            .unwrap();
+        let dup_version = db
+            .conn()
+            .execute(
+                "INSERT INTO document_version (epic_id, version, html, created_at) \
+                 VALUES ('e', 1, '<p>x2</p>', 2)",
+                (),
+            )
+            .await;
+        assert!(
+            dup_version.is_err(),
+            "duplicate (epic_id, version) must be rejected"
+        );
+
+        // FK enforcement: nodes/edges/messages/assets referencing missing rows
+        // are rejected (PRAGMA foreign_keys = ON).
+        let orphan_node = db.conn().execute(&node_row("orphan", "ghost"), ()).await;
+        assert!(orphan_node.is_err(), "FK violation on epic_id must be rejected");
+        let orphan_edge = db
+            .conn()
+            .execute(
+                "INSERT INTO map_node_dependency (blocker_id, blocked_id) VALUES ('ghost', 'n2')",
+                (),
+            )
+            .await;
+        assert!(orphan_edge.is_err(), "FK violation on blocker_id must be rejected");
+        let orphan_message = db
+            .conn()
+            .execute(
+                "INSERT INTO node_message (id, node_id, role, content, seq, created_at) \
+                 VALUES ('m1', 'ghost', 'user', 'hi', 1, 1)",
+                (),
+            )
+            .await;
+        assert!(orphan_message.is_err(), "FK violation on node_id must be rejected");
+        let orphan_asset = db
+            .conn()
+            .execute(
+                "INSERT INTO node_asset (id, node_id, mime, bytes, created_at) \
+                 VALUES ('a1', 'ghost', 'text/html', X'00', 1)",
+                (),
+            )
+            .await;
+        assert!(orphan_asset.is_err(), "FK violation on node_id must be rejected");
+
+        // The overhauled comment anchors to a node and defaults its flags.
+        db.conn()
+            .execute(
+                "INSERT INTO comment (id, epic_id, thread_id, anchor_kind, anchor_id, body, created_at) \
+                 VALUES ('c1', 'e', 't1', 'node', 'n1', 'hello', 1)",
+                (),
+            )
+            .await
+            .unwrap();
+        let mut rows = db
+            .conn()
+            .query("SELECT is_agent, resolved FROM comment WHERE id = 'c1'", ())
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("comment row");
+        assert_eq!(row.get::<i64>(0).unwrap(), 0, "is_agent defaults to 0");
+        assert_eq!(row.get::<i64>(1).unwrap(), 0, "resolved defaults to 0");
+    }
+
+    /// The planning-map cutover leaves Ready/InProgress epics intact: on a DB
+    /// migrated through 0013, a pre-existing epic row with executor columns
+    /// populated still round-trips, and the executor task tables/claim indexes
+    /// are untouched (planning nodes are a separate namespace).
+    #[tokio::test]
+    async fn migration_0013_keeps_existing_ready_and_in_progress_epics_intact() {
+        let db = Db::connect(":memory:").await.unwrap();
+        db.run_migrations().await.unwrap();
+
+        db.conn()
+            .execute(
+                "INSERT INTO project (id, name, repo_url, created_at, updated_at) \
+                 VALUES ('p', 'P', 'https://example.com/p.git', 1, 1)",
+                (),
+            )
+            .await
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO epic (id, project_id, title, status, pr_url, pr_number, \
+                 created_at, updated_at) \
+                 VALUES ('e-ready', 'p', 'Shipped', 'Ready', \
+                 'https://github.com/acme/demo/pull/7', 7, 1, 1)",
+                (),
+            )
+            .await
+            .unwrap();
+        db.conn()
+            .execute(
+                "INSERT INTO task (id, epic_id, project_id, title, status, created_at, updated_at) \
+                 VALUES ('t1', 'e-ready', 'p', 'Slice', 'Done', 1, 1)",
+                (),
+            )
+            .await
+            .unwrap();
+
+        // The Ready epic keeps its executor state; nothing was backfilled or
+        // cleared by the cutover (destination etc. simply stay NULL).
+        let mut rows = db
+            .conn()
+            .query(
+                "SELECT status, pr_url, pr_number, destination, notes FROM epic WHERE id = 'e-ready'",
+                (),
+            )
+            .await
+            .unwrap();
+        let row = rows.next().await.unwrap().expect("epic row");
+        assert_eq!(row.get::<String>(0).unwrap(), "Ready");
+        assert_eq!(
+            row.get::<String>(1).unwrap(),
+            "https://github.com/acme/demo/pull/7"
+        );
+        assert_eq!(row.get::<i64>(2).unwrap(), 7);
+        assert_eq!(row.get::<Option<String>>(3).unwrap(), None);
+        assert_eq!(row.get::<Option<String>>(4).unwrap(), None);
+
+        // The executor's claim index (idx_task_claim) still exists — planning
+        // tables are additive and did not disturb the task namespace.
+        let mut rows = db
+            .conn()
+            .query(
+                "SELECT name FROM sqlite_master WHERE type='index' AND name='idx_task_claim'",
+                (),
+            )
+            .await
+            .unwrap();
+        assert!(
+            rows.next().await.unwrap().is_some(),
+            "idx_task_claim must survive the planning-map migration"
         );
     }
 }

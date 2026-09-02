@@ -2554,8 +2554,6 @@ async fn run_epic_pipeline_inner(state: AppState, epic_id: String, lease: LeaseH
         let epic_ctx = EpicContext {
             title: &epic.title,
             description: epic.description.as_deref(),
-            product_context: epic.product_context.as_deref(),
-            technical_context: epic.technical_context.as_deref(),
         };
 
         match process_one_task(
@@ -8825,8 +8823,8 @@ mod tests {
 
     /// The D8 prompt actually carries the epic's background and the sibling
     /// manifest, not a bare spec: A's prompt lists B under "Owned by later
-    /// tasks" (with the epic's description/product/technical context all
-    /// present); once A is Done, B's prompt lists A under "Already built".
+    /// tasks" (with the epic's description present); once A is Done, B's
+    /// prompt lists A under "Already built".
     #[tokio::test]
     async fn implement_prompt_includes_epic_context_and_sibling_manifest() {
         let agent = Arc::new(ScriptedTaskAgent::new());
@@ -8840,14 +8838,8 @@ mod tests {
             .db
             .conn()
             .execute(
-                "UPDATE epic SET description = ?1, product_context = ?2, technical_context = ?3 \
-                 WHERE id = ?4",
-                params![
-                    "Let users manage their profile.",
-                    "Users abandon onboarding at the profile step.",
-                    "REST endpoints backed by the existing user table.",
-                    epic_id.clone(),
-                ],
+                "UPDATE epic SET description = ?1 WHERE id = ?2",
+                params!["Let users manage their profile.", epic_id.clone()],
             )
             .await
             .unwrap();
@@ -8873,12 +8865,6 @@ mod tests {
         // A's prompt: epic context present; B listed as owned by a later task.
         assert!(runs[0].prompt.contains("Epic Context"));
         assert!(runs[0].prompt.contains("Let users manage their profile."));
-        assert!(runs[0]
-            .prompt
-            .contains("Users abandon onboarding at the profile step."));
-        assert!(runs[0]
-            .prompt
-            .contains("REST endpoints backed by the existing user table."));
         assert!(runs[0].prompt.contains("Owned by later tasks"));
         assert!(runs[0].prompt.contains("Wire the profile API"));
 

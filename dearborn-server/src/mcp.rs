@@ -1,21 +1,19 @@
 //! Dearborn's in-process **local MCP server** for the planning agent (T-203).
 //!
 //! During an interactive planning run, the shelled-out Claude Code agent connects
-//! *back* to Dearborn over MCP to maintain the epic record and inspect the
-//! project's code. Per MILESTONE_1 §2.4 / ARCHITECTURE §11 the planning tool
-//! surface is exactly two tools:
+//! *back* to Dearborn over MCP to inspect the project's code. Per MILESTONE_1
+//! §2.4 / ARCHITECTURE §11 the planning tool surface is exactly one tool (the
+//! old `update_epic` context-writer went away with its epic columns in the
+//! wayfinder schema cutover):
 //!
-//! * [`update_epic`](tool_update_epic) — write the epic's planning context for
-//!   the run's phase (`product`→`product_context`, `technical`→`technical_context`).
 //! * [`read_codebase_context`](tool_read_codebase_context) — **read-only** access
 //!   to the project's canonical clone (list dirs / read files), confined to the
 //!   clone root.
 //!
 //! ## Transport: in-process HTTP (streamable-http), not stdio
 //!
-//! Dearborn is already a live axum server and `update_epic` must mutate the
-//! **shared libSQL DB** and publish a WS event on the **in-memory [`Hub`]** — a
-//! stdio subprocess could reach neither. So Dearborn hosts the MCP server itself
+//! Dearborn is already a live axum server and MCP tools must reach the
+//! **shared libSQL DB** and the **in-memory [`Hub`]** — a stdio subprocess could reach neither. So Dearborn hosts the MCP server itself
 //! as a route ([`mcp_endpoint`], `POST /mcp/:cap`) speaking minimal JSON-RPC 2.0
 //! over HTTP (the MCP "streamable HTTP" transport). Only two tools are exposed,
 //! so a hand-rolled JSON-RPC endpoint keeps deps lean — no `rmcp`. Requests get a
@@ -29,11 +27,10 @@
 //! carried as the `:cap` path segment of the MCP URL. Each token maps server-side
 //! to a fixed [`CapabilityScope`] — `{ epic_id, phase, clone_path }`. The agent
 //! never supplies the target epic/phase: they come from the token's scope, so a
-//! token minted for epic A + `product` can only ever write epic A's
-//! `product_context` and read A's clone. It cannot address another epic, change
-//! `status`/lane/`branch_name`/leases, or escape the clone directory. The token
-//! is short-lived (TTL) and the run holds a [`CapabilityGuard`] that revokes it
-//! when the run ends.
+//! token minted for epic A + `product` can only ever read A's clone. It cannot
+//! address another epic, change `status`/lane/`branch_name`/leases, or escape
+//! the clone directory. The token is short-lived (TTL) and the run holds a
+//! [`CapabilityGuard`] that revokes it when the run ends.
 
 use std::collections::HashMap;
 use std::path::{Component, Path, PathBuf};
@@ -48,7 +45,6 @@ use axum::{
 };
 use serde_json::{json, Value};
 
-use crate::epics::update_epic_context;
 use crate::tasks;
 use crate::{AppError, AppState};
 
@@ -56,9 +52,10 @@ use crate::{AppError, AppState};
 pub const MCP_SERVER_NAME: &str = "dearborn";
 
 /// The phase-scoped `--allowedTools` allow-list value for a planning run
-/// (MILESTONE_1 §2.4). These are the *only* tools the agent may call.
-pub const PLANNING_ALLOWED_TOOLS: &str =
-    "mcp__dearborn__update_epic,mcp__dearborn__read_codebase_context";
+/// (MILESTONE_1 §2.4). These are the *only* tools the agent may call. The old
+/// `update_epic` context-writing tool is gone with its epic columns (wayfinder
+/// cutover) — planning keeps only the read-only codebase access.
+pub const PLANNING_ALLOWED_TOOLS: &str = "mcp__dearborn__read_codebase_context";
 
 /// The phase-scoped `--allowedTools` allow-list value for a breakdown run
 /// (MILESTONE_1 §2.4). These are the *only* tools the breakdown agent may call.
@@ -86,7 +83,7 @@ pub struct CapabilityScope {
     /// to set `task.project_id`; the agent never supplies it).
     pub project_id: String,
     /// The phase whose tool surface + scope this token grants:
-    /// `product` | `technical` (planning: `update_epic` + `read_codebase_context`)
+    /// `product` | `technical` (planning: `read_codebase_context`)
     /// or `breakdown` (`create_task` + `link_dependency`).
     pub phase: String,
     /// The project's canonical read-only clone; the confinement root for reads.
@@ -286,7 +283,7 @@ fn initialize_result(params: &Value) -> Value {
     })
 }
 
-/// The `tools/list` result, scoped to `phase`: the two planning tools for
+/// The `tools/list` result, scoped to `phase`: the codebase-read tool for
 /// `product`/`technical`, or the two breakdown tools for `breakdown`.
 fn tools_list_result(phase: &str) -> Value {
     if phase == "breakdown" {
@@ -294,26 +291,6 @@ fn tools_list_result(phase: &str) -> Value {
     }
     json!({
         "tools": [
-            {
-                "name": "update_epic",
-                "description": "Maintain THIS epic's planning context for the current \
-                    planning phase. Call it whenever the shared understanding advances; \
-                    the `content` you pass REPLACES the stored context (send the full \
-                    up-to-date context, in markdown). The target epic and phase are fixed \
-                    by the planning session — you cannot address another epic or change \
-                    the epic's status, lane, or branch.",
-                "inputSchema": {
-                    "type": "object",
-                    "properties": {
-                        "content": {
-                            "type": "string",
-                            "description": "The full, current planning context (markdown) \
-                                to store for this epic + phase."
-                        }
-                    },
-                    "required": ["content"]
-                }
-            },
             {
                 "name": "read_codebase_context",
                 "description": "Read-only access to the project's canonical clone. With no \
@@ -403,7 +380,6 @@ async fn tools_call(
     let args = params.get("arguments").cloned().unwrap_or(Value::Null);
 
     let outcome = match name {
-        "update_epic" => tool_update_epic(state, scope, &args).await,
         "read_codebase_context" => tool_read_codebase_context(scope, &args).await,
         "create_task" => tool_create_task(state, scope, &args).await,
         "link_dependency" => tool_link_dependency(state, scope, &args).await,
@@ -420,50 +396,6 @@ async fn tools_call(
             json!({ "content": [{ "type": "text", "text": message }], "isError": true })
         }
     })
-}
-
-// ---- tool: update_epic ---------------------------------------------------
-
-/// Write the scoped epic+phase context column, bump `updated_at`, and publish an
-/// `epic_updated` event on `epic:<id>` so the client updates live. The epic and
-/// phase come from `scope`, never from `args`, so the agent cannot retarget.
-async fn tool_update_epic(
-    state: &AppState,
-    scope: &CapabilityScope,
-    args: &Value,
-) -> Result<String, String> {
-    let content = extract_content(args)
-        .ok_or_else(|| "update_epic requires a non-empty `content` string".to_string())?;
-
-    let epic = update_epic_context(state.db.conn(), &scope.epic_id, &scope.phase, &content)
-        .await
-        .map_err(|e| format!("failed to update epic: {e}"))?;
-
-    // Live epic record update for subscribers (client Epic view).
-    let payload = serde_json::to_value(&epic).unwrap_or(Value::Null);
-    state
-        .hub
-        .publish(&format!("epic:{}", scope.epic_id), "epic_updated", payload);
-
-    Ok(format!(
-        "Updated {} context for this epic ({} chars).",
-        scope.phase,
-        content.len()
-    ))
-}
-
-/// Pull the context text from a tool-call `arguments` object. Accepts `content`
-/// (canonical) or the phase-named / generic aliases an agent might use; always
-/// writes to the *scoped* column regardless of which key it arrived under.
-fn extract_content(args: &Value) -> Option<String> {
-    for key in ["content", "product_context", "technical_context", "context"] {
-        if let Some(s) = args.get(key).and_then(Value::as_str) {
-            if !s.trim().is_empty() {
-                return Some(s.to_string());
-            }
-        }
-    }
-    None
 }
 
 // ---- tool: create_task (breakdown) ---------------------------------------
@@ -833,18 +765,6 @@ mod tests {
         (status, value)
     }
 
-    async fn read_epic_column(state: &AppState, epic_id: &str, column: &str) -> Option<String> {
-        let sql = format!("SELECT {column} FROM epic WHERE id = ?1");
-        let mut rows = state
-            .db
-            .conn()
-            .query(&sql, libsql::params![epic_id])
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().unwrap();
-        row.get::<Option<String>>(0).unwrap()
-    }
-
     // ---- capability scoping / auth ----
 
     #[tokio::test]
@@ -879,7 +799,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn initialize_then_tools_list_returns_the_two_scoped_tools() {
+    async fn initialize_then_tools_list_returns_the_scoped_tools() {
         let (state, app) = boot().await;
         let (_p, epic_id) = seed_epic(&state, None).await;
         let guard = state.caps.mint(
@@ -911,7 +831,7 @@ mod tests {
         assert_eq!(status, StatusCode::ACCEPTED);
         assert_eq!(body, Value::Null);
 
-        // tools/list → exactly the two planning tools.
+        // tools/list → exactly the phase-scoped planning tools.
         let (_status, listed) = rpc(
             &app,
             guard.token(),
@@ -920,143 +840,7 @@ mod tests {
         .await;
         let tools = listed["result"]["tools"].as_array().unwrap();
         let names: Vec<&str> = tools.iter().map(|t| t["name"].as_str().unwrap()).collect();
-        assert_eq!(names, vec!["update_epic", "read_codebase_context"]);
-    }
-
-    // ---- update_epic ----
-
-    #[tokio::test]
-    async fn update_epic_writes_scoped_column_and_publishes_ws_event() {
-        let (state, app) = boot().await;
-        let (_p, epic_id) = seed_epic(&state, None).await;
-        let guard = state.caps.mint(
-            epic_id.clone(),
-            "proj".into(),
-            "product".into(),
-            PathBuf::from("/tmp"),
-        );
-
-        // Subscribe BEFORE the call so we catch the epic_updated frame.
-        let mut sub = state.hub.subscribe(&format!("epic:{epic_id}"));
-
-        let (status, body) = rpc(
-            &app,
-            guard.token(),
-            json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
-                   "params":{"name":"update_epic","arguments":{"content":"The product is X."}}}),
-        )
-        .await;
-        assert_eq!(status, StatusCode::OK);
-        assert_eq!(body["result"]["isError"], false);
-
-        // The scoped column changed; the other phase's column stayed NULL.
-        assert_eq!(
-            read_epic_column(&state, &epic_id, "product_context")
-                .await
-                .as_deref(),
-            Some("The product is X.")
-        );
-        assert_eq!(
-            read_epic_column(&state, &epic_id, "technical_context").await,
-            None
-        );
-
-        // A live epic_updated event carried the updated record.
-        let frame = sub.recv().await.unwrap();
-        let value: Value = serde_json::from_str(&frame).unwrap();
-        assert_eq!(value["type"], "epic_updated");
-        assert_eq!(value["topic"], format!("epic:{epic_id}"));
-        assert_eq!(value["payload"]["product_context"], "The product is X.");
-    }
-
-    #[tokio::test]
-    async fn technical_scope_writes_technical_column() {
-        let (state, app) = boot().await;
-        let (_p, epic_id) = seed_epic(&state, None).await;
-        let guard = state.caps.mint(
-            epic_id.clone(),
-            "proj".into(),
-            "technical".into(),
-            PathBuf::from("/tmp"),
-        );
-
-        rpc(
-            &app,
-            guard.token(),
-            json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
-                   "params":{"name":"update_epic","arguments":{"content":"Use libSQL."}}}),
-        )
-        .await;
-        assert_eq!(
-            read_epic_column(&state, &epic_id, "technical_context")
-                .await
-                .as_deref(),
-            Some("Use libSQL.")
-        );
-        assert_eq!(
-            read_epic_column(&state, &epic_id, "product_context").await,
-            None
-        );
-    }
-
-    #[tokio::test]
-    async fn update_epic_cannot_touch_status_or_another_epic() {
-        let (state, app) = boot().await;
-        let (_p, epic_a) = seed_epic(&state, None).await;
-        // A second epic B in the same project.
-        let (project_id, _) = seed_epic(&state, None).await;
-        let epic_b = ulid::Ulid::new().to_string();
-        state
-            .db
-            .conn()
-            .execute(
-                "INSERT INTO epic (id, project_id, title, status, created_at, updated_at) \
-                 VALUES (?1, ?2, 'B', 'Planning', ?3, ?3)",
-                libsql::params![epic_b.clone(), project_id, now_ms()],
-            )
-            .await
-            .unwrap();
-
-        // A token for epic A. The agent can't name epic B or a status field — the
-        // scope fixes the target — but we also pass hostile args to prove they're
-        // ignored.
-        let guard = state.caps.mint(
-            epic_a.clone(),
-            "proj".into(),
-            "product".into(),
-            PathBuf::from("/tmp"),
-        );
-        rpc(
-            &app,
-            guard.token(),
-            json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
-            "params":{"name":"update_epic","arguments":{
-                "content":"ctx",
-                "epic_id": epic_b,           // ignored
-                "status": "InProgress"       // ignored
-            }}}),
-        )
-        .await;
-
-        // Epic A got the context; its status is unchanged; epic B is untouched.
-        assert_eq!(
-            read_epic_column(&state, &epic_a, "product_context")
-                .await
-                .as_deref(),
-            Some("ctx")
-        );
-        assert_eq!(
-            read_epic_column(&state, &epic_a, "status").await.as_deref(),
-            Some("Planning")
-        );
-        assert_eq!(
-            read_epic_column(&state, &epic_b, "product_context").await,
-            None
-        );
-        assert_eq!(
-            read_epic_column(&state, &epic_b, "status").await.as_deref(),
-            Some("Planning")
-        );
+        assert_eq!(names, vec!["read_codebase_context"]);
     }
 
     #[tokio::test]

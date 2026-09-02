@@ -341,11 +341,11 @@ pub fn is_supported_harness(harness: &str) -> bool {
 /// Whether a slot's run needs the agent to call *back* into Dearborn over MCP.
 ///
 /// True for exactly the three planning-side slots: `planning_product` and
-/// `planning_technical` maintain the epic record through `update_epic` and
-/// read the canonical clone through `read_codebase_context`; `breakdown`
-/// builds the task DAG through `create_task`/`link_dependency`. The five
-/// task-stage slots act on a checked-out workspace with the CLI's own file
-/// tools and never call home, so they impose no such requirement.
+/// `planning_technical` read the canonical clone through
+/// `read_codebase_context`; `breakdown` builds the task DAG through
+/// `create_task`/`link_dependency`. The five task-stage slots act on a
+/// checked-out workspace with the CLI's own file tools and never call home,
+/// so they impose no such requirement.
 pub fn slot_requires_mcp(slot: AgentSlot) -> bool {
     match slot {
         AgentSlot::PlanningProduct | AgentSlot::PlanningTechnical | AgentSlot::Breakdown => true,

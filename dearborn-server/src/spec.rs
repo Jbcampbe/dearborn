@@ -155,10 +155,6 @@ pub struct EpicContext<'a> {
     pub title: &'a str,
     /// The epic's free-text description, if recorded.
     pub description: Option<&'a str>,
-    /// Product-planning context maintained live during planning, if any.
-    pub product_context: Option<&'a str>,
-    /// Technical-planning context maintained live during planning, if any.
-    pub technical_context: Option<&'a str>,
 }
 
 /// Everything [`build_context`] needs to render the D8 prompt-context block:
@@ -240,16 +236,6 @@ pub fn build_context(ctx: &TaskContext) -> String {
         if let Some(description) = non_empty_opt(epic.description) {
             out.push('\n');
             out.push_str(description);
-            out.push('\n');
-        }
-        if let Some(product) = non_empty_opt(epic.product_context) {
-            out.push_str("\n### Product Context\n");
-            out.push_str(product);
-            out.push('\n');
-        }
-        if let Some(technical) = non_empty_opt(epic.technical_context) {
-            out.push_str("\n### Technical Context\n");
-            out.push_str(technical);
             out.push('\n');
         }
     }
@@ -654,14 +640,12 @@ mod tests {
     }
 
     #[test]
-    fn emits_epic_context_with_product_and_technical_context() {
+    fn emits_epic_context_with_title_and_description() {
         let ctx = TaskContext {
             spec: spec("Task in an epic"),
             epic: Some(EpicContext {
                 title: "Checkout flow",
                 description: Some("Let users pay."),
-                product_context: Some("Users abandon carts at the payment step."),
-                technical_context: Some("Stripe, webhook-driven confirmation."),
             }),
             siblings: &[],
             base_sha: None,
@@ -670,21 +654,15 @@ mod tests {
         assert!(rendered.contains("## Epic Context"));
         assert!(rendered.contains("Checkout flow"));
         assert!(rendered.contains("Let users pay."));
-        assert!(rendered.contains("### Product Context"));
-        assert!(rendered.contains("Users abandon carts at the payment step."));
-        assert!(rendered.contains("### Technical Context"));
-        assert!(rendered.contains("Stripe, webhook-driven confirmation."));
     }
 
     #[test]
-    fn epic_with_no_recorded_context_skips_empty_subsections() {
+    fn epic_with_no_description_still_emits_the_epic_header() {
         let ctx = TaskContext {
             spec: spec("Task in a thin epic"),
             epic: Some(EpicContext {
                 title: "Bare epic",
                 description: None,
-                product_context: None,
-                technical_context: None,
             }),
             siblings: &[],
             base_sha: None,
@@ -692,8 +670,6 @@ mod tests {
         let rendered = build_context(&ctx);
         assert!(rendered.contains("## Epic Context"));
         assert!(rendered.contains("Bare epic"));
-        assert!(!rendered.contains("### Product Context"));
-        assert!(!rendered.contains("### Technical Context"));
     }
 
     #[test]

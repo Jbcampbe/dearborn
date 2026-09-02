@@ -68,16 +68,15 @@ pub struct PlanningConfig {
     pub slot: crate::agent_slot::AgentSlot,
     /// Appended to the agent via `--append-system-prompt`; stable across turns.
     pub system_prompt: &'static str,
-    /// Whether this phase exposes Dearborn's planning MCP tools (`update_epic`,
-    /// `read_codebase_context`) to the agent. When `true`, [`spawn_run`] mints a
+    /// Whether this phase exposes Dearborn's planning MCP tools
+    /// (`read_codebase_context`) to the agent. When `true`, [`spawn_run`] mints a
     /// capability token, wires `--mcp-config`/`--allowedTools`, and points `cwd`
     /// at the project's read-only clone (T-203).
     pub tools_enabled: bool,
 }
 
-/// Product-planning role (T-202/T-203). A conversational planner that also has
-/// the phase-scoped MCP tools: it maintains the epic's `product_context` via
-/// `update_epic` and may inspect the project's canonical clone (read-only) via
+/// Product-planning role (T-202/T-203). A conversational planner that may
+/// inspect the project's canonical clone (read-only) via
 /// `read_codebase_context`.
 pub const PRODUCT_PLANNING: PlanningConfig = PlanningConfig {
     phase: "product",
@@ -95,27 +94,23 @@ scope boundaries, and concrete acceptance criteria. Draw out ambiguity by asking
 one or two sharp questions at a time rather than interrogating. Do not design the \
 technical implementation — a separate technical-planning phase handles that later.
 
-You have two tools:
-- `update_epic`: keep the epic's product context current. Whenever the shared \
-understanding advances, call it with the FULL up-to-date product context (markdown); \
-the value you pass REPLACES the stored context. Do this proactively as the plan \
-firms up, not only when asked.
+You have one tool:
 - `read_codebase_context`: read-only access to the project's code (list \
 directories, read files) to ground the plan in what already exists.
 
-You must NOT modify the codebase, run commands, or change the epic's status, lane, \
-or anything beyond its product context — those tools are the entire surface you have. \
+You must NOT modify the codebase, run commands, or change the epic's status or lane — \
+that tool is the entire surface you have. \
 Be concise and conversational.";
 
 /// Technical-planning role (T-205). The second half of planning: given a
 /// product definition already agreed in the product phase, this planner works
 /// out *how* to build it. It has the same tool surface as product planning
-/// (`update_epic` + `read_codebase_context`) but maintains the epic's
-/// `technical_context` and is steered to ground every decision in the real code.
+/// (`read_codebase_context`) and is steered to ground every decision in the
+/// real code.
 ///
-/// The product outcome does not carry over automatically — each phase is its own
-/// harness session — so [`spawn_run`] seeds the prior product context into this
-/// run's continuity preamble (see [`PlanningRunRequest::continuity`]).
+/// Each phase is its own harness session, so [`spawn_run`] seeds this run's
+/// continuity preamble with the epic it continues (see
+/// [`PlanningRunRequest::continuity`]).
 pub const TECHNICAL_PLANNING: PlanningConfig = PlanningConfig {
     phase: "technical",
     slot: crate::agent_slot::AgentSlot::PlanningTechnical,
@@ -125,23 +120,19 @@ pub const TECHNICAL_PLANNING: PlanningConfig = PlanningConfig {
 
 pub(crate) const TECHNICAL_PLANNING_PROMPT: &str = "\
 You are Dearborn's technical-planning partner. The product-planning phase has \
-already agreed WHAT to build (its outcome is provided to you as the product \
-context). Your job is to work out HOW: the technical approach, architecture, the \
-concrete files and modules to touch, data model / API changes, sequencing, and \
-technical risks.
+already agreed WHAT to build. Your job is to work out HOW: the technical approach, \
+architecture, the concrete files and modules to touch, data model / API changes, \
+sequencing, and technical risks.
 
 Ground every decision in the ACTUAL code, not assumptions:
 - `read_codebase_context`: read-only access to the project's canonical clone \
 (list directories, read files). Inspect the real structure, existing patterns, \
 and the specific files your plan would change BEFORE proposing an approach. Quote \
 what you find.
-- `update_epic`: keep the epic's technical context current. Whenever the approach \
-firms up, call it with the FULL up-to-date technical plan (markdown); the value you \
-pass REPLACES the stored technical context. Do this proactively, not only when asked.
 
-Build on the product context — do not re-open settled product decisions. You must \
-NOT modify the codebase, run commands, or change the epic's status, lane, or \
-anything beyond its technical context — those two tools are your entire surface. \
+Build on the product phase's decisions — do not re-open settled product decisions. \
+You must NOT modify the codebase, run commands, or change the epic's status or lane — \
+that tool is your entire surface. \
 Be concise and conversational, asking one or two sharp questions at a time.";
 
 /// Resolve the [`PlanningConfig`] for a transcript phase, or `None` if the phase
@@ -154,24 +145,14 @@ pub fn config_for_phase(phase: &str) -> Option<&'static PlanningConfig> {
     }
 }
 
-/// Build the technical phase's continuity preamble from the epic's title and the
-/// `product_context` the product phase produced. Returned as a system-prompt
-/// block so the technical planner builds on the settled product decisions rather
-/// than re-deriving them. Best-effort: on a DB error / missing epic it returns
+/// Build the technical phase's continuity preamble from the epic's title.
+/// Returned as a system-prompt block so the technical planner knows which
+/// epic it is continuing. Best-effort: on a DB error / missing epic it returns
 /// `None` and the run proceeds without the seed (the tools still work).
 async fn technical_continuity(conn: &Connection, epic_id: &str) -> Option<String> {
     let epic = fetch_epic(conn, epic_id).await.ok().flatten()?;
-    let product = epic
-        .product_context
-        .as_deref()
-        .map(str::trim)
-        .filter(|s| !s.is_empty())
-        .unwrap_or("(the product phase recorded no product context)");
     Some(format!(
-        "You are continuing planning for the epic titled \"{title}\".\n\n\
-         The product-planning phase already produced the product context below. \
-         Treat it as settled input and build your technical plan on top of it:\n\n\
-         --- PRODUCT CONTEXT ---\n{product}\n--- END PRODUCT CONTEXT ---",
+        "You are continuing planning for the epic titled \"{title}\".",
         title = epic.title,
     ))
 }
@@ -209,7 +190,7 @@ pub struct PlanningRunRequest {
     /// Cross-phase continuity, appended as a *second* system prompt (T-205).
     /// Because each phase is its own harness session, a later phase cannot see an
     /// earlier phase's conversation; [`spawn_run`] seeds the prior phase's outcome
-    /// here (e.g. the technical run receives the epic's `product_context` + title)
+    /// here (e.g. the technical run receives the epic's title as continuity)
     /// so the run builds on it. `None` for the first phase, which has no prior.
     pub continuity: Option<String>,
     /// MCP wiring for a tools-enabled phase (T-203). `None` for a plain
@@ -261,7 +242,7 @@ impl PlanningAgent for ClaudePlanningAgent {
         // into a state the API refuses to create. Surface loudly through the
         // same synthetic Error+Exited stream a spawn failure uses — the trait's
         // return type has no room for a `Result`. Planning is MCP-bound (the
-        // agent calls `update_epic`/`read_codebase_context` back into Dearborn),
+        // agent calls `read_codebase_context` back into Dearborn),
         // so this rejects an MCP-incapable harness as well as an unknown one.
         if !crate::agent_settings::harness_supports_slot(&req.harness, req.slot) {
             let (tx, rx) = std::sync::mpsc::channel();
@@ -289,8 +270,8 @@ impl PlanningAgent for ClaudePlanningAgent {
             extra_args.push(continuity.clone());
         }
         // Tools-enabled phase (T-203): wire Dearborn's local MCP server exactly as
-        // the T-200 spike proved. Read-only is enforced by the allow-list (only the
-        // two planning tools) + the read-only clone as `cwd`, NOT by `RunMode`.
+        // the T-200 spike proved. Read-only is enforced by the allow-list (the
+        // codebase-read tool) + the read-only clone as `cwd`, NOT by `RunMode`.
         if let Some(mcp) = &req.mcp {
             extra_args.push("--mcp-config".to_string());
             extra_args.push(mcp.config_path.to_string_lossy().into_owned());
@@ -1159,16 +1140,8 @@ mod tests {
         );
         wait_for_transcript(&state, &epic_id, 2).await; // user + agent
 
-        // Record a product context, so the technical continuity has real content.
-        state
-            .db
-            .conn()
-            .execute(
-                "UPDATE epic SET product_context = ?1 WHERE id = ?2",
-                libsql::params!["Users need one-click export.".to_string(), epic_id.clone()],
-            )
-            .await
-            .unwrap();
+        // Record nothing: the old product-context column is gone (wayfinder
+        // cutover); the technical continuity carries the epic title only.
 
         // Advance product → technical.
         let advanced = advance_phase(&app, &epic_id).await;
@@ -1201,7 +1174,7 @@ mod tests {
         let roles: Vec<&str> = items.iter().map(|m| m["role"].as_str().unwrap()).collect();
         assert_eq!(roles, vec!["user", "agent", "user", "agent"]);
 
-        // The technical run was seeded with the product context (continuity).
+        // The technical run was seeded with the continuity preamble (title).
         let runs = recorded.lock().unwrap();
         assert_eq!(runs.len(), 2, "one product run + one technical run");
         let tech = &runs[1];
@@ -1210,8 +1183,8 @@ mod tests {
             .as_deref()
             .expect("technical run carries continuity");
         assert!(
-            continuity.contains("Users need one-click export."),
-            "continuity must seed the product context, got: {continuity}"
+            continuity.contains("continuing planning"),
+            "continuity must seed the epic title, got: {continuity}"
         );
     }
 
@@ -1313,69 +1286,6 @@ mod tests {
         // Nothing was persisted for the rejected technical message.
         let items = load_transcript(state.db.conn(), &epic_id).await.unwrap();
         assert!(items.is_empty(), "rejected message must not persist");
-    }
-
-    /// The technical run's `update_epic` (via the MCP handler) writes
-    /// `technical_context` and publishes `epic_updated` on `epic:<id>` — the epic
-    /// fills in live during the technical phase exactly as it does for product.
-    #[tokio::test]
-    async fn technical_phase_update_epic_writes_technical_context_and_publishes() {
-        let (state, app) = app_with(Arc::new(SilentPlanningAgent)).await;
-        let project_id = seed_project(&app).await;
-        let epic_id = create_epic(&app, &project_id).await;
-        assert_eq!(
-            advance_phase(&app, &epic_id).await.status(),
-            StatusCode::CREATED
-        );
-
-        // A technical-phase run mints a capability scoped to (epic, technical).
-        let guard = state.caps.mint(
-            epic_id.clone(),
-            project_id.clone(),
-            "technical".into(),
-            std::path::PathBuf::from("/tmp"),
-        );
-
-        let mut sub = state.hub.subscribe(&format!("epic:{epic_id}"));
-
-        let response = app
-            .clone()
-            .oneshot(
-                Request::builder()
-                    .method("POST")
-                    .uri(format!("/mcp/{}", guard.token()))
-                    .header(CONTENT_TYPE, "application/json")
-                    .body(Body::from(
-                        json!({"jsonrpc":"2.0","id":1,"method":"tools/call",
-                               "params":{"name":"update_epic",
-                                         "arguments":{"content":"Add an axum route + libSQL migration."}}})
-                        .to_string(),
-                    ))
-                    .unwrap(),
-            )
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::OK);
-
-        // The technical column filled; product stayed NULL.
-        let epic = crate::epics::fetch_epic(state.db.conn(), &epic_id)
-            .await
-            .unwrap()
-            .unwrap();
-        assert_eq!(
-            epic.technical_context.as_deref(),
-            Some("Add an axum route + libSQL migration.")
-        );
-        assert_eq!(epic.product_context, None);
-
-        // Live epic_updated frame carried the technical context.
-        let frame = sub.recv().await.unwrap();
-        let value: Value = serde_json::from_str(&frame).unwrap();
-        assert_eq!(value["type"], "epic_updated");
-        assert_eq!(
-            value["payload"]["technical_context"],
-            "Add an axum route + libSQL migration."
-        );
     }
 
     /// Ignore-marked live smoke test: drives the REAL `claude` CLI end to end.

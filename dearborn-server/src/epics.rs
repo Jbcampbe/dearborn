@@ -45,7 +45,7 @@ use crate::{git, projects, AppError, AppResult, AppState};
 /// (M2 §2.1) *are* part of the API-facing shape: they tell the user where the
 /// epic's PR landed and, if it stalled, why.
 const EPIC_COLUMNS: &str =
-    "id, project_id, title, description, product_context, technical_context, \
+    "id, project_id, title, description, \
      base_branch, status, pr_url, pr_number, blocked_reason, failure_detail, created_at, updated_at";
 
 /// Columns projected into a [`TranscriptMessage`] DTO, in schema (§2.2) order.
@@ -57,23 +57,22 @@ const INITIAL_PHASE: &str = "product";
 
 /// An epic as returned by the API. Lands in `status='Planning'` on create.
 ///
-/// `product_context` / `technical_context` / `description` are `Option<String>`
-/// so a `NULL` column round-trips as JSON `null` (the contexts are maintained
-/// live by the planning agent in T-203; the description is a user-facing short
-/// blurb shown on kanban cards). `pr_url` / `pr_number` / `blocked_reason`
-/// (M2 §2.1) are populated by the executor: the PR identity once one opens, and
-/// the structured reason (§2.3) if the epic lands in `Blocked` — with
-/// `failure_detail` (Rec 5) alongside it: the same event's redacted,
-/// length-capped message. The lease
-/// columns are deliberately **not** on this struct — see [`EPIC_COLUMNS`].
+/// `description` is `Option<String>` so a `NULL` column round-trips as JSON
+/// `null` (it is a user-facing short blurb shown on kanban cards). The
+/// wayfinder prose (`destination`, `notes`, `not_yet_specified`,
+/// `out_of_scope`) is not projected here yet — the epic-create/PATCH surface
+/// grows those fields when the map workflow replaces linear planning.
+/// `pr_url` / `pr_number` / `blocked_reason` (M2 §2.1) are populated by the
+/// executor: the PR identity once one opens, and the structured reason (§2.3)
+/// if the epic lands in `Blocked` — with `failure_detail` (Rec 5) alongside
+/// it: the same event's redacted, length-capped message. The lease columns
+/// are deliberately **not** on this struct — see [`EPIC_COLUMNS`].
 #[derive(Debug, Serialize)]
 pub struct Epic {
     pub id: String,
     pub project_id: String,
     pub title: String,
     pub description: Option<String>,
-    pub product_context: Option<String>,
-    pub technical_context: Option<String>,
     /// The epic's §5 base-branch override (`None` = project default / repo
     /// default). Set at creation only; immutable afterwards.
     pub base_branch: Option<String>,
@@ -150,7 +149,7 @@ pub struct AppendMessage {
 
 /// `PATCH /epics/{id}` body — manual edits to the epic's user-facing fields
 /// (the Details tab). Every field is optional; absent fields are left
-/// untouched. The context fields are double-options: absent → untouched,
+/// untouched. `description` is a double-option: absent → untouched,
 /// `null` → clear to `NULL`, value → set. `title` must be non-empty when
 /// present (validated in the handler).
 #[derive(Debug, Deserialize)]
@@ -159,10 +158,6 @@ pub struct UpdateEpic {
     title: Option<String>,
     #[serde(default, deserialize_with = "double_option")]
     description: Option<Option<String>>,
-    #[serde(default, deserialize_with = "double_option")]
-    product_context: Option<Option<String>>,
-    #[serde(default, deserialize_with = "double_option")]
-    technical_context: Option<Option<String>>,
 }
 
 /// Deserialize a present-but-maybe-null field into `Some(_)`, leaving an absent
@@ -296,7 +291,7 @@ pub async fn get_epic(
 /// does not exist, `400` on an empty `title`. `200` with the updated epic.
 ///
 /// On success the updated epic is published as `epic_updated` on `epic:<id>` —
-/// the same frame the planning agent's `update_epic` tool emits — so any
+/// the same frame any epic edit emits — so any
 /// subscribed view (planning record, DAG editor, kanban, or a second Details
 /// tab) re-renders live with the manual edit.
 pub async fn update_epic(
@@ -314,11 +309,7 @@ pub async fn update_epic(
         assignments.push("title = ?");
         values.push(Value::Text(require_field(Some(title), "title")?));
     }
-    for (column, field) in [
-        ("description = ?", req.description),
-        ("product_context = ?", req.product_context),
-        ("technical_context = ?", req.technical_context),
-    ] {
+    for (column, field) in [("description = ?", req.description)] {
         if let Some(value) = field {
             assignments.push(column);
             values.push(match value {
@@ -618,41 +609,6 @@ pub async fn get_harness_session_id(
     }
 }
 
-/// Write an epic's phase context column (`product`→`product_context`,
-/// `technical`→`technical_context`), bump `updated_at`, and return the updated
-/// [`Epic`]. Used by the planning agent's `update_epic` MCP tool (T-203); the
-/// **column is chosen from a fixed match on `phase`**, never interpolated from
-/// caller input, so there is no injection surface. `phase` is validated to the
-/// two planning phases; a missing epic is a `404`.
-pub(crate) async fn update_epic_context(
-    conn: &Connection,
-    epic_id: &str,
-    phase: &str,
-    content: &str,
-) -> AppResult<Epic> {
-    let column = match phase {
-        "product" => "product_context",
-        "technical" => "technical_context",
-        other => {
-            return Err(AppError::BadRequest(format!(
-                "`phase` must be `product` or `technical`, got `{other}`"
-            )))
-        }
-    };
-
-    let sql = format!("UPDATE epic SET {column} = ?1, updated_at = ?2 WHERE id = ?3");
-    let affected = conn
-        .execute(&sql, params![content, now_ms(), epic_id])
-        .await?;
-    if affected == 0 {
-        return Err(epic_not_found(epic_id));
-    }
-
-    fetch_epic(conn, epic_id)
-        .await?
-        .ok_or_else(|| AppError::Internal(format!("epic {epic_id} vanished after update")))
-}
-
 /// The `project_id` an epic belongs to, or `None` if the epic is unknown. Used
 /// when minting a capability that needs the project (breakdown's `create_task`,
 /// and planning's scope) without projecting a whole [`Epic`].
@@ -737,16 +693,14 @@ fn row_to_epic(row: &Row) -> Result<Epic, libsql::Error> {
         project_id: row.get(1)?,
         title: row.get(2)?,
         description: row.get(3)?,
-        product_context: row.get(4)?,
-        technical_context: row.get(5)?,
-        base_branch: row.get(6)?,
-        status: row.get(7)?,
-        pr_url: row.get(8)?,
-        pr_number: row.get(9)?,
-        blocked_reason: row.get(10)?,
-        failure_detail: row.get(11)?,
-        created_at: row.get(12)?,
-        updated_at: row.get(13)?,
+        base_branch: row.get(4)?,
+        status: row.get(5)?,
+        pr_url: row.get(6)?,
+        pr_number: row.get(7)?,
+        blocked_reason: row.get(8)?,
+        failure_detail: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
     })
 }
 
@@ -1037,7 +991,6 @@ mod tests {
         assert_eq!(created["status"], "Planning");
         assert_eq!(created["title"], "Ship it");
         assert_eq!(created["project_id"], project_id);
-        assert_eq!(created["product_context"], Json::Null);
 
         // GET one -> equal to the created resource.
         let got = app
@@ -1120,7 +1073,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn update_epic_patches_title_and_contexts_and_publishes() {
+    async fn update_epic_patches_title_and_description_and_publishes() {
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
         let state = AppState::new(Config::for_test(), db);
@@ -1138,8 +1091,7 @@ mod tests {
                 &format!("/epics/{id}"),
                 Some(json!({
                     "title": "New title",
-                    "product_context": "## Why\nShip it.",
-                    "technical_context": "Use the thing.",
+                    "description": "Short blurb.",
                 })),
             ))
             .await
@@ -1147,12 +1099,11 @@ mod tests {
         assert_eq!(patched.status(), StatusCode::OK);
         let epic = body_json(patched).await;
         assert_eq!(epic["title"], "New title");
-        assert_eq!(epic["product_context"], "## Why\nShip it.");
-        assert_eq!(epic["technical_context"], "Use the thing.");
+        assert_eq!(epic["description"], "Short blurb.");
         assert!(epic["updated_at"].as_i64().unwrap() >= created_updated_at);
 
-        // The manual edit is live-published on epic:<id> (same frame the
-        // planning agent's update_epic tool emits).
+        // The manual edit is live-published on epic:<id> (the epic_updated frame
+        // any epic edit emits).
         let frame = sub.recv().await.unwrap();
         let v: Json = serde_json::from_str(&frame).unwrap();
         assert_eq!(v["type"], "epic_updated");
@@ -1173,26 +1124,26 @@ mod tests {
             .oneshot(req(
                 "PATCH",
                 &format!("/epics/{id}"),
-                Some(json!({ "product_context": "ctx" })),
+                Some(json!({ "description": "ctx" })),
             ))
             .await
             .unwrap();
         assert_eq!(patched.status(), StatusCode::OK);
         let epic = body_json(patched).await;
         assert_eq!(epic["title"], "Keep me", "absent title untouched");
-        assert_eq!(epic["product_context"], "ctx");
+        assert_eq!(epic["description"], "ctx");
 
-        // An explicit null clears a context back to NULL.
+        // An explicit null clears the description back to NULL.
         let cleared = app
             .oneshot(req(
                 "PATCH",
                 &format!("/epics/{id}"),
-                Some(json!({ "product_context": null })),
+                Some(json!({ "description": null })),
             ))
             .await
             .unwrap();
         assert_eq!(cleared.status(), StatusCode::OK);
-        assert_eq!(body_json(cleared).await["product_context"], Json::Null);
+        assert_eq!(body_json(cleared).await["description"], Json::Null);
     }
 
     /// A local bare git fixture with `main` + `release/1` heads — the
