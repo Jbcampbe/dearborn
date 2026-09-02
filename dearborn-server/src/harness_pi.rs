@@ -30,10 +30,12 @@
 //! `--mcp-config`, nothing MCP-shaped in `dist/`). That is why Dearborn's
 //! planning and breakdown slots — which used to call back into the server
 //! over a now-retired in-process MCP server — were Claude-only for a while.
-//! Agents now reach Dearborn through the harness-agnostic `dearborn` CLI
-//! ([`crate::cli`]), which any harness able to run a shell command can call;
-//! the slot capability restriction is enforced by
-//! [`crate::agent_settings::harness_supports_slot`], not by this module.
+//!
+//! Agents now reach Dearborn through the `dearborn` CLI ([`crate::cli`]) —
+//! any harness able to run a shell command can call it — but the *slot*
+//! restriction stands: breakdown runs are still driven by the Claude Code
+//! adapter, and [`crate::agent_settings::harness_supports_slot`] (not this
+//! module) is what refuses a non-Claude harness for a Claude-only slot.
 //!
 //! ## Auth
 //!

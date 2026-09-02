@@ -1,0 +1,408 @@
+//! The `dearborn` agent CLI — a thin, authenticated REST client (T-301
+//! follow-up to the MCP retirement).
+//!
+//! Dearborn's agent runs (breakdown today; the per-node planning engines as
+//! they land) mint a per-run capability token ([`crate::capability`]) and hand
+//! the agent a shell command of the form
+//!
+//! ```text
+//! dearborn --url <base> --token <cap> <verb> [flags]
+//! ```
+//!
+//! Every invocation is a fresh process: the global `--url`/`--token` flags
+//! travel with each call (an `export` would not survive between the agent's
+//! tool calls). The CLI speaks plain HTTPS/JSON to Dearborn's REST API with an
+//! `Authorization: Bearer <token>` header; the server's
+//! [`crate::capability::authorize_cap_request`] allow-list keeps a scoped token
+//! able to act **only on its own epic**, so the client itself carries no
+//! privilege logic — the epic is never an argument, it is resolved from the
+//! token's scope via `GET /auth/capability`.
+//!
+//! The verbs (mirrored by the breakdown prompt in [`crate::breakdown`]):
+//!
+//! - `task create --title ... [--description ...] [--acceptance ...] [--blocks id1,id2]`
+//! - `task link BLOCKER BLOCKED`
+//! - `dag` — print the epic's current task DAG
+//! - `scope` — print the token's own capability scope (`GET /auth/capability`)
+//!
+//! Output contract (assumed by the prompt text and the breakdown
+//! `dag_write_failed` guard, which greps run output for [`ERROR_PREFIX`]):
+//! every verb prints the API's JSON on stdout on success, and on any failure
+//! prints `dearborn: <error>` (see [`ERROR_PREFIX`]) to stderr and exits
+//! non-zero.
+
+use serde_json::{json, Value};
+
+/// The substring every CLI failure prints to stderr. [`crate::breakdown`]
+/// greps agent run output for exactly this marker to tell a failed DAG write
+/// (fatal: the epic must stay in `Planning`) from harness-side noise.
+pub const ERROR_PREFIX: &str = "dearborn: ";
+
+/// A CLI failure: an HTTP status (when the API answered) plus a message.
+///
+/// `Display` renders only the message; the binary's error path formats the
+/// full `dearborn: <error>` line around it.
+#[derive(Debug)]
+pub struct CliError {
+    /// HTTP status of the API response, when one arrived.
+    pub status: Option<u16>,
+    /// Human-readable failure message.
+    pub message: String,
+}
+
+impl std::fmt::Display for CliError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self.status {
+            Some(status) => write!(f, "{status}: {}", self.message),
+            None => f.write_str(&self.message),
+        }
+    }
+}
+
+impl CliError {
+    fn transport(err: reqwest::Error) -> CliError {
+        CliError {
+            status: None,
+            message: err.to_string(),
+        }
+    }
+}
+
+/// The authenticated REST client the verbs run through. Cheap to construct —
+/// each CLI invocation builds exactly one.
+pub struct CliClient {
+    /// Dearborn's base URL (e.g. `http://127.0.0.1:8787`), no trailing slash.
+    base_url: String,
+    /// The per-run capability token, sent as `Authorization: Bearer`.
+    token: String,
+    http: reqwest::Client,
+}
+
+impl CliClient {
+    /// Build a client for `base_url` authenticated with `token`.
+    pub fn new(base_url: &str, token: &str) -> Result<CliClient, CliError> {
+        let http = reqwest::Client::builder()
+            .build()
+            .map_err(CliError::transport)?;
+        Ok(CliClient {
+            base_url: base_url.trim_end_matches('/').to_string(),
+            token: token.to_string(),
+            http,
+        })
+    }
+
+    fn url(&self, path: &str) -> String {
+        format!("{}{path}", self.base_url)
+    }
+
+    /// Perform one authenticated request and decode the JSON body.
+    ///
+    /// Error envelope: every API failure renders
+    /// `{ "error": { "code", "message" } }` (see [`crate::error`]) — the
+    /// message is surfaced verbatim so the agent sees the server's exact
+    /// complaint (e.g. a cycle rejection or the list of valid task ids).
+    async fn request(
+        &self,
+        method: reqwest::Method,
+        path: &str,
+        body: Option<Value>,
+    ) -> Result<Value, CliError> {
+        let mut req = self
+            .http
+            .request(method, self.url(path))
+            .bearer_auth(&self.token);
+        if let Some(body) = body {
+            req = req.json(&body);
+        }
+        let response = req.send().await.map_err(CliError::transport)?;
+        let status = response.status();
+        let text = response.text().await.map_err(CliError::transport)?;
+
+        if !status.is_success() {
+            let message = serde_json::from_str::<Value>(&text)
+                .ok()
+                .and_then(|v| {
+                    v["error"]["message"]
+                        .as_str()
+                        .map(|m| m.to_string())
+                })
+                .unwrap_or_else(|| {
+                    // Non-JSON body (proxy page, empty 401): show a truncated
+                    // raw body so the agent still gets something actionable.
+                    let snippet: String = text.chars().take(200).collect();
+                    if snippet.is_empty() {
+                        format!("HTTP {status} with an empty body")
+                    } else {
+                        snippet
+                    }
+                });
+            return Err(CliError {
+                status: Some(status.as_u16()),
+                message,
+            });
+        }
+
+        serde_json::from_str(&text).map_err(|err| CliError {
+            status: Some(status.as_u16()),
+            message: format!("malformed JSON from the API: {err}"),
+        })
+    }
+
+    /// Resolve the token's capability scope (`GET /auth/capability`). Every
+    /// epic-addressed verb derives its path epic from this — the scope is a
+    /// property of the token, never of the agent's arguments.
+    pub async fn scope(&self) -> Result<Value, CliError> {
+        self.request(reqwest::Method::GET, "/auth/capability", None)
+            .await
+    }
+
+    async fn epic_id(&self) -> Result<String, CliError> {
+        let scope = self.scope().await?;
+        Ok(scope["epic_id"].as_str().unwrap_or_default().to_string())
+    }
+
+    /// `task create` — `POST /epics/{scoped epic}/tasks`. Returns the created
+    /// task (its `id` is what later `task link` calls must copy verbatim).
+    pub async fn task_create(
+        &self,
+        title: &str,
+        description: Option<&str>,
+        acceptance: Option<&str>,
+        blocks: &[String],
+    ) -> Result<Value, CliError> {
+        let epic_id = self.epic_id().await?;
+        let body = json!({
+            "title": title,
+            "description": description,
+            "acceptance": acceptance,
+            "blocks": blocks,
+        });
+        self.request(
+            reqwest::Method::POST,
+            &format!("/epics/{epic_id}/tasks"),
+            Some(body),
+        )
+        .await
+    }
+
+    /// `task link` — `POST /epics/{scoped epic}/dependencies`, wiring
+    /// `blocker → blocked` (the blocker must finish first). Both tasks must
+    /// belong to the scoped epic; cycles are rejected by the server.
+    pub async fn task_link(&self, blocker_id: &str, blocked_id: &str) -> Result<Value, CliError> {
+        let epic_id = self.epic_id().await?;
+        let body = json!({
+            "blocker_id": blocker_id,
+            "blocked_id": blocked_id,
+        });
+        self.request(
+            reqwest::Method::POST,
+            &format!("/epics/{epic_id}/dependencies"),
+            Some(body),
+        )
+        .await
+    }
+
+    /// `dag` — `GET /epics/{scoped epic}/dag`, the current task DAG with
+    /// computed per-node readiness.
+    pub async fn dag(&self) -> Result<Value, CliError> {
+        let epic_id = self.epic_id().await?;
+        self.request(reqwest::Method::GET, &format!("/epics/{epic_id}/dag"), None)
+            .await
+    }
+}
+
+// ---- tests ----------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::capability::now_ms;
+    use crate::users::{self, Role};
+    use crate::{app, AppState, Config, Db};
+    use std::path::PathBuf;
+
+    /// Boot state + router and serve it on a random loopback port, so the CLI
+    /// client is exercised over real HTTP against the real API (criterion:
+    /// the CLI client is unit-tested against the API — not a mock).
+    async fn boot() -> (AppState, CliClient) {
+        let db = Db::connect(":memory:").await.unwrap();
+        db.run_migrations().await.unwrap();
+        let state = AppState::new(Config::for_test(), db);
+        let router = app(state.clone());
+
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        tokio::spawn(async move {
+            axum::serve(listener, router).await.unwrap();
+        });
+
+        let client = CliClient::new(&format!("http://{addr}"), "token-to-be-replaced").unwrap();
+        (state, client)
+    }
+
+    /// Insert a project + epic; return ids.
+    async fn seed_epic(state: &AppState) -> (String, String) {
+        let conn = state.db.conn();
+        let now = now_ms();
+        let project_id = ulid::Ulid::new().to_string();
+        conn.execute(
+            "INSERT INTO project (id, name, repo_url, clone_path, clone_status, created_at, updated_at) \
+             VALUES (?1, 'P', 'https://example.com/p.git', NULL, 'ready', ?2, ?2)",
+            libsql::params![project_id.clone(), now],
+        )
+        .await
+        .unwrap();
+        let epic_id = ulid::Ulid::new().to_string();
+        conn.execute(
+            "INSERT INTO epic (id, project_id, title, status, created_at, updated_at) \
+             VALUES (?1, ?2, 'E', 'Planning', ?3, ?3)",
+            libsql::params![epic_id.clone(), project_id.clone(), now],
+        )
+        .await
+        .unwrap();
+        (project_id, epic_id)
+    }
+
+    /// Mint a capability scoped to the epic and a matching client. The guard
+    /// is returned and must stay alive in the test — dropping it revokes the
+    /// token.
+    fn scoped(
+        state: &AppState,
+        client: &CliClient,
+        project_id: &str,
+        epic_id: &str,
+    ) -> (CliClient, crate::capability::CapabilityGuard) {
+        let guard = state.caps.mint(
+            epic_id.to_string(),
+            project_id.to_string(),
+            "breakdown".into(),
+            PathBuf::from("/tmp"),
+        );
+        let cli = CliClient::new(
+            // Reuse the client's base URL; swap only the token.
+            client.base_url.trim_end_matches('/'),
+            guard.token(),
+        )
+        .unwrap();
+        (cli, guard)
+    }
+
+    fn rendered(err: &CliError) -> String {
+        format!("{ERROR_PREFIX}{err}")
+    }
+
+    #[tokio::test]
+    async fn scope_verb_names_the_tokens_capability() {
+        let (state, client) = boot().await;
+        let (project_id, epic_id) = seed_epic(&state).await;
+        let (cli, _guard) = scoped(&state, &client, &project_id, &epic_id);
+
+        let scope = cli.scope().await.unwrap();
+        assert_eq!(scope["kind"], "capability");
+        assert_eq!(scope["epic_id"], epic_id.as_str());
+        assert_eq!(scope["project_id"], project_id.as_str());
+        assert_eq!(scope["phase"], "breakdown");
+        assert!(scope["expires_at"].as_i64().is_some());
+    }
+
+    #[tokio::test]
+    async fn task_create_and_link_and_dag_round_trip_through_the_api() {
+        let (state, client) = boot().await;
+        let (project_id, epic_id) = seed_epic(&state).await;
+        let (cli, _guard) = scoped(&state, &client, &project_id, &epic_id);
+
+        // Create two tasks; the first carries `--blocks` for the second.
+        let blocker = cli
+            .task_create("Blocker", Some("End-to-end slice one"), Some("Demoable"), &[])
+            .await
+            .unwrap();
+        let blocked = cli
+            .task_create("Blocked", None, None, &[blocker["id"].as_str().unwrap().to_string()])
+            .await
+            .unwrap();
+
+        assert_eq!(blocker["epic_id"], epic_id.as_str());
+        assert_eq!(blocker["title"], "Blocker");
+        assert_eq!(blocked["title"], "Blocked");
+
+        // `task link` wires an additional edge (blocker → blocked is already
+        // there via --blocks; link the blocked task back under a second task
+        // to exercise the verb itself). Create a third task first.
+        let third = cli.task_create("Third", None, None, &[]).await.unwrap();
+        let edge = cli
+            .task_link(blocked["id"].as_str().unwrap(), third["id"].as_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(edge["blocker_id"], blocked["id"].as_str().unwrap());
+        assert_eq!(edge["blocked_id"], third["id"].as_str().unwrap());
+
+        // `dag` reflects the two edges.
+        let dag = cli.dag().await.unwrap();
+        let nodes = dag["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 3);
+        let edges = dag["edges"].as_array().unwrap();
+        assert_eq!(edges.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn failed_verbs_carry_the_error_marker_and_the_api_message() {
+        let (state, client) = boot().await;
+        let (project_id, epic_id) = seed_epic(&state).await;
+        let (cli, _guard) = scoped(&state, &client, &project_id, &epic_id);
+
+        // Missing required title → the API's 400 message, verbatim, behind
+        // the `dearborn: ` marker the breakdown guard greps for.
+        let err = cli.task_create("   ", None, None, &[]).await.unwrap_err();
+        assert_eq!(err.status, Some(400));
+        assert!(err.message.contains("`title` is required"));
+        let line = rendered(&err);
+        assert!(line.starts_with(crate::breakdown::DEARBORN_CLI_ERROR_MARKER));
+
+        // Linking a task that does not belong to the epic → 400 with the
+        // server's message (the prompt tells the agent to read and retry).
+        let err = cli.task_link("01JZZZNOPE", "01JZZZALSOPE").await.unwrap_err();
+        assert_eq!(err.status, Some(400));
+        assert!(err.message.contains("not part of epic"));
+
+        // Cycle rejection → 409.
+        let a = cli.task_create("A", None, None, &[]).await.unwrap();
+        let b = cli.task_create("B", None, None, &[]).await.unwrap();
+        let (a_id, b_id) = (a["id"].as_str().unwrap(), b["id"].as_str().unwrap());
+        cli.task_link(a_id, b_id).await.unwrap(); // a → b
+        let err = cli.task_link(b_id, a_id).await.unwrap_err(); // b → a closes the cycle
+        assert_eq!(err.status, Some(409));
+        assert!(rendered(&err).starts_with(ERROR_PREFIX));
+    }
+
+    #[tokio::test]
+    async fn an_unscoped_token_fails_with_a_401_behind_the_marker() {
+        let (_state, client) = boot().await;
+        // No token minted — this client's token is garbage.
+
+        let err = client.scope().await.unwrap_err();
+        assert_eq!(err.status, Some(401));
+        assert!(rendered(&err).starts_with(ERROR_PREFIX));
+
+        // And so does every verb built on the scope resolution.
+        let err = client.task_create("x", None, None, &[]).await.unwrap_err();
+        assert_eq!(err.status, Some(401));
+    }
+
+    #[tokio::test]
+    async fn a_session_token_is_not_a_capability_token() {
+        let (state, client) = boot().await;
+        let (_project_id, _epic_id) = seed_epic(&state).await;
+
+        // A browser session token authenticates (kind 1) but the CLI's verbs
+        // are capability-token territory: the scope verb rejects it with 403.
+        let user = users::testing::seed_user(&state, "tester", Role::Admin, true).await;
+        let session_token = crate::sessions::testing::login_as(&state, &user).await;
+        let session_cli = CliClient::new(
+            client.base_url.trim_end_matches('/'),
+            &session_token,
+        )
+        .unwrap();
+        let err = session_cli.scope().await.unwrap_err();
+        assert_eq!(err.status, Some(403));
+    }
+}

@@ -308,8 +308,9 @@ async fn technical_session_exists(state: &AppState, epic_id: &str) -> AppResult<
 /// DAG write, not harness-side noise: those are the calls the Planning → Ready
 /// guard exists for. (Until the CLI retirement these were `mcp__dearborn__*`
 /// tool names; shell-invoked CLI calls have no such name, so the *output*
-/// marker is the signature instead.)
-const DEARBORN_CLI_ERROR_MARKER: &str = "dearborn: ";
+/// marker is the signature instead.) Aliased from the CLI module's
+/// [`crate::cli::ERROR_PREFIX`] so the two can never drift apart.
+pub(crate) const DEARBORN_CLI_ERROR_MARKER: &str = crate::cli::ERROR_PREFIX;
 
 /// What a drained breakdown run leaves behind, persisted after the stream ends.
 #[derive(Default)]

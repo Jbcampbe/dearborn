@@ -10,6 +10,7 @@ pub mod auth;
 pub mod board;
 pub mod breakdown;
 pub mod capability;
+pub mod cli;
 pub mod cmd;
 pub mod config;
 pub mod cost;
