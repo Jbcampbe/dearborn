@@ -11,12 +11,20 @@
 //!
 //! ## What the agent reads
 //!
-//! In the wayfinder epic the plan source is moving from the old product/technical
-//! planning transcripts to the **living Document** the map produces. The
-//! context-fed plan assembly (`build_plan`) is deliberately minimal in this
-//! cutover — it carries the epic's title only — and the Document-backed
-//! completion gate ("only offered when no open map nodes remain and nothing
-//! foggy is left") lands in a later task of that epic.
+//! In the wayfinder epic the plan source is the **living Document** the map
+//! produces — the settled-decisions spec, never any chat transcript. The
+//! context-fed plan assembly ([`build_plan`]) folds in the Document's current
+//! HTML alongside the epic's title and destination.
+//!
+//! ## The completion gate
+//!
+//! Breakdown is offered only when **the way is clear** (wayfinder epic §8):
+//! no open (or in-progress) map nodes remain AND the fog
+//! (`epic.not_yet_specified`) is empty — the same computed eligibility the map
+//! itself exposes ([`crate::map::MapCompletion`]). The trigger is **human-only**:
+//! the route requires a signed-in user (a capability token is `403`ed by the
+//! allow-list before the handler runs, and the handler re-checks), preserving
+//! today's approve gate.
 //!
 //! ## Relation to the node engines
 //!
@@ -247,19 +255,25 @@ impl BreakdownAgent for ClaudeBreakdownAgent {
 
 // ---- route: trigger breakdown --------------------------------------------
 
-/// `POST /epics/{id}/breakdown` — run the one-shot breakdown agent on an approved
-/// epic, then move it Planning → Ready.
+/// `POST /epics/{id}/breakdown` — run the one-shot breakdown agent on a
+/// completed planning epic, then move it Planning → Ready.
 ///
 /// * `404` if the epic does not exist.
 /// * `409` if the epic is not in `Planning`, or if a run is already in flight
-///   for it. (Completion eligibility — no open map nodes, nothing foggy left —
-///   is enforced by the map workflow in a later task; until then any Planning
-///   epic can be broken down, which is the only gate breakdown itself owns.)
+///   for it, or if **the way is not yet clear** — open map nodes remain or the
+///   fog (`not_yet_specified`) is non-empty. Breakdown consumes the settled
+///   Document, so it is offered only on a completed map (wayfinder epic §8).
 /// * `202 Accepted` once the background run is spawned (its events stream over
 ///   WS on `epic:<id>`; the DAG + lane change land when the run completes).
+///
+/// Human-only: a capability token never reaches this handler (the capability
+/// allow-list `403`s the route), and [`crate::auth::CurrentUser`] re-checks
+/// that the caller is a signed-in user — an unattended agent cannot trigger
+/// breakdown.
 pub async fn trigger_breakdown(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    _human: crate::auth::CurrentUser,
 ) -> AppResult<(StatusCode, Json<Value>)> {
     let conn = state.db.conn();
 
@@ -271,6 +285,24 @@ pub async fn trigger_breakdown(
         return Err(AppError::Conflict(format!(
             "epic {id} is `{}`, not `Planning`; only a planning epic can be broken down",
             epic.status
+        )));
+    }
+
+    // The completion gate (wayfinder epic §8): breakdown reads the settled
+    // Document, so it is offered only when the map is complete — no open
+    // (or in-progress) nodes remain and the fog is empty. The map computes
+    // this on every read; the same eligibility the client surfaces as "the
+    // way is clear — ready to break down" is what gates the trigger here.
+    let map = crate::map::compute_map(conn, &id).await?;
+    if !map.completion.eligible {
+        return Err(AppError::Conflict(format!(
+            "epic {id} is not ready to break down: the way is not yet clear — {} open map node(s) remain{}",
+            map.completion.open_nodes,
+            if map.completion.fog_remaining {
+                " and the fog (not_yet_specified) is not empty"
+            } else {
+                ""
+            }
         )));
     }
 
@@ -609,18 +641,41 @@ async fn rollback_partial_dag(
     }
 }
 
-/// Assemble the plan (PRD) an epic hands the breakdown agent from its title.
+/// Assemble the plan (PRD) an epic hands the breakdown agent: the epic's
+/// title + destination, then the **settled living Document** — the map's
+/// source of truth for its prose (wayfinder epic §8: breakdown reads the
+/// Document, *not* any node transcript or other session artifact).
 /// `None` if the epic no longer exists.
-///
-/// The old product/technical context sections are gone with their epic
-/// columns (wayfinder cutover): breakdown will read the living Document in a
-/// later epic task, so for now the plan carries the title only.
 async fn build_plan(state: &AppState, epic_id: &str) -> Option<String> {
-    let epic = fetch_epic(state.db.conn(), epic_id).await.ok().flatten()?;
-    Some(format!(
+    let conn = state.db.conn();
+    let epic = fetch_epic(conn, epic_id).await.ok().flatten()?;
+    let document = crate::document::fetch_document(conn, epic_id)
+        .await
+        .ok()
+        .flatten();
+
+    let mut plan = format!(
         "The epic to break down is titled \"{title}\".",
         title = epic.title,
-    ))
+    );
+    if let Some(destination) = epic.destination.as_deref().filter(|d| !d.trim().is_empty()) {
+        plan.push_str(&format!(
+            "\nIts destination — what the finished plan looks like — is: {destination}"
+        ));
+    }
+    match document {
+        Some(document) => plan.push_str(&format!(
+            "\n\nThe settled plan follows as HTML (version v{:0>2} of the epic's living \
+             Document — the decisions the planning map resolved). Break the plan it \
+             describes into tasks:\n{}",
+            document.version, document.html,
+        )),
+        None => plan.push_str(
+            "\n\nThe epic's living Document is empty — no sections were written \
+             during planning. Plan from the destination alone.",
+        ),
+    }
+    Some(plan)
 }
 
 /// Current unix time in milliseconds (matches the `*_at` columns).
@@ -935,6 +990,64 @@ mod tests {
             .unwrap()
     }
 
+    /// Drive the epic's map to completion eligibility the same way the
+    /// planning flow does: resolve every open/in-progress node (settling the
+    /// seed grilling node the create flow seeds) and clear the fog. Both a
+    /// 1-node epic and a large multi-layer epic complete through this
+    /// identical ceremony — there is no shortcut.
+    async fn complete_map(app: &axum::Router, epic_id: &str) {
+        let map = body_json(
+            app.clone()
+                .oneshot(req("GET", &format!("/epics/{epic_id}/map"), None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        for node in map["nodes"].as_array().unwrap() {
+            if node["state"] == "open" || node["state"] == "in_progress" {
+                let r = app
+                    .clone()
+                    .oneshot(req(
+                        "PATCH",
+                        &format!(
+                            "/epics/{epic_id}/map-nodes/{}",
+                            node["id"].as_str().unwrap()
+                        ),
+                        Some(json!({"state": "resolved"})),
+                    ))
+                    .await
+                    .unwrap();
+                assert_eq!(r.status(), StatusCode::OK);
+            }
+        }
+        let r = app
+            .clone()
+            .oneshot(req(
+                "PATCH",
+                &format!("/epics/{epic_id}/map"),
+                Some(json!({"not_yet_specified": ""})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+    }
+
+    /// Sync an HTML document onto the epic (the scratch round-trip's write),
+    /// as a grilling resolution would. Returns the new version.
+    async fn sync_document(app: &axum::Router, epic_id: &str, html: &str) -> i64 {
+        let r = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                &format!("/epics/{epic_id}/document/sync"),
+                Some(json!({"html": html, "base_version": 0})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        body_json(r).await["version"].as_i64().unwrap()
+    }
+
     /// Poll until the epic reaches `status` (or timeout); returns the status seen.
     async fn wait_for_status(state: &AppState, epic_id: &str, status: &str) -> String {
         let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
@@ -957,6 +1070,7 @@ mod tests {
         let (state, app) = app_with_breakdown(agent).await;
         let project_id = seed_project(&app).await;
         let epic_id = create_epic(&app, &project_id).await;
+        complete_map(&app, &epic_id).await;
         let sub = state.hub.subscribe(&format!("epic:{epic_id}"));
 
         let response = trigger(&app, &epic_id).await;
@@ -990,12 +1104,222 @@ mod tests {
             Some("bd-sess")
         );
 
-        // The engine received the plan built from the epic's context. After
-        // the wayfinder cutover the plan carries the epic's title (the living
-        // Document takes over as the PRD in a later task).
+        // The engine received the plan built from the settled Document: the
+        // epic's title + destination, then the living Document's HTML (an
+        // empty-Document note here — nothing was synced in this test).
         let runs = recorded.lock().unwrap();
         assert_eq!(runs.len(), 1);
         assert!(runs[0].plan.contains("titled \"E\""));
+        assert!(runs[0].plan.contains("It works end to end"));
+        assert!(runs[0].plan.contains("living Document is empty"));
+    }
+
+    // ---- the completion gate (wayfinder epic §8) --------------------------
+
+    /// Breakdown is offered only when the way is clear: an open map node or
+    /// non-empty fog is a `409` naming what remains; settling every node and
+    /// clearing the fog lets the identical trigger through.
+    #[tokio::test]
+    async fn breakdown_blocked_until_no_open_nodes_remain_and_the_fog_is_empty() {
+        let (state, app) = app_with_breakdown(Arc::new(SilentBreakdownAgent)).await;
+        let project_id = seed_project(&app).await;
+        let epic_id = create_epic(&app, &project_id).await;
+
+        // The seed grilling node is still open → 409, naming the blocker.
+        let response = trigger(&app, &epic_id).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let message = body_json(response).await["error"]["message"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(message.contains("1 open map node"), "{message}");
+
+        // Fog blocks too, even before the node settles.
+        let r = app
+            .clone()
+            .oneshot(req(
+                "PATCH",
+                &format!("/epics/{epic_id}/map"),
+                Some(json!({"not_yet_specified": "which blob store?"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let response = trigger(&app, &epic_id).await;
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+        let message = body_json(response).await["error"]["message"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        assert!(message.contains("not_yet_specified"), "{message}");
+
+        // Resolving the seed node alone is not enough while fog remains.
+        let map = body_json(
+            app.clone()
+                .oneshot(req("GET", &format!("/epics/{epic_id}/map"), None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let seed_id = map["nodes"][0]["id"].as_str().unwrap().to_string();
+        let r = app
+            .clone()
+            .oneshot(req(
+                "PATCH",
+                &format!("/epics/{epic_id}/map-nodes/{seed_id}"),
+                Some(json!({"state": "resolved"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        assert_eq!(trigger(&app, &epic_id).await.status(), StatusCode::CONFLICT);
+
+        // Clearing the fog completes the map; the same trigger goes through.
+        let r = app
+            .clone()
+            .oneshot(req(
+                "PATCH",
+                &format!("/epics/{epic_id}/map"),
+                Some(json!({"not_yet_specified": ""})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        let response = trigger(&app, &epic_id).await;
+        assert_eq!(response.status(), StatusCode::ACCEPTED);
+        assert_eq!(wait_for_status(&state, &epic_id, "Ready").await, "Ready");
+    }
+
+    /// A 1-node epic and a large multi-layer epic complete through the
+    /// identical flow — the same trigger, the same gate, the same Planning →
+    /// Ready transition — with no special-casing for either size.
+    #[tokio::test]
+    async fn one_node_and_multi_layer_epics_complete_through_the_identical_flow() {
+        let (state, app) = app_with_breakdown(Arc::new(SilentBreakdownAgent)).await;
+        let project_id = seed_project(&app).await;
+
+        // 1-node epic: the seeded grilling node, resolved, nothing else.
+        let small = create_epic(&app, &project_id).await;
+        complete_map(&app, &small).await;
+        assert_eq!(trigger(&app, &small).await.status(), StatusCode::ACCEPTED);
+        assert_eq!(wait_for_status(&state, &small, "Ready").await, "Ready");
+
+        // Multi-layer epic: seed → two children → a grandchild, all settled
+        // in dependency order through the same node PATCH surface.
+        let big = create_epic(&app, &project_id).await;
+        let map = body_json(
+            app.clone()
+                .oneshot(req("GET", &format!("/epics/{big}/map"), None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let seed = map["nodes"][0]["id"].as_str().unwrap().to_string();
+        // Two children of the seed, then a grandchild blocked by both —
+        // created sequentially so each `blocked_by` names existing ids.
+        let mut ids = vec![seed.clone()];
+        for i in 0..3 {
+            let parents: Vec<String> = match i {
+                0 | 1 => vec![seed.clone()],
+                _ => vec![ids[1].clone(), ids[2].clone()],
+            };
+            let r = app
+                .clone()
+                .oneshot(req(
+                    "POST",
+                    &format!("/epics/{big}/map-nodes"),
+                    Some(json!({
+                        "kind": "grilling",
+                        "title": format!("Layer node {i}"),
+                        "blocked_by": parents,
+                    })),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::CREATED);
+            ids.push(body_json(r).await["id"].as_str().unwrap().to_string());
+        }
+        // The grandchild is blocked until its parents settle.
+        let r = app
+            .clone()
+            .oneshot(req(
+                "PATCH",
+                &format!("/epics/{big}/map-nodes/{}", ids[3]),
+                Some(json!({"state": "resolved"})),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(r.status(), StatusCode::OK);
+        complete_map(&app, &big).await;
+        assert_eq!(trigger(&app, &big).await.status(), StatusCode::ACCEPTED);
+        assert_eq!(wait_for_status(&state, &big, "Ready").await, "Ready");
+    }
+
+    /// Breakdown consumes the settled Document, not any transcript: the plan
+    /// handed to the engine carries the Document's current HTML (plus the
+    /// title + destination framing).
+    #[tokio::test]
+    async fn breakdown_plan_carries_the_document() {
+        let agent = Arc::new(ScriptedBreakdownAgent::new("bd-doc", &[]));
+        let recorded = agent.recorded();
+        let (state, app) = app_with_breakdown(agent).await;
+        let project_id = seed_project(&app).await;
+        let epic_id = create_epic(&app, &project_id).await;
+
+        sync_document(
+            &app,
+            &epic_id,
+            "<h1 id='decisions'>Decisions</h1><p id='store'>Use the evidence blob store.</p>",
+        )
+        .await;
+        complete_map(&app, &epic_id).await;
+
+        assert_eq!(trigger(&app, &epic_id).await.status(), StatusCode::ACCEPTED);
+        assert_eq!(wait_for_status(&state, &epic_id, "Ready").await, "Ready");
+
+        let runs = recorded.lock().unwrap();
+        assert_eq!(runs.len(), 1);
+        assert!(runs[0].plan.contains("titled \"E\""));
+        assert!(runs[0].plan.contains("It works end to end"));
+        assert!(runs[0].plan.contains("version v01"));
+        assert!(runs[0].plan.contains("Use the evidence blob store."));
+    }
+
+    /// Only a human can trigger breakdown: a capability token — the agent
+    /// runs' credential — is `403`ed by the allow-list before the handler.
+    #[tokio::test]
+    async fn breakdown_cannot_be_triggered_by_a_capability_token() {
+        let (state, app) = app_with_breakdown(Arc::new(SilentBreakdownAgent)).await;
+        let project_id = seed_project(&app).await;
+        let epic_id = create_epic(&app, &project_id).await;
+        complete_map(&app, &epic_id).await;
+
+        let cap = state.caps.mint(
+            epic_id.clone(),
+            project_id.clone(),
+            "grilling".to_string(),
+            std::path::PathBuf::from("/tmp"),
+        );
+        let response = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .method("POST")
+                    .uri(format!("/epics/{epic_id}/breakdown"))
+                    .header(AUTHORIZATION, format!("Bearer {}", cap.token()))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::FORBIDDEN);
+
+        // The epic never moved, and no breakdown run is on record.
+        let epic = fetch_epic(state.db.conn(), &epic_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(epic.status, "Planning");
     }
 
     /// A dearborn CLI call failing must abort the run: the epic
@@ -1007,6 +1331,7 @@ mod tests {
         let (state, app) = app_with_breakdown(Arc::new(FailedToolCallBreakdownAgent)).await;
         let project_id = seed_project(&app).await;
         let epic_id = create_epic(&app, &project_id).await;
+        complete_map(&app, &epic_id).await;
         let response = trigger(&app, &epic_id).await;
         assert_eq!(response.status(), StatusCode::ACCEPTED);
 
@@ -1156,6 +1481,7 @@ mod tests {
         };
         let project_id = seed_project(&app).await;
         let epic_id = create_epic(&app, &project_id).await;
+        complete_map(&app, &epic_id).await;
         let response = trigger(&app, &epic_id).await;
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         assert_eq!(wait_for_status(&state, &epic_id, "Ready").await, "Ready");

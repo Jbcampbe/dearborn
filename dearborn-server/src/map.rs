@@ -26,6 +26,13 @@
 //! state transition the frontier computation needs to be observable end to
 //! end; the resolution flow builds on top of it.
 //!
+//! The map also carries its computed **completion eligibility** (plan §8):
+//! the way is clear — ready to break down — when no open (or in-progress)
+//! nodes remain AND the fog (`not_yet_specified`) is empty. Like readiness it
+//! is computed on every read, never stored, and it is what gates breakdown
+//! ([`crate::breakdown::trigger_breakdown`]: only a human may pull that
+//! trigger, and only once this says the way is clear).
+//!
 //! The REST surface is exactly what the `dearborn` CLI's map verbs call
 //! (`node create|link|resolve`, `map` query + `map set-destination|set-notes|
 //! set-fog|set-out-of-scope`), so it is on the capability-token allow-list
@@ -158,6 +165,21 @@ pub struct MapEdge {
     pub blocked_id: String,
 }
 
+/// The epic's computed completion eligibility (wayfinder plan §8): whether
+/// "the way is clear — ready to break down". Derived from the live node
+/// graph + the fog prose on every read, never stored.
+#[derive(Debug, Clone, Serialize, PartialEq)]
+pub struct MapCompletion {
+    /// `true` when no open (or in-progress) map nodes remain AND the fog
+    /// (`epic.not_yet_specified`) is empty — breakdown may be offered. A
+    /// human still pulls the trigger ([`crate::breakdown`]).
+    pub eligible: bool,
+    /// How many nodes are still open or in progress (0 when eligible).
+    pub open_nodes: usize,
+    /// Whether fog prose remains (`not_yet_specified` non-empty).
+    pub fog_remaining: bool,
+}
+
 /// The epic's planning map: the four wayfinder prose fields plus the node
 /// graph with per-node computed readiness. This is the whole `map_updated`
 /// WS payload, so a single frame re-renders a client's map view completely.
@@ -176,6 +198,9 @@ pub struct Map {
     pub out_of_scope: Option<String>,
     pub nodes: Vec<MapNodeView>,
     pub edges: Vec<MapEdge>,
+    /// Computed completion eligibility: "the way is clear — ready to break
+    /// down" once no open nodes remain and the fog is empty (plan §8).
+    pub completion: MapCompletion,
 }
 
 /// `POST /epics/{id}/map-nodes` body. `title` and `kind` are required;
@@ -653,6 +678,7 @@ pub async fn compute_map(conn: &Connection, epic_id: &str) -> AppResult<Map> {
     let nodes = list_nodes_for_epic(conn, epic_id).await?;
     let edges = list_edges_for_epic(conn, epic_id).await?;
 
+    let completion = compute_completion(&nodes, not_yet_specified.as_deref());
     let readiness = readiness_index(&nodes, &edges);
     let nodes = nodes
         .into_iter()
@@ -677,7 +703,31 @@ pub async fn compute_map(conn: &Connection, epic_id: &str) -> AppResult<Map> {
         out_of_scope,
         nodes,
         edges,
+        completion,
     })
+}
+
+/// Compute completion eligibility (wayfinder plan §8): the way is clear when
+/// no node is still open (or in progress — being worked, not settled) AND the
+/// fog prose is empty (`NULL` or blank). Every node kind counts — a leftover
+/// open task node blocks completion exactly like an open grilling node — and
+/// `resolved` / `out_of_scope` nodes never do (settled, like dependencies).
+pub(crate) fn compute_completion(
+    nodes: &[MapNode],
+    not_yet_specified: Option<&str>,
+) -> MapCompletion {
+    let open_nodes = nodes
+        .iter()
+        .filter(|n| OPEN_STATES.contains(&n.state.as_str()))
+        .count();
+    let fog_remaining = not_yet_specified
+        .map(|fog| !fog.trim().is_empty())
+        .unwrap_or(false);
+    MapCompletion {
+        eligible: open_nodes == 0 && !fog_remaining,
+        open_nodes,
+        fog_remaining,
+    }
 }
 
 // ---- prose -----------------------------------------------------------------
@@ -1416,6 +1466,91 @@ mod tests {
         .await;
         assert_eq!(frontier_of(&map, &d["id"]), (json!(true), json!([])));
         let _ = c;
+    }
+
+    // ---- AC: completion eligibility (the way is clear) --------------------
+
+    #[tokio::test]
+    async fn completion_is_eligible_only_when_no_open_nodes_and_no_fog_remain() {
+        let (state, app) = boot().await;
+        let user = users::testing::seed_user(&state, "planner", Role::Admin, true).await;
+        let token = crate::sessions::testing::login_as(&state, &user).await;
+        let (_project_id, epic_id) = seed_epic(&state).await;
+        let nodes_path = format!("/epics/{epic_id}/map-nodes");
+
+        let a = create_node(&app, &token, &epic_id, json!({"kind": "grilling", "title": "A"})).await;
+        let b = create_node(&app, &token, &epic_id, json!({"kind": "task", "title": "B", "task_mode": "hitl", "blocked_by": [a["id"]]})).await;
+
+        // Open nodes → not eligible (every node kind counts, incl. task).
+        let map = body_json(
+            app.clone()
+                .oneshot(get_bearer(&format!("/epics/{epic_id}/map"), &token))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(map["completion"]["eligible"], false);
+        assert_eq!(map["completion"]["open_nodes"], 2);
+        assert_eq!(map["completion"]["fog_remaining"], false);
+
+        // Fog blocks completion even with no open nodes.
+        app.clone()
+            .oneshot(patch_json_bearer(
+                &format!("/epics/{epic_id}/map"),
+                &token,
+                json!({"not_yet_specified": "  Retention policy undecided  "}),
+            ))
+            .await
+            .unwrap();
+        let map = body_json(
+            app.clone()
+                .oneshot(get_bearer(&format!("/epics/{epic_id}/map"), &token))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(map["completion"]["fog_remaining"], true);
+
+        // Settle both nodes (out_of_scope settles like resolved); fog still blocks.
+        for node in [&a, &b] {
+            let r = app
+                .clone()
+                .oneshot(patch_json_bearer(
+                    &format!("{nodes_path}/{}", node["id"].as_str().unwrap()),
+                    &token,
+                    json!({"state": "resolved"}),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(r.status(), StatusCode::OK);
+        }
+        let map = body_json(
+            app.clone()
+                .oneshot(get_bearer(&format!("/epics/{epic_id}/map"), &token))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(map["completion"]["eligible"], false, "fog still blocks");
+
+        // Clearing the fog (blank prose counts as empty) makes the way clear.
+        app.clone()
+            .oneshot(patch_json_bearer(
+                &format!("/epics/{epic_id}/map"),
+                &token,
+                json!({"not_yet_specified": "   "}),
+            ))
+            .await
+            .unwrap();
+        let map = body_json(
+            app.oneshot(get_bearer(&format!("/epics/{epic_id}/map"), &token))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(map["completion"]["eligible"], true);
+        assert_eq!(map["completion"]["open_nodes"], 0);
+        assert_eq!(map["completion"]["fog_remaining"], false);
     }
 
     #[tokio::test]
