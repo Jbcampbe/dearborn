@@ -165,6 +165,37 @@ existing edges (adding `blocker → blocked` is rejected iff `blocked` already
 reaches `blocker`) — the same guard the breakdown `link_dependency` MCP tool
 uses (T-301).
 
+#### Planning map API (wayfinder epic: map nodes, frontier, prose)
+
+The planning map is the epic's graph of decision **nodes** (`map_node`; kinds
+`grilling | research | prototype | task`; states `open | in_progress |
+resolved | out_of_scope`) plus its dependency edges (`map_node_dependency`) and
+the four wayfinder prose fields on the epic row (`destination`, `notes`,
+`not_yet_specified`, `out_of_scope`). Readiness is **computed**, never stored
+(mirrors the task DAG): `frontier` = open (or `in_progress`) with every blocker
+settled (`resolved` **or** `out_of_scope` — ruling work out of scope unblocks
+its dependents); `blocked_by` = the unsettled blocker ids otherwise. Fog is
+never a node state — it is the epic-level `not_yet_specified` prose.
+
+| Action | Method + path | Success status |
+| ------ | ------------- | -------------- |
+| read the full map | `GET /epics/{id}/map` | `200` (`{ epic_id, destination, notes, not_yet_specified, out_of_scope, nodes: [MapNodeView], edges: [{blocker_id, blocked_id}] }`) |
+| create a map node | `POST /epics/{id}/map-nodes` | `201` (node; body `{ kind, title, question?, task_mode?, blocked_by?: [ids], blocks?: [ids], position_x?, position_y? }` — `blocked_by` = the graduation shape (each listed node blocks the new node); `blocks` mirrors the task DAG's `--blocks` (the new node blocks each listed id); `task_mode` (`afk\|hitl`) is required for `kind="task"` and rejected for every other kind — fixed at creation) |
+| get one node | `GET /epics/{id}/map-nodes/{nodeId}` | `200` (MapNodeView) |
+| partially update a node | `PATCH /epics/{id}/map-nodes/{nodeId}` | `200` (node; body `{ state?, title?, question?, gist?, out_of_scope_reason?, position_x?, position_y? }`; `state = "resolved"` stamps `resolved_by` with the acting user — `null` for capability-token actors) |
+| link a dependency | `POST /epics/{id}/map-node-dependencies` | `201` (`{ blocker_id, blocked_id }`); `409` on a cycle, `400` on self/cross-epic |
+| set the four prose fields | `PATCH /epics/{id}/map` | `200` (the updated full map; body `{ destination?, notes?, not_yet_specified?, out_of_scope? }` — absent fields untouched, `destination` must be non-empty, the other three clear to `NULL` on an empty string) |
+
+A `MapNodeView` is the `map_node` row (flattened) plus `frontier: bool` and
+`blocked_by: [string]` computed from the graph. Cycle rejection uses the same
+forward-DFS guard as the task DAG. Every mutating endpoint publishes a
+`map_updated` frame on `epic:<id>` whose payload is the full computed map
+(the `GET /epics/{id}/map` shape — prose included — so one frame re-renders a
+client's whole map view). These are the routes the `dearborn` CLI's `node
+create|link|resolve` and `map` / `map set-destination|set-notes|set-fog|
+set-out-of-scope` verbs call; they accept either a session token or a
+capability token (the allow-list in `capability::authorize_cap_request`).
+
 #### Project board & epic lanes (T-401)
 
 The project board is the kanban view at the project level — the project's epics
@@ -604,9 +635,12 @@ existence at the transport layer):
 - `epic:<id>` also carries `dag_updated` (T-301), published whenever a task or
   dependency is created/changed under the epic (`payload`: `{ nodes: [DagNode],
   edges: [{ blocker_id, blocked_id }] }` — the same shape as `GET
-  /epics/{id}/dag`, so nodes carry computed `ready`/`blocked_by`), and
+  /epics/{id}/dag`, so nodes carry computed `ready`/`blocked_by`),
   `epic_updated` (payload = the updated epic) on the `Planning → Ready`
-  breakdown transition.
+  breakdown transition, and `map_updated` (planning map) whenever a map node,
+  map dependency edge, or one of the four wayfinder prose fields is mutated
+  (`payload` = the full computed map — the same shape as `GET /epics/{id}/map`,
+  prose included).
 - `task:<id>` — a task-stage agent run's `RunEvent` firehose (T-512), the same
   mapping as the planning stream below (reusing `planning::ws_type`). Kept on
   its own topic, separate from the coarse `epic:<id>` frames, precisely so a
@@ -637,6 +671,7 @@ malformed frames get an `error` frame back (the connection stays open).
 | `error`        | Protocol error; `payload.message` explains it. `topic` is `""`. |
 | `epic_updated` | An epic's record changed (planning `update_epic`, the breakdown `Planning → Ready` transition, or a lane transition via `POST /epics/{id}/lane`). `payload` = the updated epic. |
 | `dag_updated`  | A task or dependency changed under the epic (T-301). `payload` = `{ nodes: [DagNode], edges: [{ blocker_id, blocked_id }] }` (same shape as `GET /epics/{id}/dag`; nodes carry `ready` + `blocked_by`). |
+| `map_updated` | The planning map changed (map node create/patch, map dependency link, or one of the four wayfinder prose fields via `PATCH /epics/{id}/map`). `payload` = the full computed map (same shape as `GET /epics/{id}/map` — `{ epic_id, destination, notes, not_yet_specified, out_of_scope, nodes: [MapNodeView], edges }`; nodes carry computed `frontier` + `blocked_by`). Published on `epic:<id>`. |
 | `board_updated` | The project board changed (epic lane transition via `POST /epics/{id}/lane`, breakdown's `Planning → Ready`, or a standalone task create/patch/delete). `payload` = `{ epics: [Epic], tasks: [Task] }` (same shape as `GET /projects/{id}/board`; `tasks` are standalone). Published on `project:<id>`. |
 | `stage_changed` | A task-stage transition with a known outcome (T-530, T-532: a `review` or `verify_complete` verdict). `payload` = `{ task_id, stage, attempt, status, verdict? }` (`verdict` present only for those two verdict-emitting stages; `status` is the `agent_run.status` vocabulary — `ok`\|`error`\|`timeout`\|`cancelled`). Published on **both** `task:<id>` and, coarse, `epic:<id>` (identical payload) — see below. |
 | *(any other)*  | A published event, delivered only to connections subscribed to its `topic`. |

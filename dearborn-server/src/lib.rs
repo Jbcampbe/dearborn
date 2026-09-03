@@ -24,6 +24,7 @@ pub mod git_host;
 pub mod harness_pi;
 pub mod hub;
 pub mod lanes;
+pub mod map;
 pub mod planning;
 pub mod pr;
 pub mod projects;
@@ -514,6 +515,22 @@ pub fn app(state: AppState) -> Router {
             axum::routing::put(agent_settings::put_agent_setting),
         )
         .route("/epics/:id", get(epics::get_epic).patch(epics::update_epic))
+        // The planning map (wayfinder epic): node CRUD + dependency edges +
+        // the four prose fields, plus the computed-map query. The `dearborn`
+        // CLI's `node`/`map` verbs call exactly these (capability-token scoped).
+        .route(
+            "/epics/:id/map",
+            get(map::get_map).patch(map::patch_map_prose),
+        )
+        .route("/epics/:id/map-nodes", axum::routing::post(map::create_map_node))
+        .route(
+            "/epics/:id/map-nodes/:nodeId",
+            get(map::get_map_node).patch(map::patch_map_node),
+        )
+        .route(
+            "/epics/:id/map-node-dependencies",
+            axum::routing::post(map::link_map_nodes),
+        )
         .route(
             "/epics/:id/breakdown",
             axum::routing::post(breakdown::trigger_breakdown),

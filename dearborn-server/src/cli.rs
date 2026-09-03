@@ -18,11 +18,18 @@
 //! privilege logic — the epic is never an argument, it is resolved from the
 //! token's scope via `GET /auth/capability`.
 //!
-//! The verbs (mirrored by the breakdown prompt in [`crate::breakdown`]):
+//! The verbs (mirrored by the breakdown prompt in [`crate::breakdown`], and
+//! by the per-node planning engines as they land):
 //!
 //! - `task create --title ... [--description ...] [--acceptance ...] [--blocks id1,id2]`
 //! - `task link BLOCKER BLOCKED`
 //! - `dag` — print the epic's current task DAG
+//! - `node create --kind ... --title ... [--question ...] [--task-mode afk|hitl]
+//!   [--blocked-by id1,id2] [--blocks id1,id2]` — planning-map node creation
+//! - `node link BLOCKER BLOCKED` — planning-map dependency edge (cycle-rejected)
+//! - `node resolve NODE [--gist "..."]` — the minimal resolution state transition
+//! - `map` — print the epic's full planning map (nodes + computed frontier/blocked + prose)
+//! - `map set-destination|set-notes|set-fog|set-out-of-scope "TEXT"` — the four wayfinder prose fields
 //! - `scope` — print the token's own capability scope (`GET /auth/capability`)
 //!
 //! Output contract (assumed by the prompt text and the breakdown
@@ -208,6 +215,100 @@ impl CliClient {
         let epic_id = self.epic_id().await?;
         self.request(reqwest::Method::GET, &format!("/epics/{epic_id}/dag"), None)
             .await
+    }
+
+    // ---- planning-map verbs (wayfinder epic §10) ---------------------------
+
+    /// `node create` — `POST /epics/{scoped epic}/map-nodes`. Creates a
+    /// decision node (`kind`: grilling|research|prototype|task; `task_mode`
+    /// afk|hitl is required for kind=task, fixed at creation). `blocked_by`
+    /// lists ids of existing nodes that block the new node (the graduation
+    /// shape); `blocks` — matching `task create`'s convention — lists ids of
+    /// existing nodes the new node blocks. Returns the created node.
+    pub async fn node_create(
+        &self,
+        kind: &str,
+        title: &str,
+        question: Option<&str>,
+        task_mode: Option<&str>,
+        blocked_by: &[String],
+        blocks: &[String],
+    ) -> Result<Value, CliError> {
+        let epic_id = self.epic_id().await?;
+        let body = json!({
+            "kind": kind,
+            "title": title,
+            "question": question,
+            "task_mode": task_mode,
+            "blocked_by": blocked_by,
+            "blocks": blocks,
+        });
+        self.request(
+            reqwest::Method::POST,
+            &format!("/epics/{epic_id}/map-nodes"),
+            Some(body),
+        )
+        .await
+    }
+
+    /// `node link` — `POST /epics/{scoped epic}/map-node-dependencies`,
+    /// wiring `blocker → blocked` (the blocker must settle first). Both map
+    /// nodes must belong to the scoped epic; cycles are rejected by the
+    /// server with 409.
+    pub async fn node_link(&self, blocker_id: &str, blocked_id: &str) -> Result<Value, CliError> {
+        let epic_id = self.epic_id().await?;
+        let body = json!({
+            "blocker_id": blocker_id,
+            "blocked_id": blocked_id,
+        });
+        self.request(
+            reqwest::Method::POST,
+            &format!("/epics/{epic_id}/map-node-dependencies"),
+            Some(body),
+        )
+        .await
+    }
+
+    /// `node resolve` — `PATCH /epics/{scoped epic}/map-nodes/{node}`, the
+    /// minimal resolution state transition: `state = "resolved"` plus the
+    /// optional one-line `gist`. (The rich grilling resolution bundle —
+    /// document edits, fog graduation, map reshaping — is a later task's
+    /// surface and builds on this.)
+    pub async fn node_resolve(&self, node_id: &str, gist: Option<&str>) -> Result<Value, CliError> {
+        let epic_id = self.epic_id().await?;
+        let body = match gist {
+            Some(gist) => json!({ "state": "resolved", "gist": gist }),
+            None => json!({ "state": "resolved" }),
+        };
+        self.request(
+            reqwest::Method::PATCH,
+            &format!("/epics/{epic_id}/map-nodes/{node_id}"),
+            Some(body),
+        )
+        .await
+    }
+
+    /// `map` — `GET /epics/{scoped epic}/map`, the epic's full planning map:
+    /// the four prose fields plus nodes with computed frontier/blocked state.
+    pub async fn map(&self) -> Result<Value, CliError> {
+        let epic_id = self.epic_id().await?;
+        self.request(reqwest::Method::GET, &format!("/epics/{epic_id}/map"), None)
+            .await
+    }
+
+    /// `map set-destination|set-notes|set-fog|set-out-of-scope` —
+    /// `PATCH /epics/{scoped epic}/map` with the one prose field. `field` is
+    /// the API's JSON key (`destination` | `notes` | `not_yet_specified` |
+    /// `out_of_scope`); the binary maps the verb spellings onto it.
+    pub async fn map_set_prose(&self, field: &str, text: &str) -> Result<Value, CliError> {
+        let epic_id = self.epic_id().await?;
+        let body = json!({ field: text });
+        self.request(
+            reqwest::Method::PATCH,
+            &format!("/epics/{epic_id}/map"),
+            Some(body),
+        )
+        .await
     }
 }
 
@@ -404,5 +505,135 @@ mod tests {
         .unwrap();
         let err = session_cli.scope().await.unwrap_err();
         assert_eq!(err.status, Some(403));
+    }
+
+    // ---- planning-map verbs (wayfinder epic §10) ---------------------------
+
+    #[tokio::test]
+    async fn map_node_verbs_round_trip_through_the_api() {
+        let (state, client) = boot().await;
+        let (project_id, epic_id) = seed_epic(&state).await;
+        let (cli, _guard) = scoped(&state, &client, &project_id, &epic_id);
+
+        // Create nodes of each kind; the research and prototype nodes are
+        // blocked by the grilling one (`blocked_by` = the graduation shape).
+        let grilling = cli
+            .node_create("grilling", "Which blob store?", Some("Pick one"), None, &[], &[])
+            .await
+            .unwrap();
+        let grilling_id = grilling["id"].as_str().unwrap().to_string();
+        let research = cli
+            .node_create("research", "Survey libsql blobs", None, None, &[grilling_id.clone()], &[])
+            .await
+            .unwrap();
+        let task = cli
+            .node_create("task", "Provision the bucket", None, Some("afk"), &[], &[])
+            .await
+            .unwrap();
+        assert_eq!(grilling["kind"], "grilling");
+        assert_eq!(task["task_mode"], "afk");
+
+        // `node link` wires an additional edge (grilling blocks prototype).
+        let prototype = cli
+            .node_create("prototype", "Spike the reader", None, None, &[], &[])
+            .await
+            .unwrap();
+        let edge = cli
+            .node_link(&grilling_id, prototype["id"].as_str().unwrap())
+            .await
+            .unwrap();
+        assert_eq!(edge["blocker_id"], grilling["id"]);
+        assert_eq!(edge["blocked_id"], prototype["id"]);
+
+        // `map` shows the graph with computed frontier/blocked state: the
+        // blocked research node is off the frontier until its dependency
+        // resolves.
+        let map = cli.map().await.unwrap();
+        assert_eq!(map["epic_id"], epic_id.as_str());
+        assert_eq!(map["nodes"].as_array().unwrap().len(), 4);
+        assert_eq!(map["edges"].as_array().unwrap().len(), 2);
+        let frontier_of = |map: &Value, id: &Value| {
+            map["nodes"]
+                .as_array()
+                .unwrap()
+                .iter()
+                .find(|n| n["id"] == *id)
+                .unwrap()["frontier"]
+                .clone()
+        };
+        assert_eq!(frontier_of(&map, &grilling["id"]), json!(true));
+        assert_eq!(frontier_of(&map, &research["id"]), json!(false));
+        assert_eq!(frontier_of(&map, &prototype["id"]), json!(false));
+
+        // Resolving the grilling node releases the research node.
+        cli.node_resolve(grilling["id"].as_str().unwrap(), Some("Use evidence blobs"))
+            .await
+            .unwrap();
+        let map = cli.map().await.unwrap();
+        assert_eq!(frontier_of(&map, &research["id"]), json!(true));
+        let resolved = map["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["id"] == grilling["id"])
+            .unwrap();
+        assert_eq!(resolved["gist"], "Use evidence blobs");
+        assert_eq!(resolved["state"], "resolved");
+    }
+
+    #[tokio::test]
+    async fn map_prose_verbs_set_the_four_fields() {
+        let (state, client) = boot().await;
+        let (project_id, epic_id) = seed_epic(&state).await;
+        let (cli, _guard) = scoped(&state, &client, &project_id, &epic_id);
+
+        for (field, text) in [
+            ("destination", "An exporter that works end to end"),
+            ("notes", "Executor stays untouched"),
+            ("not_yet_specified", "Which events export; retention"),
+            ("out_of_scope", "Multi-region replication"),
+        ] {
+            let map = cli.map_set_prose(field, text).await.unwrap();
+            assert_eq!(map[field], text);
+        }
+
+        let map = cli.map().await.unwrap();
+        assert_eq!(map["destination"], "An exporter that works end to end");
+        assert_eq!(map["not_yet_specified"], "Which events export; retention");
+        assert_eq!(map["out_of_scope"], "Multi-region replication");
+    }
+
+    #[tokio::test]
+    async fn map_verbs_surface_the_servers_error_messages_behind_the_marker() {
+        let (state, client) = boot().await;
+        let (project_id, epic_id) = seed_epic(&state).await;
+        let (cli, _guard) = scoped(&state, &client, &project_id, &epic_id);
+
+        // Bad kind → 400 with the server's vocabulary message.
+        let err = cli
+            .node_create("charting", "T", None, None, &[], &[])
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, Some(400));
+        assert!(err.message.contains("grilling|research|prototype|task"));
+
+        // kind=task without a task_mode → 400 (fixed at creation).
+        let err = cli.node_create("task", "T", None, None, &[], &[]).await.unwrap_err();
+        assert_eq!(err.status, Some(400));
+        assert!(err.message.contains("task_mode"));
+
+        // Cycle rejection → 409, same contract as task link.
+        let a = cli.node_create("grilling", "A", None, None, &[], &[]).await.unwrap();
+        let b = cli.node_create("grilling", "B", None, None, &[], &[]).await.unwrap();
+        let (a_id, b_id) = (a["id"].as_str().unwrap(), b["id"].as_str().unwrap());
+        cli.node_link(a_id, b_id).await.unwrap();
+        let err = cli.node_link(b_id, a_id).await.unwrap_err();
+        assert_eq!(err.status, Some(409));
+        assert!(err.message.contains("cycle"));
+        assert!(rendered(&err).starts_with(ERROR_PREFIX));
+
+        // A blank destination → 400 (it fixes the map's scope).
+        let err = cli.map_set_prose("destination", "   ").await.unwrap_err();
+        assert_eq!(err.status, Some(400));
     }
 }

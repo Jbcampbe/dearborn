@@ -1,7 +1,7 @@
 //! The `dearborn` agent CLI binary — argument parsing + output contract around
 //! [`dearborn_server::cli::CliClient`].
 //!
-//! Shape (this is the exact string the breakdown agent's access block issues):
+//! Shape (this is the exact string an agent's access block issues):
 //!
 //! ```text
 //! dearborn --url <base> --token <cap> <verb> [flags]
@@ -12,6 +12,12 @@
 //! - `task create --title "..." [--description "..."] [--acceptance "..."] [--blocks id1,id2]`
 //! - `task link BLOCKER BLOCKED`
 //! - `dag`
+//! - `node create --kind grilling|research|prototype|task --title "..."`
+//!   `[--question "..."] [--task-mode afk|hitl] [--blocked-by id1,id2] [--blocks id1,id2]`
+//! - `node link BLOCKER BLOCKED`
+//! - `node resolve NODE [--gist "..."]`
+//! - `map` — print the epic's full planning map
+//! - `map set-destination|set-notes|set-fog|set-out-of-scope "TEXT"`
 //! - `scope`
 //!
 //! Every verb prints the API's JSON to stdout on success (exit 0). Any failure
@@ -61,7 +67,7 @@ fn run(args: Vec<String>) -> Result<(), i32> {
 
     let verb = match args.first() {
         Some(verb) => verb.as_str(),
-        None => return usage("expected a verb: task create | task link | dag | scope"),
+        None => return usage("expected a verb: task create | task link | dag | node create | node link | node resolve | map | map set-* | scope"),
     };
     args = &args[1..];
 
@@ -88,14 +94,48 @@ fn run(args: Vec<String>) -> Result<(), i32> {
                 Ok(())
             })
         }
-        "task" => {
+        "map" => {
+            if args.is_empty() {
+                // Bare `map`: query the epic's full planning map.
+                let client = client(&base_url, &token)?;
+                return block_on(async move {
+                    let map = client.map().await?;
+                    println!("{}", serde_json::to_string(&map).expect("map is JSON"));
+                    Ok(())
+                });
+            }
+            // `map set-destination|set-notes|set-fog|set-out-of-scope "TEXT"`
+            let sub = args[0].as_str();
+            let field = match sub {
+                "set-destination" => "destination",
+                "set-notes" => "notes",
+                "set-fog" => "not_yet_specified",
+                "set-out-of-scope" => "out_of_scope",
+                other => {
+                    return usage(&format!(
+                        "unknown map verb `{other}` (expected: set-destination | set-notes | set-fog | set-out-of-scope)"
+                    ))
+                }
+            };
+            let text = match args[1..].first() {
+                Some(text) if args.len() == 2 => text.clone(),
+                _ => return usage(&format!("expected `map {sub} \"TEXT\"`")),
+            };
+            let client = client(&base_url, &token)?;
+            block_on(async move {
+                let map = client.map_set_prose(field, &text).await?;
+                println!("{}", serde_json::to_string(&map).expect("map is JSON"));
+                Ok(())
+            })
+        }
+        "task" | "node" => {
             let sub = match args.first() {
                 Some(sub) => sub.as_str(),
-                None => return usage("expected `task create` or `task link`"),
+                None => return usage("expected a `task` or `node` sub-verb (create | link, node also resolve)"),
             };
             args = &args[1..];
-            match sub {
-                "create" => {
+            match (verb, sub) {
+                ("task", "create") => {
                     let (title, description, acceptance, blocks) = task_create_flags(args)?;
                     let client = client(&base_url, &token)?;
                     block_on(async move {
@@ -106,11 +146,8 @@ fn run(args: Vec<String>) -> Result<(), i32> {
                         Ok(())
                     })
                 }
-                "link" => {
-                    let (blocker, blocked) = match args {
-                        [a, b] => (a.clone(), b.clone()),
-                        _ => return usage("expected `task link BLOCKER BLOCKED`"),
-                    };
+                ("task", "link") => {
+                    let (blocker, blocked) = positional_pair(args, "task link BLOCKER BLOCKED")?;
                     let client = client(&base_url, &token)?;
                     block_on(async move {
                         let edge = client.task_link(&blocker, &blocked).await?;
@@ -118,11 +155,50 @@ fn run(args: Vec<String>) -> Result<(), i32> {
                         Ok(())
                     })
                 }
-                other => usage(&format!("unknown task verb `{other}` (expected create or link)")),
+                ("node", "create") => {
+                    let (kind, title, question, task_mode, blocked_by, blocks) =
+                        node_create_flags(args)?;
+                    let client = client(&base_url, &token)?;
+                    block_on(async move {
+                        let node = client
+                            .node_create(
+                                &kind,
+                                &title,
+                                question.as_deref(),
+                                task_mode.as_deref(),
+                                &blocked_by,
+                                &blocks,
+                            )
+                            .await?;
+                        println!("{}", serde_json::to_string(&node).expect("node is JSON"));
+                        Ok(())
+                    })
+                }
+                ("node", "link") => {
+                    let (blocker, blocked) = positional_pair(args, "node link BLOCKER BLOCKED")?;
+                    let client = client(&base_url, &token)?;
+                    block_on(async move {
+                        let edge = client.node_link(&blocker, &blocked).await?;
+                        println!("{}", serde_json::to_string(&edge).expect("edge is JSON"));
+                        Ok(())
+                    })
+                }
+                ("node", "resolve") => {
+                    let (node_id, gist) = node_resolve_args(args)?;
+                    let client = client(&base_url, &token)?;
+                    block_on(async move {
+                        let node = client.node_resolve(&node_id, gist.as_deref()).await?;
+                        println!("{}", serde_json::to_string(&node).expect("node is JSON"));
+                        Ok(())
+                    })
+                }
+                (_, other) => usage(&format!(
+                    "unknown {verb} verb `{other}` (expected create or link; node also resolve)"
+                )),
             }
         }
         other => usage(&format!(
-            "unknown verb `{other}` (expected: task create | task link | dag | scope)"
+            "unknown verb `{other}` (expected: task create | task link | dag | node create | node link | node resolve | map | map set-* | scope)"
         )),
     }
 }
@@ -165,6 +241,14 @@ fn take_value(args: &mut &[String], inline: Option<String>, flag: &str) -> Resul
     Ok(value)
 }
 
+/// Require exactly two positional arguments, or print the given usage line.
+fn positional_pair(args: &[String], usage_line: &str) -> Result<(String, String), i32> {
+    match args {
+        [a, b] => Ok((a.clone(), b.clone())),
+        _ => usage(&format!("expected `{usage_line}`")),
+    }
+}
+
 /// The parsed `task create` flag set: `(--title, --description, --acceptance, --blocks)`.
 type TaskCreateFlags = (String, Option<String>, Option<String>, Vec<String>);
 
@@ -199,15 +283,7 @@ fn task_create_flags(args: &[String]) -> Result<TaskCreateFlags, i32> {
             "--acceptance" => acceptance = Some(take()?),
             "--blocks" => {
                 let raw = take()?;
-                blocks = raw
-                    .split(',')
-                    .map(str::trim)
-                    .filter(|s| !s.is_empty())
-                    .map(str::to_string)
-                    .collect();
-                if blocks.is_empty() {
-                    return usage("--blocks requires a comma-separated id list");
-                }
+                blocks = parse_id_list(&raw, "--blocks")?;
             }
             other => return usage(&format!("unknown task create flag `{other}`")),
         }
@@ -220,6 +296,133 @@ fn task_create_flags(args: &[String]) -> Result<TaskCreateFlags, i32> {
     }
 }
 
+/// The parsed `node create` flag set:
+/// `(kind, title, question, task_mode, blocked_by, blocks)`.
+type NodeCreateFlags = (
+    String,
+    String,
+    Option<String>,
+    Option<String>,
+    Vec<String>,
+    Vec<String>,
+);
+
+/// `node create` flags: `--kind` (required:
+/// grilling|research|prototype|task), `--title` (required), `--question`
+/// (optional), `--task-mode afk|hitl` (required for `--kind task`, rejected
+/// by the server for every other kind — fixed at creation), `--blocked-by
+/// id1,id2` (optional: existing nodes that block the new node — the
+/// graduation shape), `--blocks id1,id2` (optional: existing nodes the new
+/// node blocks, matching `task create`).
+fn node_create_flags(args: &[String]) -> Result<NodeCreateFlags, i32> {
+    let mut kind: Option<String> = None;
+    let mut title: Option<String> = None;
+    let mut question: Option<String> = None;
+    let mut task_mode: Option<String> = None;
+    let mut blocked_by: Vec<String> = Vec::new();
+    let mut blocks: Vec<String> = Vec::new();
+
+    let mut i = 0;
+    while i < args.len() {
+        let (name, inline) = match args[i].split_once('=') {
+            Some((name, value)) => (name, Some(value.to_string())),
+            None => (args[i].as_str(), None),
+        };
+        let take = || -> Result<String, i32> {
+            if let Some(value) = inline.clone() {
+                return Ok(value);
+            }
+            if i + 1 >= args.len() {
+                return usage(&format!("{name} requires a value"));
+            }
+            Ok(args[i + 1].clone())
+        };
+        match name {
+            "--kind" => kind = Some(take()?),
+            "--title" => title = Some(take()?),
+            "--question" => question = Some(take()?),
+            "--task-mode" => task_mode = Some(take()?),
+            "--blocked-by" => {
+                let raw = take()?;
+                blocked_by = parse_id_list(&raw, "--blocked-by")?;
+            }
+            "--blocks" => {
+                let raw = take()?;
+                blocks = parse_id_list(&raw, "--blocks")?;
+            }
+            other => return usage(&format!("unknown node create flag `{other}`")),
+        }
+        i += if inline.is_some() { 1 } else { 2 };
+    }
+
+    let kind = match kind {
+        Some(kind) if !kind.trim().is_empty() => kind,
+        _ => return usage("--kind is required (grilling | research | prototype | task)"),
+    };
+    let title = match title {
+        Some(title) if !title.trim().is_empty() => title,
+        _ => return usage("--title is required and must not be empty"),
+    };
+    Ok((kind, title, question, task_mode, blocked_by, blocks))
+}
+
+/// `node resolve NODE [--gist "..."]` — the positional node id plus the
+/// optional one-line resolution gist.
+fn node_resolve_args(args: &[String]) -> Result<(String, Option<String>), i32> {
+    let mut positional: Option<String> = None;
+    let mut gist: Option<String> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        let (name, inline) = match args[i].split_once('=') {
+            Some((name, value)) => (name, Some(value.to_string())),
+            None => (args[i].as_str(), None),
+        };
+        match name {
+            "--gist" => {
+                gist = Some(if let Some(value) = inline {
+                    value
+                } else {
+                    if i + 1 >= args.len() {
+                        return usage("--gist requires a value");
+                    }
+                    i += 1;
+                    args[i].clone()
+                });
+            }
+            other if other.starts_with("--") => {
+                return usage(&format!("unknown node resolve flag `{other}`"));
+            }
+            _ => {
+                if positional.is_some() {
+                    return usage("expected `node resolve NODE [--gist \"...\"]` (one positional node id)");
+                }
+                positional = Some(args[i].clone());
+            }
+        }
+        i += 1;
+    }
+
+    match positional {
+        Some(node_id) if !node_id.trim().is_empty() => Ok((node_id, gist)),
+        _ => usage("expected `node resolve NODE [--gist \"...\"]`"),
+    }
+}
+
+/// Parse a comma-separated id list flag value into trimmed, non-empty ids.
+fn parse_id_list(raw: &str, flag: &str) -> Result<Vec<String>, i32> {
+    let ids: Vec<String> = raw
+        .split(',')
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .map(str::to_string)
+        .collect();
+    if ids.is_empty() {
+        return usage(&format!("{flag} requires a comma-separated id list"));
+    }
+    Ok(ids)
+}
+
 /// Print a usage error with the CLI error marker (exit code 2).
 fn usage<T>(message: &str) -> Result<T, i32> {
     eprintln!(
@@ -228,6 +431,11 @@ usage: dearborn --url <base> --token <cap> <verb>
   task create --title \"...\" [--description \"...\"] [--acceptance \"...\"] [--blocks id1,id2]
   task link BLOCKER BLOCKED
   dag
+  node create --kind grilling|research|prototype|task --title \"...\" [--question \"...\"] [--task-mode afk|hitl] [--blocked-by id1,id2] [--blocks id1,id2]
+  node link BLOCKER BLOCKED
+  node resolve NODE [--gist \"...\"]
+  map
+  map set-destination|set-notes|set-fog|set-out-of-scope \"TEXT\"
   scope"
     );
     Err(2)

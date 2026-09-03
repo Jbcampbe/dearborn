@@ -170,11 +170,13 @@ impl Drop for CapabilityGuard {
 /// Whether a request carrying a capability token is authorized.
 ///
 /// The allow-list is exactly the REST surface the `dearborn` CLI exposes to
-/// agents — reads of the scoped epic and the two task-DAG writes breakdown
-/// performs — plus `GET /auth/capability`, which names the token's own scope.
-/// Every epic-addressed pattern requires the path's epic id to equal the
-/// scope's: **a scoped token can only act on its epic.** Anything else is a
-/// `403` from [`crate::auth::require_auth`], before any handler runs.
+/// agents — reads of the scoped epic, the two task-DAG writes breakdown
+/// performs, and the planning-map verbs (node create/link/resolve, map prose
+/// edits, map query; wayfinder epic §10) — plus `GET /auth/capability`, which
+/// names the token's own scope. Every epic-addressed pattern requires the
+/// path's epic id to equal the scope's: **a scoped token can only act on its
+/// epic.** Anything else is a `403` from [`crate::auth::require_auth`],
+/// before any handler runs.
 ///
 /// Session tokens bypass this table entirely (full access, as before).
 pub fn authorize_cap_request(
@@ -190,6 +192,14 @@ pub fn authorize_cap_request(
         ("GET", ["epics", e, "dag"]) => *e == epic,
         ("POST", ["epics", e, "tasks"]) => *e == epic,
         ("POST", ["epics", e, "dependencies"]) => *e == epic,
+        // The planning map (`dearborn node create|link|resolve`, `dearborn
+        // map [set-*]` — see `crate::map`).
+        ("GET", ["epics", e, "map"]) => *e == epic,
+        ("PATCH", ["epics", e, "map"]) => *e == epic,
+        ("POST", ["epics", e, "map-nodes"]) => *e == epic,
+        ("GET", ["epics", e, "map-nodes", _]) => *e == epic,
+        ("PATCH", ["epics", e, "map-nodes", _]) => *e == epic,
+        ("POST", ["epics", e, "map-node-dependencies"]) => *e == epic,
         _ => false,
     }
 }
