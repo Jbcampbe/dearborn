@@ -30,6 +30,14 @@
 //! - `node resolve NODE [--gist "..."]` — the minimal resolution state transition
 //! - `map` — print the epic's full planning map (nodes + computed frontier/blocked + prose)
 //! - `map set-destination|set-notes|set-fog|set-out-of-scope "TEXT"` — the four wayfinder prose fields
+//! - `document pull PATH` — write the epic's living HTML document to a scratch
+//!   workspace file (for the harness's native Edit/Write); prints `{ "path",
+//!   "version", "html": null, "epic_id" }` (no HTML in tool output — the file
+//!   carries it)
+//! - `document sync PATH --base-version N [--node id]` — commit the edited
+//!   scratch file as a new version: per-epic semaphore, base-version check
+//!   (a stale base is a clean 409 for re-read/retry), version + section-index
+//!   persistence, `document_updated` on `epic:<id>`
 //! - `scope` — print the token's own capability scope (`GET /auth/capability`)
 //!
 //! Output contract (assumed by the prompt text and the breakdown
@@ -309,6 +317,85 @@ impl CliClient {
             Some(body),
         )
         .await
+    }
+
+    // ---- living-document verbs (wayfinder epic §10, Phase 3) ----------------
+
+    /// `document pull PATH` — `GET /epics/{scoped epic}/document`, the epic's
+    /// living document plus its section index. Returns the raw API JSON (the
+    /// binary is responsible for writing `html` to the scratch file at `path`
+    /// and stamping the version alongside it for the sync round trip).
+    pub async fn document(&self) -> Result<Value, CliError> {
+        let epic_id = self.epic_id().await?;
+        self.request(
+            reqwest::Method::GET,
+            &format!("/epics/{epic_id}/document"),
+            None,
+        )
+        .await
+    }
+
+    /// `document sync PATH --base-version N` — `POST /epics/{scoped
+    /// epic}/document/sync` with the edited scratch file's HTML and the
+    /// version it was read at. Takes the server's per-epic write semaphore;
+    /// a stale base version is a `409` (re-read and retry). `node_id` is the
+    /// optional provenance stamp for the sections this sync touches.
+    pub async fn document_sync(
+        &self,
+        html: &str,
+        base_version: i64,
+        node_id: Option<&str>,
+    ) -> Result<Value, CliError> {
+        let epic_id = self.epic_id().await?;
+        let body = json!({
+            "html": html,
+            "base_version": base_version,
+            "node_id": node_id,
+        });
+        self.request(
+            reqwest::Method::POST,
+            &format!("/epics/{epic_id}/document/sync"),
+            Some(body),
+        )
+        .await
+    }
+
+    /// `document pull PATH` — fetch the living document and write its HTML to
+    /// the scratch workspace file at `path` for the harness's native Edit/
+    /// Write (big HTML through file tools, not tool-args). Returns
+    /// `{ path, version, updated_at, epic_id }` — `version` is the base
+    /// version the follow-up [`Self::document_sync_file`](Self::document_sync_file)
+    /// must carry (0 before the first sync).
+    pub async fn document_pull(&self, path: &std::path::Path) -> Result<Value, CliError> {
+        let doc = self.document().await?;
+        let html = doc["html"].as_str().unwrap_or("");
+        std::fs::write(path, html).map_err(|err| CliError {
+            status: None,
+            message: format!("failed to write {}: {err}", path.display()),
+        })?;
+        Ok(json!({
+            "path": path.display().to_string(),
+            "version": doc["version"],
+            "updated_at": doc["updated_at"],
+            "epic_id": doc["epic_id"],
+        }))
+    }
+
+    /// `document sync PATH --base-version N` — read the edited scratch file
+    /// and commit it as a new document version. A stale `base_version` is a
+    /// `409` here: re-pull, re-edit, retry. See
+    /// [`Self::document_sync`](Self::document_sync) for the write itself.
+    pub async fn document_sync_file(
+        &self,
+        path: &std::path::Path,
+        base_version: i64,
+        node_id: Option<&str>,
+    ) -> Result<Value, CliError> {
+        let html = std::fs::read_to_string(path).map_err(|err| CliError {
+            status: None,
+            message: format!("failed to read {}: {err}", path.display()),
+        })?;
+        self.document_sync(&html, base_version, node_id).await
     }
 }
 
@@ -635,5 +722,78 @@ mod tests {
         // A blank destination → 400 (it fixes the map's scope).
         let err = cli.map_set_prose("destination", "   ").await.unwrap_err();
         assert_eq!(err.status, Some(400));
+    }
+
+    // ---- living-document verbs (wayfinder epic §10, Phase 3) -----------------
+
+    #[tokio::test]
+    async fn document_pull_and_sync_round_trip_through_the_scratch_file() {
+        let (state, client) = boot().await;
+        let (project_id, epic_id) = seed_epic(&state).await;
+        let (cli, _guard) = scoped(&state, &client, &project_id, &epic_id);
+
+        // The scratch workspace file the agent edits with native file tools.
+        let scratch = std::env::temp_dir().join(format!("dearborn-doc-test-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let path = scratch.join("document.html");
+
+        // Pull the never-synced document: empty file, base version 0.
+        let pulled = cli.document_pull(&path).await.unwrap();
+        assert_eq!(pulled["version"], 0);
+        assert_eq!(pulled["epic_id"], epic_id.as_str());
+        assert_eq!(path.is_file(), true);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), "");
+
+        // The agent edits the file, then syncs carrying the base version.
+        let v1 = "<h1 id=\"decisions\">Decisions</h1><p>Use libsql blobs.</p>";
+        std::fs::write(&path, v1).unwrap();
+        let synced = cli.document_sync_file(&path, 0, None).await.unwrap();
+        assert_eq!(synced["version"], 1);
+        assert_eq!(synced["html"], v1);
+
+        // Syncing the same stale base again is rejected with the server's
+        // current-version message — the clean re-read/retry signal.
+        let err = cli.document_sync_file(&path, 0, None).await.unwrap_err();
+        assert_eq!(err.status, Some(409));
+        assert!(err.message.contains("current version is 1"));
+
+        // Re-pull (fresh base version), edit, retry: the round trip closes.
+        let pulled = cli.document_pull(&path).await.unwrap();
+        assert_eq!(pulled["version"], 1);
+        assert_eq!(std::fs::read_to_string(&path).unwrap(), v1);
+        let v2 = "<h1 id=\"decisions\">Decisions</h1><p>Use libsql blobs, v2.</p>";
+        std::fs::write(&path, v2).unwrap();
+        let synced = cli.document_sync_file(&path, 1, None).await.unwrap();
+        assert_eq!(synced["version"], 2);
+        assert_eq!(synced["sections"][0]["section_id"], "decisions");
+
+        std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    #[tokio::test]
+    async fn document_verbs_surface_errors_behind_the_marker() {
+        let (state, client) = boot().await;
+        let (project_id, epic_id) = seed_epic(&state).await;
+        let (cli, _guard) = scoped(&state, &client, &project_id, &epic_id);
+
+        // A missing scratch file → a local (no-status) CLI error.
+        let missing = std::env::temp_dir().join(format!("dearborn-missing-{}", ulid::Ulid::new()));
+        let err = cli.document_sync_file(&missing, 0, None).await.unwrap_err();
+        assert_eq!(err.status, None);
+        assert!(rendered(&err).starts_with(ERROR_PREFIX));
+
+        // A provenance node outside the epic → the server's 400 message.
+        let scratch = std::env::temp_dir().join(format!("dearborn-doc-err-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let path = scratch.join("document.html");
+        std::fs::write(&path, "<p>x</p>").unwrap();
+        let err = cli
+            .document_sync_file(&path, 0, Some("01JZZNOPE"))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, Some(400));
+        assert!(err.message.contains("not part of epic"));
+
+        std::fs::remove_dir_all(&scratch).ok();
     }
 }

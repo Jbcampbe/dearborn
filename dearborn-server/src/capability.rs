@@ -171,8 +171,10 @@ impl Drop for CapabilityGuard {
 ///
 /// The allow-list is exactly the REST surface the `dearborn` CLI exposes to
 /// agents — reads of the scoped epic, the two task-DAG writes breakdown
-/// performs, and the planning-map verbs (node create/link/resolve, map prose
-/// edits, map query; wayfinder epic §10) — plus `GET /auth/capability`, which
+/// performs, the planning-map verbs (node create/link/resolve, map prose
+/// edits, map query; wayfinder epic §10), and the living-Document round trip
+/// (`GET /epics/e/document` for `document pull`, `POST /epics/e/document/sync`
+/// for `document sync`; Phase 3) — plus `GET /auth/capability`, which
 /// names the token's own scope. Every epic-addressed pattern requires the
 /// path's epic id to equal the scope's: **a scoped token can only act on its
 /// epic.** Anything else is a `403` from [`crate::auth::require_auth`],
@@ -200,6 +202,10 @@ pub fn authorize_cap_request(
         ("GET", ["epics", e, "map-nodes", _]) => *e == epic,
         ("PATCH", ["epics", e, "map-nodes", _]) => *e == epic,
         ("POST", ["epics", e, "map-node-dependencies"]) => *e == epic,
+        // The living Document round trip (`dearborn document pull|sync` —
+        // see `crate::document`).
+        ("GET", ["epics", e, "document"]) => *e == epic,
+        ("POST", ["epics", e, "document", "sync"]) => *e == epic,
         _ => false,
     }
 }

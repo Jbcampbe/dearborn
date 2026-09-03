@@ -17,6 +17,7 @@ pub mod config;
 pub mod cost;
 pub mod crypto;
 pub mod db;
+pub mod document;
 pub mod epics;
 pub mod error;
 pub mod evidence;
@@ -186,6 +187,17 @@ pub struct AppState {
     /// `.await`); the per-project `tokio::sync::Mutex` it hands out is the
     /// actual (long-held, across-await) exclusion.
     pub refresh_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Per-epic document write semaphores (wayfinder epic §7): a
+    /// `tokio::sync::Mutex` keyed by `epic_id`, handed out by
+    /// [`AppState::document_write_lock`]. The living Document's sync
+    /// ([`crate::document::sync_document`]) takes this for its bounded
+    /// read→check→commit — base-version check, version + section-index
+    /// persistence — so two sibling node sessions' resolution edits can never
+    /// interleave. An in-process lock suffices: Dearborn is a single server
+    /// process (no horizontal scaling) and SQLite already serializes writers.
+    /// Keyed by epic id, so epics never block each other. Same pattern as
+    /// [`AppState::refresh_locks`] and the in-flight sets above.
+    pub document_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Live `RunHandle`s for whatever agent stage is currently running,
     /// keyed by the claimed item's id (T-542, MILESTONE_2 D12/§7). Populated
     /// by [`task_agent::run_agent_stage`] for the duration of exactly one
@@ -254,6 +266,21 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Hand out `epic_id`'s document write semaphore (wayfinder epic §7),
+    /// creating it on first use. The same epic id always yields the same
+    /// underlying `tokio::sync::Mutex` (checked via `Arc::ptr_eq` in tests),
+    /// so every document sync on that epic excludes every other, while
+    /// different epics never contend. See [`AppState::document_locks`].
+    pub fn document_write_lock(&self, epic_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = self
+            .document_locks
+            .lock()
+            .expect("document_locks mutex poisoned");
+        map.entry(epic_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
     /// Construct shared state from a resolved [`Config`] and open [`Db`], using
     /// the production interactive agent ([`planning::ClaudePlanningAgent`]).
     ///
@@ -369,6 +396,7 @@ impl AppState {
             advertised_base: Arc::new(Mutex::new(None)),
             notify: Arc::new(tokio::sync::Notify::new()),
             refresh_locks: Arc::new(Mutex::new(HashMap::new())),
+            document_locks: Arc::new(Mutex::new(HashMap::new())),
             cancel_registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
             #[cfg(test)]
             test_pipeline_hook: None,
@@ -626,6 +654,16 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/epics/:id/map-nodes/:nodeId/run",
             axum::routing::post(afk_engine::fire_node),
+        )
+        // The living Document (wayfinder epic §4.5/§10, Phase 3): read the
+        // epic's HTML document for the scratch-file round trip, and sync an
+        // edited file back as a new version under the per-epic write
+        // semaphore. The `dearborn` CLI's `document pull|sync` verbs call
+        // exactly these (capability-token scoped).
+        .route("/epics/:id/document", get(document::get_document))
+        .route(
+            "/epics/:id/document/sync",
+            axum::routing::post(document::sync_document),
         )
         .route(
             "/epics/:id/map-node-dependencies",

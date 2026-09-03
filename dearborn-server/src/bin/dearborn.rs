@@ -18,6 +18,14 @@
 //! - `node resolve NODE [--gist "..."]`
 //! - `map` — print the epic's full planning map
 //! - `map set-destination|set-notes|set-fog|set-out-of-scope "TEXT"`
+//! - `document pull [PATH]` — write the epic's living HTML document to a
+//!   scratch workspace file (default `./document.html`) for editing with the
+//!   harness's native file tools; prints `{ "path", "version", ... }` where
+//!   `version` is the base version the sync must carry
+//! - `document sync PATH --base-version N [--node NODE_ID]` — commit the
+//!   edited scratch file as a new document version (per-epic write semaphore,
+//!   base-version check, section index, `document_updated` WS frame); a stale
+//!   base version exits non-zero naming the current version — re-pull and retry
 //! - `scope`
 //!
 //! Every verb prints the API's JSON to stdout on success (exit 0). Any failure
@@ -26,6 +34,8 @@
 //! it (breakdown's DAG-write guard greps run output for exactly that marker).
 
 use dearborn_server::cli::{CliClient, ERROR_PREFIX};
+
+use std::path::Path;
 
 fn main() {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -67,7 +77,7 @@ fn run(args: Vec<String>) -> Result<(), i32> {
 
     let verb = match args.first() {
         Some(verb) => verb.as_str(),
-        None => return usage("expected a verb: task create | task link | dag | node create | node link | node resolve | map | map set-* | scope"),
+        None => return usage("expected a verb: task create | task link | dag | node create | node link | node resolve | map | map set-* | document pull | document sync | scope"),
     };
     args = &args[1..];
 
@@ -197,9 +207,112 @@ fn run(args: Vec<String>) -> Result<(), i32> {
                 )),
             }
         }
+        "document" => {
+            let sub = match args.first() {
+                Some(sub) => sub.as_str(),
+                None => return usage("expected a `document` sub-verb (pull | sync)"),
+            };
+            args = &args[1..];
+            match sub {
+                "pull" => document_pull(args, &base_url, &token),
+                "sync" => {
+                    let (path, base_version, node) = document_sync_flags(args)?;
+                    let client = client(&base_url, &token)?;
+                    block_on(async move {
+                        let synced = client
+                            .document_sync_file(Path::new(&path), base_version, node.as_deref())
+                            .await?;
+                        println!("{}", serde_json::to_string(&synced).expect("sync result is JSON"));
+                        Ok(())
+                    })
+                }
+                other => usage(&format!(
+                    "unknown document verb `{other}` (expected: pull | sync)"
+                )),
+            }
+        }
         other => usage(&format!(
-            "unknown verb `{other}` (expected: task create | task link | dag | node create | node link | node resolve | map | map set-* | scope)"
+            "unknown verb `{other}` (expected: task create | task link | dag | node create | node link | node resolve | map | map set-* | document pull | document sync | scope)"
         )),
+    }
+}
+
+/// `document pull [PATH]` — optional positional scratch-file path (default
+/// `./document.html`); writes the epic's HTML document to it and prints the
+/// pulled state (path + base version) as JSON.
+fn document_pull(args: &[String], base_url: &str, token: &str) -> Result<(), i32> {
+    if args.len() > 1 {
+        return usage("expected `document pull [PATH]` (one optional path)");
+    }
+    let path = args
+        .first()
+        .cloned()
+        .unwrap_or_else(|| "document.html".to_string());
+    let client = client(base_url, token)?;
+    block_on(async move {
+        let pulled = client.document_pull(Path::new(&path)).await?;
+        println!("{}", serde_json::to_string(&pulled).expect("pull result is JSON"));
+        Ok(())
+    })
+}
+
+/// The parsed `document sync` flag set: `(path, base_version, node_id)`.
+type DocumentSyncFlags = (String, i64, Option<String>);
+
+/// `document sync PATH --base-version N [--node NODE_ID]` — the scratch-file
+/// path (required), the version it was read at (required; 0 before the first
+/// sync), and the optional map-node provenance stamp.
+fn document_sync_flags(args: &[String]) -> Result<DocumentSyncFlags, i32> {
+    let mut path: Option<String> = None;
+    let mut base_version: Option<i64> = None;
+    let mut node: Option<String> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        let (name, inline) = match args[i].split_once('=') {
+            Some((name, value)) => (name, Some(value.to_string())),
+            None => (args[i].as_str(), None),
+        };
+        let take = || -> Result<String, i32> {
+            if let Some(value) = inline.clone() {
+                return Ok(value);
+            }
+            if i + 1 >= args.len() {
+                return usage(&format!("{name} requires a value"));
+            }
+            Ok(args[i + 1].clone())
+        };
+        match name {
+            "--base-version" => {
+                let raw = take()?;
+                base_version = Some(raw.parse::<i64>().map_err(|_| {
+                    eprintln!("{ERROR_PREFIX}--base-version must be an integer, got `{raw}`");
+                    2
+                })?);
+            }
+            "--node" => node = Some(take()?),
+            other if other.starts_with("--") => {
+                return usage(&format!(
+                    "unknown document sync flag `{other}` (expected: --base-version, --node)"
+                ))
+            }
+            _ => {
+                if path.is_some() {
+                    return usage("expected `document sync PATH --base-version N` (one positional path)");
+                }
+                path = Some(args[i].clone());
+            }
+        }
+        i += if inline.is_some() { 1 } else { 2 };
+    }
+
+    let path = match path {
+        Some(path) if !path.trim().is_empty() => path,
+        _ => return usage("expected `document sync PATH --base-version N [--node NODE_ID]`"),
+    };
+    match base_version {
+        Some(base_version) => Ok((path, base_version, node)),
+        None => usage("--base-version is required (the version you pulled; 0 before the first sync)"),
     }
 }
 
@@ -436,6 +549,8 @@ usage: dearborn --url <base> --token <cap> <verb>
   node resolve NODE [--gist \"...\"]
   map
   map set-destination|set-notes|set-fog|set-out-of-scope \"TEXT\"
+  document pull [PATH]
+  document sync PATH --base-version N [--node NODE_ID]
   scope"
     );
     Err(2)
