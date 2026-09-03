@@ -1034,7 +1034,7 @@ pub async fn publish_map(state: &AppState, epic_id: &str) {
 }
 
 /// Whether an epic exists (lightweight existence check for route guards).
-async fn epic_exists(conn: &Connection, epic_id: &str) -> AppResult<bool> {
+pub(crate) async fn epic_exists(conn: &Connection, epic_id: &str) -> AppResult<bool> {
     let mut rows = conn
         .query("SELECT 1 FROM epic WHERE id = ?1", params![epic_id])
         .await?;

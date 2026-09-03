@@ -13,6 +13,7 @@ pub mod breakdown;
 pub mod capability;
 pub mod cli;
 pub mod cmd;
+pub mod comments;
 pub mod config;
 pub mod cost;
 pub mod crypto;
@@ -674,6 +675,19 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/epics/:id/document/sync",
             axum::routing::post(document::sync_document),
+        )
+        // Comments (wayfinder epic §4.8/§9): threaded, anchored to a map node
+        // or a Document section, user-attributed with agent replies (an agent
+        // run posts through its capability token, `is_agent = 1`), thread-
+        // level resolve. The `dearborn` CLI's `comment post|list|resolve`
+        // verbs call exactly these (capability-token scoped).
+        .route(
+            "/epics/:id/comments",
+            get(comments::list_comments_handler).post(comments::post_comment),
+        )
+        .route(
+            "/epics/:id/comments/:commentId/resolve",
+            axum::routing::post(comments::resolve_comment),
         )
         .route(
             "/epics/:id/map-node-dependencies",

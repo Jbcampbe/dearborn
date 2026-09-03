@@ -45,6 +45,14 @@
 //!   scratch file as a new version: per-epic semaphore, base-version check
 //!   (a stale base is a clean 409 for re-read/retry), version + section-index
 //!   persistence, `document_updated` on `epic:<id>`
+//! - `comment post (--anchor node|section --id ANCHOR_ID | --thread THREAD_ID)
+//!   --body "TEXT"` — post a threaded comment anchored to a map node or a
+//!   Document section, or reply into an existing thread (the agent's reply
+//!   path); attribution comes from the token (a capability token posts as
+//!   the agent, `is_agent = 1`)
+//! - `comment list [--anchor-kind node|section --anchor-id ANCHOR_ID]` — the
+//!   epic's comments (optionally narrowed to one anchor)
+//! - `comment resolve COMMENT` — resolve a comment's whole thread
 //! - `scope` — print the token's own capability scope (`GET /auth/capability`)
 //!
 //! Output contract (assumed by the prompt text and the breakdown
@@ -54,6 +62,21 @@
 //! non-zero.
 
 use serde_json::{json, Value};
+
+/// Percent-encode a query-string value (anchor ids are ULIDs — plain — but
+/// never assume: keep the encoding total and cheap).
+fn urlencode(value: &str) -> String {
+    let mut out = String::with_capacity(value.len());
+    for byte in value.bytes() {
+        match byte {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(byte as char)
+            }
+            _ => out.push_str(&format!("%{byte:02X}")),
+        }
+    }
+    out
+}
 
 /// The substring every CLI failure prints to stderr. [`crate::breakdown`]
 /// greps agent run output for exactly this marker to tell a failed DAG write
@@ -428,6 +451,73 @@ impl CliClient {
         })?;
         self.document_sync(&html, base_version, node_id).await
     }
+
+    // ---- comment verbs (wayfinder epic §9) --------------------------------
+
+    /// `comment post` — `POST /epics/{scoped epic}/comments`. Starts a thread
+    /// under an anchor (`anchor_kind`: node|section + `anchor_id`) or replies
+    /// into one (`thread_id`; the anchor is inherited from the thread — an
+    /// agent reply never re-anchors it). Attribution is the token's identity:
+    /// a capability token posts as the agent (`is_agent = 1`, no human
+    /// author). Returns the created comment (its `thread_id` is what replies
+    /// and a later resolve copy).
+    pub async fn comment_post(
+        &self,
+        anchor_kind: Option<&str>,
+        anchor_id: Option<&str>,
+        body: &str,
+        thread_id: Option<&str>,
+    ) -> Result<Value, CliError> {
+        let epic_id = self.epic_id().await?;
+        let body = json!({
+            "anchor_kind": anchor_kind,
+            "anchor_id": anchor_id,
+            "body": body,
+            "thread_id": thread_id,
+        });
+        self.request(
+            reqwest::Method::POST,
+            &format!("/epics/{epic_id}/comments"),
+            Some(body),
+        )
+        .await
+    }
+
+    /// `comment list [--anchor-kind node|section --anchor-id ID]` —
+    /// `GET /epics/{scoped epic}/comments`, the epic's comments (optionally
+    /// narrowed to one anchor).
+    pub async fn comment_list(
+        &self,
+        anchor_kind: Option<&str>,
+        anchor_id: Option<&str>,
+    ) -> Result<Value, CliError> {
+        let epic_id = self.epic_id().await?;
+        let mut path = format!("/epics/{epic_id}/comments");
+        match (anchor_kind, anchor_id) {
+            (Some(kind), Some(id)) => {
+                path += &format!(
+                    "?anchor_kind={}&anchor_id={}",
+                    urlencode(kind),
+                    urlencode(id)
+                );
+            }
+            _ => {}
+        }
+        self.request(reqwest::Method::GET, &path, None).await
+    }
+
+    /// `comment resolve COMMENT` — `POST
+    /// /epics/{scoped epic}/comments/{comment}/resolve`, resolving the
+    /// comment's whole thread. Returns the resolved thread.
+    pub async fn comment_resolve(&self, comment_id: &str) -> Result<Value, CliError> {
+        let epic_id = self.epic_id().await?;
+        self.request(
+            reqwest::Method::POST,
+            &format!("/epics/{epic_id}/comments/{comment_id}/resolve"),
+            None,
+        )
+        .await
+    }
 }
 
 // ---- tests ----------------------------------------------------------------
@@ -593,6 +683,82 @@ mod tests {
         cli.task_link(a_id, b_id).await.unwrap(); // a → b
         let err = cli.task_link(b_id, a_id).await.unwrap_err(); // b → a closes the cycle
         assert_eq!(err.status, Some(409));
+        assert!(rendered(&err).starts_with(ERROR_PREFIX));
+    }
+
+    /// The `comment` verbs round trip through the API: an agent-run
+    /// capability token posts a thread (anchored to a map node), replies into
+    /// it, lists, and resolves — attributed `is_agent = 1` with no human
+    /// author. (AC: users and the agent can post threaded comments; the
+    /// users' side is covered in `crate::comments`'s tests.)
+    #[tokio::test]
+    async fn the_comment_verbs_round_trip_with_agent_attribution() {
+        let (state, client) = boot().await;
+        let (project_id, epic_id) = seed_epic(&state).await;
+        let node = crate::map::create_node(
+            state.db.conn(),
+            &epic_id,
+            "grilling",
+            None,
+            "Which store?",
+            Some("Pick the blob store"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let (cli, _guard) = scoped(&state, &client, &project_id, &epic_id, "grilling");
+
+        // `comment post --anchor node --id ... --body ...` starts a thread.
+        let head = cli
+            .comment_post(Some("node"), Some(&node.id), "Which store are we picking?", None)
+            .await
+            .unwrap();
+        assert_eq!(head["anchor_kind"], "node");
+        assert_eq!(head["anchor_id"], node.id.as_str());
+        assert_eq!(head["is_agent"], true);
+        assert_eq!(head["author_user_id"], Value::Null);
+        assert_eq!(head["resolved"], false);
+        let thread_id = head["thread_id"].as_str().unwrap().to_string();
+
+        // `comment post --thread ...` replies (the anchor is inherited).
+        let reply = cli
+            .comment_post(None, None, "Leaning the evidence store.", Some(&thread_id))
+            .await
+            .unwrap();
+        assert_eq!(reply["thread_id"], thread_id.as_str());
+        assert_eq!(reply["anchor_id"], node.id.as_str());
+        assert_eq!(reply["is_agent"], true);
+
+        // `comment list` shows both; the anchor filter narrows to them.
+        let list = cli.comment_list(Some("node"), Some(&node.id)).await.unwrap();
+        let items = list["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        for item in items {
+            assert_eq!(item["thread_id"], thread_id.as_str());
+            assert_eq!(item["is_agent"], true);
+        }
+
+        // `comment resolve COMMENT` resolves the whole thread.
+        let resolved = cli
+            .comment_resolve(head["id"].as_str().unwrap())
+            .await
+            .unwrap();
+        let items = resolved["items"].as_array().unwrap();
+        assert_eq!(items.len(), 2);
+        for item in items {
+            assert_eq!(item["resolved"], true);
+        }
+
+        // An unknown anchor is the API's 400 message, verbatim, behind the
+        // `dearborn: ` marker.
+        let err = cli
+            .comment_post(Some("section"), Some("no-such-section"), "hi", None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, Some(400));
+        assert!(err.message.contains("not part of epic"));
         assert!(rendered(&err).starts_with(ERROR_PREFIX));
     }
 

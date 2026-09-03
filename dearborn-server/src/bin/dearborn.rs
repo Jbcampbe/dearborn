@@ -36,6 +36,12 @@
 //!   edited scratch file as a new document version (per-epic write semaphore,
 //!   base-version check, section index, `document_updated` WS frame); a stale
 //!   base version exits non-zero naming the current version — re-pull and retry
+//! - `comment post (--anchor node|section --id ANCHOR_ID | --thread THREAD_ID)
+//!   --body "TEXT"` — post a threaded comment anchored to a map node or a
+//!   Document section, or reply into an existing thread (the anchor is
+//!   inherited; attribution comes from the token)
+//! - `comment list [--anchor-kind node|section --anchor-id ANCHOR_ID]`
+//! - `comment resolve COMMENT` — resolve a comment's whole thread
 //! - `scope`
 //!
 //! Every verb prints the API's JSON to stdout on success (exit 0). Any failure
@@ -88,7 +94,7 @@ fn run(args: Vec<String>) -> Result<(), i32> {
 
     let verb = match args.first() {
         Some(verb) => verb.as_str(),
-        None => return usage("expected a verb: task create | task link | dag | node create | node link | node resolve | map | map set-* | document pull | document sync | scope"),
+        None => return usage("expected a verb: task create | task link | dag | node create | node link | node resolve | map | map set-* | document pull | document sync | comment post | comment list | comment resolve | scope"),
     };
     args = &args[1..];
 
@@ -244,8 +250,59 @@ fn run(args: Vec<String>) -> Result<(), i32> {
                 )),
             }
         }
+        "comment" => {
+            let sub = match args.first() {
+                Some(sub) => sub.as_str(),
+                None => return usage("expected a `comment` sub-verb (post | list | resolve)"),
+            };
+            args = &args[1..];
+            match sub {
+                "post" => {
+                    let (anchor_kind, anchor_id, body, thread) = comment_post_flags(args)?;
+                    let client = client(&base_url, &token)?;
+                    block_on(async move {
+                        let comment = client
+                            .comment_post(
+                                anchor_kind.as_deref(),
+                                anchor_id.as_deref(),
+                                &body,
+                                thread.as_deref(),
+                            )
+                            .await?;
+                        println!("{}", serde_json::to_string(&comment).expect("comment is JSON"));
+                        Ok(())
+                    })
+                }
+                "list" => {
+                    let (anchor_kind, anchor_id) = comment_list_flags(args)?;
+                    let client = client(&base_url, &token)?;
+                    block_on(async move {
+                        let comments = client
+                            .comment_list(anchor_kind.as_deref(), anchor_id.as_deref())
+                            .await?;
+                        println!("{}", serde_json::to_string(&comments).expect("comments are JSON"));
+                        Ok(())
+                    })
+                }
+                "resolve" => {
+                    let comment_id = match args {
+                        [id] if !id.trim().is_empty() => id.clone(),
+                        _ => return usage("expected `comment resolve COMMENT`"),
+                    };
+                    let client = client(&base_url, &token)?;
+                    block_on(async move {
+                        let thread = client.comment_resolve(&comment_id).await?;
+                        println!("{}", serde_json::to_string(&thread).expect("resolve result is JSON"));
+                        Ok(())
+                    })
+                }
+                other => usage(&format!(
+                    "unknown comment verb `{other}` (expected: post | list | resolve)"
+                )),
+            }
+        }
         other => usage(&format!(
-            "unknown verb `{other}` (expected: task create | task link | dag | node create | node link | node resolve | map | map set-* | document pull | document sync | scope)"
+            "unknown verb `{other}` (expected: task create | task link | dag | node create | node link | node resolve | map | map set-* | document pull | document sync | comment post | comment list | comment resolve | scope)"
         )),
     }
 }
@@ -330,6 +387,113 @@ fn document_sync_flags(args: &[String]) -> Result<DocumentSyncFlags, i32> {
     match base_version {
         Some(base_version) => Ok((path, base_version, node)),
         None => usage("--base-version is required (the version you pulled; 0 before the first sync)"),
+    }
+}
+
+/// The parsed `comment post` flag set:
+/// `(anchor_kind, anchor_id, body, thread_id)`.
+type CommentPostFlags = (Option<String>, Option<String>, String, Option<String>);
+
+/// `comment post` flags: `--anchor node|section` + `--id ANCHOR_ID` (together
+/// they start a new thread) OR `--thread THREAD_ID` (join an existing thread —
+/// the anchor is inherited, so a reply needs no anchor), plus the required
+/// `--body "TEXT"`.
+fn comment_post_flags(args: &[String]) -> Result<CommentPostFlags, i32> {
+    let mut anchor_kind: Option<String> = None;
+    let mut anchor_id: Option<String> = None;
+    let mut body: Option<String> = None;
+    let mut thread: Option<String> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        let (name, inline) = match args[i].split_once('=') {
+            Some((name, value)) => (name, Some(value.to_string())),
+            None => (args[i].as_str(), None),
+        };
+        let take = || -> Result<String, i32> {
+            if let Some(value) = inline.clone() {
+                return Ok(value);
+            }
+            if i + 1 >= args.len() {
+                return usage(&format!("{name} requires a value"));
+            }
+            Ok(args[i + 1].clone())
+        };
+        match name {
+            "--anchor" => anchor_kind = Some(take()?),
+            "--id" => anchor_id = Some(take()?),
+            "--body" => body = Some(take()?),
+            "--thread" => thread = Some(take()?),
+            other => return usage(&format!(
+                "unknown comment post flag `{other}` (expected: --anchor, --id, --body, --thread)"
+            )),
+        }
+        i += if inline.is_some() { 1 } else { 2 };
+    }
+
+    let body = match body {
+        Some(body) if !body.trim().is_empty() => body,
+        _ => return usage("--body is required and must not be empty"),
+    };
+    match (&anchor_kind, &anchor_id, &thread) {
+        // Starting a thread: both anchor halves required.
+        (Some(kind), Some(id), None) if !kind.trim().is_empty() && !id.trim().is_empty() => {
+            Ok((Some(kind.clone()), Some(id.clone()), body, None))
+        }
+        // Replying: the thread id alone fixes the anchor.
+        (None, None, Some(thread)) if !thread.trim().is_empty() => {
+            Ok((None, None, body, Some(thread.clone())))
+        }
+        (Some(_), Some(_), Some(_)) => usage(
+            "pass either --anchor node|section --id ANCHOR_ID (new thread) or --thread THREAD_ID (reply), not both",
+        ),
+        _ => usage(
+            "expected `comment post --anchor node|section --id ANCHOR_ID --body \"TEXT\"` or `comment post --thread THREAD_ID --body \"TEXT\"`",
+        ),
+    }
+}
+
+/// The parsed `comment list` flag set: `(anchor_kind, anchor_id)` — both or
+/// neither.
+type CommentListFlags = (Option<String>, Option<String>);
+
+/// `comment list` flags: the optional `--anchor-kind node|section` +
+/// `--anchor-id ANCHOR_ID` pair (together they narrow the list to one anchor).
+fn comment_list_flags(args: &[String]) -> Result<CommentListFlags, i32> {
+    let mut anchor_kind: Option<String> = None;
+    let mut anchor_id: Option<String> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        let (name, inline) = match args[i].split_once('=') {
+            Some((name, value)) => (name, Some(value.to_string())),
+            None => (args[i].as_str(), None),
+        };
+        let take = || -> Result<String, i32> {
+            if let Some(value) = inline.clone() {
+                return Ok(value);
+            }
+            if i + 1 >= args.len() {
+                return usage(&format!("{name} requires a value"));
+            }
+            Ok(args[i + 1].clone())
+        };
+        match name {
+            "--anchor-kind" => anchor_kind = Some(take()?),
+            "--anchor-id" => anchor_id = Some(take()?),
+            other => return usage(&format!(
+                "unknown comment list flag `{other}` (expected: --anchor-kind, --anchor-id)"
+            )),
+        }
+        i += if inline.is_some() { 1 } else { 2 };
+    }
+
+    match (anchor_kind, anchor_id) {
+        (None, None) => Ok((None, None)),
+        (Some(kind), Some(id)) if !kind.trim().is_empty() && !id.trim().is_empty() => {
+            Ok((Some(kind), Some(id)))
+        }
+        _ => usage("--anchor-kind and --anchor-id go together"),
     }
 }
 
@@ -719,6 +883,10 @@ usage: dearborn --url <base> --token <cap> <verb>
   map set-destination|set-notes|set-fog|set-out-of-scope \"TEXT\"
   document pull [PATH]
   document sync PATH --base-version N [--node NODE_ID]
+  comment post --anchor node|section --id ANCHOR_ID --body \"TEXT\"
+  comment post --thread THREAD_ID --body \"TEXT\"
+  comment list [--anchor-kind node|section --anchor-id ANCHOR_ID]
+  comment resolve COMMENT
   scope"
     );
     Err(2)
@@ -843,6 +1011,79 @@ mod tests {
         assert_eq!(path, "doc.html");
         assert_eq!(base_version, 2);
         assert_eq!(node.as_deref(), Some("01N"));
+    }
+
+    #[test]
+    fn comment_post_flags_require_either_a_full_anchor_or_a_thread() {
+        // A new thread: the anchor pair + body.
+        let (kind, id, body, thread) = comment_post_flags(
+            &[
+                "--anchor", "node", "--id", "01NODE", "--body", "Which store?",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(kind.as_deref(), Some("node"));
+        assert_eq!(id.as_deref(), Some("01NODE"));
+        assert_eq!(body, "Which store?");
+        assert_eq!(thread, None);
+
+        // A reply: the thread id alone fixes the anchor (an agent reply
+        // never re-anchors).
+        let (kind, id, body, thread) = comment_post_flags(
+            &["--thread=01THREAD", "--body", "Reply"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(kind, None);
+        assert_eq!(id, None);
+        assert_eq!(body, "Reply");
+        assert_eq!(thread.as_deref(), Some("01THREAD"));
+
+        // Usage errors: half an anchor, both shapes at once, a blank body,
+        // an unknown flag.
+        for args in [
+            vec!["--anchor", "node", "--body", "hi"],
+            vec!["--id", "01N", "--body", "hi"],
+            vec![
+                "--anchor", "node", "--id", "01N", "--thread", "01T", "--body", "hi",
+            ],
+            vec!["--anchor", "node", "--id", "01N", "--body", "   "],
+            vec!["--anchor", "node", "--id", "01N", "--body", "hi", "--wat"],
+        ] {
+            let args: Vec<String> = args.into_iter().map(String::from).collect();
+            assert_eq!(comment_post_flags(&args).unwrap_err(), 2);
+        }
+    }
+
+    #[test]
+    fn comment_list_flags_take_the_anchor_pair_or_nothing() {
+        let (kind, id) = comment_list_flags(&[]).unwrap();
+        assert_eq!(kind, None);
+        assert_eq!(id, None);
+
+        let (kind, id) = comment_list_flags(
+            &[
+                "--anchor-kind", "section", "--anchor-id", "decisions",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(kind.as_deref(), Some("section"));
+        assert_eq!(id.as_deref(), Some("decisions"));
+
+        // Half the pair is a usage error.
+        let args: Vec<String> = ["--anchor-kind", "node"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(comment_list_flags(&args).unwrap_err(), 2);
     }
 
     #[test]

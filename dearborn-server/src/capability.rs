@@ -227,6 +227,13 @@ pub fn authorize_cap_request(
         // resolution edit, so it is HITL-only too.
         ("GET", ["epics", e, "document"]) => *e == epic,
         ("POST", ["epics", e, "document", "sync"]) => *e == epic && reshape,
+        // Comments (`dearborn comment post|list|resolve` — see
+        // `crate::comments`): threaded, node/section-anchored conversation.
+        // Posting (the agent's replies included), reading, and resolving are
+        // open to every phase — comments never reshape the map.
+        ("GET", ["epics", e, "comments"]) => *e == epic,
+        ("POST", ["epics", e, "comments"]) => *e == epic,
+        ("POST", ["epics", e, "comments", _, "resolve"]) => *e == epic,
         _ => false,
     }
 }
