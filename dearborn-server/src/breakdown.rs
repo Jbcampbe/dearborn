@@ -818,43 +818,47 @@ mod tests {
     use tower::ServiceExt;
 
     /// The bearer credential HTTP tests present, minted **once per process**
-    /// from a seeded active admin (`crate::users::testing::seed_user` +
-    /// `crate::sessions::testing::login_as`) — the replacement for the deleted
+    /// for a fixed user id ([`TEST_USER_ID`]) — the replacement for the deleted
     /// static `TOKEN` constant. Access-token verification is stateless (one
     /// HMAC check against the fixed test master key, no database read), so a
     /// token minted here authenticates against every in-memory instance these
-    /// tests boot.
+    /// tests boot; each instance seeds the named user row (see
+    /// [`seed_bearer_user`]) so rows attributed to the actor — like the map
+    /// node that epic creation seeds — satisfy their foreign keys.
     fn auth_bearer() -> &'static str {
         static BEARER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
         BEARER.get_or_init(|| {
-            // Seeding and login are async store calls, and `req` below is
-            // synchronous. Mint on a dedicated OS thread: `Runtime::block_on`
-            // panics if called from inside a test's own async context, but a
-            // plain thread has none, so a throwaway current-thread runtime is
-            // legal there.
-            let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("test runtime");
-                let token = runtime.block_on(async {
-                    let db = crate::Db::connect(":memory:").await.unwrap();
-                    db.run_migrations().await.unwrap();
-                    let state = crate::AppState::new(crate::Config::for_test(), db);
-                    let user = crate::users::testing::seed_user(
-                        &state,
-                        "tester",
-                        crate::users::Role::Admin,
-                        true,
-                    )
-                    .await;
-                    crate::sessions::testing::login_as(&state, &user).await
-                });
-                tx.send(token).expect("bearer receiver dropped");
-            });
-            rx.recv().expect("bearer minter panicked")
+            let key = crate::auth::AuthKey::derive(&Config::for_test().master_key).unwrap();
+            key.mint(&crate::auth::Claims {
+                sub: TEST_USER_ID.to_string(),
+                sid: TEST_SESSION_ID.to_string(),
+                role: crate::users::Role::Admin,
+                exp: now_ms() + 3_600_000,
+            })
         })
+    }
+
+    /// The fixed user id the shared bearer token names (seeded into every test
+    /// app by [`seed_bearer_user`]).
+    const TEST_USER_ID: &str = "01TESTUSER0000000000000000";
+    /// The fixed session id inside the shared bearer token (verification is
+    /// stateless — it is never looked up).
+    const TEST_SESSION_ID: &str = "01TESTSESSION00000000000000";
+
+    /// Seed the shared bearer user directly (raw SQL: `users::create` mints a
+    /// fresh ULID, and the token's `sub` must match the row it attributes).
+    async fn seed_bearer_user(state: &AppState) {
+        state
+            .db
+            .conn()
+            .execute(
+                "INSERT INTO user (id, username, display_name, password_hash, role, active, \
+                 created_at, updated_at) \
+                 VALUES (?1, 'tester', 'Tester', 'test-fixture-not-a-login', 'admin', 1, ?2, ?2)",
+                libsql::params![TEST_USER_ID, now_ms()],
+            )
+            .await
+            .unwrap();
     }
 
     fn req(method: &str, uri: &str, body: Option<Value>) -> Request<Body> {
@@ -891,6 +895,7 @@ mod tests {
             Arc::new(SilentPlanningAgent),
             breakdown,
         );
+        seed_bearer_user(&state).await;
         let app = app(state.clone());
         (state, app)
     }

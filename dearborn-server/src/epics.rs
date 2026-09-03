@@ -2,9 +2,11 @@
 //! Planning" §3/§4.10).
 //!
 //! An **epic** is the unit of planning. Creating one requires a **destination**
-//! — what the finished plan looks like — and lands it in `status='Planning'`;
-//! the map workflow (decision nodes, the living Document) grows out from there
-//! in later tasks. The old linear product/technical planning-session flow was
+//! — what the finished plan looks like — lands it in `status='Planning'`, and
+//! auto-seeds its planning map with exactly one open grilling node (wayfinder
+//! plan §8: the seed is a plain grilling node that infers "I'm first" from the
+//! empty map; no agent session runs at create time and the living Document
+//! starts empty). The old linear product/technical planning-session flow was
 //! removed in the clean cutover: there is no epic-level transcript, no phase
 //! sessions, and no advance-phase step — planning history lives on map nodes.
 //!
@@ -21,6 +23,7 @@ use libsql::{params, params_from_iter, Connection, Row, Value};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
 
+use crate::map::Actor;
 use crate::{git, projects, AppError, AppResult, AppState};
 
 /// Columns projected into an [`Epic`] DTO. The lease columns (`lease_owner`,
@@ -124,13 +127,16 @@ where
 
 /// `POST /projects/{id}/epics` — create an epic with its destination.
 ///
-/// Lands the epic in `status='Planning'`. `404` if the project does not exist;
-/// `400` if `title` or `destination` is missing/empty. The map workflow grows
-/// from the destination (the seed grilling node is added in a later task; the
-/// old linear planning session is gone with the cutover).
+/// Lands the epic in `status='Planning'` and seeds its map: exactly one open
+/// grilling node on the frontier, attributed to the creating user (wayfinder
+/// plan §8 — the seed uses the standard grilling prompt, which infers "I'm
+/// first" from the empty map; no agent charting session runs and the Document
+/// starts empty). `404` if the project does not exist; `400` if `title` or
+/// `destination` is missing/empty.
 pub async fn create_epic(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
+    actor: Actor,
     Json(req): Json<CreateEpic>,
 ) -> AppResult<(StatusCode, Json<Epic>)> {
     let title = require_field(req.title, "title")?;
@@ -206,10 +212,55 @@ pub async fn create_epic(
     )
     .await?;
 
+    // Seed the map (wayfinder plan §8, lifecycle step 1): exactly one open
+    // grilling node on the frontier, attributed to the creating user. No agent
+    // session is started here — the standard grilling prompt infers "I'm
+    // first" from the empty map when a human opens the node — and the
+    // Document stays empty (no `document` row until the first sync, so the
+    // document view already reports its `version: 0` empty state). A seed
+    // failure fails the whole create: an epic without its seed node has no
+    // way to start the map workflow.
+    seed_first_grilling_node(conn, &id, actor.user_id.as_deref()).await?;
+
     let epic = fetch_epic(conn, &id)
         .await?
         .ok_or_else(|| AppError::Internal(format!("epic {id} vanished after insert")))?;
     Ok((StatusCode::CREATED, Json(epic)))
+}
+
+/// The seed grilling node's title — the map's first frontier ticket, worked
+/// with the standard grilling prompt like any other grilling node (wayfinder
+/// plan §8).
+const SEED_NODE_TITLE: &str = "Chart the route";
+
+/// The seed grilling node's question — the decision the map's first session
+/// resolves. Destination-agnostic on purpose: the interactive engine's
+/// first-turn context already adds the epic's destination.
+const SEED_NODE_QUESTION: &str = "What decisions must be settled to reach the destination?";
+
+/// Auto-seed a fresh epic's map (wayfinder plan §8): one open `grilling` node,
+/// the map's first frontier ticket. The seed is deliberately a **plain**
+/// grilling node — no separate "charting" kind, and no agent session (a node
+/// session row exists only once a human opens the node) — so it opens exactly
+/// like any other grilling node.
+async fn seed_first_grilling_node(
+    conn: &Connection,
+    epic_id: &str,
+    created_by: Option<&str>,
+) -> AppResult<()> {
+    crate::map::create_node(
+        conn,
+        epic_id,
+        "grilling",
+        None,
+        SEED_NODE_TITLE,
+        Some(SEED_NODE_QUESTION),
+        created_by,
+        None,
+        None,
+    )
+    .await?;
+    Ok(())
 }
 
 /// `GET /projects/{id}/epics` — list a project's epics, newest first. `404` if
@@ -446,42 +497,58 @@ mod tests {
     use serde_json::Value as Json;
     use tower::ServiceExt; // for `oneshot`
 
+    /// The fixed user id the shared bearer token names. Every test app seeds
+    /// this row ([`seed_bearer_user`]) so rows attributed to the acting user —
+    /// like the seed grilling node's `created_by` — satisfy their foreign keys
+    /// in every instance, not just the one that minted the token.
+    const TEST_USER_ID: &str = "01TESTUSER0000000000000000";
+    /// The fixed session id inside the shared bearer token (verification is
+    /// stateless — it is never looked up).
+    const TEST_SESSION_ID: &str = "01TESTSESSION00000000000000";
+
+    async fn test_state(db: Db) -> AppState {
+        let state = AppState::new(Config::for_test(), db);
+        seed_bearer_user(&state).await;
+        state
+    }
+
+    /// Seed the shared bearer user directly (raw SQL: `users::create` mints a
+    /// fresh ULID, and the token's `sub` must match the row it attributes).
+    async fn seed_bearer_user(state: &AppState) {
+        state
+            .db
+            .conn()
+            .execute(
+                "INSERT INTO user (id, username, display_name, password_hash, role, active, \
+                 created_at, updated_at) \
+                 VALUES (?1, 'tester', 'Tester', 'test-fixture-not-a-login', 'admin', 1, ?2, ?2)",
+                libsql::params![TEST_USER_ID, now_ms()],
+            )
+            .await
+            .unwrap();
+    }
+
     async fn test_app() -> axum::Router {
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
-        app(AppState::new(Config::for_test(), db))
+        app(test_state(db).await)
     }
 
     fn auth_bearer() -> &'static str {
         static BEARER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
         BEARER.get_or_init(|| {
-            // Seeding and login are async store calls, and `req` below is
-            // synchronous. Mint on a dedicated OS thread: `Runtime::block_on`
-            // panics if called from inside a test's own async context, but a
-            // plain thread has none, so a throwaway current-thread runtime is
-            // legal there.
-            let (tx, rx) = std::sync::mpsc::channel();
-            std::thread::spawn(move || {
-                let runtime = tokio::runtime::Builder::new_current_thread()
-                    .enable_all()
-                    .build()
-                    .expect("test runtime");
-                let token = runtime.block_on(async {
-                    let db = crate::Db::connect(":memory:").await.unwrap();
-                    db.run_migrations().await.unwrap();
-                    let state = crate::AppState::new(crate::Config::for_test(), db);
-                    let user = crate::users::testing::seed_user(
-                        &state,
-                        "tester",
-                        crate::users::Role::Admin,
-                        true,
-                    )
-                    .await;
-                    crate::sessions::testing::login_as(&state, &user).await
-                });
-                tx.send(token).expect("bearer receiver dropped");
-            });
-            rx.recv().expect("bearer minter panicked")
+            // Mint directly for the fixed `TEST_USER_ID` instead of seeding a
+            // throwaway instance and logging in: token verification is
+            // stateless (one HMAC against the fixed test master key), and
+            // every test app seeds the named user row, so attribution foreign
+            // keys resolve in each instance the token is used against.
+            let key = crate::auth::AuthKey::derive(&Config::for_test().master_key).unwrap();
+            key.mint(&crate::auth::Claims {
+                sub: TEST_USER_ID.to_string(),
+                sid: TEST_SESSION_ID.to_string(),
+                role: crate::users::Role::Admin,
+                exp: now_ms() + 3_600_000,
+            })
         })
     }
 
@@ -542,7 +609,7 @@ mod tests {
     async fn epic_pr_and_blocked_reason_round_trip_but_lease_columns_stay_internal() {
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
-        let state = AppState::new(Config::for_test(), db);
+        let state = test_state(db).await;
         let app = app(state.clone());
         let project_id = seed_project(&app).await;
         let id = create_epic_via_api(&app, &project_id, "Ship it").await["id"]
@@ -682,7 +749,7 @@ mod tests {
     async fn create_epic_persists_destination_and_notes() {
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
-        let state = AppState::new(Config::for_test(), db);
+        let state = test_state(db).await;
         let app = app(state.clone());
         let project_id = seed_project(&app).await;
 
@@ -748,6 +815,131 @@ mod tests {
         assert_eq!(body_json(omitted_notes).await["notes"], Json::Null);
     }
 
+    // ---- AC: epic create seeds the map (one open grilling node, empty doc) --
+
+    #[tokio::test]
+    async fn creating_an_epic_seeds_one_open_grilling_node_on_the_frontier() {
+        let app = test_app().await;
+        let project_id = seed_project(&app).await;
+        let epic_id = create_epic_via_api(&app, &project_id, "Ship it").await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        let map = body_json(
+            app.clone()
+                .oneshot(req("GET", &format!("/epics/{epic_id}/map"), None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(map["epic_id"], epic_id.as_str());
+
+        // Exactly one node, and it is the open grilling seed on the frontier.
+        let nodes = map["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 1);
+        assert_eq!(nodes[0]["kind"], "grilling");
+        assert_eq!(nodes[0]["state"], "open");
+        assert_eq!(nodes[0]["frontier"], true);
+        assert!(nodes[0]["blocked_by"].as_array().unwrap().is_empty());
+        // No edges: the seed is the map's only node.
+        assert_eq!(map["edges"].as_array().unwrap().len(), 0);
+        // Attributed to the authenticated user who created the epic.
+        assert_eq!(nodes[0]["created_by"], TEST_USER_ID);
+
+        // A second epic seeds its own node — the map is per-epic, one seed
+        // per create.
+        let other = create_epic_via_api(&app, &project_id, "Second").await;
+        let other_map = body_json(
+            app.clone()
+                .oneshot(req(
+                    "GET",
+                    &format!("/epics/{}/map", other["id"].as_str().unwrap()),
+                    None,
+                ))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let other_nodes = other_map["nodes"].as_array().unwrap();
+        assert_eq!(other_nodes.len(), 1);
+        assert_ne!(other_nodes[0]["id"], nodes[0]["id"]);
+    }
+
+    #[tokio::test]
+    async fn a_fresh_epic_starts_with_an_empty_document() {
+        let app = test_app().await;
+        let project_id = seed_project(&app).await;
+        let epic_id = create_epic_via_api(&app, &project_id, "Ship it").await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+
+        // The Document starts empty: no row until the first sync, so the
+        // view reports the version-0 empty state with no sections.
+        let doc = body_json(
+            app.clone()
+                .oneshot(req("GET", &format!("/epics/{epic_id}/document"), None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        assert_eq!(doc["epic_id"], epic_id.as_str());
+        assert_eq!(doc["html"], Json::Null);
+        assert_eq!(doc["version"], 0);
+        assert_eq!(doc["sections"].as_array().unwrap().len(), 0);
+    }
+
+    #[tokio::test]
+    async fn the_seeded_node_opens_like_any_other_grilling_node() {
+        let app = test_app().await;
+        let project_id = seed_project(&app).await;
+        let epic_id = create_epic_via_api(&app, &project_id, "Ship it").await["id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let map = body_json(
+            app.clone()
+                .oneshot(req("GET", &format!("/epics/{epic_id}/map"), None))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let node_id = map["nodes"][0]["id"].as_str().unwrap().to_string();
+
+        // No agent session runs at seed time: the node has no session until a
+        // human opens it (no "charting" session on create).
+        let response = app
+            .clone()
+            .oneshot(req(
+                "GET",
+                &format!("/epics/{epic_id}/map-nodes/{node_id}/session"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // Opening it works exactly like any other grilling node: an active
+        // node-scoped session, no resume handle yet, empty transcript.
+        let response = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                &format!("/epics/{epic_id}/map-nodes/{node_id}/session"),
+                None,
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let view = body_json(response).await;
+        // The session view flattens the resume handle alongside the transcript.
+        assert_eq!(view["node_id"], node_id.as_str());
+        assert_eq!(view["status"], "active");
+        assert_eq!(view["harness_session_id"], Json::Null);
+        assert_eq!(view["messages"].as_array().unwrap().len(), 0);
+    }
+
     #[tokio::test]
     async fn create_epic_on_unknown_project_is_404() {
         let app = test_app().await;
@@ -767,7 +959,7 @@ mod tests {
     async fn update_epic_patches_title_and_description_and_publishes() {
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
-        let state = AppState::new(Config::for_test(), db);
+        let state = test_state(db).await;
         let app = app(state.clone());
         let project_id = seed_project(&app).await;
         let created = create_epic_via_api(&app, &project_id, "Old title").await;
@@ -898,10 +1090,10 @@ mod tests {
 
     #[tokio::test]
     async fn create_epic_with_existing_base_branch_stores_it_and_returns_it() {
-        use crate::{Config, Db};
+        use crate::Db;
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
-        let state = crate::AppState::new(Config::for_test(), db);
+        let state = test_state(db).await;
         let app = app(state.clone());
         let (project_id, _bare) = seed_local_bare_project(&state).await;
 
@@ -925,10 +1117,10 @@ mod tests {
 
     #[tokio::test]
     async fn create_epic_with_unknown_base_branch_is_structured_bad_request() {
-        use crate::{Config, Db};
+        use crate::Db;
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
-        let state = crate::AppState::new(Config::for_test(), db);
+        let state = test_state(db).await;
         let app = app(state.clone());
         let (project_id, _bare) = seed_local_bare_project(&state).await;
 
@@ -950,10 +1142,10 @@ mod tests {
 
     #[tokio::test]
     async fn create_epic_blank_base_branch_stores_null_like_omitted() {
-        use crate::{Config, Db};
+        use crate::Db;
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
-        let state = crate::AppState::new(Config::for_test(), db);
+        let state = test_state(db).await;
         let app = app(state.clone());
         let project_id = seed_project(&app).await;
 
@@ -1097,5 +1289,5 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
-}
+    }
 }
