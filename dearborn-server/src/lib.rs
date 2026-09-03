@@ -4,6 +4,7 @@
 //! binary entrypoint so later tasks can add modules and integration tests
 //! cleanly.
 
+pub mod afk_engine;
 pub mod agent_settings;
 pub mod agent_slot;
 pub mod auth;
@@ -54,6 +55,7 @@ use tower_http::{
 };
 
 pub use breakdown::BreakdownAgent;
+pub use afk_engine::AfkAgent;
 pub use config::{AuthConfig, Config, ConfigError, ExecutorConfig};
 pub use crypto::{CryptoError, MasterKey};
 pub use db::{Db, DbError};
@@ -119,6 +121,16 @@ pub struct AppState {
     /// claimed task at a time, by construction of the DAG walk), not a
     /// per-epic guard like planning's.
     pub task_agent: Arc<dyn TaskAgent>,
+    /// The one-shot AFK node engine that runs research and AFK-task map nodes
+    /// unattended (wayfinder epic §5). Production is
+    /// [`afk_engine::ClaudeAfkAgent`]; tests inject a scripted fake. Like
+    /// breakdown it is one-shot (no resume), but it is wired to no `dearborn`
+    /// CLI at all — an unattended run gets no write surface, so the map it is
+    /// forbidden from reshaping is structurally out of reach; Dearborn itself
+    /// records the report into the node's `gist`. Concurrency is the
+    /// per-node run-lock ([`AppState::node_inflight`]), so the frontier's AFK
+    /// nodes fire in parallel.
+    pub afk: Arc<dyn AfkAgent>,
     /// The git-hosting seam (T-514): push the epic branch and open its PR.
     /// Production is [`git_host::GithubHost`]; tests inject
     /// [`git_host::testing::FakeHost`] so `just test` never talks to a real
@@ -290,6 +302,16 @@ impl AppState {
         )
     }
 
+    /// Swap in an injected [`AfkAgent`] — the seam tests use to drive the
+    /// one-shot AFK node engine (research / AFK-task nodes) hermetically.
+    /// Consumes and returns `self` so it chains after any constructor;
+    /// production wiring defaults the agent to
+    /// [`afk_engine::ClaudeAfkAgent`].
+    pub fn with_afk(mut self, afk: Arc<dyn AfkAgent>) -> AppState {
+        self.afk = afk;
+        self
+    }
+
     /// Like [`with_agents`](Self::with_agents) but also injecting the
     /// [`TaskAgent`] — the seam tests use to drive task-stage runs
     /// hermetically (T-512) without spawning `claude`. Defaults `git_host` to
@@ -339,6 +361,7 @@ impl AppState {
             planner,
             breakdown,
             task_agent,
+            afk: Arc::new(afk_engine::ClaudeAfkAgent::new()),
             git_host,
             inflight: Arc::new(Mutex::new(HashSet::new())),
             node_inflight: Arc::new(Mutex::new(HashSet::new())),
@@ -594,6 +617,15 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/epics/:id/map-nodes/:nodeId/messages",
             get(node_engine::list_node_messages).post(node_engine::post_node_message),
+        )
+        // The one-shot AFK node engine (wayfinder epic §5): firing a research
+        // or AFK-task node runs one unattended agent turn whose report lands
+        // in the node's `gist`; per-node runs never reshape the map and fire
+        // in parallel under the per-node run-lock. Live `RunEvent`s stream on
+        // `node:<id>`.
+        .route(
+            "/epics/:id/map-nodes/:nodeId/run",
+            axum::routing::post(afk_engine::fire_node),
         )
         .route(
             "/epics/:id/map-node-dependencies",

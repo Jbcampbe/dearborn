@@ -128,7 +128,8 @@ artifact, not a production feature.";
 
 /// The node kinds this interactive engine drives (wayfinder epic §5): grilling
 /// and prototype are HITL, multi-turn, node-scoped. Research/task nodes run on
-/// the one-shot engine (a later task) and never open an interactive session.
+/// the one-shot AFK engine ([`crate::afk_engine`]) and never open an
+/// interactive session.
 pub const INTERACTIVE_KINDS: &[&str] = &["grilling", "prototype"];
 
 /// The agent slot a node kind resolves its live settings under, or `None` for a

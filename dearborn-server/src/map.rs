@@ -16,10 +16,12 @@
 //! re-renders with correct frontier/blocked state — the same pattern as
 //! `publish_dag`'s `dag_updated` frames.
 //!
-//! The engines that *drive* nodes (grilling/prototype interactive runs,
-//! research/task one-shots) and the rich grilling resolution bundle (document
-//! edits, fog graduation, map reshaping) are later tasks in the epic; this
-//! module is deliberately only the node/edge/prose CRUD + computation layer.
+//! The engines that *drive* nodes — grilling/prototype interactive runs
+//! ([`crate::node_engine`]) and research/AFK-task one-shots
+//! ([`crate::afk_engine`]) — build on this module; the rich grilling
+//! resolution bundle (document edits, fog graduation, map reshaping) is a
+//! later task in the epic. This module is deliberately only the node/edge/prose
+//! CRUD + computation layer.
 //! `PATCH /epics/{id}/map-nodes/{id}` with `state = "resolved"` is the minimal
 //! state transition the frontier computation needs to be observable end to
 //! end; the later resolution flow builds on top of it.

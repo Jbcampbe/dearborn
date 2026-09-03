@@ -42,6 +42,13 @@ pub enum AgentSlot {
     /// Interactive per-node prototype engine (wayfinder epic §5): the HITL
     /// throwaway-artifact session that informs a decision.
     Prototype,
+    /// One-shot AFK node engine (wayfinder epic §5): the unattended
+    /// fact-finding run that reports a research node's findings into `gist`.
+    Research,
+    /// One-shot AFK node engine (wayfinder epic §5): the unattended run that
+    /// performs an AFK `task` node's small manual work and reports the outcome
+    /// into `gist`. (A HITL `task` node has no engine at all.)
+    AfkTask,
 }
 
 impl AgentSlot {
@@ -57,6 +64,8 @@ impl AgentSlot {
         AgentSlot::Triage,
         AgentSlot::Grilling,
         AgentSlot::Prototype,
+        AgentSlot::Research,
+        AgentSlot::AfkTask,
     ];
 
     /// The stable snake_case wire/storage key.
@@ -71,6 +80,8 @@ impl AgentSlot {
             AgentSlot::Triage => "triage",
             AgentSlot::Grilling => "grilling",
             AgentSlot::Prototype => "prototype",
+            AgentSlot::Research => "research",
+            AgentSlot::AfkTask => "afk_task",
         }
     }
 
@@ -158,9 +169,11 @@ mod tests {
                 AgentSlot::Triage => {}
                 AgentSlot::Grilling => {}
                 AgentSlot::Prototype => {}
+                AgentSlot::Research => {}
+                AgentSlot::AfkTask => {}
             }
         }
-        assert_eq!(AgentSlot::ALL.len(), 9);
+        assert_eq!(AgentSlot::ALL.len(), 11);
     }
 
     #[test]

@@ -354,6 +354,10 @@ pub fn slot_is_claude_only(slot: AgentSlot) -> bool {
         // adapter today (wayfinder epic §5's determinism seam runs through the
         // Claude-bound `PlanningAgent`).
         AgentSlot::Breakdown | AgentSlot::Grilling | AgentSlot::Prototype => true,
+        // The one-shot AFK node engine (research / afk_task) is likewise
+        // implemented on the Claude Code adapter only (wayfinder epic §5's
+        // determinism seam runs through the Claude-bound agent).
+        AgentSlot::Research | AgentSlot::AfkTask => true,
         AgentSlot::Implement
         | AgentSlot::Fix
         | AgentSlot::Review
@@ -705,6 +709,10 @@ pub fn default_prompt(slot: AgentSlot) -> &'static str {
         // calls"), adapted from `matt-pocock-skills` and owned by `node_engine`.
         AgentSlot::Grilling => crate::node_engine::GRILLING_PROMPT,
         AgentSlot::Prototype => crate::node_engine::PROTOTYPE_PROMPT,
+        // The one-shot AFK node engine likewise carries its per-kind method
+        // as a system prompt (wayfinder epic §5), owned by `afk_engine`.
+        AgentSlot::Research => crate::afk_engine::RESEARCH_PROMPT,
+        AgentSlot::AfkTask => crate::afk_engine::AFK_TASK_PROMPT,
     }
 }
 
@@ -1489,12 +1497,14 @@ mod tests {
     fn slot_capability_splits_the_claude_bound_slots_from_the_task_stages() {
         use crate::harness_pi::PI_HARNESS_ID;
 
-        // Breakdown and the interactive per-node engines run on the Claude Code
-        // adapter only.
+        // Breakdown, the interactive per-node engines, and the one-shot AFK
+        // node engine run on the Claude Code adapter only.
         for slot in [
             AgentSlot::Breakdown,
             AgentSlot::Grilling,
             AgentSlot::Prototype,
+            AgentSlot::Research,
+            AgentSlot::AfkTask,
         ] {
             assert!(slot_is_claude_only(slot), "{slot}");
             assert!(harness_supports_slot("claude", slot), "{slot}");
@@ -1772,7 +1782,7 @@ mod tests {
         assert_eq!(got.status(), StatusCode::OK);
         let body = body_json(got).await;
         let items = body["items"].as_array().unwrap();
-        assert_eq!(items.len(), 9, "the closed slot vocabulary, all present");
+        assert_eq!(items.len(), 11, "the closed slot vocabulary, all present");
         let slot_keys: Vec<&str> = items.iter().map(|i| i["slot"].as_str().unwrap()).collect();
         assert_eq!(
             slot_keys,
@@ -1785,7 +1795,9 @@ mod tests {
                 "summarize",
                 "triage",
                 "grilling",
-                "prototype"
+                "prototype",
+                "research",
+                "afk_task"
             ]
         );
         // No overrides yet: raw facets null, effective resolves to the seed.
