@@ -253,7 +253,7 @@ watch(
           <li v-for="epic in epics" :key="epic.id">
             <RouterLink
               class="epic-row card-interactive"
-              :to="{ name: 'epic-planning', params: { id: epic.id } }"
+              :to="{ name: 'epic-details', params: { id: epic.id } }"
             >
               <StatusIcon :status="epic.status" :size="14" />
               <span class="epic-title">{{ epic.title }}</span>

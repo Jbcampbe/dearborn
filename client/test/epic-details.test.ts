@@ -22,8 +22,8 @@ function epic(overrides: Partial<Epic> = {}): Epic {
     project_id: "P1",
     title: "Ship it",
     description: null,
-    product_context: null,
-    technical_context: null,
+    destination: "A working exporter, end to end",
+    notes: null,
     status: "Planning",
     created_at: 1,
     updated_at: 1,
@@ -35,18 +35,16 @@ function draft(overrides: Partial<EpicDraft> = {}): EpicDraft {
   return {
     title: "Ship it",
     description: "",
-    product_context: "",
-    technical_context: "",
     ...overrides,
   };
 }
 
 describe("draftFromEpic", () => {
-  it("maps null contexts to empty strings for editing", () => {
+  it("maps a null description to an empty string for editing", () => {
     expect(draftFromEpic(epic())).toEqual(draft());
-    expect(
-      draftFromEpic(epic({ product_context: "why", technical_context: "how" })),
-    ).toEqual(draft({ product_context: "why", technical_context: "how" }));
+    expect(draftFromEpic(epic({ description: "A blurb" }))).toEqual(
+      draft({ description: "A blurb" }),
+    );
   });
 });
 
@@ -57,8 +55,8 @@ describe("diffEpicEdits", () => {
   });
 
   it("emits only the changed fields", () => {
-    const body = diffEpicEdits(draft(), draft({ product_context: "why" }));
-    expect(body).toEqual({ product_context: "why" });
+    const body = diffEpicEdits(draft(), draft({ description: "A blurb" }));
+    expect(body).toEqual({ description: "A blurb" });
   });
 
   it("trims a changed title (the server trims on save too)", () => {
@@ -70,24 +68,18 @@ describe("diffEpicEdits", () => {
     expect(diffEpicEdits(draft(), draft({ title: "Ship it " }))).toEqual({});
   });
 
-  it("maps an emptied context back to null (clears the column)", () => {
+  it("maps an emptied description back to null (clears the column)", () => {
     const body = diffEpicEdits(
-      draft({ product_context: "why" }),
-      draft({ product_context: "" }),
+      draft({ description: "A blurb" }),
+      draft({ description: "" }),
     );
-    expect(body).toEqual({ product_context: null });
+    expect(body).toEqual({ description: null });
   });
 
-  it("diffs the description like a context (set, change, clear-to-null)", () => {
-    expect(diffEpicEdits(draft(), draft({ description: "A blurb" }))).toEqual({
-      description: "A blurb",
-    });
-    expect(
-      diffEpicEdits(draft({ description: "A blurb" }), draft({ description: "" })),
-    ).toEqual({ description: null });
-    expect(diffEpicEdits(draft({ description: "Same" }), draft({ description: "Same" }))).toEqual(
-      {},
-    );
+  it("never touches destination/notes (the map workflow owns them)", () => {
+    const body = diffEpicEdits(draft(), draft({ description: "x" }));
+    expect(Object.keys(body)).not.toContain("destination");
+    expect(Object.keys(body)).not.toContain("notes");
   });
 });
 
@@ -95,28 +87,28 @@ describe("applyLiveEpic", () => {
   it("moves pristine fields to the incoming server values", () => {
     const baseline = draft();
     const local = draft();
-    applyLiveEpic(baseline, local, epic({ title: "Agent rename", product_context: "ctx" }));
+    applyLiveEpic(baseline, local, epic({ title: "Agent rename", description: "ctx" }));
 
-    expect(local).toEqual(draft({ title: "Agent rename", product_context: "ctx" }));
+    expect(local).toEqual(draft({ title: "Agent rename", description: "ctx" }));
     expect(baseline).toEqual(local);
   });
 
   it("never clobbers an unsaved local edit, and the field stays dirty", () => {
     const baseline = draft();
-    const local = draft({ technical_context: "my unsaved edit" });
+    const local = draft({ description: "my unsaved edit" });
     applyLiveEpic(
       baseline,
       local,
-      epic({ title: "Agent rename", technical_context: "agent overwrite" }),
+      epic({ title: "Agent rename", description: "agent overwrite" }),
     );
 
     // The dirty field kept the local edit; the pristine title followed the server.
-    expect(local.technical_context).toBe("my unsaved edit");
+    expect(local.description).toBe("my unsaved edit");
     expect(local.title).toBe("Agent rename");
     // The baseline moved to the server value, so the field is still dirty.
-    expect(baseline.technical_context).toBe("agent overwrite");
+    expect(baseline.description).toBe("agent overwrite");
     expect(isDirty(baseline, local)).toBe(true);
-    expect(diffEpicEdits(baseline, local)).toEqual({ technical_context: "my unsaved edit" });
+    expect(diffEpicEdits(baseline, local)).toEqual({ description: "my unsaved edit" });
   });
 
   it("resolves dirty state when the server converges on the local edit", () => {
@@ -130,8 +122,10 @@ describe("applyLiveEpic", () => {
 });
 
 describe("fieldPristine", () => {
-  it("ignores untrimmed title whitespace", () => {
-    expect(fieldPristine("title", draft(), draft({ title: " Ship it" }))).toBe(true);
-    expect(fieldPristine("title", draft(), draft({ title: "Other" }))).toBe(false);
+  it("trims the title comparison but compares other fields verbatim", () => {
+    expect(fieldPristine("title", draft(), draft({ title: "Ship it " }))).toBe(true);
+    expect(fieldPristine("title", draft(), draft({ title: "Renamed" }))).toBe(false);
+    expect(fieldPristine("description", draft(), draft({ description: "x" }))).toBe(false);
+    expect(fieldPristine("description", draft(), draft())).toBe(true);
   });
 });

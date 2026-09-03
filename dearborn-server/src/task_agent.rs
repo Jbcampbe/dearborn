@@ -18,8 +18,8 @@
 //! real enum belonged to "T-512, not this module" — this is that enum.
 //! [`Stage`] lives *here*, next to the [`TaskAgent`] trait it drives and the
 //! `RunMode`/tool-flag mapping it decides, exactly how [`crate::planning`]
-//! keeps `PlanningConfig` beside `PlanningAgent` rather than off in a
-//! separate "config" module. `spec.rs` stays a pure, dependency-light leaf
+//! keeps the run request beside its [`crate::planning::PlanningAgent`] trait
+//! rather than off in a separate "config" module. `spec.rs` stays a pure, dependency-light leaf
 //! (render/context/verdict, no I/O) — it now depends on this module only for
 //! the plain `Stage` *type* (`crate::spec::prompt_for` takes a `Stage` and
 //! returns `Option<&'static str>`, `None` for the five non-agent stages that

@@ -99,6 +99,15 @@ const MIGRATIONS: &[Migration] = &[
         name: "0013_planning_map_schema",
         sql: include_str!("../migrations/0013_planning_map_schema.sql"),
     },
+    // Clean cutover (wayfinder epic §12): retire the linear product/technical
+    // planning store — `transcript_message` and `planning_session` — now that
+    // the code paths reading and writing them are gone (no feature flag, no
+    // coexistence; per-node `node_session`/`node_message` take over).
+    Migration {
+        id: 14,
+        name: "0014_drop_linear_planning",
+        sql: include_str!("../migrations/0014_drop_linear_planning.sql"),
+    },
 ];
 
 /// Errors surfaced while opening the database or running migrations.
@@ -234,10 +243,8 @@ mod tests {
             "epic",
             "task",
             "task_dependency",
-            "transcript_message",
             "agent_run",
             "comment",
-            "planning_session",
         ] {
             let mut rows = db
                 .conn()
@@ -1165,6 +1172,30 @@ mod tests {
         let row = rows.next().await.unwrap().expect("comment row");
         assert_eq!(row.get::<i64>(0).unwrap(), 0, "is_agent defaults to 0");
         assert_eq!(row.get::<i64>(1).unwrap(), 0, "resolved defaults to 0");
+    }
+
+    /// Migration 0014 completes the clean cutover: the linear product/technical
+    /// planning store (`transcript_message`, `planning_session`) is gone, and
+    /// nothing recreated it (the tables do not exist for inserts either).
+    #[tokio::test]
+    async fn migration_0014_drops_the_linear_planning_tables() {
+        let db = Db::connect(":memory:").await.unwrap();
+        db.run_migrations().await.unwrap();
+
+        for table in ["transcript_message", "planning_session"] {
+            let mut rows = db
+                .conn()
+                .query(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name=?1",
+                    libsql::params![table],
+                )
+                .await
+                .unwrap();
+            assert!(
+                rows.next().await.unwrap().is_none(),
+                "{table} must be dropped by the cutover"
+            );
+        }
     }
 
     /// The planning-map cutover leaves Ready/InProgress epics intact: on a DB

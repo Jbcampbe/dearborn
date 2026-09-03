@@ -424,7 +424,7 @@ interface StageChangedPayload {
  *   `ask_question`, acks, future kinds): ignored. None of these are part of
  *   `agent_run.log` server-side (only `Text`/`Error` are folded into it — see
  *   `absorb`) or carry enough to update the timeline, matching
- *   `planning/stream.ts`'s/`dag/stream.ts`'s own `default` branches.
+ *   `dag/stream.ts`'s own `default` branches.
  */
 export function applyPipelineFrame(state: PipelineState, frame: PipelineFrame): PipelineState {
   switch (frame.type) {

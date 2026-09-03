@@ -1,33 +1,34 @@
 // Pure helpers for the epic Details editor (`EpicDetailView.vue`).
 // Framework-free and dependency-free (no Vue, no fetch) so they can be
-// unit-tested without a browser — mirrors `planning/stream.ts`. The view keeps
-// a local `draft` of the editable fields plus a `baseline` of the last-known
-// server values; these helpers diff the two into a minimal PATCH body and fold
-// live `epic_updated` frames in without clobbering unsaved local edits.
+// unit-tested without a browser. The view keeps a local `draft` of the
+// editable fields plus a `baseline` of the last-known server values; these
+// helpers diff the two into a minimal PATCH body and fold live `epic_updated`
+// frames in without clobbering unsaved local edits.
+//
+// `destination` / `notes` are deliberately NOT editable here — the map
+// workflow owns that prose (its set-destination/set-notes surfaces arrive
+// with the map CLI verbs).
 
 import type { Epic, UpdateEpicBody } from "../api/epics";
 
 /**
- * The editable epic fields, as local draft strings. `null` contexts edit as
- * `""` (an emptied field is sent back as `null` — see {@link diffEpicEdits}).
+ * The editable epic fields, as local draft strings. A `null` description
+ * edits as `""` (an emptied field is sent back as `null` — see
+ * {@link diffEpicEdits}).
  */
 export interface EpicDraft {
   title: string;
   description: string;
-  product_context: string;
-  technical_context: string;
 }
 
 /** The editable field keys, for iteration that stays type-safe. */
-const FIELDS = ["title", "description", "product_context", "technical_context"] as const;
+const FIELDS = ["title", "description"] as const;
 
 /** Snapshot an epic's editable fields into draft strings. */
 export function draftFromEpic(epic: Epic): EpicDraft {
   return {
     title: epic.title,
     description: epic.description ?? "",
-    product_context: epic.product_context ?? "",
-    technical_context: epic.technical_context ?? "",
   };
 }
 
@@ -44,8 +45,8 @@ export function fieldPristine(key: keyof EpicDraft, baseline: EpicDraft, draft: 
 
 /**
  * The minimal `PATCH /epics/:id` body for the fields that differ from
- * `baseline`. Changed contexts map an emptied draft to `null` (clears the
- * column); a changed title is sent trimmed (the server rejects an empty
+ * `baseline`. A changed description maps an emptied draft to `null` (clears
+ * the column); a changed title is sent trimmed (the server rejects an empty
  * title). Unchanged fields are absent, so they are never written.
  */
 export function diffEpicEdits(baseline: EpicDraft, draft: EpicDraft): UpdateEpicBody {
@@ -55,12 +56,6 @@ export function diffEpicEdits(baseline: EpicDraft, draft: EpicDraft): UpdateEpic
   }
   if (draft.description !== baseline.description) {
     body.description = draft.description.length > 0 ? draft.description : null;
-  }
-  if (draft.product_context !== baseline.product_context) {
-    body.product_context = draft.product_context.length > 0 ? draft.product_context : null;
-  }
-  if (draft.technical_context !== baseline.technical_context) {
-    body.technical_context = draft.technical_context.length > 0 ? draft.technical_context : null;
   }
   return body;
 }

@@ -1,24 +1,33 @@
 //! One-shot breakdown agent — epic → task DAG (T-301).
 //!
-//! After planning (product + technical) an epic is *approved* and ready to be
-//! broken into work. `POST /epics/:id/breakdown` runs a **single, non-interactive**
-//! agent that reads the epic's product + technical context and creates a graph of
-//! tasks (thin vertical slices / tracer bullets, per `references/prompts/to-tasks.md`)
-//! via the harness-agnostic `dearborn` CLI's `task create` / `task link` verbs,
+//! A **human-approved** epic that is ready to be broken into work gets
+//! `POST /epics/:id/breakdown`, which runs a **single, non-interactive** agent
+//! that reads the epic's plan and creates a graph of tasks (thin vertical
+//! slices / tracer bullets, per `references/prompts/to-tasks.md`) via the
+//! harness-agnostic `dearborn` CLI's `task create` / `task link` verbs,
 //! authenticated by a per-run capability token ([`crate::capability`]). When the
-//! run finishes, Dearborn moves the epic **Planning → Ready** and records the run
-//! in `agent_run`.
+//! run finishes, Dearborn moves the epic **Planning → Ready** and records the
+//! run in `agent_run`.
 //!
-//! ## Relation to planning
+//! ## What the agent reads
 //!
-//! This mirrors [`crate::planning`]'s run machinery — the agent sits behind a
-//! [`BreakdownAgent`] trait (production [`ClaudeBreakdownAgent`]; tests inject a
-//! scripted fake), the blocking `RunEvent` receiver is drained on
+//! In the wayfinder epic the plan source is moving from the old product/technical
+//! planning transcripts to the **living Document** the map produces. The
+//! context-fed plan assembly (`build_plan`) is deliberately minimal in this
+//! cutover — it carries the epic's title only — and the Document-backed
+//! completion gate ("only offered when no open map nodes remain and nothing
+//! foggy is left") lands in a later task of that epic.
+//!
+//! ## Relation to the node engines
+//!
+//! This mirrors [`crate::planning`]'s interactive-agent machinery — the agent
+//! sits behind a [`BreakdownAgent`] trait (production [`ClaudeBreakdownAgent`];
+//! tests inject a scripted fake), the blocking `RunEvent` receiver is drained on
 //! `spawn_blocking` and every event is relayed live to `epic:<id>` (reusing
 //! [`crate::planning::ws_type`]) — but the run is **one-shot**: no `resume`, no
-//! multi-turn, and it does **not** write to `transcript_message`. Its durable
-//! output is the task rows + edges the CLI's REST verbs persist, plus the
-//! `agent_run` evidence row and the `epic.status='Ready'` transition.
+//! multi-turn. Its durable output is the task rows + edges the CLI's REST verbs
+//! persist, plus the `agent_run` evidence row and the `epic.status='Ready'`
+//! transition.
 //!
 //! ## Determinism boundary
 //!
@@ -46,11 +55,10 @@ use crate::epics::{fetch_epic, get_epic_clone_path, get_epic_project_id};
 use crate::{AppError, AppResult, AppState, InflightGuard};
 
 /// The system prompt that encodes the `to-tasks` vertical-slice breakdown logic.
-/// The epic's product + technical context is appended separately (as the "PRD").
+/// The epic's plan is appended separately (see the module doc for what feeds it).
 pub(crate) const BREAKDOWN_PROMPT: &str = "\
 You are Dearborn's breakdown agent. You run ONCE (non-interactively) to convert an \
-approved epic into an executable task DAG. The epic's product and technical context \
-are provided to you as the plan.
+approved epic into an executable task DAG. The epic's plan is provided to you as the PRD.
 
 Break the plan into TRACER-BULLET tasks: each task is a thin vertical slice that cuts \
 through ALL integration layers end-to-end (schema, API, UI, tests), NOT a horizontal \
@@ -86,7 +94,7 @@ pub struct BreakdownRunRequest {
     pub run_id: String,
     /// The breakdown instruction (the user-visible "go" prompt).
     pub prompt: String,
-    /// The epic's product + technical context, appended as a system prompt (PRD).
+    /// The epic's plan, appended as a system prompt (PRD).
     pub plan: String,
     /// Working directory: the project's read-only clone (code grounding). `None`
     /// when the clone isn't ready — the run proceeds without code context.
@@ -184,7 +192,7 @@ impl BreakdownAgent for ClaudeBreakdownAgent {
         let mut extra_args = vec![
             "--append-system-prompt".to_string(),
             req.system_prompt.clone(),
-            // The epic's product + technical context, as the plan to break down.
+            // The epic's plan, as the PRD to break down.
             "--append-system-prompt".to_string(),
             req.plan.clone(),
         ];
@@ -243,8 +251,10 @@ impl BreakdownAgent for ClaudeBreakdownAgent {
 /// epic, then move it Planning → Ready.
 ///
 /// * `404` if the epic does not exist.
-/// * `409` if the epic is not in `Planning`, if it has not advanced to technical
-///   planning (no `technical` session), or if a run is already in flight for it.
+/// * `409` if the epic is not in `Planning`, or if a run is already in flight
+///   for it. (Completion eligibility — no open map nodes, nothing foggy left —
+///   is enforced by the map workflow in a later task; until then any Planning
+///   epic can be broken down, which is the only gate breakdown itself owns.)
 /// * `202 Accepted` once the background run is spawned (its events stream over
 ///   WS on `epic:<id>`; the DAG + lane change land when the run completes).
 pub async fn trigger_breakdown(
@@ -264,15 +274,8 @@ pub async fn trigger_breakdown(
         )));
     }
 
-    // Breakdown runs on the *approved* epic — after technical planning has begun.
-    if !technical_session_exists(&state, &id).await? {
-        return Err(AppError::Conflict(format!(
-            "epic {id} has not advanced to technical planning; complete planning before breakdown"
-        )));
-    }
-
-    // One run at a time per epic (shares the planning in-flight slot so a
-    // planning run and a breakdown run never overlap on the same epic).
+    // One run at a time per epic (shares the in-flight slot so two breakdown
+    // runs never overlap on the same epic).
     let Some(guard) = state.try_acquire_run(&id) else {
         return Err(AppError::Conflict(format!(
             "a run is already in flight for epic {id}"
@@ -285,20 +288,6 @@ pub async fn trigger_breakdown(
         StatusCode::ACCEPTED,
         Json(json!({ "status": "breakdown_started" })),
     ))
-}
-
-/// Whether the epic has a `technical` planning session (i.e. it advanced past
-/// product planning) — the marker that planning is far enough along to break down.
-async fn technical_session_exists(state: &AppState, epic_id: &str) -> AppResult<bool> {
-    let mut rows = state
-        .db
-        .conn()
-        .query(
-            "SELECT 1 FROM planning_session WHERE epic_id = ?1 AND phase = 'technical'",
-            params![epic_id],
-        )
-        .await?;
-    Ok(rows.next().await?.is_some())
 }
 
 // ---- run orchestration ---------------------------------------------------
@@ -380,7 +369,7 @@ pub fn spawn_breakdown(state: AppState, epic_id: String, guard: InflightGuard) {
         let _guard = guard;
         let conn = state.db.conn();
 
-        // Build the plan (PRD) from the epic's product + technical context.
+        // Build the plan (PRD) the breakdown agent reads.
         let plan = match build_plan(&state, &epic_id).await {
             Some(plan) => plan,
             None => {
@@ -926,25 +915,12 @@ mod tests {
             .oneshot(req(
                 "POST",
                 &format!("/projects/{project_id}/epics"),
-                Some(json!({ "title": "E" })),
+                Some(json!({ "title": "E", "destination": "It works end to end" })),
             ))
             .await
             .unwrap();
         assert_eq!(created.status(), StatusCode::CREATED);
         body_json(created).await["id"].as_str().unwrap().to_string()
-    }
-
-    async fn advance(app: &axum::Router, epic_id: &str) {
-        let r = app
-            .clone()
-            .oneshot(req(
-                "POST",
-                &format!("/epics/{epic_id}/advance-phase"),
-                None,
-            ))
-            .await
-            .unwrap();
-        assert_eq!(r.status(), StatusCode::CREATED);
     }
 
     async fn trigger(app: &axum::Router, epic_id: &str) -> axum::response::Response {
@@ -976,8 +952,6 @@ mod tests {
         let (state, app) = app_with_breakdown(agent).await;
         let project_id = seed_project(&app).await;
         let epic_id = create_epic(&app, &project_id).await;
-        advance(&app, &epic_id).await;
-
         let sub = state.hub.subscribe(&format!("epic:{epic_id}"));
 
         let response = trigger(&app, &epic_id).await;
@@ -1028,8 +1002,6 @@ mod tests {
         let (state, app) = app_with_breakdown(Arc::new(FailedToolCallBreakdownAgent)).await;
         let project_id = seed_project(&app).await;
         let epic_id = create_epic(&app, &project_id).await;
-        advance(&app, &epic_id).await;
-
         let response = trigger(&app, &epic_id).await;
         assert_eq!(response.status(), StatusCode::ACCEPTED);
 
@@ -1122,7 +1094,6 @@ mod tests {
         let (state, app) = app_with_breakdown(Arc::new(SilentBreakdownAgent)).await;
         let project_id = seed_project(&app).await;
         let epic_id = create_epic(&app, &project_id).await;
-        advance(&app, &epic_id).await;
         // Force the epic out of Planning.
         state
             .db
@@ -1137,16 +1108,6 @@ mod tests {
         let response = trigger(&app, &epic_id).await;
         assert_eq!(response.status(), StatusCode::CONFLICT);
         assert_eq!(body_json(response).await["error"]["code"], "conflict");
-    }
-
-    #[tokio::test]
-    async fn breakdown_rejected_before_technical_planning() {
-        let (_state, app) = app_with_breakdown(Arc::new(SilentBreakdownAgent)).await;
-        let project_id = seed_project(&app).await;
-        let epic_id = create_epic(&app, &project_id).await;
-        // No advance → no technical session.
-        let response = trigger(&app, &epic_id).await;
-        assert_eq!(response.status(), StatusCode::CONFLICT);
     }
 
     #[tokio::test]
@@ -1190,7 +1151,6 @@ mod tests {
         };
         let project_id = seed_project(&app).await;
         let epic_id = create_epic(&app, &project_id).await;
-        advance(&app, &epic_id).await;
         let response = trigger(&app, &epic_id).await;
         assert_eq!(response.status(), StatusCode::ACCEPTED);
         assert_eq!(wait_for_status(&state, &epic_id, "Ready").await, "Ready");

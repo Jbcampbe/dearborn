@@ -33,10 +33,8 @@ function makeView(overrides: Partial<SlotSetting> = {}): SlotSetting {
 }
 
 describe("AGENT_SLOTS", () => {
-  it("lists exactly the nine server slots in canonical order", () => {
+  it("lists exactly the server slots in canonical order", () => {
     expect(AGENT_SLOTS).toEqual([
-      "planning_product",
-      "planning_technical",
       "breakdown",
       "implement",
       "fix",
@@ -127,12 +125,8 @@ describe("harness/slot capability", () => {
     }
   });
 
-  it("names exactly the three planning-side slots as MCP-bound", () => {
-    expect([...MCP_BOUND_SLOTS].sort()).toEqual([
-      "breakdown",
-      "planning_product",
-      "planning_technical",
-    ]);
+  it("names breakdown as the single CLI-bound slot", () => {
+    expect([...MCP_BOUND_SLOTS]).toEqual(["breakdown"]);
   });
 
   it("makes no capability claims about a harness with no adapter", () => {

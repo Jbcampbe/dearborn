@@ -1,5 +1,5 @@
 // WebSocket client composable for the task detail pipeline's live tail
-// (T-563). Mirrors `dag/useDagStream.ts`/`planning/useEpicStream.ts`: opens
+// (T-563). Mirrors `dag/useDagStream.ts`: opens
 // `GET /ws?token=<token>`, subscribes to `task:<id>`, then feeds every
 // subsequent frame through the pure reducer (`./pipeline.ts`'s
 // `applyPipelineFrame`) into a caller-provided reactive `PipelineState`. Owns

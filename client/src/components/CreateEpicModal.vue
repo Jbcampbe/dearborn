@@ -6,14 +6,18 @@ import { ApiError } from "../api/client";
 import { createEpic } from "../api/epics";
 import AppModal from "./AppModal.vue";
 
-// "Start planning" dialog: name the epic, create it, and drop straight into
-// the planning chat. Replaces the old window.prompt flow.
+// "New epic" dialog: name the epic, state its destination (required — what the
+// finished plan looks like), optionally add notes, and create it. Lands the
+// epic in the Planning lane and opens the epic's Details page; the map
+// workflow grows from there.
 const props = defineProps<{ open: boolean; projectId: string }>();
 const emit = defineEmits<{ close: [] }>();
 
 const auth = useAuthStore();
 const router = useRouter();
 const title = ref("");
+const destination = ref("");
+const notes = ref("");
 const description = ref("");
 const baseBranch = ref("");
 const busy = ref(false);
@@ -25,6 +29,8 @@ watch(
   async (open) => {
     if (open) {
       title.value = "";
+      destination.value = "";
+      notes.value = "";
       description.value = "";
       baseBranch.value = "";
       error.value = null;
@@ -37,29 +43,33 @@ watch(
 async function submit() {
   const token = auth.accessToken;
   const trimmed = title.value.trim();
-  if (token === null || trimmed.length === 0 || busy.value) {
+  const destinationTrimmed = destination.value.trim();
+  if (token === null || trimmed.length === 0 || destinationTrimmed.length === 0 || busy.value) {
     return;
   }
   busy.value = true;
   error.value = null;
   try {
     const blurb = description.value.trim();
+    const epicNotes = notes.value.trim();
     const branch = baseBranch.value.trim();
     const epic = await createEpic(token, props.projectId, {
       title: trimmed,
+      destination: destinationTrimmed,
       ...(blurb ? { description: blurb } : {}),
-      // Optional base-branch override (design §5): validated against the
-      // remote server-side; a bad name surfaces in `error` below.
+      ...(epicNotes ? { notes: epicNotes } : {}),
+      // Optional base-branch override: validated against the remote
+      // server-side; a bad name surfaces in `error` below.
       ...(branch ? { base_branch: branch } : {}),
     });
     emit("close");
-    await router.push({ name: "epic-planning", params: { id: epic.id } });
+    await router.push({ name: "epic-details", params: { id: epic.id } });
   } catch (err) {
     if (err instanceof ApiError && err.isAuth) {
       auth.logout(`Token rejected (401): ${err.message}. Please re-enter it.`);
       return;
     }
-    error.value = err instanceof Error ? err.message : "failed to start planning";
+    error.value = err instanceof Error ? err.message : "failed to create the epic";
   } finally {
     busy.value = false;
   }
@@ -70,8 +80,8 @@ async function submit() {
   <AppModal :open="open" title="New epic" :width="440" @close="emit('close')">
     <form class="form" @submit.prevent="submit">
       <p class="epic-hint">
-        A new epic lands in the <strong>Planning</strong> lane — you'll define it with the
-        planning agent.
+        A new epic lands in the <strong>Planning</strong> lane. Start from its
+        <strong>destination</strong> — what the finished plan looks like.
       </p>
       <p v-if="error" class="banner banner-error" role="alert">{{ error }}</p>
       <div>
@@ -83,6 +93,31 @@ async function submit() {
           class="input"
           type="text"
           placeholder="Epic title"
+          :disabled="busy"
+          @keydown.enter.prevent="submit"
+        />
+      </div>
+      <div>
+        <label class="label" for="epic-destination">Destination</label>
+        <textarea
+          id="epic-destination"
+          v-model="destination"
+          class="textarea"
+          rows="3"
+          placeholder="What the finished plan looks like — the scope the plan must land"
+          :disabled="busy"
+        ></textarea>
+      </div>
+      <div>
+        <label class="label" for="epic-notes">
+          Notes <span class="optional">(optional)</span>
+        </label>
+        <input
+          id="epic-notes"
+          v-model="notes"
+          class="input"
+          type="text"
+          placeholder="Any context the plan should carry from the start"
           :disabled="busy"
           @keydown.enter.prevent="submit"
         />
@@ -126,10 +161,10 @@ async function submit() {
       <button class="btn" :disabled="busy" @click="emit('close')">Cancel</button>
       <button
         class="btn btn-primary"
-        :disabled="busy || title.trim().length === 0"
+        :disabled="busy || title.trim().length === 0 || destination.trim().length === 0"
         @click="submit"
       >
-        {{ busy ? "Creating…" : "Start planning" }}
+        {{ busy ? "Creating…" : "Create epic" }}
       </button>
     </template>
   </AppModal>

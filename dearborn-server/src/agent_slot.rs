@@ -1,13 +1,13 @@
 //! The agent-slot vocabulary (design §1).
 //!
 //! An **agent slot** is one configurable point in Dearborn's pipeline: a
-//! closed, compile-time enum of the eight places Dearborn runs a coding agent.
+//! closed, compile-time enum of the places Dearborn runs a coding agent.
 //! Settings (harness, model, system prompt) are keyed per slot; the closed
 //! enum guarantees the settings API, the stores, and the worker can never
 //! disagree about what exists — a new slot arrives with a code change, never
 //! with a stray settings row.
 //!
-//! Wire format is the stable snake_case key (`"planning_product"`, …), the
+//! Wire format is the stable snake_case key (`"breakdown"`, …), the
 //! same convention as the stage vocabulary in [`crate::task_agent::Stage`].
 //! Slot keys are stable forever: they are persisted in `agent_setting.slot`
 //! and appear in API paths, so renaming one would be a data migration, not a
@@ -21,10 +21,6 @@ use std::fmt;
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum AgentSlot {
-    /// Interactive epic planning, product phase (`PRODUCT_PLANNING_PROMPT`).
-    PlanningProduct,
-    /// Interactive epic planning, technical phase (`TECHNICAL_PLANNING_PROMPT`).
-    PlanningTechnical,
     /// One-shot epic → task DAG breakdown.
     Breakdown,
     /// Per-task implementation stage.
@@ -46,8 +42,6 @@ impl AgentSlot {
     /// Every slot, in the canonical display order used by the settings API
     /// and the client's slot cards (design §1's table order).
     pub const ALL: &'static [AgentSlot] = &[
-        AgentSlot::PlanningProduct,
-        AgentSlot::PlanningTechnical,
         AgentSlot::Breakdown,
         AgentSlot::Implement,
         AgentSlot::Fix,
@@ -60,8 +54,6 @@ impl AgentSlot {
     /// The stable snake_case wire/storage key.
     pub fn as_str(&self) -> &'static str {
         match self {
-            AgentSlot::PlanningProduct => "planning_product",
-            AgentSlot::PlanningTechnical => "planning_technical",
             AgentSlot::Breakdown => "breakdown",
             AgentSlot::Implement => "implement",
             AgentSlot::Fix => "fix",
@@ -110,8 +102,6 @@ mod tests {
 
     #[test]
     fn keys_are_stable_snake_case() {
-        assert_eq!(AgentSlot::PlanningProduct.as_str(), "planning_product");
-        assert_eq!(AgentSlot::PlanningTechnical.as_str(), "planning_technical");
         assert_eq!(AgentSlot::Breakdown.as_str(), "breakdown");
         assert_eq!(AgentSlot::Implement.as_str(), "implement");
         assert_eq!(AgentSlot::Fix.as_str(), "fix");
@@ -149,8 +139,6 @@ mod tests {
         // listed in ALL, this non-exhaustive match fails to compile.
         for slot in AgentSlot::ALL {
             match slot {
-                AgentSlot::PlanningProduct => {}
-                AgentSlot::PlanningTechnical => {}
                 AgentSlot::Breakdown => {}
                 AgentSlot::Implement => {}
                 AgentSlot::Fix => {}
@@ -160,7 +148,7 @@ mod tests {
                 AgentSlot::Triage => {}
             }
         }
-        assert_eq!(AgentSlot::ALL.len(), 9);
+        assert_eq!(AgentSlot::ALL.len(), 7);
     }
 
     #[test]

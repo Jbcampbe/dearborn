@@ -2,7 +2,6 @@ import { createRouter, createWebHistory, type RouteRecordRaw } from "vue-router"
 
 import ProjectsView from "../components/ProjectsView.vue";
 import ProjectDetailView from "../components/ProjectDetailView.vue";
-import PlanningView from "../components/PlanningView.vue";
 import EpicDetailView from "../components/EpicDetailView.vue";
 import DagEditorView from "../components/DagEditorView.vue";
 import EpicKanbanView from "../components/EpicKanbanView.vue";
@@ -52,13 +51,14 @@ const routes: RouteRecordRaw[] = [
     props: true,
   },
   {
-    // Singular `/epic/:id` for the same reason as `/project/:id`: the API owns
-    // `/epics` (and the Vite dev proxy forwards it), so the singular path avoids
-    // shadowing the REST namespace on a hard reload / deep link.
+    // The planning-map workflow's own views (map graph, node sessions,
+    // Document) land with their client tasks; for now `/epic/:id` redirects to
+    // the epic's Details page. The API owns `/epics/:id` (GET/PATCH), so the
+    // singular path avoids shadowing the REST namespace on a hard reload /
+    // deep link (same pattern as `/project/:id`).
     path: "/epic/:id",
-    name: "epic-planning",
-    component: PlanningView,
-    props: true,
+    name: "epic-details-default",
+    redirect: (to) => ({ name: "epic-details", params: { id: to.params.id } }),
   },
   {
     // Manual epic-details editor: view/edit the epic's title and product /

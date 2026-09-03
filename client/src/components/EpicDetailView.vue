@@ -15,19 +15,21 @@ import {
   isDirty,
   type EpicDraft,
 } from "../lib/epicEdit";
-import { renderMarkdown } from "../lib/markdown";
 import AppIcon from "./AppIcon.vue";
 import EpicTabs from "./EpicTabs.vue";
 import StatusIcon from "./StatusIcon.vue";
 
 // Manual epic-details page — the leftmost tab of the epic detail pages. It
-// defaults to a read-only *view mode* (title + contexts rendered as markdown,
-// like the planning view's Epic record panel); an Edit button switches into
-// *edit mode* (a form over the same fields), and Save / Cancel returns to
-// view mode. Saves go through `PATCH /epics/:id`; the server replies with the
-// updated epic and broadcasts the same `epic_updated` frame the agent's
-// `update_epic` tool produces, so every other view of this epic (and a second
-// open tab) updates live.
+// defaults to a read-only *view mode* (title + the wayfinder prose rendered,
+// with the editable fields switchable into a form); an Edit button switches
+// into *edit mode* (title + description), and Save / Cancel returns to view
+// mode. Saves go through `PATCH /epics/:id`; the server replies with the
+// updated epic and broadcasts the same `epic_updated` frame, so every other
+// view of this epic (and a second open tab) updates live.
+//
+// `destination` / `notes` — the wayfinder prose — are shown read-only here;
+// the map workflow owns editing them (set-destination/set-notes land with the
+// map CLI verbs).
 //
 // Live updates vs. local edits: the view subscribes to `epic:<id>` (reusing
 // the DAG stream composable — only the `epic` slice of its state is used) and
@@ -51,8 +53,8 @@ const projectName = ref<string | null>(null);
 
 // The local edit buffer and the last-known server values it diffs against.
 // Only meaningful in edit mode; view mode renders straight from `state.epic`.
-const draft = reactive<EpicDraft>({ title: "", description: "", product_context: "", technical_context: "" });
-const baseline = reactive<EpicDraft>({ title: "", description: "", product_context: "", technical_context: "" });
+const draft = reactive<EpicDraft>({ title: "", description: "" });
+const baseline = reactive<EpicDraft>({ title: "", description: "" });
 
 const epic = computed(() => state.epic);
 const projectId = computed<string | null>(() => state.epic?.project_id ?? null);
@@ -247,27 +249,18 @@ onMounted(load);
         <hr class="divider" />
 
         <section class="context">
-          <h3>Product context</h3>
+          <h3>Destination</h3>
           <div
-            v-if="epic.product_context"
-            class="context-body md"
-            v-html="renderMarkdown(epic.product_context)"
-          />
-          <p v-else class="context-empty">
-            No product context yet — it fills in during product planning, or add it via Edit.
-          </p>
+            v-if="epic.destination"
+            class="context-body"
+          >{{ epic.destination }}</div>
+          <p v-else class="context-empty">No destination set.</p>
         </section>
 
         <section class="context">
-          <h3>Technical context</h3>
-          <div
-            v-if="epic.technical_context"
-            class="context-body md"
-            v-html="renderMarkdown(epic.technical_context)"
-          />
-          <p v-else class="context-empty">
-            No technical context yet — it fills in during technical planning, or add it via Edit.
-          </p>
+          <h3>Notes</h3>
+          <div v-if="epic.notes" class="context-body">{{ epic.notes }}</div>
+          <p v-else class="context-empty">No notes.</p>
         </section>
       </section>
 
@@ -302,30 +295,6 @@ onMounted(load);
             placeholder="A short blurb — shown on the epic's kanban card"
             :disabled="saving"
           />
-        </div>
-
-        <div class="field">
-          <label class="label" for="epic-product-context">Product context</label>
-          <textarea
-            id="epic-product-context"
-            v-model="draft.product_context"
-            class="textarea context-input"
-            rows="9"
-            placeholder="What and why — the planning agent fills this in during product planning; edit it directly here. Markdown supported."
-            :disabled="saving"
-          ></textarea>
-        </div>
-
-        <div class="field">
-          <label class="label" for="epic-technical-context">Technical context</label>
-          <textarea
-            id="epic-technical-context"
-            v-model="draft.technical_context"
-            class="textarea context-input"
-            rows="9"
-            placeholder="How — the technical approach from technical planning; edit it directly here. Markdown supported."
-            :disabled="saving"
-          ></textarea>
         </div>
 
         <p v-if="error" class="banner banner-error" role="alert">{{ error }}</p>
@@ -405,7 +374,7 @@ onMounted(load);
   color: var(--color-pulse-green);
 }
 
-/* --- View mode (mirrors the planning view's Epic record panel) ------------ */
+/* --- View mode ------------------------------------------------------------ */
 
 .record-props {
   display: flex;
@@ -464,14 +433,6 @@ onMounted(load);
   display: flex;
   flex-direction: column;
   gap: var(--spacing-8);
-}
-
-.context-input {
-  font-family: var(--font-mono);
-  font-size: var(--text-caption);
-  line-height: 1.55;
-  resize: vertical;
-  min-height: 140px;
 }
 
 .editor-foot {

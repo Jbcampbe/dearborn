@@ -340,16 +340,16 @@ pub fn is_supported_harness(harness: &str) -> bool {
     SUPPORTED_HARNESSES.contains(&harness)
 }
 
-/// Whether a slot's run is implemented on the Claude Code adapter only (the
-/// three planning-side slots: `planning_product`, `planning_technical`, and
-/// `breakdown`). These slots call back into Dearborn through the harness-
+/// Whether a slot's run is implemented on the Claude Code adapter only
+/// (`breakdown` — until the per-node planning engines land). These slots call
+/// back into Dearborn through the harness-
 /// agnostic `dearborn` CLI — but their run engines themselves are Claude-
 /// Code-bound until the per-node engines land. The task-stage slots act on a
 /// checked-out workspace with the CLI's own file tools and run on every
 /// supported harness.
 pub fn slot_is_claude_only(slot: AgentSlot) -> bool {
     match slot {
-        AgentSlot::PlanningProduct | AgentSlot::PlanningTechnical | AgentSlot::Breakdown => true,
+        AgentSlot::Breakdown => true,
         AgentSlot::Implement
         | AgentSlot::Fix
         | AgentSlot::Review
@@ -678,12 +678,9 @@ fn slot_view(
 /// planning/breakdown from their own modules' single constants).
 pub fn default_prompt(slot: AgentSlot) -> &'static str {
     use crate::breakdown::BREAKDOWN_PROMPT;
-    use crate::planning::{PRODUCT_PLANNING_PROMPT, TECHNICAL_PLANNING_PROMPT};
     use crate::spec::prompt_for;
     use crate::task_agent::Stage;
     match slot {
-        AgentSlot::PlanningProduct => PRODUCT_PLANNING_PROMPT,
-        AgentSlot::PlanningTechnical => TECHNICAL_PLANNING_PROMPT,
         AgentSlot::Breakdown => BREAKDOWN_PROMPT,
         // Every agent stage has a compiled prompt (`spec.rs`'s own test
         // asserts non-empty for each); `expect` mirrors the spawn sites.
@@ -717,7 +714,7 @@ async fn ensure_project(db: &Db, project_id: &str) -> AppResult<()> {
     Ok(())
 }
 
-/// `GET /projects/{id}/agent-settings` — all nine slots in canonical order,
+/// `GET /projects/{id}/agent-settings` — all slots in canonical order,
 /// each with its raw overrides and resolved effective config.
 pub async fn get_project_agent_settings(
     State(state): State<AppState>,
@@ -1107,7 +1104,7 @@ mod tests {
             &db,
             &project,
             &AgentSetting {
-                slot: AgentSlot::PlanningProduct,
+                slot: AgentSlot::Breakdown,
                 harness: Some("claude".to_string()),
                 model: None,
                 system_prompt: Some("plan well".to_string()),
@@ -1117,7 +1114,7 @@ mod tests {
         .unwrap();
         let listed = list_agent_settings(&db, &project).await.unwrap();
         let slots: Vec<AgentSlot> = listed.iter().map(|s| s.slot).collect();
-        assert_eq!(slots, vec![AgentSlot::PlanningProduct, AgentSlot::Review]);
+        assert_eq!(slots, vec![AgentSlot::Breakdown, AgentSlot::Review]);
 
         // Delete removes exactly the targeted slot.
         assert!(delete_agent_setting(&db, &project, AgentSlot::Review)
@@ -1483,12 +1480,9 @@ mod tests {
     fn slot_capability_splits_the_claude_bound_slots_from_the_task_stages() {
         use crate::harness_pi::PI_HARNESS_ID;
 
-        // The three planning-side slots run on the Claude Code adapter only.
-        for slot in [
-            AgentSlot::PlanningProduct,
-            AgentSlot::PlanningTechnical,
-            AgentSlot::Breakdown,
-        ] {
+        // Breakdown runs on the Claude Code adapter only (the per-node
+        // planning engines pick up their slots when they land).
+        for slot in [AgentSlot::Breakdown] {
             assert!(slot_is_claude_only(slot), "{slot}");
             assert!(harness_supports_slot("claude", slot), "{slot}");
             assert!(!harness_supports_slot(PI_HARNESS_ID, slot), "{slot}");
@@ -1702,18 +1696,15 @@ mod tests {
     }
 
     /// The editor-prefill contract: `default_prompt` is non-empty for all
-    /// nine slots and byte-identical to the constant each spawn site uses
+    /// slots and byte-identical to the constant each spawn site uses
     /// (no duplication, no drift between API and spawn path).
     #[tokio::test]
     async fn every_slot_serves_its_compiled_default_prompt() {
         use crate::breakdown::BREAKDOWN_PROMPT;
-        use crate::planning::{PRODUCT_PLANNING_PROMPT, TECHNICAL_PLANNING_PROMPT};
         use crate::spec::prompt_for;
         use crate::task_agent::Stage;
 
         let expected = [
-            (AgentSlot::PlanningProduct, PRODUCT_PLANNING_PROMPT),
-            (AgentSlot::PlanningTechnical, TECHNICAL_PLANNING_PROMPT),
             (AgentSlot::Breakdown, BREAKDOWN_PROMPT),
             (AgentSlot::Implement, prompt_for(Stage::Implement).unwrap()),
             (AgentSlot::Fix, prompt_for(Stage::Fix).unwrap()),
@@ -1752,7 +1743,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_agent_settings_lists_all_nine_slots_with_effective_values() {
+    async fn get_agent_settings_lists_all_slots_with_effective_values() {
         let (app, _state) = test_app().await;
         let project = create_project(&app).await;
 
@@ -1768,13 +1759,11 @@ mod tests {
         assert_eq!(got.status(), StatusCode::OK);
         let body = body_json(got).await;
         let items = body["items"].as_array().unwrap();
-        assert_eq!(items.len(), 9, "the closed slot vocabulary, all present");
+        assert_eq!(items.len(), 7, "the closed slot vocabulary, all present");
         let slot_keys: Vec<&str> = items.iter().map(|i| i["slot"].as_str().unwrap()).collect();
         assert_eq!(
             slot_keys,
             vec![
-                "planning_product",
-                "planning_technical",
                 "breakdown",
                 "implement",
                 "fix",

@@ -99,8 +99,9 @@ pub struct AppState {
     /// `user` rows are never deleted, and the lockout guards make "zero active
     /// admins" unreachable through the API. See [`AppState::instance_claimed`].
     pub claimed: Arc<AtomicBool>,
-    /// The planning agent that drives interactive epic-planning runs (T-202).
-    /// Production is [`planning::ClaudePlanningAgent`]; tests inject a fake.
+    /// The interactive agent-run seam (see [`planning`]). The per-node
+    /// planning engines (grilling/prototype — wayfinder epic, later tasks)
+    /// build on this seam; tests inject a scripted fake.
     pub planner: Arc<dyn PlanningAgent>,
     /// The one-shot breakdown agent that turns an approved epic into a task DAG
     /// (T-301). Production is [`breakdown::ClaudeBreakdownAgent`]; tests inject
@@ -227,7 +228,7 @@ pub struct AppState {
 
 impl AppState {
     /// Construct shared state from a resolved [`Config`] and open [`Db`], using
-    /// the production planning agent ([`planning::ClaudePlanningAgent`]).
+    /// the production interactive agent ([`planning::ClaudePlanningAgent`]).
     ///
     /// The master key is derived here; `config.master_key` is guaranteed
     /// non-empty by config loading, so derivation cannot fail. Boot code should
@@ -242,9 +243,7 @@ impl AppState {
     }
 
     /// Like [`AppState::new`] but with an injected [`PlanningAgent`] — the seam
-    /// that lets tests drive planning runs hermetically with a scripted fake.
-    /// The breakdown agent defaults to the production
-    /// [`breakdown::ClaudeBreakdownAgent`] (override it via [`with_agents`]).
+    /// that lets tests drive interactive runs hermetically with a scripted fake.
     pub fn with_planner(config: Config, db: Db, planner: Arc<dyn PlanningAgent>) -> AppState {
         AppState::with_agents(
             config,
@@ -515,16 +514,6 @@ pub fn app(state: AppState) -> Router {
             axum::routing::put(agent_settings::put_agent_setting),
         )
         .route("/epics/:id", get(epics::get_epic).patch(epics::update_epic))
-        .route(
-            "/epics/:id/messages",
-            axum::routing::post(epics::post_message),
-        )
-        .route("/epics/:id/transcript", get(epics::get_transcript))
-        .route("/epics/:id/sessions", get(epics::list_sessions))
-        .route(
-            "/epics/:id/advance-phase",
-            axum::routing::post(epics::advance_phase),
-        )
         .route(
             "/epics/:id/breakdown",
             axum::routing::post(breakdown::trigger_breakdown),

@@ -197,7 +197,7 @@ async function toggle(run: AgentRunSummary) {
 
 /**
  * Pair `tool_start`/`tool_end` events by `toolCallId` into resolved pills —
- * same pairing logic as planning/stream.ts's foldMessages, but over the
+ * same pairing logic as the epic-level stream reducers' foldMessages, but over the
  * persisted event rows rather than WS frames.
  */
 function foldToolEvents(events: ToolCallEvent[]): ToolCall[] {

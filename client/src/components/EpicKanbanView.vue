@@ -261,7 +261,7 @@ onMounted(load);
 
       <div v-if="nodes.length === 0" class="empty-state">
         <AppIcon name="board" :size="20" />
-        <p>No tasks yet. Break the epic down from the planning view.</p>
+        <p>No tasks yet. Add one by hand (breakdown moves to the planning map's completion flow).</p>
       </div>
 
       <div v-else class="lanes">

@@ -1,30 +1,16 @@
-//! Epics, planning-session lifecycle, and the durable transcript store (T-201).
+//! Epics and the wayfinder prose they carry (epic "Wayfinder-Inspired
+//! Planning" §3/§4.10).
 //!
-//! An **epic** is the unit of planning (MILESTONE_1 §2.2). Creating one lands it
-//! in `status='Planning'` and *starts a planning session*: the epic row, its
-//! `planning_session` row(s), and its `transcript_message` history all live in
-//! libSQL, so a session is durable and resumable across a server restart with no
-//! in-memory state.
+//! An **epic** is the unit of planning. Creating one requires a **destination**
+//! — what the finished plan looks like — and lands it in `status='Planning'`;
+//! the map workflow (decision nodes, the living Document) grows out from there
+//! in later tasks. The old linear product/technical planning-session flow was
+//! removed in the clean cutover: there is no epic-level transcript, no phase
+//! sessions, and no advance-phase step — planning history lives on map nodes.
 //!
-//! ## Transcript store
-//!
-//! Every user / agent / tool message is appended to `transcript_message` with a
-//! **monotonic `seq` per epic**. [`append_message`] assigns the next seq inside
-//! the single `INSERT` statement (`MAX(seq)+1` as a correlated subquery), which
-//! libSQL executes atomically under its single writer — two concurrent appends
-//! to one epic can never collide on `seq`. [`load_transcript`] reads an epic's
-//! messages back in `seq` order. T-202 reuses [`append_message`] to persist the
-//! agent's streamed reply and any tool calls on the same monotonic sequence.
-//!
-//! ## Planning-session resume
-//!
-//! `planning_session` holds the native harness `session_id` (nullable until
-//! T-202's first run) keyed by `(epic_id, phase)`. [`set_harness_session_id`]
-//! lets T-202 persist the resume handle; because it is durable, a restarted
-//! server resumes the same agent session rather than starting over. Following
-//! the wire contract in `CONVENTIONS.md`: single resources render directly,
-//! collections wrap an `items` array, IDs are server-generated ULIDs, and all
-//! `*_at` timestamps are unix milliseconds.
+//! Following the wire contract in `CONVENTIONS.md`: single resources render
+//! directly, collections wrap an `items` array, IDs are server-generated
+//! ULIDs, and all `*_at` timestamps are unix milliseconds.
 
 use axum::{
     extract::{Path, State},
@@ -35,7 +21,6 @@ use libsql::{params, params_from_iter, Connection, Row, Value};
 use serde::{Deserialize, Deserializer, Serialize};
 use serde_json::json;
 
-use crate::planning::config_for_phase;
 use crate::{git, projects, AppError, AppResult, AppState};
 
 /// Columns projected into an [`Epic`] DTO. The lease columns (`lease_owner`,
@@ -45,23 +30,17 @@ use crate::{git, projects, AppError, AppResult, AppState};
 /// (M2 §2.1) *are* part of the API-facing shape: they tell the user where the
 /// epic's PR landed and, if it stalled, why.
 const EPIC_COLUMNS: &str =
-    "id, project_id, title, description, \
+    "id, project_id, title, description, destination, notes, \
      base_branch, status, pr_url, pr_number, blocked_reason, failure_detail, created_at, updated_at";
-
-/// Columns projected into a [`TranscriptMessage`] DTO, in schema (§2.2) order.
-const MESSAGE_COLUMNS: &str = "id, epic_id, phase, role, content, seq, created_at";
-
-/// The phase planning starts in; its `planning_session` row is created with the
-/// epic. T-205 adds the `technical` phase when the user advances the epic.
-const INITIAL_PHASE: &str = "product";
 
 /// An epic as returned by the API. Lands in `status='Planning'` on create.
 ///
 /// `description` is `Option<String>` so a `NULL` column round-trips as JSON
-/// `null` (it is a user-facing short blurb shown on kanban cards). The
-/// wayfinder prose (`destination`, `notes`, `not_yet_specified`,
-/// `out_of_scope`) is not projected here yet — the epic-create/PATCH surface
-/// grows those fields when the map workflow replaces linear planning.
+/// `null` (it is a user-facing short blurb shown on kanban cards).
+/// `destination` is the required, human-typed statement of what the finished
+/// plan looks like (wayfinder plan §3); `notes` is its optional companion
+/// prose. The remaining wayfinder prose (`not_yet_specified` / `out_of_scope`)
+/// is not projected here — it belongs to the map workflow's own surfaces.
 /// `pr_url` / `pr_number` / `blocked_reason` (M2 §2.1) are populated by the
 /// executor: the PR identity once one opens, and the structured reason (§2.3)
 /// if the epic lands in `Blocked` — with `failure_detail` (Rec 5) alongside
@@ -73,6 +52,12 @@ pub struct Epic {
     pub project_id: String,
     pub title: String,
     pub description: Option<String>,
+    /// What the finished plan looks like — fixes scope (wayfinder plan §3).
+    /// Required at creation; never `None` for epics created after the cutover
+    /// (legacy rows keep `None` until re-created under the new flow).
+    pub destination: Option<String>,
+    /// Optional freeform prose alongside the destination (wayfinder plan §3).
+    pub notes: Option<String>,
     /// The epic's §5 base-branch override (`None` = project default / repo
     /// default). Set at creation only; immutable afterwards.
     pub base_branch: Option<String>,
@@ -87,49 +72,23 @@ pub struct Epic {
     pub updated_at: i64,
 }
 
-/// A durable planning-transcript message (`transcript_message`, §2.2).
-#[derive(Debug, Serialize)]
-pub struct TranscriptMessage {
-    pub id: String,
-    pub epic_id: String,
-    /// `product` | `technical`.
-    pub phase: String,
-    /// `user` | `agent` | `tool` | `system`.
-    pub role: String,
-    /// Text, or a serialized `RunEvent` (T-202).
-    pub content: String,
-    /// Monotonic per epic, starting at 1.
-    pub seq: i64,
-    pub created_at: i64,
-}
-
-/// A planning session as returned by the API (`planning_session`, §2.2), one per
-/// `(epic, phase)`. The durable `harness_session_id` is an internal resume handle
-/// and is deliberately **omitted** from this DTO — the client never sees it.
-#[derive(Debug, Serialize)]
-pub struct PlanningSession {
-    pub epic_id: String,
-    /// `product` | `technical`.
-    pub phase: String,
-    /// `active` | `complete`.
-    pub status: String,
-    pub created_at: i64,
-    pub updated_at: i64,
-}
-
-/// Columns projected into a [`PlanningSession`] DTO. Note the absence of
-/// `harness_session_id`: it is a server-only resume handle.
-const SESSION_COLUMNS: &str = "epic_id, phase, status, created_at, updated_at";
-
-/// `POST /projects/{id}/epics` body. `title` is required (validated in the
-/// handler so a missing/empty field yields the standard `bad_request` envelope).
+/// `POST /projects/{id}/epics` body. `title` and `destination` are required
+/// (validated in the handler so a missing/empty field yields the standard
+/// `bad_request` envelope).
 #[derive(Debug, Deserialize)]
 pub struct CreateEpic {
     title: Option<String>,
+    /// Required: what the finished plan looks like (wayfinder plan §3). The
+    /// seed for the whole map workflow — an epic cannot be created without one.
+    destination: Option<String>,
     /// Optional short description (kanban card blurb). An empty/whitespace
     /// string is stored as `NULL`.
     #[serde(default)]
     description: Option<String>,
+    /// Optional freeform prose alongside the destination (wayfinder plan §3).
+    /// An empty/whitespace string is stored as `NULL`, like `description`.
+    #[serde(default)]
+    notes: Option<String>,
     /// Optional base-branch override (design doc §5): this epic provisions
     /// from and PRs into this branch instead of the project default / repo
     /// default. Validated against the remote at creation time (`ls-remote`
@@ -137,14 +96,6 @@ pub struct CreateEpic {
     /// afterwards** — no PATCH surface exists by design.
     #[serde(default)]
     base_branch: Option<String>,
-}
-
-/// `POST /epics/{id}/messages` body — append a `user` message to the transcript.
-#[derive(Debug, Deserialize)]
-pub struct AppendMessage {
-    /// `product` | `technical` (validated).
-    phase: Option<String>,
-    content: Option<String>,
 }
 
 /// `PATCH /epics/{id}` body — manual edits to the epic's user-facing fields
@@ -171,17 +122,19 @@ where
     Deserialize::deserialize(deserializer).map(Some)
 }
 
-/// `POST /projects/{id}/epics` — create an epic and start its planning session.
+/// `POST /projects/{id}/epics` — create an epic with its destination.
 ///
-/// Lands the epic in `status='Planning'` and creates the `product`-phase
-/// `planning_session` row. `404` if the project does not exist; `400` if
-/// `title` is missing/empty.
+/// Lands the epic in `status='Planning'`. `404` if the project does not exist;
+/// `400` if `title` or `destination` is missing/empty. The map workflow grows
+/// from the destination (the seed grilling node is added in a later task; the
+/// old linear planning session is gone with the cutover).
 pub async fn create_epic(
     State(state): State<AppState>,
     Path(project_id): Path<String>,
     Json(req): Json<CreateEpic>,
 ) -> AppResult<(StatusCode, Json<Epic>)> {
     let title = require_field(req.title, "title")?;
+    let destination = require_field(req.destination, "destination")?;
     let conn = state.db.conn();
 
     // The project must exist (FK is declared but not enforced without
@@ -227,26 +180,29 @@ pub async fn create_epic(
     let id = ulid::Ulid::new().to_string();
     let now = now_ms();
 
-    // `status` takes its schema default of 'Planning' by omission; the context
-    // columns and Half-2 lease columns stay NULL. An empty/whitespace
-    // description is stored as NULL (unset).
+    // `status` takes its schema default of 'Planning' by omission; the
+    // wayfinder fog/out-of-scope prose and the Half-2 lease columns stay NULL.
+    // An empty/whitespace description or notes is stored as NULL (unset).
     let description = req
         .description
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty());
+    let notes = req.notes.as_deref().map(str::trim).filter(|s| !s.is_empty());
     conn.execute(
-        "INSERT INTO epic (id, project_id, title, description, base_branch, created_at, updated_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-        params![id.clone(), project_id, title, description, base_branch, now, now],
-    )
-    .await?;
-
-    // Starting planning = a session row for the initial (product) phase.
-    conn.execute(
-        "INSERT INTO planning_session (epic_id, phase, status, created_at, updated_at) \
-         VALUES (?1, ?2, 'active', ?3, ?4)",
-        params![id.clone(), INITIAL_PHASE, now, now],
+        "INSERT INTO epic (id, project_id, title, description, destination, notes, \
+         base_branch, created_at, updated_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?8)",
+        params![
+            id.clone(),
+            project_id,
+            title,
+            description,
+            destination,
+            notes,
+            base_branch,
+            now
+        ],
     )
     .await?;
 
@@ -344,271 +300,6 @@ pub async fn update_epic(
     Ok(Json(epic))
 }
 
-/// `POST /epics/{id}/messages` — append a `user` message to the transcript.
-///
-/// `201` with the stored message (including its assigned `seq`). `404` if the
-/// epic does not exist; `400` on a missing/empty `content` or an invalid
-/// `phase`. Agent/tool messages are appended by T-202 via [`append_message`].
-pub async fn post_message(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-    Json(req): Json<AppendMessage>,
-) -> AppResult<(StatusCode, Json<TranscriptMessage>)> {
-    let phase = require_field(req.phase, "phase")?;
-    let content = require_field(req.content, "content")?;
-    let conn = state.db.conn();
-
-    // Reject an unknown phase first (400) so it never masquerades as a missing
-    // session (409) below.
-    validate_phase(&phase)?;
-
-    if !epic_exists(conn, &id).await? {
-        return Err(epic_not_found(&id));
-    }
-
-    // A message may only be posted in a phase whose planning session has been
-    // started. The `product` session is created with the epic; the `technical`
-    // session only exists after the user advances the epic (T-205). Posting a
-    // `technical` message before advancing is a state conflict, not a bad body.
-    if !planning_session_exists(conn, &id, &phase).await? {
-        return Err(AppError::Conflict(format!(
-            "epic {id} has not advanced to `{phase}` planning; no active {phase} session"
-        )));
-    }
-
-    let message = append_message(conn, &id, &phase, "user", &content).await?;
-
-    // Trigger a planning agent run for this turn (T-202). The reply streams over
-    // WS on `epic:<id>` and is persisted on completion — not returned inline. A
-    // second trigger while a run is in flight for this epic is ignored: the user
-    // message above is still stored, but no overlapping run starts (so `seq` and
-    // native resume never interleave).
-    if config_for_phase(&phase).is_some() {
-        if let Some(guard) = state.try_acquire_run(&id) {
-            crate::planning::spawn_run(state.clone(), id, phase, guard, content);
-        }
-    }
-
-    Ok((StatusCode::CREATED, Json(message)))
-}
-
-/// `GET /epics/{id}/transcript` — the epic's messages in `seq` order. `404` if
-/// the epic does not exist.
-pub async fn get_transcript(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> AppResult<Json<serde_json::Value>> {
-    let conn = state.db.conn();
-    if !epic_exists(conn, &id).await? {
-        return Err(epic_not_found(&id));
-    }
-    let items = load_transcript(conn, &id).await?;
-    Ok(Json(json!({ "items": items })))
-}
-
-/// `GET /epics/{id}/sessions` — the epic's planning sessions (`items`), so the
-/// client knows which phase is active and whether it may advance. `404` if the
-/// epic does not exist. The internal `harness_session_id` is never exposed.
-pub async fn list_sessions(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> AppResult<Json<serde_json::Value>> {
-    let conn = state.db.conn();
-    if !epic_exists(conn, &id).await? {
-        return Err(epic_not_found(&id));
-    }
-    let items = load_sessions(conn, &id).await?;
-    Ok(Json(json!({ "items": items })))
-}
-
-/// `POST /epics/{id}/advance-phase` — advance an epic from product → technical
-/// planning **on the same transcript**.
-///
-/// Validates that the epic and its `product` planning session exist, marks the
-/// product session `complete`, and creates the `technical` session (`active`).
-/// The transcript continues on the same monotonic `seq`; only the `phase` on new
-/// messages differs. Returns the epic's planning sessions (`items`) so the client
-/// can flip to the technical phase. `404` if the epic (or its product session) is
-/// missing; `409` if the epic has already advanced (a technical session exists).
-pub async fn advance_phase(
-    State(state): State<AppState>,
-    Path(id): Path<String>,
-) -> AppResult<(StatusCode, Json<serde_json::Value>)> {
-    let conn = state.db.conn();
-
-    if !epic_exists(conn, &id).await? {
-        return Err(epic_not_found(&id));
-    }
-    // The product phase must have been started (it is, at epic creation); guard
-    // anyway so advancing is only ever from a real product session.
-    if !planning_session_exists(conn, &id, "product").await? {
-        return Err(AppError::NotFound(format!(
-            "epic {id} has no product planning session to advance from"
-        )));
-    }
-    // Idempotency guard: advancing twice is a state conflict.
-    if planning_session_exists(conn, &id, "technical").await? {
-        return Err(AppError::Conflict(format!(
-            "epic {id} has already advanced to technical planning"
-        )));
-    }
-
-    let now = now_ms();
-    // Product planning is done; mark its session complete (the transcript stays).
-    conn.execute(
-        "UPDATE planning_session SET status = 'complete', updated_at = ?1 \
-         WHERE epic_id = ?2 AND phase = 'product'",
-        params![now, id.clone()],
-    )
-    .await?;
-    // Open the technical session; the durable harness_session_id stays NULL until
-    // the first technical run captures it (mirrors epic creation for product).
-    conn.execute(
-        "INSERT INTO planning_session (epic_id, phase, status, created_at, updated_at) \
-         VALUES (?1, 'technical', 'active', ?2, ?3)",
-        params![id.clone(), now, now],
-    )
-    .await?;
-
-    let items = load_sessions(conn, &id).await?;
-    Ok((StatusCode::CREATED, Json(json!({ "items": items }))))
-}
-
-// ---- reusable store helpers (T-202 consumes these) ----------------------
-
-/// Append one message to `transcript_message`, assigning the next monotonic
-/// `seq` for `epic_id`.
-///
-/// The seq is computed as `MAX(seq)+1` for the epic **inside the single INSERT
-/// statement**, so libSQL's single writer assigns it atomically: two concurrent
-/// appends to the same epic serialize and can never produce a duplicate or a gap
-/// in `seq`. Validates `phase ∈ {product, technical}` and
-/// `role ∈ {user, agent, tool, system}`. Returns the stored message.
-///
-/// This is the shared write path — T-202 calls it to persist the agent's reply
-/// and any tool-call events onto the same sequence.
-pub async fn append_message(
-    conn: &Connection,
-    epic_id: &str,
-    phase: &str,
-    role: &str,
-    content: &str,
-) -> AppResult<TranscriptMessage> {
-    validate_phase(phase)?;
-    validate_role(role)?;
-
-    let id = ulid::Ulid::new().to_string();
-    let now = now_ms();
-
-    conn.execute(
-        "INSERT INTO transcript_message (id, epic_id, phase, role, content, seq, created_at) \
-         VALUES (?1, ?2, ?3, ?4, ?5, \
-             (SELECT COALESCE(MAX(seq), 0) + 1 FROM transcript_message WHERE epic_id = ?2), \
-             ?6)",
-        params![id.clone(), epic_id, phase, role, content, now],
-    )
-    .await?;
-
-    // Read the row back so the caller gets the DB-assigned seq.
-    fetch_message(conn, &id)
-        .await?
-        .ok_or_else(|| AppError::Internal(format!("message {id} vanished after insert")))
-}
-
-/// Load an epic's full transcript, ordered by `seq` ascending.
-pub async fn load_transcript(
-    conn: &Connection,
-    epic_id: &str,
-) -> AppResult<Vec<TranscriptMessage>> {
-    let sql = format!(
-        "SELECT {MESSAGE_COLUMNS} FROM transcript_message WHERE epic_id = ?1 ORDER BY seq ASC"
-    );
-    let mut rows = conn.query(&sql, params![epic_id]).await?;
-    let mut items = Vec::new();
-    while let Some(row) = rows.next().await? {
-        items.push(row_to_message(&row)?);
-    }
-    Ok(items)
-}
-
-/// Load an epic's planning sessions, ordered by `created_at` (product before
-/// technical). The internal `harness_session_id` is not projected.
-pub async fn load_sessions(conn: &Connection, epic_id: &str) -> AppResult<Vec<PlanningSession>> {
-    let sql = format!(
-        "SELECT {SESSION_COLUMNS} FROM planning_session WHERE epic_id = ?1 \
-         ORDER BY created_at ASC, phase ASC"
-    );
-    let mut rows = conn.query(&sql, params![epic_id]).await?;
-    let mut items = Vec::new();
-    while let Some(row) = rows.next().await? {
-        items.push(row_to_session(&row)?);
-    }
-    Ok(items)
-}
-
-/// Whether a `planning_session` row exists for `(epic_id, phase)`. Gates message
-/// posting (a `technical` message is rejected until the epic advances) and the
-/// advance flow.
-async fn planning_session_exists(conn: &Connection, epic_id: &str, phase: &str) -> AppResult<bool> {
-    let mut rows = conn
-        .query(
-            "SELECT 1 FROM planning_session WHERE epic_id = ?1 AND phase = ?2",
-            params![epic_id, phase],
-        )
-        .await?;
-    Ok(rows.next().await?.is_some())
-}
-
-/// Persist the native harness `session_id` for an epic's planning phase (T-202).
-///
-/// Durable resume handle: on the next turn a restarted server resumes this
-/// session instead of starting a new conversation. `404` if no session row
-/// exists for `(epic_id, phase)`.
-pub async fn set_harness_session_id(
-    conn: &Connection,
-    epic_id: &str,
-    phase: &str,
-    harness_session_id: &str,
-) -> AppResult<()> {
-    validate_phase(phase)?;
-    let affected = conn
-        .execute(
-            "UPDATE planning_session SET harness_session_id = ?1, updated_at = ?2 \
-             WHERE epic_id = ?3 AND phase = ?4",
-            params![harness_session_id, now_ms(), epic_id, phase],
-        )
-        .await?;
-    if affected == 0 {
-        return Err(AppError::NotFound(format!(
-            "planning session ({epic_id}, {phase}) not found"
-        )));
-    }
-    Ok(())
-}
-
-/// Read the stored native harness `session_id` for an epic's planning phase, if
-/// one has been captured yet (T-202 passes it back as `RunRequest.resume`).
-///
-/// `Ok(None)` when the session exists but has no id yet, or when no session row
-/// exists for `(epic_id, phase)` — callers treat "no resume id" uniformly.
-pub async fn get_harness_session_id(
-    conn: &Connection,
-    epic_id: &str,
-    phase: &str,
-) -> AppResult<Option<String>> {
-    let mut rows = conn
-        .query(
-            "SELECT harness_session_id FROM planning_session \
-             WHERE epic_id = ?1 AND phase = ?2",
-            params![epic_id, phase],
-        )
-        .await?;
-    match rows.next().await? {
-        Some(row) => Ok(row.get::<Option<String>>(0)?),
-        None => Ok(None),
-    }
-}
-
 /// The `project_id` an epic belongs to, or `None` if the epic is unknown. Used
 /// when minting a capability that needs the project (breakdown's `create_task`,
 /// and planning's scope) without projecting a whole [`Epic`].
@@ -678,51 +369,22 @@ pub(crate) async fn fetch_epic(conn: &Connection, id: &str) -> AppResult<Option<
     }
 }
 
-async fn fetch_message(conn: &Connection, id: &str) -> AppResult<Option<TranscriptMessage>> {
-    let sql = format!("SELECT {MESSAGE_COLUMNS} FROM transcript_message WHERE id = ?1");
-    let mut rows = conn.query(&sql, params![id]).await?;
-    match rows.next().await? {
-        Some(row) => Ok(Some(row_to_message(&row)?)),
-        None => Ok(None),
-    }
-}
-
 fn row_to_epic(row: &Row) -> Result<Epic, libsql::Error> {
     Ok(Epic {
         id: row.get(0)?,
         project_id: row.get(1)?,
         title: row.get(2)?,
         description: row.get(3)?,
-        base_branch: row.get(4)?,
-        status: row.get(5)?,
-        pr_url: row.get(6)?,
-        pr_number: row.get(7)?,
-        blocked_reason: row.get(8)?,
-        failure_detail: row.get(9)?,
-        created_at: row.get(10)?,
-        updated_at: row.get(11)?,
-    })
-}
-
-fn row_to_session(row: &Row) -> Result<PlanningSession, libsql::Error> {
-    Ok(PlanningSession {
-        epic_id: row.get(0)?,
-        phase: row.get(1)?,
-        status: row.get(2)?,
-        created_at: row.get(3)?,
-        updated_at: row.get(4)?,
-    })
-}
-
-fn row_to_message(row: &Row) -> Result<TranscriptMessage, libsql::Error> {
-    Ok(TranscriptMessage {
-        id: row.get(0)?,
-        epic_id: row.get(1)?,
-        phase: row.get(2)?,
-        role: row.get(3)?,
-        content: row.get(4)?,
-        seq: row.get(5)?,
-        created_at: row.get(6)?,
+        destination: row.get(4)?,
+        notes: row.get(5)?,
+        base_branch: row.get(6)?,
+        status: row.get(7)?,
+        pr_url: row.get(8)?,
+        pr_number: row.get(9)?,
+        blocked_reason: row.get(10)?,
+        failure_detail: row.get(11)?,
+        created_at: row.get(12)?,
+        updated_at: row.get(13)?,
     })
 }
 
@@ -746,33 +408,6 @@ async fn project_repo_url(conn: &Connection, project_id: &str) -> AppResult<Stri
         Some(row) => Ok(row.get(0)?),
         None => Err(AppError::NotFound(format!(
             "project {project_id} not found"
-        ))),
-    }
-}
-
-async fn epic_exists(conn: &Connection, epic_id: &str) -> AppResult<bool> {
-    let mut rows = conn
-        .query("SELECT 1 FROM epic WHERE id = ?1", params![epic_id])
-        .await?;
-    Ok(rows.next().await?.is_some())
-}
-
-/// `product` | `technical` — the two planning phases (§2.2).
-fn validate_phase(phase: &str) -> AppResult<()> {
-    match phase {
-        "product" | "technical" => Ok(()),
-        other => Err(AppError::BadRequest(format!(
-            "`phase` must be `product` or `technical`, got `{other}`"
-        ))),
-    }
-}
-
-/// `user` | `agent` | `tool` | `system` — the transcript roles (§2.2).
-fn validate_role(role: &str) -> AppResult<()> {
-    match role {
-        "user" | "agent" | "tool" | "system" => Ok(()),
-        other => Err(AppError::BadRequest(format!(
-            "`role` must be one of user|agent|tool|system, got `{other}`"
         ))),
     }
 }
@@ -814,23 +449,9 @@ mod tests {
     async fn test_app() -> axum::Router {
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
-        // These tests exercise the pure transcript store, so inject the silent
-        // planner: message triggers still fire a run, but it streams and persists
-        // nothing (T-202's run behaviour is tested in `crate::planning`).
-        app(AppState::with_planner(
-            Config::for_test(),
-            db,
-            std::sync::Arc::new(crate::planning::testing::SilentPlanningAgent),
-        ))
+        app(AppState::new(Config::for_test(), db))
     }
 
-    /// The bearer credential HTTP tests present, minted **once per process**
-    /// from a seeded active admin (`crate::users::testing::seed_user` +
-    /// `crate::sessions::testing::login_as`) — the replacement for the deleted
-    /// static `TOKEN` constant. Access-token verification is stateless (one
-    /// HMAC check against the fixed test master key, no database read), so a
-    /// token minted here authenticates against every in-memory instance these
-    /// tests boot.
     fn auth_bearer() -> &'static str {
         static BEARER: std::sync::OnceLock<String> = std::sync::OnceLock::new();
         BEARER.get_or_init(|| {
@@ -909,7 +530,7 @@ mod tests {
             .oneshot(req(
                 "POST",
                 &format!("/projects/{project_id}/epics"),
-                Some(json!({ "title": title })),
+                Some(json!({ "title": title, "destination": "It works end to end" })),
             ))
             .await
             .unwrap();
@@ -917,10 +538,6 @@ mod tests {
         body_json(created).await
     }
 
-    /// T-500 AC: the Half-2 executor columns (`pr_url`, `pr_number`,
-    /// `blocked_reason`) round-trip through `fetch_epic` and its JSON, while the
-    /// lease columns (internal executor state, written directly by the worker)
-    /// never appear on the DTO or in the API response.
     #[tokio::test]
     async fn epic_pr_and_blocked_reason_round_trip_but_lease_columns_stay_internal() {
         let db = Db::connect(":memory:").await.unwrap();
@@ -1015,33 +632,6 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_epic_starts_a_product_planning_session() {
-        let db = Db::connect(":memory:").await.unwrap();
-        db.run_migrations().await.unwrap();
-        let state = AppState::new(Config::for_test(), db);
-        let app = app(state.clone());
-        let project_id = seed_project(&app).await;
-        let epic = create_epic_via_api(&app, &project_id, "E").await;
-        let id = epic["id"].as_str().unwrap().to_string();
-
-        // The starting (product) planning session exists, active, with no resume
-        // id yet (T-202 populates it).
-        let mut rows = state
-            .db
-            .conn()
-            .query(
-                "SELECT status, harness_session_id FROM planning_session \
-                 WHERE epic_id = ?1 AND phase = 'product'",
-                params![id],
-            )
-            .await
-            .unwrap();
-        let row = rows.next().await.unwrap().expect("product session row");
-        assert_eq!(row.get::<String>(0).unwrap(), "active");
-        assert_eq!(row.get::<Option<String>>(1).unwrap(), None);
-    }
-
-    #[tokio::test]
     async fn create_epic_missing_title_is_structured_bad_request() {
         let app = test_app().await;
         let project_id = seed_project(&app).await;
@@ -1058,13 +648,114 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn create_epic_requires_a_destination() {
+        let app = test_app().await;
+        let project_id = seed_project(&app).await;
+
+        // Missing destination -> 400.
+        let missing = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                &format!("/projects/{project_id}/epics"),
+                Some(json!({ "title": "No destination" })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(missing.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(missing).await["error"]["code"], "bad_request");
+
+        // Blank (whitespace-only) destination -> 400 too.
+        let blank = app
+            .oneshot(req(
+                "POST",
+                &format!("/projects/{project_id}/epics"),
+                Some(json!({ "title": "Blank", "destination": "   " })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(blank.status(), StatusCode::BAD_REQUEST);
+        assert_eq!(body_json(blank).await["error"]["code"], "bad_request");
+    }
+
+    #[tokio::test]
+    async fn create_epic_persists_destination_and_notes() {
+        let db = Db::connect(":memory:").await.unwrap();
+        db.run_migrations().await.unwrap();
+        let state = AppState::new(Config::for_test(), db);
+        let app = app(state.clone());
+        let project_id = seed_project(&app).await;
+
+        // Destination (required) and notes (optional) are trimmed and stored.
+        let created = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                &format!("/projects/{project_id}/epics"),
+                Some(json!({
+                    "title": "Ship it",
+                    "destination": "  A working exporter, end to end.  ",
+                    "notes": "  Keep the executor untouched.  ",
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(created.status(), StatusCode::CREATED);
+        let epic = body_json(created).await;
+        assert_eq!(epic["destination"], "A working exporter, end to end.");
+        assert_eq!(epic["notes"], "Keep the executor untouched.");
+
+        // Round-trips through GET.
+        let id = epic["id"].as_str().unwrap().to_string();
+        let got = app
+            .clone()
+            .oneshot(req("GET", &format!("/epics/{id}"), None))
+            .await
+            .unwrap();
+        assert_eq!(got.status(), StatusCode::OK);
+        let got = body_json(got).await;
+        assert_eq!(got["destination"], "A working exporter, end to end.");
+        assert_eq!(got["notes"], "Keep the executor untouched.");
+
+        // Blank or omitted notes store NULL (the destination is never null).
+        let blank_notes = app
+            .clone()
+            .oneshot(req(
+                "POST",
+                &format!("/projects/{project_id}/epics"),
+                Some(json!({
+                    "title": "Blank notes",
+                    "destination": "Done",
+                    "notes": "   ",
+                })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(blank_notes.status(), StatusCode::CREATED);
+        let epic = body_json(blank_notes).await;
+        assert_eq!(epic["destination"], "Done");
+        assert_eq!(epic["notes"], Json::Null);
+
+        let omitted_notes = app
+            .oneshot(req(
+                "POST",
+                &format!("/projects/{project_id}/epics"),
+                Some(json!({ "title": "Omitted notes", "destination": "Done" })),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(omitted_notes.status(), StatusCode::CREATED);
+        assert_eq!(body_json(omitted_notes).await["notes"], Json::Null);
+    }
+
+    #[tokio::test]
     async fn create_epic_on_unknown_project_is_404() {
         let app = test_app().await;
         let response = app
             .oneshot(req(
                 "POST",
                 "/projects/does-not-exist/epics",
-                Some(json!({ "title": "E" })),
+                Some(json!({ "title": "E", "destination": "Done" })),
             ))
             .await
             .unwrap();
@@ -1210,11 +901,7 @@ mod tests {
         use crate::{Config, Db};
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
-        let state = crate::AppState::with_planner(
-            Config::for_test(),
-            db,
-            std::sync::Arc::new(crate::planning::testing::SilentPlanningAgent),
-        );
+        let state = crate::AppState::new(Config::for_test(), db);
         let app = app(state.clone());
         let (project_id, _bare) = seed_local_bare_project(&state).await;
 
@@ -1222,7 +909,11 @@ mod tests {
             .oneshot(req(
                 "POST",
                 &format!("/projects/{project_id}/epics"),
-                Some(json!({ "title": "Stacked", "base_branch": " release/1 " })),
+                Some(json!({
+                    "title": "Stacked",
+                    "destination": "Done",
+                    "base_branch": " release/1 "
+                })),
             ))
             .await
             .unwrap();
@@ -1237,11 +928,7 @@ mod tests {
         use crate::{Config, Db};
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
-        let state = crate::AppState::with_planner(
-            Config::for_test(),
-            db,
-            std::sync::Arc::new(crate::planning::testing::SilentPlanningAgent),
-        );
+        let state = crate::AppState::new(Config::for_test(), db);
         let app = app(state.clone());
         let (project_id, _bare) = seed_local_bare_project(&state).await;
 
@@ -1249,7 +936,11 @@ mod tests {
             .oneshot(req(
                 "POST",
                 &format!("/projects/{project_id}/epics"),
-                Some(json!({ "title": "Typo", "base_branch": "no-such-branch" })),
+                Some(json!({
+                    "title": "Typo",
+                    "destination": "Done",
+                    "base_branch": "no-such-branch"
+                })),
             ))
             .await
             .unwrap();
@@ -1262,11 +953,7 @@ mod tests {
         use crate::{Config, Db};
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
-        let state = crate::AppState::with_planner(
-            Config::for_test(),
-            db,
-            std::sync::Arc::new(crate::planning::testing::SilentPlanningAgent),
-        );
+        let state = crate::AppState::new(Config::for_test(), db);
         let app = app(state.clone());
         let project_id = seed_project(&app).await;
 
@@ -1275,7 +962,11 @@ mod tests {
             .oneshot(req(
                 "POST",
                 &format!("/projects/{project_id}/epics"),
-                Some(json!({ "title": "Blank base", "base_branch": "   " })),
+                Some(json!({
+                    "title": "Blank base",
+                    "destination": "Done",
+                    "base_branch": "   "
+                })),
             ))
             .await
             .unwrap();
@@ -1286,7 +977,7 @@ mod tests {
             .oneshot(req(
                 "POST",
                 &format!("/projects/{project_id}/epics"),
-                Some(json!({ "title": "Omitted base" })),
+                Some(json!({ "title": "Omitted base", "destination": "Done" })),
             ))
             .await
             .unwrap();
@@ -1305,7 +996,11 @@ mod tests {
             .oneshot(req(
                 "POST",
                 &format!("/projects/{project_id}/epics"),
-                Some(json!({ "title": "Ship it", "description": "  Short blurb.  " })),
+                Some(json!({
+                    "title": "Ship it",
+                    "description": "  Short blurb.  ",
+                    "destination": "Done"
+                })),
             ))
             .await
             .unwrap();
@@ -1322,7 +1017,11 @@ mod tests {
             .oneshot(req(
                 "POST",
                 &format!("/projects/{project_id}/epics"),
-                Some(json!({ "title": "Blank", "description": "   " })),
+                Some(json!({
+                    "title": "Blank",
+                    "description": "   ",
+                    "destination": "Done"
+                })),
             ))
             .await
             .unwrap();
@@ -1398,223 +1097,5 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(missing.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn messages_persist_and_reload_in_seq_order() {
-        let app = test_app().await;
-        let project_id = seed_project(&app).await;
-        let id = create_epic_via_api(&app, &project_id, "E").await["id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-
-        // Append N user messages; each returns the next seq with no gaps/dupes.
-        const N: i64 = 12;
-        for i in 1..=N {
-            let posted = app
-                .clone()
-                .oneshot(req(
-                    "POST",
-                    &format!("/epics/{id}/messages"),
-                    Some(json!({ "phase": "product", "content": format!("msg {i}") })),
-                ))
-                .await
-                .unwrap();
-            assert_eq!(posted.status(), StatusCode::CREATED);
-            let posted = body_json(posted).await;
-            assert_eq!(posted["seq"].as_i64().unwrap(), i, "seq must be monotonic");
-            assert_eq!(posted["role"], "user");
-        }
-
-        // Transcript reloads in seq order, 1..N, no gaps or dupes.
-        let transcript = app
-            .clone()
-            .oneshot(req("GET", &format!("/epics/{id}/transcript"), None))
-            .await
-            .unwrap();
-        assert_eq!(transcript.status(), StatusCode::OK);
-        let items = body_json(transcript).await["items"]
-            .as_array()
-            .unwrap()
-            .clone();
-        assert_eq!(items.len(), N as usize);
-        for (idx, item) in items.iter().enumerate() {
-            assert_eq!(item["seq"].as_i64().unwrap(), idx as i64 + 1);
-            assert_eq!(item["content"], format!("msg {}", idx + 1));
-        }
-    }
-
-    #[tokio::test]
-    async fn concurrent_appends_to_one_epic_get_unique_seqs() {
-        let db = Db::connect(":memory:").await.unwrap();
-        db.run_migrations().await.unwrap();
-        let state = AppState::new(Config::for_test(), db);
-        let app = app(state.clone());
-        let project_id = seed_project(&app).await;
-        let id = create_epic_via_api(&app, &project_id, "E").await["id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-
-        // Fire many appends concurrently against the shared connection; the
-        // single-INSERT MAX(seq)+1 must still hand out a contiguous 1..N set.
-        const N: usize = 25;
-        let mut handles = Vec::new();
-        for i in 0..N {
-            let conn = state.db.conn().clone();
-            let epic_id = id.clone();
-            handles.push(tokio::spawn(async move {
-                append_message(&conn, &epic_id, "product", "agent", &format!("c{i}"))
-                    .await
-                    .unwrap()
-                    .seq
-            }));
-        }
-        let mut seqs = Vec::new();
-        for h in handles {
-            seqs.push(h.await.unwrap());
-        }
-        seqs.sort_unstable();
-        let expected: Vec<i64> = (1..=N as i64).collect();
-        assert_eq!(
-            seqs, expected,
-            "seqs must be a contiguous 1..N with no dupes"
-        );
-    }
-
-    #[tokio::test]
-    async fn post_message_validates_phase_and_content() {
-        let app = test_app().await;
-        let project_id = seed_project(&app).await;
-        let id = create_epic_via_api(&app, &project_id, "E").await["id"]
-            .as_str()
-            .unwrap()
-            .to_string();
-
-        // Bad phase -> 400.
-        let bad_phase = app
-            .clone()
-            .oneshot(req(
-                "POST",
-                &format!("/epics/{id}/messages"),
-                Some(json!({ "phase": "marketing", "content": "hi" })),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(bad_phase.status(), StatusCode::BAD_REQUEST);
-
-        // Empty content -> 400.
-        let empty = app
-            .clone()
-            .oneshot(req(
-                "POST",
-                &format!("/epics/{id}/messages"),
-                Some(json!({ "phase": "product", "content": "" })),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(empty.status(), StatusCode::BAD_REQUEST);
-    }
-
-    #[tokio::test]
-    async fn message_on_unknown_epic_is_404() {
-        let app = test_app().await;
-        let response = app
-            .oneshot(req(
-                "POST",
-                "/epics/nope/messages",
-                Some(json!({ "phase": "product", "content": "hi" })),
-            ))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    #[tokio::test]
-    async fn transcript_on_unknown_epic_is_404() {
-        let app = test_app().await;
-        let response = app
-            .oneshot(req("GET", "/epics/nope/transcript", None))
-            .await
-            .unwrap();
-        assert_eq!(response.status(), StatusCode::NOT_FOUND);
-    }
-
-    /// Resumable after a server restart: append messages, then open a *fresh*
-    /// `Db` against the *same file* (simulating a process restart) and read the
-    /// transcript back in full, in order. Uses a temp file DB, since `:memory:`
-    /// does not persist across connections.
-    #[tokio::test]
-    async fn transcript_survives_a_server_restart() {
-        let path = std::env::temp_dir().join(format!(
-            "dearborn-t201-restart-{}-{}.db",
-            std::process::id(),
-            now_ms()
-        ));
-        let path_str = path.to_str().unwrap().to_string();
-
-        let epic_id;
-        // ---- first "process": create the epic and append 5 messages. ----
-        {
-            let db = Db::connect(&path_str).await.unwrap();
-            db.run_migrations().await.unwrap();
-            let state = AppState::new(Config::for_test(), db);
-            let app = app(state.clone());
-            let project_id = seed_project(&app).await;
-            epic_id = create_epic_via_api(&app, &project_id, "Durable").await["id"]
-                .as_str()
-                .unwrap()
-                .to_string();
-            for i in 1..=5 {
-                append_message(
-                    state.db.conn(),
-                    &epic_id,
-                    "product",
-                    if i % 2 == 0 { "agent" } else { "user" },
-                    &format!("turn {i}"),
-                )
-                .await
-                .unwrap();
-            }
-            // Also stash a harness resume id, as T-202 would.
-            set_harness_session_id(state.db.conn(), &epic_id, "product", "sess-abc")
-                .await
-                .unwrap();
-        }
-
-        // ---- second "process": a fresh Db on the same file reads it all back. ----
-        {
-            let db = Db::connect(&path_str).await.unwrap();
-            // Re-running migrations is a no-op on the existing file.
-            assert_eq!(db.run_migrations().await.unwrap(), 0);
-            let conn = db.conn();
-
-            let transcript = load_transcript(conn, &epic_id).await.unwrap();
-            assert_eq!(transcript.len(), 5, "all messages persisted across restart");
-            for (idx, m) in transcript.iter().enumerate() {
-                assert_eq!(m.seq, idx as i64 + 1, "seq order preserved");
-                assert_eq!(m.content, format!("turn {}", idx + 1));
-            }
-
-            // The durable resume handle survived, so a restart resumes the session.
-            let mut rows = conn
-                .query(
-                    "SELECT harness_session_id FROM planning_session \
-                     WHERE epic_id = ?1 AND phase = 'product'",
-                    params![epic_id.clone()],
-                )
-                .await
-                .unwrap();
-            let row = rows.next().await.unwrap().unwrap();
-            assert_eq!(
-                row.get::<Option<String>>(0).unwrap().as_deref(),
-                Some("sess-abc")
-            );
-        }
-
-        for suffix in ["", "-shm", "-wal"] {
-            let _ = std::fs::remove_file(format!("{path_str}{suffix}"));
-        }
-    }
+}
 }
