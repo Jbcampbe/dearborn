@@ -482,7 +482,6 @@ fn node_create_flags(args: &[String]) -> Result<NodeCreateFlags, i32> {
             }
             other => return usage(&format!("unknown node create flag `{other}`")),
         }
-        i += if inline.is_some() { 1 } else { 2 };
         i += if inline.is_some() || !name.starts_with("--") { 1 } else { 2 };
     }
 
@@ -784,6 +783,38 @@ mod tests {
         assert_eq!(body["trim_fog"], "Retention policy");
 
         std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    #[test]
+    fn node_create_parses_space_separated_flags_without_skipping() {
+        // Regression: a stale cursor advance in `node_create_flags` double-
+        // stepped the loop for the space-separated form, so every flag after
+        // the first was skipped and parsing failed with `--title is required`.
+        let (kind, title, question, task_mode, blocked_by, blocks) = node_create_flags(
+            &["--kind", "grilling", "--title", "Which events export?", "--question", "Scope",
+              "--blocked-by", "01A,01B", "--blocks", "01C"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(kind, "grilling");
+        assert_eq!(title, "Which events export?");
+        assert_eq!(question.as_deref(), Some("Scope"));
+        assert_eq!(task_mode, None);
+        assert_eq!(blocked_by, vec!["01A", "01B"]);
+        assert_eq!(blocks, vec!["01C"]);
+
+        // The `--flag=value` inline form keeps working too.
+        let (kind, title, _, _, _, _) = node_create_flags(
+            &["--kind=task", "--title=Provision bucket", "--task-mode=afk"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(kind, "task");
+        assert_eq!(title, "Provision bucket");
     }
 
     #[test]
