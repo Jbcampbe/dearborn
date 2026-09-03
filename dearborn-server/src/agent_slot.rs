@@ -36,6 +36,12 @@ pub enum AgentSlot {
     /// PR-feedback triage stage (classifies one piece of review feedback as a
     /// question vs. a change request).
     Triage,
+    /// Interactive per-node grilling engine (wayfinder epic §5): the HITL
+    /// map-building conversation that resolves a decision node.
+    Grilling,
+    /// Interactive per-node prototype engine (wayfinder epic §5): the HITL
+    /// throwaway-artifact session that informs a decision.
+    Prototype,
 }
 
 impl AgentSlot {
@@ -49,6 +55,8 @@ impl AgentSlot {
         AgentSlot::VerifyComplete,
         AgentSlot::Summarize,
         AgentSlot::Triage,
+        AgentSlot::Grilling,
+        AgentSlot::Prototype,
     ];
 
     /// The stable snake_case wire/storage key.
@@ -61,6 +69,8 @@ impl AgentSlot {
             AgentSlot::VerifyComplete => "verify_complete",
             AgentSlot::Summarize => "summarize",
             AgentSlot::Triage => "triage",
+            AgentSlot::Grilling => "grilling",
+            AgentSlot::Prototype => "prototype",
         }
     }
 
@@ -146,9 +156,11 @@ mod tests {
                 AgentSlot::VerifyComplete => {}
                 AgentSlot::Summarize => {}
                 AgentSlot::Triage => {}
+                AgentSlot::Grilling => {}
+                AgentSlot::Prototype => {}
             }
         }
-        assert_eq!(AgentSlot::ALL.len(), 7);
+        assert_eq!(AgentSlot::ALL.len(), 9);
     }
 
     #[test]

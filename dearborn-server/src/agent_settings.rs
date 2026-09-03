@@ -349,7 +349,11 @@ pub fn is_supported_harness(harness: &str) -> bool {
 /// supported harness.
 pub fn slot_is_claude_only(slot: AgentSlot) -> bool {
     match slot {
-        AgentSlot::Breakdown => true,
+        // The one-shot breakdown engine and the interactive per-node
+        // grilling/prototype engines are all implemented on the Claude Code
+        // adapter today (wayfinder epic §5's determinism seam runs through the
+        // Claude-bound `PlanningAgent`).
+        AgentSlot::Breakdown | AgentSlot::Grilling | AgentSlot::Prototype => true,
         AgentSlot::Implement
         | AgentSlot::Fix
         | AgentSlot::Review
@@ -696,6 +700,11 @@ pub fn default_prompt(slot: AgentSlot) -> &'static str {
             prompt_for(Stage::Summarize).expect("Stage::Summarize always has a prompt")
         }
         AgentSlot::Triage => prompt_for(Stage::Triage).expect("Stage::Triage always has a prompt"),
+        // The interactive per-node engines carry their methodology as a system
+        // prompt (wayfinder epic §5: "methodologies are prompts, not Skill-tool
+        // calls"), adapted from `matt-pocock-skills` and owned by `node_engine`.
+        AgentSlot::Grilling => crate::node_engine::GRILLING_PROMPT,
+        AgentSlot::Prototype => crate::node_engine::PROTOTYPE_PROMPT,
     }
 }
 
@@ -1480,9 +1489,13 @@ mod tests {
     fn slot_capability_splits_the_claude_bound_slots_from_the_task_stages() {
         use crate::harness_pi::PI_HARNESS_ID;
 
-        // Breakdown runs on the Claude Code adapter only (the per-node
-        // planning engines pick up their slots when they land).
-        for slot in [AgentSlot::Breakdown] {
+        // Breakdown and the interactive per-node engines run on the Claude Code
+        // adapter only.
+        for slot in [
+            AgentSlot::Breakdown,
+            AgentSlot::Grilling,
+            AgentSlot::Prototype,
+        ] {
             assert!(slot_is_claude_only(slot), "{slot}");
             assert!(harness_supports_slot("claude", slot), "{slot}");
             assert!(!harness_supports_slot(PI_HARNESS_ID, slot), "{slot}");
@@ -1759,7 +1772,7 @@ mod tests {
         assert_eq!(got.status(), StatusCode::OK);
         let body = body_json(got).await;
         let items = body["items"].as_array().unwrap();
-        assert_eq!(items.len(), 7, "the closed slot vocabulary, all present");
+        assert_eq!(items.len(), 9, "the closed slot vocabulary, all present");
         let slot_keys: Vec<&str> = items.iter().map(|i| i["slot"].as_str().unwrap()).collect();
         assert_eq!(
             slot_keys,
@@ -1770,7 +1783,9 @@ mod tests {
                 "review",
                 "verify_complete",
                 "summarize",
-                "triage"
+                "triage",
+                "grilling",
+                "prototype"
             ]
         );
         // No overrides yet: raw facets null, effective resolves to the seed.

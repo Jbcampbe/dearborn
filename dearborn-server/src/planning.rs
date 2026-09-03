@@ -181,7 +181,7 @@ pub fn ws_type(event: &RunEvent) -> &'static str {
 #[cfg(test)]
 pub(crate) mod testing {
     use super::*;
-    use std::sync::{Condvar, Mutex};
+    use std::sync::{Arc, Condvar, Mutex};
 
     /// A one-shot gate: the fake's run thread blocks before its terminal
     /// `Exited` until [`Gate::release`] is called, so a test can hold a run
@@ -220,6 +220,94 @@ pub(crate) mod testing {
                 let _ = tx.send(RunEvent::Started {
                     run_id: run_id.clone(),
                 });
+                let _ = tx.send(RunEvent::Exited {
+                    run_id,
+                    exit_code: Some(0),
+                    cancelled: false,
+                });
+            });
+            rx
+        }
+    }
+
+    /// One interactive turn as the fake saw it — enough for a test to assert the
+    /// per-node engine passed the right prompt, resume handle, and system prompt.
+    #[derive(Clone, Debug)]
+    #[allow(dead_code)]
+    pub struct RecordedPlanningRun {
+        pub run_id: String,
+        pub prompt: String,
+        pub resume: Option<String>,
+        pub system_prompt: String,
+    }
+
+    /// A scripted [`PlanningAgent`] (mirrors breakdown's `ScriptedBreakdownAgent`):
+    /// per turn it records the request, then emits Started → Session (a fixed
+    /// resume id) → Text* → Exited. An optional [`Gate`] pins the run in flight
+    /// before its terminal `Exited`, so a test can hold one turn open and assert
+    /// the per-node run-lock behaviour deterministically (no sleeps).
+    pub struct ScriptedPlanningAgent {
+        session_id: String,
+        chunks: Vec<String>,
+        recorded: Arc<Mutex<Vec<RecordedPlanningRun>>>,
+        gate: Option<Arc<Gate>>,
+    }
+
+    impl ScriptedPlanningAgent {
+        pub fn new(session_id: &str, chunks: &[&str]) -> ScriptedPlanningAgent {
+            ScriptedPlanningAgent {
+                session_id: session_id.to_string(),
+                chunks: chunks.iter().map(|s| s.to_string()).collect(),
+                recorded: Arc::new(Mutex::new(Vec::new())),
+                gate: None,
+            }
+        }
+
+        /// Pin every run in flight on `gate` until [`Gate::release`] is called.
+        pub fn with_gate(mut self, gate: Arc<Gate>) -> ScriptedPlanningAgent {
+            self.gate = Some(gate);
+            self
+        }
+
+        pub fn recorded(&self) -> Arc<Mutex<Vec<RecordedPlanningRun>>> {
+            self.recorded.clone()
+        }
+    }
+
+    impl PlanningAgent for ScriptedPlanningAgent {
+        fn run(&self, req: PlanningRunRequest) -> Receiver<RunEvent> {
+            self.recorded.lock().unwrap().push(RecordedPlanningRun {
+                run_id: req.run_id.clone(),
+                prompt: req.prompt.clone(),
+                resume: req.resume.clone(),
+                system_prompt: req.system_prompt.clone(),
+            });
+
+            let (tx, rx) = std::sync::mpsc::channel();
+            let run_id = req.run_id;
+            let session_id = self.session_id.clone();
+            let chunks = self.chunks.clone();
+            let gate = self.gate.clone();
+
+            std::thread::spawn(move || {
+                let _ = tx.send(RunEvent::Started {
+                    run_id: run_id.clone(),
+                });
+                let _ = tx.send(RunEvent::Session {
+                    run_id: run_id.clone(),
+                    session_id: Some(session_id),
+                    model: Some("fake-model".to_string()),
+                });
+                for chunk in chunks {
+                    let _ = tx.send(RunEvent::Text {
+                        run_id: run_id.clone(),
+                        delta: chunk,
+                    });
+                }
+                // Hold the run in flight until released, if a gate was attached.
+                if let Some(gate) = gate {
+                    gate.wait();
+                }
                 let _ = tx.send(RunEvent::Exited {
                     run_id,
                     exit_code: Some(0),

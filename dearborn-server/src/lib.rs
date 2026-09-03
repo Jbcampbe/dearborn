@@ -25,6 +25,7 @@ pub mod harness_pi;
 pub mod hub;
 pub mod lanes;
 pub mod map;
+pub mod node_engine;
 pub mod planning;
 pub mod pr;
 pub mod projects;
@@ -129,7 +130,20 @@ pub struct AppState {
     /// Epics with a planning run currently in flight. A second trigger for an
     /// epic already in this set is ignored (its user message is still stored),
     /// so runs never interleave on `seq`/resume. See [`AppState::try_acquire_run`].
+    ///
+    /// Breakdown (the one-shot epic → task DAG run) is the only remaining
+    /// per-epic-locked engine. The interactive per-node engines
+    /// (grilling/prototype) moved their one-run-in-flight lock down to
+    /// [`AppState::node_inflight`] so unblocked frontier nodes run concurrently
+    /// (wayfinder epic §7).
     pub inflight: Arc<Mutex<HashSet<String>>>,
+    /// Map nodes with an interactive agent reply currently in flight, keyed by
+    /// `map_node.id` — the per-node run-lock (wayfinder epic §7). A message
+    /// posted into a node whose id is already here is still stored, but does not
+    /// start a second agent turn: the lock serializes the agent's replies within
+    /// a node while leaving *different* nodes free to run in parallel. See
+    /// [`AppState::try_acquire_node_run`].
+    pub node_inflight: Arc<Mutex<HashSet<String>>>,
     /// Per-run capability tokens. An agent run mints a token scoped to one
     /// `(epic, project, phase, clone)`; the agent authenticates its `dearborn`
     /// CLI calls with it as a bearer, and the token can act only on that epic
@@ -327,6 +341,7 @@ impl AppState {
             task_agent,
             git_host,
             inflight: Arc::new(Mutex::new(HashSet::new())),
+            node_inflight: Arc::new(Mutex::new(HashSet::new())),
             caps: Arc::new(CapabilityStore::new()),
             advertised_base: Arc::new(Mutex::new(None)),
             notify: Arc::new(tokio::sync::Notify::new()),
@@ -417,6 +432,31 @@ impl AppState {
             epic_id: epic_id.to_string(),
         })
     }
+
+    /// Claim the per-node run-lock for `node_id` for an interactive agent reply
+    /// (wayfinder epic §7).
+    ///
+    /// Returns `Some(guard)` if no reply was already in flight for the node —
+    /// the caller spawns the reply and holds the guard for its lifetime;
+    /// dropping it frees the lock. Returns `None` if a reply is already running
+    /// (the caller then leaves the just-stored user message for the in-flight
+    /// turn's successor, exactly like [`try_acquire_run`](Self::try_acquire_run)
+    /// does per epic). The lock is keyed by node, so a reply in one node never
+    /// blocks a reply in another.
+    pub fn try_acquire_node_run(&self, node_id: &str) -> Option<NodeRunGuard> {
+        let mut set = self
+            .node_inflight
+            .lock()
+            .expect("node_inflight mutex poisoned");
+        if set.contains(node_id) {
+            return None;
+        }
+        set.insert(node_id.to_string());
+        Some(NodeRunGuard {
+            set: self.node_inflight.clone(),
+            node_id: node_id.to_string(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -441,6 +481,22 @@ impl Drop for InflightGuard {
     fn drop(&mut self) {
         if let Ok(mut set) = self.set.lock() {
             set.remove(&self.epic_id);
+        }
+    }
+}
+
+/// RAII claim on a map node's interactive run-lock. Frees the lock on drop, so
+/// the node is workable again however the reply ends (completion, error, or
+/// panic). The per-node analogue of [`InflightGuard`] (wayfinder epic §7).
+pub struct NodeRunGuard {
+    set: Arc<Mutex<HashSet<String>>>,
+    node_id: String,
+}
+
+impl Drop for NodeRunGuard {
+    fn drop(&mut self) {
+        if let Ok(mut set) = self.set.lock() {
+            set.remove(&self.node_id);
         }
     }
 }
@@ -526,6 +582,18 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/epics/:id/map-nodes/:nodeId",
             get(map::get_map_node).patch(map::patch_map_node),
+        )
+        // The interactive per-node engine (wayfinder epic §5/§7): opening a
+        // grilling/prototype node starts/resumes its node-scoped session, and
+        // any user may post a message whose reply the per-node run-lock
+        // serializes. Live `RunEvent`s stream on `node:<id>`.
+        .route(
+            "/epics/:id/map-nodes/:nodeId/session",
+            get(node_engine::get_node_session).post(node_engine::open_node_session),
+        )
+        .route(
+            "/epics/:id/map-nodes/:nodeId/messages",
+            get(node_engine::list_node_messages).post(node_engine::post_node_message),
         )
         .route(
             "/epics/:id/map-node-dependencies",
