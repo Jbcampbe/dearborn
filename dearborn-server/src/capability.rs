@@ -167,6 +167,22 @@ impl Drop for CapabilityGuard {
 
 // ---- what a capability token may do over REST -----------------------------
 
+/// The phases whose tokens may RESHAPE the planning map (wayfinder epic §6):
+/// the interactive HITL sessions — grilling and prototype — are the primary
+/// map-builders. AFK kinds (research, AFK-task) report facts and never redraw
+/// the map, and breakdown writes the task DAG only — a token minted for any
+/// other phase gets `403` on every map-mutating route (node create/link/
+/// resolve, map-prose edits, document sync), so an unattended agent cannot
+/// silently redraw the frontier overnight. AFK runs additionally mint no
+/// token at all (`crate::afk_engine`), making this the second of two
+/// structural bars.
+const MAP_RESHAPING_PHASES: &[&str] = &["grilling", "prototype"];
+
+/// Whether `scope`'s phase belongs to a HITL map-reshaping session.
+fn may_reshape_map(scope: &CapabilityScope) -> bool {
+    MAP_RESHAPING_PHASES.contains(&scope.phase.as_str())
+}
+
 /// Whether a request carrying a capability token is authorized.
 ///
 /// The allow-list is exactly the REST surface the `dearborn` CLI exposes to
@@ -177,8 +193,9 @@ impl Drop for CapabilityGuard {
 /// for `document sync`; Phase 3) — plus `GET /auth/capability`, which
 /// names the token's own scope. Every epic-addressed pattern requires the
 /// path's epic id to equal the scope's: **a scoped token can only act on its
-/// epic.** Anything else is a `403` from [`crate::auth::require_auth`],
-/// before any handler runs.
+/// epic.** Map-RESHAPING routes additionally require a HITL grilling/
+/// prototype phase ([`may_reshape_map`]). Anything else is a `403` from
+/// [`crate::auth::require_auth`], before any handler runs.
 ///
 /// Session tokens bypass this table entirely (full access, as before).
 pub fn authorize_cap_request(
@@ -188,6 +205,7 @@ pub fn authorize_cap_request(
 ) -> bool {
     let segs: Vec<&str> = path.split('/').filter(|s| !s.is_empty()).collect();
     let epic = scope.epic_id.as_str();
+    let reshape = may_reshape_map(scope);
     match (method.as_str(), segs.as_slice()) {
         ("GET", ["auth", "capability"]) => true,
         ("GET", ["epics", e]) => *e == epic,
@@ -195,17 +213,20 @@ pub fn authorize_cap_request(
         ("POST", ["epics", e, "tasks"]) => *e == epic,
         ("POST", ["epics", e, "dependencies"]) => *e == epic,
         // The planning map (`dearborn node create|link|resolve`, `dearborn
-        // map [set-*]` — see `crate::map`).
+        // map [set-*]` — see `crate::map`). Reads are open to every phase;
+        // every map MUTATION is HITL-only (§6).
         ("GET", ["epics", e, "map"]) => *e == epic,
-        ("PATCH", ["epics", e, "map"]) => *e == epic,
-        ("POST", ["epics", e, "map-nodes"]) => *e == epic,
         ("GET", ["epics", e, "map-nodes", _]) => *e == epic,
-        ("PATCH", ["epics", e, "map-nodes", _]) => *e == epic,
-        ("POST", ["epics", e, "map-node-dependencies"]) => *e == epic,
+        ("PATCH", ["epics", e, "map"]) => *e == epic && reshape,
+        ("POST", ["epics", e, "map-nodes"]) => *e == epic && reshape,
+        ("PATCH", ["epics", e, "map-nodes", _]) => *e == epic && reshape,
+        ("POST", ["epics", e, "map-node-dependencies"]) => *e == epic && reshape,
+        ("POST", ["epics", e, "map-nodes", _, "resolve"]) => *e == epic && reshape,
         // The living Document round trip (`dearborn document pull|sync` —
-        // see `crate::document`).
+        // see `crate::document`). Pulling is a read; syncing is the
+        // resolution edit, so it is HITL-only too.
         ("GET", ["epics", e, "document"]) => *e == epic,
-        ("POST", ["epics", e, "document", "sync"]) => *e == epic,
+        ("POST", ["epics", e, "document", "sync"]) => *e == epic && reshape,
         _ => false,
     }
 }

@@ -15,7 +15,17 @@
 //! - `node create --kind grilling|research|prototype|task --title "..."`
 //!   `[--question "..."] [--task-mode afk|hitl] [--blocked-by id1,id2] [--blocks id1,id2]`
 //! - `node link BLOCKER BLOCKED`
-//! - `node resolve NODE [--gist "..."]`
+//! - `node resolve NODE [--gist "..."] [--document PATH --base-version N]`
+//!   `[--graduate "kind=grilling; title=...; question=..."]...`
+//!   `[--out-of-scope "title=...; reason=..."]...`
+//!   `[--update "id=NODE_ID; state=...; ..."]... [--trim-fog "..."]`
+//!   — the grilling resolution bundle (wayfinder epic §6): record the decision,
+//!   fold the edited document in as a new version under the per-epic write
+//!   semaphore, graduate fog into new frontier nodes (blocked by this node),
+//!   rule things out of scope (create+close an out_of_scope node + prose
+//!   line), and update/invalidate affected nodes — one call. A stale
+//!   `--base-version` exits non-zero naming the current version — re-pull,
+//!   re-edit, retry. HITL kinds only (grilling/prototype).
 //! - `map` — print the epic's full planning map
 //! - `map set-destination|set-notes|set-fog|set-out-of-scope "TEXT"`
 //! - `document pull [PATH]` — write the epic's living HTML document to a
@@ -35,6 +45,7 @@
 
 use dearborn_server::cli::{CliClient, ERROR_PREFIX};
 
+use serde_json::json;
 use std::path::Path;
 
 fn main() {
@@ -194,11 +205,13 @@ fn run(args: Vec<String>) -> Result<(), i32> {
                     })
                 }
                 ("node", "resolve") => {
-                    let (node_id, gist) = node_resolve_args(args)?;
+                    let (node_id, resolution) = node_resolve_args(args)?;
                     let client = client(&base_url, &token)?;
                     block_on(async move {
-                        let node = client.node_resolve(&node_id, gist.as_deref()).await?;
-                        println!("{}", serde_json::to_string(&node).expect("node is JSON"));
+                        let outcome = client
+                            .node_resolve_bundle(&node_id, &resolution)
+                            .await?;
+                        println!("{}", serde_json::to_string(&outcome).expect("resolve result is JSON"));
                         Ok(())
                     })
                 }
@@ -303,7 +316,11 @@ fn document_sync_flags(args: &[String]) -> Result<DocumentSyncFlags, i32> {
                 path = Some(args[i].clone());
             }
         }
-        i += if inline.is_some() { 1 } else { 2 };
+        // Advance: an inline `--flag=value` or a positional consumes only
+        // itself; a separate-value flag consumed the NEXT token too. (A
+        // positional must not skip the following flag — `document sync
+        // PATH --base-version N` depends on it.)
+        i += if inline.is_some() || !name.starts_with("--") { 1 } else { 2 };
     }
 
     let path = match path {
@@ -466,6 +483,7 @@ fn node_create_flags(args: &[String]) -> Result<NodeCreateFlags, i32> {
             other => return usage(&format!("unknown node create flag `{other}`")),
         }
         i += if inline.is_some() { 1 } else { 2 };
+        i += if inline.is_some() || !name.starts_with("--") { 1 } else { 2 };
     }
 
     let kind = match kind {
@@ -479,11 +497,23 @@ fn node_create_flags(args: &[String]) -> Result<NodeCreateFlags, i32> {
     Ok((kind, title, question, task_mode, blocked_by, blocks))
 }
 
-/// `node resolve NODE [--gist "..."]` — the positional node id plus the
-/// optional one-line resolution gist.
-fn node_resolve_args(args: &[String]) -> Result<(String, Option<String>), i32> {
+/// `node resolve` resolution flags: the optional one-line decision (`--gist`),
+/// the folded document edit (`--document PATH` + `--base-version N`, the
+/// version the file was pulled at — big HTML through file tools, not
+/// tool-args), repeated `key=value; key=value` specs for the map-reshaping
+/// parts (`--graduate`, `--out-of-scope`, `--update`), and the replacement fog
+/// prose (`--trim-fog`). Assembles the resolution-bundle request body.
+fn node_resolve_args(args: &[String]) -> Result<(String, serde_json::Value), i32> {
+    use serde_json::{Map, Value};
+
     let mut positional: Option<String> = None;
     let mut gist: Option<String> = None;
+    let mut document: Option<String> = None;
+    let mut base_version: Option<i64> = None;
+    let mut graduations: Vec<String> = Vec::new();
+    let mut out_of_scope: Vec<String> = Vec::new();
+    let mut updates: Vec<String> = Vec::new();
+    let mut trim_fog: Option<String> = None;
 
     let mut i = 0;
     while i < args.len() {
@@ -491,35 +521,170 @@ fn node_resolve_args(args: &[String]) -> Result<(String, Option<String>), i32> {
             Some((name, value)) => (name, Some(value.to_string())),
             None => (args[i].as_str(), None),
         };
-        match name {
-            "--gist" => {
-                gist = Some(if let Some(value) = inline {
-                    value
-                } else {
-                    if i + 1 >= args.len() {
-                        return usage("--gist requires a value");
-                    }
-                    i += 1;
-                    args[i].clone()
-                });
+        let take = || -> Result<String, i32> {
+            if let Some(value) = inline.clone() {
+                return Ok(value);
             }
+            if i + 1 >= args.len() {
+                return usage(&format!("{name} requires a value"));
+            }
+            Ok(args[i + 1].clone())
+        };
+        match name {
+            "--gist" => gist = Some(take()?),
+            "--document" => document = Some(take()?),
+            "--base-version" => {
+                let raw = take()?;
+                base_version = Some(raw.parse::<i64>().map_err(|_| {
+                    eprintln!("{ERROR_PREFIX}--base-version must be an integer, got `{raw}`");
+                    2
+                })?);
+            }
+            "--graduate" => graduations.push(take()?),
+            "--out-of-scope" => out_of_scope.push(take()?),
+            "--update" => updates.push(take()?),
+            "--trim-fog" => trim_fog = Some(take()?),
             other if other.starts_with("--") => {
-                return usage(&format!("unknown node resolve flag `{other}`"));
+                return usage(&format!(
+                    "unknown node resolve flag `{other}` (expected: --gist, --document, \
+                     --base-version, --graduate, --out-of-scope, --update, --trim-fog)"
+                ));
             }
             _ => {
                 if positional.is_some() {
-                    return usage("expected `node resolve NODE [--gist \"...\"]` (one positional node id)");
+                    return usage(
+                        "expected `node resolve NODE [flags]` (one positional node id)",
+                    );
                 }
                 positional = Some(args[i].clone());
             }
         }
-        i += 1;
+        // Advance: an inline `--flag=value` or a positional consumes only
+        // itself; a separate-value flag consumed the NEXT token too. (A
+        // positional must not skip the following flag — `document sync PATH
+        // --base-version N` and `node resolve NODE --gist "..."` depend on it.)
+        i += if inline.is_some() || !name.starts_with("--") { 1 } else { 2 };
     }
 
-    match positional {
-        Some(node_id) if !node_id.trim().is_empty() => Ok((node_id, gist)),
-        _ => usage("expected `node resolve NODE [--gist \"...\"]`"),
+    let node_id = match positional {
+        Some(node_id) if !node_id.trim().is_empty() => node_id,
+        _ => return usage("expected `node resolve NODE [flags]`"),
+    };
+
+    // `--document` and `--base-version` go together: the sync must carry the
+    // version the scratch file was pulled at.
+    let document = match (document, base_version) {
+        (Some(path), Some(base_version)) => {
+            let html = std::fs::read_to_string(&path).map_err(|err| {
+                eprintln!("{ERROR_PREFIX}failed to read {path}: {err}");
+                1
+            })?;
+            Some(json!({ "html": html, "base_version": base_version }))
+        }
+        (Some(_), None) => {
+            return usage("--document requires --base-version N (the version you pulled)")
+        }
+        (None, Some(_)) => {
+            return usage("--base-version requires --document PATH (the file you edited)")
+        }
+        (None, None) => None,
+    };
+
+    let mut body = Map::new();
+    if let Some(gist) = gist {
+        body.insert("gist".into(), Value::String(gist));
     }
+    if let Some(document) = document {
+        body.insert("document".into(), document);
+    }
+    if !graduations.is_empty() {
+        body.insert(
+            "graduations".into(),
+            Value::Array(parse_kv_specs(
+                &graduations,
+                "--graduate",
+                &["kind", "title"],
+                &["kind", "title", "question", "task_mode"],
+            )?),
+        );
+    }
+    if !out_of_scope.is_empty() {
+        body.insert(
+            "out_of_scope".into(),
+            Value::Array(parse_kv_specs(
+                &out_of_scope,
+                "--out-of-scope",
+                &["title", "reason"],
+                &["title", "kind", "reason"],
+            )?),
+        );
+    }
+    if !updates.is_empty() {
+        body.insert(
+            "updates".into(),
+            Value::Array(parse_kv_specs(
+                &updates,
+                "--update",
+                &["id"],
+                &["id", "state", "title", "question", "gist", "out_of_scope_reason"],
+            )?),
+        );
+    }
+    if let Some(trim_fog) = trim_fog {
+        body.insert("trim_fog".into(), Value::String(trim_fog));
+    }
+    Ok((node_id, Value::Object(body)))
+}
+
+/// Parse repeated `key=value; key=value` spec strings (the `--graduate` /
+/// `--out-of-scope` / `--update` flags) into JSON objects. Every key must be
+/// in `allowed` and every key in `required` must be present; a malformed pair
+/// is a usage error naming the flag.
+fn parse_kv_specs(
+    specs: &[String],
+    flag: &str,
+    required: &[&str],
+    allowed: &[&str],
+) -> Result<Vec<serde_json::Value>, i32> {
+    use serde_json::{Map, Value};
+
+    let mut objects = Vec::with_capacity(specs.len());
+    for spec in specs {
+        let mut object = Map::new();
+        for pair in spec.split(';') {
+            let pair = pair.trim();
+            if pair.is_empty() {
+                continue;
+            }
+            let Some((key, value)) = pair.split_once('=') else {
+                return usage(&format!(
+                    "{flag} specs are `key=value; key=value` pairs, got `{pair}`"
+                ));
+            };
+            let key = key.trim();
+            if !allowed.contains(&key) {
+                return usage(&format!(
+                    "unknown {flag} key `{key}` (expected: {})",
+                    allowed.join(", ")
+                ));
+            }
+            object.insert(key.to_string(), Value::String(value.trim().to_string()));
+        }
+        for key in required {
+            if !object.contains_key(*key) {
+                let example = allowed
+                    .iter()
+                    .map(|k| format!("{k}=..."))
+                    .collect::<Vec<_>>()
+                    .join("; ");
+                return usage(&format!(
+                    "{flag} requires a `{key}` (e.g. `{flag} \"{example}\"`)"
+                ));
+            }
+        }
+        objects.push(Value::Object(object));
+    }
+    Ok(objects)
 }
 
 /// Parse a comma-separated id list flag value into trimmed, non-empty ids.
@@ -546,7 +711,11 @@ usage: dearborn --url <base> --token <cap> <verb>
   dag
   node create --kind grilling|research|prototype|task --title \"...\" [--question \"...\"] [--task-mode afk|hitl] [--blocked-by id1,id2] [--blocks id1,id2]
   node link BLOCKER BLOCKED
-  node resolve NODE [--gist \"...\"]
+  node resolve NODE [--gist \"...\"] [--document PATH --base-version N]
+    [--graduate \"kind=grilling; title=...; question=...\"]...
+    [--out-of-scope \"title=...; reason=...\"]...
+    [--update \"id=NODE_ID; state=out_of_scope; out_of_scope_reason=...\"]...
+    [--trim-fog \"...\"]
   map
   map set-destination|set-notes|set-fog|set-out-of-scope \"TEXT\"
   document pull [PATH]
@@ -554,4 +723,131 @@ usage: dearborn --url <base> --token <cap> <verb>
   scope"
     );
     Err(2)
+}
+
+// ---- tests ------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // ---- the grilling resolution bundle's flag parsing -----------------------
+
+    #[test]
+    fn a_bare_resolve_assembles_a_body_with_only_the_node_id() {
+        let args: Vec<String> = ["01ABC"].iter().map(|s| s.to_string()).collect();
+        let (node_id, body) = node_resolve_args(&args).unwrap();
+        assert_eq!(node_id, "01ABC");
+        assert!(body.as_object().unwrap().is_empty());
+    }
+
+    #[test]
+    fn the_full_bundle_assembles_every_resolution_part() {
+        let scratch = std::env::temp_dir().join(format!("dearborn-cli-test-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let doc = scratch.join("document.html");
+        std::fs::write(&doc, "<h1 id=\"dec\">Decisions</h1>").unwrap();
+
+        let args: Vec<String> = [
+            "01NODE",
+            "--gist", "Use the evidence blob store",
+            "--document", doc.to_str().unwrap(),
+            "--base-version", "3",
+            "--graduate", "kind=grilling; title=Which events export?; question=Scope",
+            "--graduate", "kind=task; title=Provision bucket; task_mode=afk",
+            "--out-of-scope", "title=Multi-region; reason=Single-region only",
+            "--update", "id=01OTHER; state=out_of_scope; out_of_scope_reason=Superseded",
+            "--trim-fog", "Retention policy",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        let (node_id, body) = node_resolve_args(&args).unwrap();
+        assert_eq!(node_id, "01NODE");
+
+        assert_eq!(body["gist"], "Use the evidence blob store");
+        // The document HTML came from the scratch file, not tool-args.
+        assert_eq!(body["document"]["html"], "<h1 id=\"dec\">Decisions</h1>");
+        assert_eq!(body["document"]["base_version"], 3);
+        let graduations = body["graduations"].as_array().unwrap();
+        assert_eq!(graduations.len(), 2);
+        assert_eq!(graduations[0]["kind"], "grilling");
+        assert_eq!(graduations[0]["title"], "Which events export?");
+        assert_eq!(graduations[1]["task_mode"], "afk");
+        let oos = body["out_of_scope"].as_array().unwrap();
+        assert_eq!(oos[0]["title"], "Multi-region");
+        assert_eq!(oos[0]["reason"], "Single-region only");
+        let updates = body["updates"].as_array().unwrap();
+        assert_eq!(updates[0]["id"], "01OTHER");
+        assert_eq!(updates[0]["state"], "out_of_scope");
+        assert_eq!(body["trim_fog"], "Retention policy");
+
+        std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    #[test]
+    fn document_sync_parses_the_positional_path_followed_by_flags() {
+        // Regression: a positional PATH followed by `--base-version` used to
+        // skip the flag (the positional advanced the cursor by two).
+        let (path, base_version, node) = document_sync_flags(
+            &["doc.html", "--base-version", "7"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(path, "doc.html");
+        assert_eq!(base_version, 7);
+        assert_eq!(node, None);
+
+        // Flags before the path keep working, as does `--flag=value` form.
+        let (path, base_version, node) = document_sync_flags(
+            &["--node=01N", "--base-version", "2", "doc.html"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(path, "doc.html");
+        assert_eq!(base_version, 2);
+        assert_eq!(node.as_deref(), Some("01N"));
+    }
+
+    #[test]
+    fn malformed_resolution_flags_are_usage_errors() {
+        // --document without --base-version (the sync must carry the base).
+        let args: Vec<String> = ["01NODE", "--document", "x.html"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(node_resolve_args(&args).unwrap_err(), 2);
+
+        // --base-version without --document.
+        let args: Vec<String> = ["01NODE", "--base-version", "1"]
+            .iter()
+            .map(|s| s.to_string()).collect();
+        assert_eq!(node_resolve_args(&args).unwrap_err(), 2);
+
+        // A --graduate spec missing its required `kind`.
+        let args: Vec<String> = ["01NODE", "--graduate", "title=Only title"]
+            .iter()
+            .map(|s| s.to_string()).collect();
+        assert_eq!(node_resolve_args(&args).unwrap_err(), 2);
+
+        // An unknown spec key.
+        let args: Vec<String> = [
+            "01NODE",
+            "--graduate", "kind=grilling; title=T; cargo= cult",
+        ]
+        .iter()
+        .map(|s| s.to_string()).collect();
+        assert_eq!(node_resolve_args(&args).unwrap_err(), 2);
+
+        // A spec pair without `=`.
+        let args: Vec<String> = ["01NODE", "--update", "01OTHER"]
+            .iter()
+            .map(|s| s.to_string()).collect();
+        assert_eq!(node_resolve_args(&args).unwrap_err(), 2);
+    }
 }

@@ -32,6 +32,7 @@ pub mod planning;
 pub mod pr;
 pub mod projects;
 pub(crate) mod retry;
+pub mod resolve;
 pub mod review_poll;
 pub mod sessions;
 pub mod spec;
@@ -645,6 +646,15 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/epics/:id/map-nodes/:nodeId/messages",
             get(node_engine::list_node_messages).post(node_engine::post_node_message),
+        )
+        // The grilling resolution bundle (wayfinder epic §6/§10): one call that
+        // records the decision, folds in the Document edit under the per-epic
+        // write semaphore, graduates fog into new frontier nodes, rules things
+        // out of scope, and updates affected nodes. HITL kinds only — the
+        // `dearborn` CLI's (upgraded) `node resolve` verb calls exactly this.
+        .route(
+            "/epics/:id/map-nodes/:nodeId/resolve",
+            axum::routing::post(resolve::resolve_node),
         )
         // The one-shot AFK node engine (wayfinder epic §5): firing a research
         // or AFK-task node runs one unattended agent turn whose report lands

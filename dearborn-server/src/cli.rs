@@ -27,7 +27,14 @@
 //! - `node create --kind ... --title ... [--question ...] [--task-mode afk|hitl]
 //!   [--blocked-by id1,id2] [--blocks id1,id2]` — planning-map node creation
 //! - `node link BLOCKER BLOCKED` — planning-map dependency edge (cycle-rejected)
-//! - `node resolve NODE [--gist "..."]` — the minimal resolution state transition
+//! - `node resolve NODE [--gist "..."] [--document PATH --base-version N]
+//!   [--graduate "kind=grilling; title=...; question=..."]...
+//!   [--out-of-scope "title=...; reason=..."]...
+//!   [--update "id=NODE_ID; state=...; ..."]... [--trim-fog "..."] — the grilling
+//!   resolution bundle (wayfinder epic §6): record the decision, fold the
+//!   document edit in under the per-epic semaphore, graduate fog into new
+//!   frontier nodes, rule things out of scope, update affected nodes — one
+//!   call, HITL kinds only (grilling/prototype)
 //! - `map` — print the epic's full planning map (nodes + computed frontier/blocked + prose)
 //! - `map set-destination|set-notes|set-fog|set-out-of-scope "TEXT"` — the four wayfinder prose fields
 //! - `document pull PATH` — write the epic's living HTML document to a scratch
@@ -279,9 +286,9 @@ impl CliClient {
 
     /// `node resolve` — `PATCH /epics/{scoped epic}/map-nodes/{node}`, the
     /// minimal resolution state transition: `state = "resolved"` plus the
-    /// optional one-line `gist`. (The rich grilling resolution bundle —
-    /// document edits, fog graduation, map reshaping — is a later task's
-    /// surface and builds on this.)
+    /// optional one-line `gist`. (The rich grilling resolution bundle is
+    /// [`Self::node_resolve_bundle`](Self::node_resolve_bundle); this minimal
+    /// surface remains for simple state flips.)
     pub async fn node_resolve(&self, node_id: &str, gist: Option<&str>) -> Result<Value, CliError> {
         let epic_id = self.epic_id().await?;
         let body = match gist {
@@ -292,6 +299,30 @@ impl CliClient {
             reqwest::Method::PATCH,
             &format!("/epics/{epic_id}/map-nodes/{node_id}"),
             Some(body),
+        )
+        .await
+    }
+
+    /// `node resolve NODE [flags]` — the grilling resolution bundle (wayfinder
+    /// epic §6): one call that records the decision (gist + resolved), folds
+    /// the Document edit in (a `document sync` under the per-epic write
+    /// semaphore, base-version checked), graduates fog into new frontier
+    /// nodes (blocked by this node), rules things out of scope (create+close
+    /// an `out_of_scope` node + prose line), and updates/invalidate affected
+    /// nodes. `resolution` is the request body the binary assembles from the
+    /// verb's flags. A stale document `base_version` is a clean `409` —
+    /// re-pull, re-edit, retry. Only HITL kinds (grilling/prototype) may
+    /// resolve through this surface; AFK kinds are refused by the server.
+    pub async fn node_resolve_bundle(
+        &self,
+        node_id: &str,
+        resolution: &Value,
+    ) -> Result<Value, CliError> {
+        let epic_id = self.epic_id().await?;
+        self.request(
+            reqwest::Method::POST,
+            &format!("/epics/{epic_id}/map-nodes/{node_id}/resolve"),
+            Some(resolution.clone()),
         )
         .await
     }
@@ -453,17 +484,20 @@ mod tests {
 
     /// Mint a capability scoped to the epic and a matching client. The guard
     /// is returned and must stay alive in the test — dropping it revokes the
-    /// token.
+    /// token. `phase` is the minting run's phase: only the HITL
+    /// grilling/prototype phases may call the map-reshaping verbs (see
+    /// `authorize_cap_request`).
     fn scoped(
         state: &AppState,
         client: &CliClient,
         project_id: &str,
         epic_id: &str,
+        phase: &str,
     ) -> (CliClient, crate::capability::CapabilityGuard) {
         let guard = state.caps.mint(
             epic_id.to_string(),
             project_id.to_string(),
-            "breakdown".into(),
+            phase.into(),
             PathBuf::from("/tmp"),
         );
         let cli = CliClient::new(
@@ -483,7 +517,7 @@ mod tests {
     async fn scope_verb_names_the_tokens_capability() {
         let (state, client) = boot().await;
         let (project_id, epic_id) = seed_epic(&state).await;
-        let (cli, _guard) = scoped(&state, &client, &project_id, &epic_id);
+        let (cli, _guard) = scoped(&state, &client, &project_id, &epic_id, "breakdown");
 
         let scope = cli.scope().await.unwrap();
         assert_eq!(scope["kind"], "capability");
@@ -497,7 +531,7 @@ mod tests {
     async fn task_create_and_link_and_dag_round_trip_through_the_api() {
         let (state, client) = boot().await;
         let (project_id, epic_id) = seed_epic(&state).await;
-        let (cli, _guard) = scoped(&state, &client, &project_id, &epic_id);
+        let (cli, _guard) = scoped(&state, &client, &project_id, &epic_id, "breakdown");
 
         // Create two tasks; the first carries `--blocks` for the second.
         let blocker = cli
@@ -536,7 +570,7 @@ mod tests {
     async fn failed_verbs_carry_the_error_marker_and_the_api_message() {
         let (state, client) = boot().await;
         let (project_id, epic_id) = seed_epic(&state).await;
-        let (cli, _guard) = scoped(&state, &client, &project_id, &epic_id);
+        let (cli, _guard) = scoped(&state, &client, &project_id, &epic_id, "breakdown");
 
         // Missing required title → the API's 400 message, verbatim, behind
         // the `dearborn: ` marker the breakdown guard greps for.
@@ -600,7 +634,7 @@ mod tests {
     async fn map_node_verbs_round_trip_through_the_api() {
         let (state, client) = boot().await;
         let (project_id, epic_id) = seed_epic(&state).await;
-        let (cli, _guard) = scoped(&state, &client, &project_id, &epic_id);
+        let (cli, _guard) = scoped(&state, &client, &project_id, &epic_id, "grilling");
 
         // Create nodes of each kind; the research and prototype nodes are
         // blocked by the grilling one (`blocked_by` = the graduation shape).
@@ -672,7 +706,7 @@ mod tests {
     async fn map_prose_verbs_set_the_four_fields() {
         let (state, client) = boot().await;
         let (project_id, epic_id) = seed_epic(&state).await;
-        let (cli, _guard) = scoped(&state, &client, &project_id, &epic_id);
+        let (cli, _guard) = scoped(&state, &client, &project_id, &epic_id, "grilling");
 
         for (field, text) in [
             ("destination", "An exporter that works end to end"),
@@ -694,7 +728,7 @@ mod tests {
     async fn map_verbs_surface_the_servers_error_messages_behind_the_marker() {
         let (state, client) = boot().await;
         let (project_id, epic_id) = seed_epic(&state).await;
-        let (cli, _guard) = scoped(&state, &client, &project_id, &epic_id);
+        let (cli, _guard) = scoped(&state, &client, &project_id, &epic_id, "grilling");
 
         // Bad kind → 400 with the server's vocabulary message.
         let err = cli
@@ -730,7 +764,7 @@ mod tests {
     async fn document_pull_and_sync_round_trip_through_the_scratch_file() {
         let (state, client) = boot().await;
         let (project_id, epic_id) = seed_epic(&state).await;
-        let (cli, _guard) = scoped(&state, &client, &project_id, &epic_id);
+        let (cli, _guard) = scoped(&state, &client, &project_id, &epic_id, "grilling");
 
         // The scratch workspace file the agent edits with native file tools.
         let scratch = std::env::temp_dir().join(format!("dearborn-doc-test-{}", ulid::Ulid::new()));
@@ -774,7 +808,7 @@ mod tests {
     async fn document_verbs_surface_errors_behind_the_marker() {
         let (state, client) = boot().await;
         let (project_id, epic_id) = seed_epic(&state).await;
-        let (cli, _guard) = scoped(&state, &client, &project_id, &epic_id);
+        let (cli, _guard) = scoped(&state, &client, &project_id, &epic_id, "grilling");
 
         // A missing scratch file → a local (no-status) CLI error.
         let missing = std::env::temp_dir().join(format!("dearborn-missing-{}", ulid::Ulid::new()));
@@ -795,5 +829,103 @@ mod tests {
         assert!(err.message.contains("not part of epic"));
 
         std::fs::remove_dir_all(&scratch).ok();
+    }
+
+    // ---- the grilling resolution bundle (wayfinder epic §6, this task) ------
+
+    #[tokio::test]
+    async fn node_resolve_bundle_does_everything_in_one_call() {
+        let (state, client) = boot().await;
+        let (project_id, epic_id) = seed_epic(&state).await;
+        let (cli, _guard) = scoped(&state, &client, &project_id, &epic_id, "grilling");
+
+        // Seed the fog the resolution will graduate from, and the node.
+        cli.map_set_prose("not_yet_specified", "Which events export; retention")
+            .await
+            .unwrap();
+        let node = cli
+            .node_create("grilling", "Which store?", Some("Pick the blob store"), None, &[], &[])
+            .await
+            .unwrap();
+        let node_id = node["id"].as_str().unwrap().to_string();
+
+        // One resolution: gist + folded document sync + graduations + fog trim
+        // + out-of-scope ruling.
+        let resolution = json!({
+            "gist": "Use the evidence blob store",
+            "document": {
+                "html": "<h1 id=\"decisions\">Decisions</h1><p>Use the evidence blob store.</p>",
+                "base_version": 0
+            },
+            "graduations": [
+                { "kind": "grilling", "title": "Which events export?", "question": "Scope the export" },
+                { "kind": "research", "title": "Survey libsql blob support" }
+            ],
+            "trim_fog": "Retention policy",
+            "out_of_scope": [
+                { "title": "Multi-region replication", "reason": "Single-region only" }
+            ]
+        });
+        let outcome = cli.node_resolve_bundle(&node_id, &resolution).await.unwrap();
+
+        assert_eq!(outcome["node"]["state"], "resolved");
+        assert_eq!(outcome["node"]["gist"], "Use the evidence blob store");
+        assert_eq!(outcome["document"]["version"], 1);
+        assert_eq!(outcome["created"].as_array().unwrap().len(), 2);
+        assert_eq!(outcome["out_of_scope"].as_array().unwrap().len(), 1);
+
+        // The map reflects everything: the graduated layer is on the frontier,
+        // the fog is trimmed, the out-of-scope prose line landed.
+        let map = cli.map().await.unwrap();
+        let nodes = map["nodes"].as_array().unwrap();
+        assert_eq!(nodes.len(), 4);
+        assert!(nodes.iter().all(|n| n["frontier"] == (n["state"] == "open")));
+        assert_eq!(map["not_yet_specified"], "Retention policy");
+        assert_eq!(map["out_of_scope"], "Single-region only");
+    }
+
+    #[tokio::test]
+    async fn an_afk_phase_token_cannot_reach_the_map_reshaping_verbs() {
+        let (state, client) = boot().await;
+        let (project_id, epic_id) = seed_epic(&state).await;
+        let node = {
+            let (cli, _guard) = scoped(&state, &client, &project_id, &epic_id, "grilling");
+            cli.node_create("grilling", "Which store?", None, None, &[], &[])
+                .await
+                .unwrap()
+        };
+        let node_id = node["id"].as_str().unwrap().to_string();
+
+        // A research run's token (hypothetically leaked) is authenticated but
+        // barred from every map-mutating surface (wayfinder epic §6: AFK kinds
+        // never reshape the map).
+        let (afk, _afk_guard) = scoped(&state, &client, &project_id, &epic_id, "research");
+
+        let err = afk
+            .node_resolve_bundle(&node_id, &json!({ "gist": "x" }))
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, Some(403));
+        let err = afk
+            .node_create("grilling", "Sneaky", None, None, &[], &[])
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, Some(403));
+        let err = afk.node_resolve(&node_id, Some("sneaky")).await.unwrap_err();
+        assert_eq!(err.status, Some(403));
+        let err = afk.map_set_prose("out_of_scope", "sneaky").await.unwrap_err();
+        assert_eq!(err.status, Some(403));
+
+        // Reads stay open: an AFK run may still look at the map it reports on.
+        let map = afk.map().await.unwrap();
+        assert_eq!(map["nodes"].as_array().unwrap().len(), 1);
+
+        // Nothing was reshaped.
+        let node = afk
+            .request(reqwest::Method::GET, &format!("/epics/{epic_id}/map-nodes/{node_id}"), None)
+            .await
+            .unwrap();
+        assert_eq!(node["state"], "open");
+        assert_eq!(node["gist"], Value::Null);
     }
 }

@@ -19,12 +19,12 @@
 //! The engines that *drive* nodes — grilling/prototype interactive runs
 //! ([`crate::node_engine`]) and research/AFK-task one-shots
 //! ([`crate::afk_engine`]) — build on this module; the rich grilling
-//! resolution bundle (document edits, fog graduation, map reshaping) is a
-//! later task in the epic. This module is deliberately only the node/edge/prose
-//! CRUD + computation layer.
+//! resolution bundle (document edits, fog graduation, map reshaping) lives in
+//! [`crate::resolve`], layered on top of this node/edge/prose CRUD +
+//! computation layer.
 //! `PATCH /epics/{id}/map-nodes/{id}` with `state = "resolved"` is the minimal
 //! state transition the frontier computation needs to be observable end to
-//! end; the later resolution flow builds on top of it.
+//! end; the resolution flow builds on top of it.
 //!
 //! The REST surface is exactly what the `dearborn` CLI's map verbs call
 //! (`node create|link|resolve`, `map` query + `map set-destination|set-notes|
@@ -47,14 +47,54 @@ use crate::{AppError, AppResult, AppState};
 
 /// The node kinds (plan §5): grilling / prototype are HITL, research is AFK,
 /// task is AFK or HITL (fixed at creation via `task_mode`).
-const VALID_KINDS: &[&str] = &["grilling", "research", "prototype", "task"];
+pub(crate) const VALID_KINDS: &[&str] = &["grilling", "research", "prototype", "task"];
 
 /// The `task_mode` vocabulary — only meaningful for `kind = "task"`, fixed at
 /// creation.
 const VALID_TASK_MODES: &[&str] = &["afk", "hitl"];
 
+/// The kinds allowed to RESHAPE the map (wayfinder epic §6): the HITL
+/// grilling/prototype sessions are the primary map-builders; research and
+/// task nodes report facts / record manual work and never redraw the map.
+pub(crate) const MAP_RESHAPING_KINDS: &[&str] = &["grilling", "prototype"];
+
+/// Validate a node `kind` (the §5 vocabulary).
+pub(crate) fn validate_kind(kind: &str) -> Result<(), AppError> {
+    if !VALID_KINDS.contains(&kind) {
+        return Err(AppError::BadRequest(format!(
+            "`kind` must be one of grilling|research|prototype|task, got `{kind}`"
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a `task_mode` for `kind` and normalize it (trimmed, empty →
+/// `None`). The shared rules of every node-creation surface (the
+/// `POST /map-nodes` handler, the grilling resolution bundle's graduations,
+/// out-of-scope rulings): `task_mode` is required for `kind = "task"` and
+/// rejected for every other kind (it is fixed at creation, plan §4.1).
+pub(crate) fn validate_task_mode(
+    kind: &str,
+    task_mode: Option<&str>,
+) -> Result<Option<String>, AppError> {
+    let task_mode = task_mode.map(str::trim).filter(|s| !s.is_empty());
+    match (kind, task_mode) {
+        ("task", Some(mode)) if VALID_TASK_MODES.contains(&mode) => Ok(Some(mode.to_string())),
+        ("task", Some(mode)) => Err(AppError::BadRequest(format!(
+            "`task_mode` must be one of afk|hitl, got `{mode}`"
+        ))),
+        ("task", None) => Err(AppError::BadRequest(
+            "`task_mode` is required for kind `task` (afk|hitl), fixed at creation".to_string(),
+        )),
+        (_, Some(_)) => Err(AppError::BadRequest(
+            "`task_mode` is only valid for kind `task`".to_string(),
+        )),
+        (_, None) => Ok(None),
+    }
+}
+
 /// The node-state vocabulary (plan §4.1).
-const VALID_STATES: &[&str] = &["open", "in_progress", "resolved", "out_of_scope"];
+pub(crate) const VALID_STATES: &[&str] = &["open", "in_progress", "resolved", "out_of_scope"];
 
 /// States still considered "open" for frontier purposes (not settled).
 const OPEN_STATES: &[&str] = &["open", "in_progress"];
@@ -173,19 +213,19 @@ pub struct CreateMapNodeBody {
 #[derive(Debug, Default, Deserialize)]
 pub struct UpdateMapNodeBody {
     #[serde(default)]
-    state: Option<String>,
+    pub(crate) state: Option<String>,
     #[serde(default)]
-    title: Option<String>,
+    pub(crate) title: Option<String>,
     #[serde(default)]
-    question: Option<String>,
+    pub(crate) question: Option<String>,
     #[serde(default)]
-    gist: Option<String>,
+    pub(crate) gist: Option<String>,
     #[serde(default)]
-    out_of_scope_reason: Option<String>,
+    pub(crate) out_of_scope_reason: Option<String>,
     #[serde(default, deserialize_with = "double_option")]
-    position_x: Option<Option<f64>>,
+    pub(crate) position_x: Option<Option<f64>>,
     #[serde(default, deserialize_with = "double_option")]
-    position_y: Option<Option<f64>>,
+    pub(crate) position_y: Option<Option<f64>>,
 }
 
 /// `POST /epics/{id}/map-node-dependencies` body: `blocker` blocks `blocked`
@@ -203,13 +243,13 @@ pub struct LinkMapNodesBody {
 #[derive(Debug, Default, Deserialize)]
 pub struct UpdateMapProseBody {
     #[serde(default)]
-    destination: Option<String>,
+    pub(crate) destination: Option<String>,
     #[serde(default)]
-    notes: Option<String>,
+    pub(crate) notes: Option<String>,
     #[serde(default)]
-    not_yet_specified: Option<String>,
+    pub(crate) not_yet_specified: Option<String>,
     #[serde(default)]
-    out_of_scope: Option<String>,
+    pub(crate) out_of_scope: Option<String>,
 }
 
 /// Deserialize a present-but-maybe-null field into `Some(_)`, leaving an
@@ -350,7 +390,7 @@ pub async fn node_belongs_to_epic(
 ///
 /// This is the minimal state-transition surface the frontier computation
 /// needs; the rich grilling resolution bundle (document edits, fog
-/// graduation, map reshaping) is a later task and builds on it.
+/// graduation, map reshaping) in [`crate::resolve`] builds on it.
 pub async fn update_node(
     conn: &Connection,
     node_id: &str,
@@ -690,6 +730,43 @@ pub async fn update_prose(
     Ok(())
 }
 
+/// Append one line to the epic's out-of-scope prose (the wayfinder §6 "rule
+/// things out of scope: create+close an out_of_scope node + prose line"
+/// write path). The line is appended on its own line after any existing prose
+/// (or becomes the first line); blank input is rejected. `404` unknown epic.
+pub async fn append_out_of_scope_prose(
+    conn: &Connection,
+    epic_id: &str,
+    line: &str,
+) -> AppResult<()> {
+    let line = line.trim();
+    if line.is_empty() {
+        return Err(AppError::BadRequest(
+            "the out-of-scope prose line must not be empty".to_string(),
+        ));
+    }
+    let mut rows = conn
+        .query("SELECT out_of_scope FROM epic WHERE id = ?1", params![epic_id])
+        .await?;
+    let existing: Option<String> = match rows.next().await? {
+        Some(row) => row.get(0)?,
+        None => return Err(AppError::NotFound(format!("epic {epic_id} not found"))),
+    };
+    let combined = match existing {
+        Some(existing) if !existing.trim().is_empty() => format!("{}\n{line}", existing.trim()),
+        _ => line.to_string(),
+    };
+    update_prose(
+        conn,
+        epic_id,
+        UpdateMapProseBody {
+            out_of_scope: Some(combined),
+            ..Default::default()
+        },
+    )
+    .await
+}
+
 // ---- REST handlers ---------------------------------------------------------
 
 /// `POST /epics/{id}/map-nodes` — create a map node (`201` with the node).
@@ -713,40 +790,19 @@ pub async fn create_map_node(
         .map(str::trim)
         .filter(|s| !s.is_empty())
         .ok_or_else(|| AppError::BadRequest("`kind` is required".to_string()))?;
-    if !VALID_KINDS.contains(&kind) {
-        return Err(AppError::BadRequest(format!(
-            "`kind` must be one of grilling|research|prototype|task, got `{kind}`"
-        )));
-    }
+    validate_kind(kind)?;
     let title = req
         .title
         .as_deref()
         .map(str::trim)
         .filter(|s| !s.is_empty())
-        .ok_or_else(|| AppError::BadRequest("`title` is required and must not be empty".to_string()))?;
+        .ok_or_else(|| {
+            AppError::BadRequest("`title` is required and must not be empty".to_string())
+        })?;
 
     // `task_mode` is fixed at creation and belongs to task nodes alone
     // (plan §4.1): required for `kind = "task"`, rejected everywhere else.
-    let task_mode = req.task_mode.as_deref().map(str::trim).filter(|s| !s.is_empty());
-    match (kind, task_mode) {
-        ("task", Some(mode)) if VALID_TASK_MODES.contains(&mode) => {}
-        ("task", Some(mode)) => {
-            return Err(AppError::BadRequest(format!(
-                "`task_mode` must be one of afk|hitl, got `{mode}`"
-            )))
-        }
-        ("task", None) => {
-            return Err(AppError::BadRequest(
-                "`task_mode` is required for kind `task` (afk|hitl), fixed at creation".to_string(),
-            ))
-        }
-        (_, Some(_)) => {
-            return Err(AppError::BadRequest(
-                "`task_mode` is only valid for kind `task`".to_string(),
-            ))
-        }
-        (_, None) => {}
-    }
+    let task_mode = validate_task_mode(kind, req.task_mode.as_deref())?;
 
     let question = req.question.as_deref().map(str::trim).filter(|s| !s.is_empty());
 
@@ -754,7 +810,7 @@ pub async fn create_map_node(
         conn,
         &id,
         kind,
-        task_mode,
+        task_mode.as_deref(),
         title,
         question,
         actor.user_id.as_deref(),

@@ -31,9 +31,10 @@
 //!
 //! The write is confined to this bounded read→check→commit step (epic §7:
 //! "only its *resolution edit* takes the semaphore"), so sibling node sessions
-//! never stall behind it. The grilling resolution bundle (a later task in the
-//! epic) folds `document sync` into `node resolve`; this module is the
-//! standalone store + REST surface it will build on.
+//! never stall behind it. The grilling resolution bundle ([`crate::resolve`])
+//! folds this same critical section into `node resolve` (via
+//! [`sync_under_semaphore`]); this module is the standalone store + REST
+//! surface it builds on.
 //!
 //! The REST surface is exactly what the `dearborn` CLI's `document pull|sync`
 //! verbs call, so it is on the capability-token allow-list
@@ -510,13 +511,42 @@ pub async fn sync_document(
         }
     }
 
+    let view = sync_under_semaphore(
+        &state,
+        &id,
+        &html,
+        base_version,
+        actor.user_id.as_deref(),
+        node_id,
+    )
+    .await?;
+    Ok(Json(view))
+}
+
+/// Commit an edited document as a new version under the per-epic write
+/// semaphore — the whole bounded read→check→commit step of [`sync_document`],
+/// factored out so the grilling resolution bundle ([`crate::resolve`]) can
+/// fold the very same critical section into `node resolve` (epic §10: the
+/// sync is "folded into `node resolve`", not duplicated beside it).
+/// `409` on a stale `base_version` — a clean re-read/retry, never a bad write
+/// — with nothing applied.
+pub async fn sync_under_semaphore(
+    state: &AppState,
+    epic_id: &str,
+    html: &str,
+    base_version: i64,
+    editor_user_id: Option<&str>,
+    node_id: Option<&str>,
+) -> AppResult<DocumentView> {
+    let conn = state.db.conn();
+
     // The per-epic write semaphore (epic §7): the whole read→check→commit is
     // bounded, so a sibling session's resolution edit never stalls behind
     // anything but this critical section.
-    let lock = state.document_write_lock(&id);
+    let lock = state.document_write_lock(epic_id);
     let _guard = lock.lock().await;
 
-    let current = current_version(&conn, &id).await?;
+    let current = current_version(&conn, epic_id).await?;
     if base_version != current {
         return Err(AppError::Conflict(format!(
             "document sync: base version {base_version} is stale (current version is {current}); \
@@ -526,34 +556,34 @@ pub async fn sync_document(
     let new_version = current + 1;
     let document = commit_version(
         &conn,
-        &id,
-        &html,
+        epic_id,
+        html,
         new_version,
-        actor.user_id.as_deref(),
+        editor_user_id,
         node_id,
     )
     .await?;
     let sections = rebuild_sections(
         &conn,
-        &id,
-        &html,
+        epic_id,
+        html,
         new_version,
-        actor.user_id.as_deref(),
+        editor_user_id,
         node_id,
     )
     .await?;
     drop(_guard);
 
     let view = DocumentView {
-        epic_id: id.clone(),
+        epic_id: epic_id.to_string(),
         html: Some(document.html),
         version: document.version,
         last_edited_by: document.last_edited_by,
         updated_at: Some(document.updated_at),
         sections,
     };
-    publish_document_updated(&state, &id, &view);
-    Ok(Json(view))
+    publish_document_updated(state, epic_id, &view);
+    Ok(view)
 }
 
 // ---- helpers ---------------------------------------------------------------

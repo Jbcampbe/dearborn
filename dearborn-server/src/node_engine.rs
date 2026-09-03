@@ -38,11 +38,15 @@
 //!
 //! ## Scope
 //!
-//! This is the conversational foundation only. The rich grilling **resolution**
-//! bundle (document edits, fog graduation, map reshaping via the scoped
-//! `dearborn` CLI) and prototype artifact capture are later tasks in the epic;
-//! this module deliberately gives the agent no write surface beyond the
-//! transcript.
+//! This module is the conversational engine **plus the resolution surface**:
+//! each grilling/prototype reply runs with a per-run capability token
+//! ([`crate::capability`]) scoped to its epic and minted for the node's own
+//! kind (the phase), and the system prompt carries a `dearborn` CLI access
+//! block so the session can resolve itself — the rich grilling resolution
+//! bundle ([`crate::resolve`]: record the decision, fold in document edits,
+//! graduate fog, rule things out of scope, update affected nodes) is the
+//! CLI's `node resolve` verb. AFK kinds (research/AFK-task) never reach this
+//! engine, so they never gain a token or a map-reshaping surface.
 
 use std::path::PathBuf;
 
@@ -60,6 +64,52 @@ use crate::agent_slot::AgentSlot;
 use crate::map::Actor;
 use crate::planning::{ws_type, PlanningRunRequest};
 use crate::{AppError, AppResult, AppState, NodeRunGuard};
+
+// ---- the Dearborn CLI access block (the session's resolution surface) -------
+
+/// The `dearborn` CLI knobs handed to an interactive node reply for its run.
+/// Mirrors [`crate::breakdown::DearbornCli`] — the loopback base URL and the
+/// per-run capability token, injected as a system-prompt access block.
+struct NodeCli {
+    /// Dearborn's loopback origin (e.g. `http://127.0.0.1:8787`) — the CLI's `--url`.
+    pub base_url: String,
+    /// The per-run capability token — the CLI's `--token`.
+    pub token: String,
+}
+
+/// The system-prompt access block injected when a node reply is wired to the
+/// `dearborn` CLI: how to authenticate (the per-run `--url`/`--token` pair,
+/// pre-scoped to this epic) and which verbs exist. The flags travel with
+/// every command — each shell invocation is a fresh process, so an `export`
+/// would not survive between the agent's tool calls.
+fn cli_access_block(cli: &NodeCli) -> String {
+    format!(
+        "\nDearborn CLI access — call it through your shell tool exactly as shaped below \
+         (the `--url`/`--token` pair is already issued and scoped to THIS epic; never \
+         modify or omit either):\n\
+         dearborn --url {url} --token {token} <verb>\n\
+         where <verb> is one of:\n\
+         - map — print the planning map (destination, fog, out-of-scope prose, every node \
+         with its state and frontier position)\n\
+         - document pull [PATH] — write the epic's living HTML document to a scratch file \
+         (default `./document.html`) for editing with your native file tools; prints its \
+         base `version`\n\
+         - node resolve NODE [--gist \"...\"] [--document PATH --base-version N] \
+         [--graduate \"kind=grilling; title=...; question=...\"]... \
+         [--out-of-scope \"title=...; reason=...\"]... \
+         [--update \"id=NODE_ID; state=out_of_scope; out_of_scope_reason=...\"]... \
+         [--trim-fog \"...\"] — resolve THIS node's decision in ONE call: record the \
+         one-line gist, fold your edited document in as a new version, graduate fog into \
+         new frontier nodes (blocked by this node), rule things out of scope (with a \
+         reason), and update or invalidate other nodes this decision affected. A stale \
+         `--base-version` fails cleanly — re-pull the document, re-edit, and retry.\n\
+         Each verb prints JSON on success and `dearborn: <error>` on failure. When the \
+         decision this node poses is settled, resolve it with ONE `node resolve` call \
+         carrying everything the decision decided.\n",
+        url = cli.base_url,
+        token = cli.token,
+    )
+}
 
 // ---- per-kind system prompts (adapted from matt-pocock-skills) --------------
 
@@ -237,6 +287,19 @@ pub async fn set_session_resume(
     conn.execute(
         "UPDATE node_session SET harness_session_id = ?2, updated_at = ?3 WHERE node_id = ?1",
         params![node_id, harness_session_id, now_ms()],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Mark a node's session `complete` (the resolution side of the loop: a
+/// resolved node's session has nothing left to resume). A node with no
+/// session row (never opened, or an AFK kind that may never create one) is a
+/// no-op.
+pub async fn mark_session_complete(conn: &Connection, node_id: &str) -> AppResult<()> {
+    conn.execute(
+        "UPDATE node_session SET status = 'complete', updated_at = ?2 WHERE node_id = ?1",
+        params![node_id, now_ms()],
     )
     .await?;
     Ok(())
@@ -494,12 +557,36 @@ pub fn spawn_node_reply(
         };
 
         // Read-only grounding: point the run at the project's checkout when it
-        // is on disk (the interactive engine has no other write surface here).
+        // is on disk. The SAME directory is the run's scratch workspace — the
+        // document round trip (`document pull` / the resolution's folded sync)
+        // works through a scratch file there.
         let cwd = crate::epics::get_epic_clone_path(conn, &epic_id)
             .await
             .ok()
             .flatten()
             .map(PathBuf::from);
+
+        // Wire the resolution surface: mint a per-run capability token scoped
+        // to this epic with the node's kind as the phase (the HITL marker —
+        // only grilling/prototype phases are allowed to reshape the map, see
+        // `crate::capability`), and append the CLI access block to the system
+        // prompt. Held for the whole turn; revoked on drop. Without a ready
+        // clone or base URL the turn proceeds conversation-only (no CLI).
+        let mut _cap_guard: Option<crate::capability::CapabilityGuard> = None;
+        let mut system_prompt = spawn_cfg.prompt;
+        if let (Some(cwd), Some(base_url)) = (cwd.clone(), state.advertised_base()) {
+            let cap = state.caps.mint(
+                epic_id.clone(),
+                project_id.clone(),
+                kind.clone(),
+                cwd,
+            );
+            system_prompt.push_str(&cli_access_block(&NodeCli {
+                base_url,
+                token: cap.token().to_string(),
+            }));
+            _cap_guard = Some(cap);
+        }
 
         let prompt = if resume.is_none() {
             format!("{}\n\n{}", first_turn_context(conn, &epic_id, &node_id).await, user_prompt)
@@ -512,7 +599,7 @@ pub fn spawn_node_reply(
             prompt,
             cwd,
             resume,
-            system_prompt: spawn_cfg.prompt,
+            system_prompt,
             slot,
             harness: spawn_cfg.harness,
             model: spawn_cfg.model,
@@ -583,14 +670,18 @@ async fn require_interactive_node(
     Ok(node)
 }
 
-/// A compact context header prepended to a node's first agent turn: the epic's
-/// destination and the node's own question, so the agent orients before the
-/// human's opening message (wayfinder epic §8: it infers "I'm first" from an
-/// empty transcript).
+/// A compact context header prepended to a node's first agent turn: the node's
+/// id (what `node resolve` addresses), the epic's destination, and the node's
+/// own question, so the agent orients before the human's opening message
+/// (wayfinder epic §8: it infers "I'm first" from an empty transcript).
 async fn first_turn_context(conn: &Connection, epic_id: &str, node_id: &str) -> String {
     let mut lines = Vec::new();
+    lines.push(format!(
+        "You are working the node with id {node_id} — pass that exact id to \
+         `node resolve` when the decision is settled."
+    ));
     if let Ok(Some(node)) = crate::map::fetch_node(conn, node_id).await {
-        lines.push(format!("You are working the \"{}\" node.", node.title));
+        lines.push(format!("The node: {}.", node.title));
         if let Some(question) = node.question.filter(|q| !q.trim().is_empty()) {
             lines.push(format!("The decision this node resolves: {question}"));
         }
@@ -963,6 +1054,94 @@ mod tests {
         wait_until_unlocked(&state, &node_b).await;
         assert_eq!(wait_for_messages(&state, &node_a, 2).await.len(), 2);
         assert_eq!(wait_for_messages(&state, &node_b, 2).await.len(), 2);
+    }
+
+    // ---- AC: a reply runs with a live HITL capability token + CLI surface ---
+
+    #[tokio::test]
+    async fn a_reply_is_wired_with_a_capability_token_and_the_cli_access_block() {
+        use std::time::Instant;
+
+        let gate = Arc::new(Gate::default());
+        let agent =
+            Arc::new(ScriptedPlanningAgent::new("sess-cli", &["grilling you"]).with_gate(gate.clone()));
+        let recorded = agent.recorded();
+        let (state, app) = boot(agent).await;
+        // Advertise the loopback base so the turn is wired to the CLI, and
+        // give the project a ready clone so the run has a cwd/scratch space.
+        *state
+            .advertised_base
+            .lock()
+            .unwrap() = Some("http://127.0.0.1:8787".to_string());
+        let user = users::testing::seed_user(&state, "planner", Role::Admin, true).await;
+        let token = crate::sessions::testing::login_as(&state, &user).await;
+        let epic_id = seed_epic(&state).await;
+        state
+            .db
+            .conn()
+            .execute(
+                "UPDATE project SET clone_path = '/tmp/dearborn-clone-x' \
+                 WHERE id = (SELECT project_id FROM epic WHERE id = ?1)",
+                params![epic_id.clone()],
+            )
+            .await
+            .unwrap();
+        let node_id = seed_node(&state, &epic_id, "grilling", None).await;
+
+        let posted = app
+            .clone()
+            .oneshot(post_json_bearer(
+                &format!("/epics/{epic_id}/map-nodes/{node_id}/messages"),
+                &token,
+                json!({ "content": "start grilling" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(body_json(posted).await["reply_started"], true);
+
+        // Wait for the run to be recorded (the gate holds it in flight).
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while recorded.lock().unwrap().is_empty() && Instant::now() < deadline {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+
+        // The system prompt carries the CLI access block: the base URL, the
+        // resolution verb, and the per-run token — which is LIVE in the store
+        // while the run is in flight.
+        let runs = recorded.lock().unwrap();
+        assert_eq!(runs.len(), 1);
+        let system_prompt = &runs[0].system_prompt;
+        assert!(system_prompt.starts_with(GRILLING_PROMPT));
+        assert!(system_prompt.contains("dearborn --url http://127.0.0.1:8787 --token "));
+        assert!(system_prompt.contains("node resolve NODE"));
+        let token_start = system_prompt
+            .find("--token ")
+            .map(|i| i + "--token ".len())
+            .unwrap();
+        let cap_token = system_prompt[token_start..]
+            .split_whitespace()
+            .next()
+            .unwrap()
+            .to_string();
+        assert!(
+            state.caps.resolve(&cap_token).is_some(),
+            "the run's capability token must be live while the run is in flight"
+        );
+        drop(runs);
+
+        // First-turn context names the node id (what `node resolve` addresses).
+        assert!(
+            recorded.lock().unwrap()[0].prompt.contains(&node_id),
+            "the prompt carries the node's id"
+        );
+
+        // When the run ends, the guard drops and the token is revoked.
+        gate.release();
+        wait_until_unlocked(&state, &node_id).await;
+        assert!(
+            state.caps.resolve(&cap_token).is_none(),
+            "the run's capability token must be revoked when the run ends"
+        );
     }
 
     // ---- non-interactive kinds have no interactive session ------------------
