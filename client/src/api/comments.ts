@@ -12,6 +12,7 @@
 // list, so a subscribed view re-renders without polling.
 
 import { apiFetch, type Collection } from "./client";
+import type { MapNode } from "./map";
 
 /** What a comment is anchored to (the server's `VALID_ANCHOR_KINDS`). */
 export type CommentAnchorKind = "node" | "section";
@@ -93,6 +94,47 @@ export function postComment(
     method: "POST",
     body: JSON.stringify(input),
   });
+}
+
+/**
+ * `POST /epics/{id}/comments/{commentId}/promote` body — turn the comment's
+ * whole thread into a NEW open frontier node (wayfinder §9's promote-to-node).
+ * `kind` is required and never `task` (the server's `PROMOTABLE_KINDS`:
+ * grilling | research | prototype). `title`/`question` are optional extra
+ * context; a blank title is derived from the thread's head comment server-side.
+ */
+export interface PromoteCommentInput {
+  kind: "grilling" | "research" | "prototype" | string;
+  title?: string;
+  question?: string;
+}
+
+/** The promote outcome (`comments.rs` `PromoteOutcome`): the fresh frontier
+ * node plus the stamped thread (every comment now carries the same
+ * `promoted_node_id`). Also arrives via `map_updated` + `comments_updated`
+ * frames, so live views re-render without acting on this response. */
+export interface PromoteOutcome {
+  node: MapNode;
+  thread: Comment[];
+}
+
+/**
+ * `POST /epics/{id}/comments/{commentId}/promote` → `201` with the fresh
+ * frontier node + stamped thread. `400` unknown/missing kind; `409` when the
+ * thread was already promoted (a thread becomes one node, once). Publishes
+ * `comments_updated` AND `map_updated` on `epic:<id>`.
+ */
+export function promoteComment(
+  token: string,
+  epicId: string,
+  commentId: string,
+  input: PromoteCommentInput,
+): Promise<PromoteOutcome> {
+  return apiFetch<PromoteOutcome>(
+    `/epics/${encodeURIComponent(epicId)}/comments/${encodeURIComponent(commentId)}/promote`,
+    token,
+    { method: "POST", body: JSON.stringify(input) },
+  );
 }
 
 /**

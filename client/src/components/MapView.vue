@@ -24,6 +24,7 @@ import {
   NODE_WIDTH,
 } from "../map/layout";
 import AppIcon from "./AppIcon.vue";
+import CommentPanel from "./CommentPanel.vue";
 import EpicTabs from "./EpicTabs.vue";
 import MapGraph from "./MapGraph.vue";
 import StatusIcon from "./StatusIcon.vue";
@@ -38,6 +39,11 @@ import StatusIcon from "./StatusIcon.vue";
 //
 // Click-to-open navigates to the node session view (`epic-node` route): the
 // multi-party chat + resolve surface that took over the open affordance.
+//
+// A toggleable side column hosts the shared CommentPanel (wayfinder §9):
+// threads anchored to nodes AND document sections, with the promote-to-node
+// affordance — promoting a thread lands a new frontier node that arrives live
+// via this view's own `map_updated` stream.
 const props = defineProps<{ id: string }>();
 
 const auth = useAuthStore();
@@ -46,6 +52,10 @@ const state = reactive<MapState>(initialMapState());
 const loading = ref(true);
 const error = ref<string | null>(null);
 const streamStatus = ref<StreamStatus>("connecting");
+// The comments side column (CommentPanel) — hidden by default; the badge
+// shows the epic's live comment count even while collapsed.
+const commentsOpen = ref(false);
+const commentCount = ref(0);
 // The breadcrumb's project name (the epic only carries `project_id`); fills in
 // after load and falls back to "…" if the fetch fails.
 const projectName = ref<string | null>(null);
@@ -181,7 +191,19 @@ onMounted(load);
             <span v-if="map?.destination" class="destination">{{ map.destination }}</span>
           </div>
         </div>
-        <span class="conn" :data-status="streamStatus">{{ streamStatus === "open" ? "live" : streamStatus }}</span>
+        <div class="head-side">
+          <button
+            type="button"
+            class="comments-toggle"
+            :data-open="commentsOpen"
+            @click="commentsOpen = !commentsOpen"
+          >
+            <AppIcon name="chat" :size="13" />
+            Comments
+            <span v-if="commentCount > 0" class="count-badge">{{ commentCount }}</span>
+          </button>
+          <span class="conn" :data-status="streamStatus">{{ streamStatus === "open" ? "live" : streamStatus }}</span>
+        </div>
       </header>
 
       <EpicTabs :id="props.id" tab="map" />
@@ -255,6 +277,14 @@ onMounted(load);
             </span>
           </div>
         </section>
+
+        <!-- Comments side column: threads by anchor + promote-to-node. -->
+        <CommentPanel
+          v-if="commentsOpen"
+          class="comments-col"
+          :epic-id="props.id"
+          @count="commentCount = $event"
+        />
       </div>
 
       <!-- Fog / out-of-scope prose (never nodes — plan §3). -->
@@ -325,6 +355,59 @@ onMounted(load);
   grid-template-columns: minmax(0, 1fr);
   gap: var(--spacing-24);
   margin-top: var(--spacing-16);
+  align-items: start;
+}
+
+/* The comments column opens as a second grid track (panel is sticky). */
+.map-columns:has(.comments-col) {
+  grid-template-columns: minmax(0, 1fr) 340px;
+}
+
+@media (max-width: 64rem) {
+  .map-columns:has(.comments-col) {
+    grid-template-columns: minmax(0, 1fr);
+  }
+}
+
+.head-side {
+  display: flex;
+  align-items: center;
+  gap: var(--spacing-12);
+  flex-shrink: 0;
+}
+
+.comments-toggle {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-pills);
+  background: transparent;
+  color: var(--text-muted);
+  font: inherit;
+  font-size: var(--text-caption);
+  cursor: pointer;
+}
+
+.comments-toggle:hover,
+.comments-toggle[data-open="true"] {
+  color: var(--text-primary);
+  border-color: var(--border-strong);
+}
+
+.count-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 17px;
+  height: 17px;
+  padding: 0 5px;
+  border-radius: var(--radius-pills);
+  background: var(--color-signal-teal);
+  color: var(--text-primary);
+  font-size: var(--text-micro);
+  font-weight: var(--weight-medium);
 }
 
 /* Node cards (slotted into the generic canvas) --------------------------- */
