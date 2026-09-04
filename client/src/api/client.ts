@@ -56,6 +56,47 @@ async function request<T>(
   token: string,
   init: RequestInit,
 ): Promise<T> {
+  const response = await requestResponse(path, token, init);
+
+  if (response.status === 204) {
+    return undefined as T;
+  }
+
+  const body = await response.json().catch(() => null);
+
+  if (!response.ok) {
+    throw toApiError(response.status, body);
+  }
+
+  return body as T;
+}
+
+/** Map a non-2xx response (with the server's error envelope, if any) to `ApiError`. */
+function toApiError(
+  status: number,
+  body: { error?: { code?: string; message?: string } } | null,
+): ApiError {
+  const err = body?.error;
+  return new ApiError(
+    status,
+    err?.code ?? "unknown",
+    err?.message ?? "request failed",
+  );
+}
+
+/**
+ * Perform one authenticated request and return the raw `Response` — the
+ * shared transport behind {@link apiFetch} (JSON bodies) and
+ * {@link apiFetchText} (text bodies, e.g. a prototype artifact's HTML).
+ * Network failures become a thrown `ApiError(0, "network_error")`; non-2xx
+ * responses are turned into `ApiError`s from the server's error envelope
+ * (the body is consumed here — the caller never sees those responses).
+ */
+async function requestResponse(
+  path: string,
+  token: string,
+  init: RequestInit,
+): Promise<Response> {
   const headers = new Headers(init.headers);
   headers.set("Authorization", `Bearer ${token}`);
   if (init.body !== undefined && !headers.has("Content-Type")) {
@@ -69,22 +110,12 @@ async function request<T>(
     throw new ApiError(0, "network_error", "could not reach the server");
   }
 
-  if (response.status === 204) {
-    return undefined as T;
+  if (!response.ok && response.status !== 204) {
+    const body = await response.json().catch(() => null);
+    throw toApiError(response.status, body);
   }
 
-  const body = await response.json().catch(() => null);
-
-  if (!response.ok) {
-    const err = (body as { error?: { code?: string; message?: string } } | null)?.error;
-    throw new ApiError(
-      response.status,
-      err?.code ?? "unknown",
-      err?.message ?? (response.statusText || "request failed"),
-    );
-  }
-
-  return body as T;
+  return response;
 }
 
 /**
@@ -132,5 +163,50 @@ export async function apiFetch<T>(
     }
     // One retry only — `request` never recurses into this logic.
     return request<T>(path, freshToken, init);
+  }
+}
+
+/**
+ * Perform an authenticated request and return the body as **text** — for the
+ * rare non-JSON endpoint (the prototype artifact read that feeds the
+ * sandboxed iframe). Same 401 refresh-and-retry-once behavior as
+ * {@link apiFetch}.
+ */
+export async function apiFetchText(
+  path: string,
+  token: string,
+  init: RequestInit = {},
+): Promise<string> {
+  const read = async (t: string): Promise<string> => {
+    const response = await requestResponse(path, t, init);
+    return response.text();
+  };
+  try {
+    return await read(token);
+  } catch (cause) {
+    if (!(cause instanceof ApiError) || cause.status !== 401) {
+      throw cause;
+    }
+    const bridge = authBridge;
+    if (bridge === null) {
+      throw cause;
+    }
+    try {
+      await bridge.refresh();
+    } catch (refreshCause) {
+      bridge.onAuthFailure(
+        refreshCause instanceof Error
+          ? refreshCause.message
+          : String(refreshCause),
+      );
+      throw cause;
+    }
+    const freshToken = bridge.getAccessToken();
+    if (freshToken === null) {
+      bridge.onAuthFailure(cause.message);
+      throw cause;
+    }
+    // One retry only — `read` never recurses into this logic.
+    return read(freshToken);
   }
 }

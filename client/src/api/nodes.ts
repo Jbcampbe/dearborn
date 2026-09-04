@@ -18,7 +18,7 @@
 // affordance never carries HTML; agents edit the Document through the
 // `dearborn` CLI during the session.
 
-import { apiFetch } from "./client";
+import { apiFetch, apiFetchText } from "./client";
 import type { Map, MapNode } from "./map";
 
 // ---- session + transcript ---------------------------------------------------
@@ -179,6 +179,58 @@ export function resolveNode(
     `/epics/${encodeURIComponent(epicId)}/map-nodes/${encodeURIComponent(nodeId)}/resolve`,
     token,
     { method: "POST", body: JSON.stringify(input) },
+  );
+}
+
+// ---- prototype artifact store (plan §4.7) ------------------------------------
+
+/**
+ * One stored prototype artifact (`node_asset`, plan §4.7) — **linked, not
+ * inlined**: the node session view lists these (metadata only) and fetches
+ * the bytes separately to render them in a sandboxed iframe.
+ */
+export interface NodeAsset {
+  id: string;
+  node_id: string;
+  mime: string;
+  label: string | null;
+  /** Computed server-side (`LENGTH(bytes)`), never a stored column. */
+  byte_size: number;
+  created_at: number;
+}
+
+/**
+ * `GET /epics/{id}/map-nodes/{nodeId}/assets` — the node's stored artifacts,
+ * metadata only. `404` unknown epic/node. Reads are open to every capability
+ * phase, so a live session's artifact is visible the moment it is stored.
+ */
+export async function listNodeAssets(
+  token: string,
+  epicId: string,
+  nodeId: string,
+): Promise<NodeAsset[]> {
+  const data = await apiFetch<{ items: NodeAsset[] }>(
+    `/epics/${encodeURIComponent(epicId)}/map-nodes/${encodeURIComponent(nodeId)}/assets`,
+    token,
+  );
+  return data.items;
+}
+
+/**
+ * `GET /epics/{id}/map-nodes/{nodeId}/assets/{assetId}` — the artifact's raw
+ * bytes (text; prototype artifacts are standalone HTML apps). Rendered in a
+ * **sandboxed iframe** (`sandbox="allow-scripts"`, no `allow-same-origin`,
+ * so the artifact runs on an opaque origin and cannot touch the app).
+ */
+export function getNodeAssetText(
+  token: string,
+  epicId: string,
+  nodeId: string,
+  assetId: string,
+): Promise<string> {
+  return apiFetchText(
+    `/epics/${encodeURIComponent(epicId)}/map-nodes/${encodeURIComponent(nodeId)}/assets/${encodeURIComponent(assetId)}`,
+    token,
   );
 }
 

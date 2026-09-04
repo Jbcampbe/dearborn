@@ -19,13 +19,18 @@
 //!   `[--graduate "kind=grilling; title=...; question=..."]...`
 //!   `[--out-of-scope "title=...; reason=..."]...`
 //!   `[--update "id=NODE_ID; state=...; ..."]... [--trim-fog "..."]`
+//!   `[--artifact PATH [--artifact-mime MIME] [--artifact-label "..."]]`
 //!   — the grilling resolution bundle (wayfinder epic §6): record the decision,
 //!   fold the edited document in as a new version under the per-epic write
 //!   semaphore, graduate fog into new frontier nodes (blocked by this node),
 //!   rule things out of scope (create+close an out_of_scope node + prose
 //!   line), and update/invalidate affected nodes — one call. A stale
 //!   `--base-version` exits non-zero naming the current version — re-pull,
-//!   re-edit, retry. HITL kinds only (grilling/prototype).
+//!   re-edit, retry. HITL kinds only (grilling/prototype). Prototype
+//!   sessions also ship their artifact here: `--artifact PATH` reads the
+//!   throwaway artifact from the scratch workspace and stores it as a
+//!   `node_asset` linked from the node (rendered client-side in a sandboxed
+//!   iframe); `--artifact-mime` defaults to `text/html`.
 //! - `map` — print the epic's full planning map
 //! - `map set-destination|set-notes|set-fog|set-out-of-scope "TEXT"`
 //! - `document pull [PATH]` — write the epic's living HTML document to a
@@ -56,6 +61,7 @@
 
 use dearborn_server::cli::{CliClient, ERROR_PREFIX};
 
+use base64::Engine as _;
 use serde_json::json;
 use std::path::Path;
 
@@ -743,9 +749,12 @@ fn node_create_flags(args: &[String]) -> Result<NodeCreateFlags, i32> {
 /// `node resolve` resolution flags: the optional one-line decision (`--gist`),
 /// the folded document edit (`--document PATH` + `--base-version N`, the
 /// version the file was pulled at — big HTML through file tools, not
-/// tool-args), repeated `key=value; key=value` specs for the map-reshaping
-/// parts (`--graduate`, `--out-of-scope`, `--update`), and the replacement fog
-/// prose (`--trim-fog`). Assembles the resolution-bundle request body.
+/// tool-args), the shipped prototype artifact (`--artifact PATH`, read from
+/// the scratch workspace and base64-uploaded; `--artifact-mime MIME` defaults
+/// to `text/html`, `--artifact-label "..."` is its display name), repeated
+/// `key=value; key=value` specs for the map-reshaping parts (`--graduate`,
+/// `--out-of-scope`, `--update`), and the replacement fog prose
+/// (`--trim-fog`). Assembles the resolution-bundle request body.
 fn node_resolve_args(args: &[String]) -> Result<(String, serde_json::Value), i32> {
     use serde_json::{Map, Value};
 
@@ -753,6 +762,9 @@ fn node_resolve_args(args: &[String]) -> Result<(String, serde_json::Value), i32
     let mut gist: Option<String> = None;
     let mut document: Option<String> = None;
     let mut base_version: Option<i64> = None;
+    let mut artifact: Option<String> = None;
+    let mut artifact_mime: Option<String> = None;
+    let mut artifact_label: Option<String> = None;
     let mut graduations: Vec<String> = Vec::new();
     let mut out_of_scope: Vec<String> = Vec::new();
     let mut updates: Vec<String> = Vec::new();
@@ -783,6 +795,9 @@ fn node_resolve_args(args: &[String]) -> Result<(String, serde_json::Value), i32
                     2
                 })?);
             }
+            "--artifact" => artifact = Some(take()?),
+            "--artifact-mime" => artifact_mime = Some(take()?),
+            "--artifact-label" => artifact_label = Some(take()?),
             "--graduate" => graduations.push(take()?),
             "--out-of-scope" => out_of_scope.push(take()?),
             "--update" => updates.push(take()?),
@@ -790,7 +805,8 @@ fn node_resolve_args(args: &[String]) -> Result<(String, serde_json::Value), i32
             other if other.starts_with("--") => {
                 return usage(&format!(
                     "unknown node resolve flag `{other}` (expected: --gist, --document, \
-                     --base-version, --graduate, --out-of-scope, --update, --trim-fog)"
+                     --base-version, --artifact, --artifact-mime, --artifact-label, \
+                     --graduate, --out-of-scope, --update, --trim-fog)"
                 ));
             }
             _ => {
@@ -833,12 +849,38 @@ fn node_resolve_args(args: &[String]) -> Result<(String, serde_json::Value), i32
         (None, None) => None,
     };
 
+    // The shipped prototype artifact: read the scratch-workspace file whole
+    // (binary-safe) and base64-encode it — big files through paths, not
+    // tool-args.
+    let artifact = match artifact {
+        Some(path) => {
+            let bytes = std::fs::read(&path).map_err(|err| {
+                eprintln!("{ERROR_PREFIX}failed to read {path}: {err}");
+                1
+            })?;
+            let mut artifact = json!({
+                "data_base64": base64::engine::general_purpose::STANDARD.encode(&bytes),
+            });
+            if let Some(mime) = artifact_mime.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                artifact["mime"] = json!(mime);
+            }
+            if let Some(label) = artifact_label.as_deref().map(str::trim).filter(|s| !s.is_empty()) {
+                artifact["label"] = json!(label);
+            }
+            Some(artifact)
+        }
+        None => None,
+    };
+
     let mut body = Map::new();
     if let Some(gist) = gist {
         body.insert("gist".into(), Value::String(gist));
     }
     if let Some(document) = document {
         body.insert("document".into(), document);
+    }
+    if let Some(artifact) = artifact {
+        body.insert("artifact".into(), artifact);
     }
     if !graduations.is_empty() {
         body.insert(
@@ -959,6 +1001,7 @@ usage: dearborn --url <base> --token <cap> <verb>
     [--out-of-scope \"title=...; reason=...\"]...
     [--update \"id=NODE_ID; state=out_of_scope; out_of_scope_reason=...\"]...
     [--trim-fog \"...\"]
+    [--artifact PATH [--artifact-mime MIME] [--artifact-label \"...\"]]
   map
   map set-destination|set-notes|set-fog|set-out-of-scope \"TEXT\"
   document pull [PATH]
@@ -1209,6 +1252,56 @@ mod tests {
             let args: Vec<String> = args.into_iter().map(String::from).collect();
             assert_eq!(comment_promote_flags(&args).unwrap_err(), 2);
         }
+    }
+
+    #[test]
+    fn the_artifact_flags_ship_the_scratch_file_base64_encoded() {
+        let scratch = std::env::temp_dir().join(format!("dearborn-cli-test-{}", ulid::Ulid::new()));
+        std::fs::create_dir_all(&scratch).unwrap();
+        let artifact = scratch.join("index.html");
+        std::fs::write(&artifact, b"<h1>Probe</h1>").unwrap();
+
+        let args: Vec<String> = [
+            "01NODE",
+            "--gist", "The list-based state model feels right",
+            "--artifact", artifact.to_str().unwrap(),
+            "--artifact-mime", "text/html",
+            "--artifact-label", "index.html",
+        ]
+        .iter()
+        .map(|s| s.to_string())
+        .collect();
+
+        let (node_id, body) = node_resolve_args(&args).unwrap();
+        assert_eq!(node_id, "01NODE");
+        assert_eq!(body["gist"], "The list-based state model feels right");
+        // The artifact bytes came from the scratch file, base64-encoded.
+        let decoded = base64::engine::general_purpose::STANDARD
+            .decode(body["artifact"]["data_base64"].as_str().unwrap())
+            .unwrap();
+        assert_eq!(decoded, b"<h1>Probe</h1>");
+        assert_eq!(body["artifact"]["mime"], "text/html");
+        assert_eq!(body["artifact"]["label"], "index.html");
+
+        // A bare --artifact defaults mime to the server's text/html (absent)
+        // and drops an empty label.
+        let bare: Vec<String> = ["01N", "--artifact", artifact.to_str().unwrap()]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        let (node_id, body) = node_resolve_args(&bare).unwrap();
+        assert_eq!(node_id, "01N");
+        assert!(body["artifact"].get("mime").is_none());
+        assert!(body["artifact"].get("label").is_none());
+
+        // A missing artifact file is a runtime error (exit 1), not a usage one.
+        let args: Vec<String> = ["01N", "--artifact", "/does/not/exist.html"]
+            .iter()
+            .map(|s| s.to_string())
+            .collect();
+        assert_eq!(node_resolve_args(&args).unwrap_err(), 1);
+
+        std::fs::remove_dir_all(&scratch).ok();
     }
 
     #[test]

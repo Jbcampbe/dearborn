@@ -29,6 +29,7 @@ pub mod harness_pi;
 pub mod hub;
 pub mod lanes;
 pub mod map;
+pub mod node_asset;
 pub mod node_engine;
 pub mod planning;
 pub mod pr;
@@ -648,6 +649,18 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/epics/:id/map-nodes/:nodeId/messages",
             get(node_engine::list_node_messages).post(node_engine::post_node_message),
+        )
+        // The prototype artifact store (wayfinder epic §4.7/§11): a node's
+        // stored prototype artifacts, listed (metadata — linked, not inlined)
+        // and read back raw so the client can render them in a sandboxed
+        // iframe. Writes ride the resolution bundle (HITL-gated above).
+        .route(
+            "/epics/:id/map-nodes/:nodeId/assets",
+            get(node_asset::list_node_assets),
+        )
+        .route(
+            "/epics/:id/map-nodes/:nodeId/assets/:assetId",
+            get(node_asset::get_node_asset),
         )
         // The grilling resolution bundle (wayfinder epic §6/§10): one call that
         // records the decision, folds in the Document edit under the per-epic

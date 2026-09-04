@@ -50,6 +50,7 @@ pub const NODE_OUT_OF_SCOPE: &str = "node_out_of_scope";
 pub const DEPENDENCY_LINKED: &str = "dependency_linked";
 pub const MAP_PROSE_UPDATED: &str = "map_prose_updated";
 pub const DOCUMENT_SYNCED: &str = "document_synced";
+pub const NODE_ASSET_STORED: &str = "node_asset_stored";
 pub const COMMENT_POSTED: &str = "comment_posted";
 pub const COMMENT_RESOLVED: &str = "comment_resolved";
 pub const THREAD_PROMOTED: &str = "thread_promoted";

@@ -102,7 +102,13 @@ fn cli_access_block(cli: &NodeCli) -> String {
          one-line gist, fold your edited document in as a new version, graduate fog into \
          new frontier nodes (blocked by this node), rule things out of scope (with a \
          reason), and update or invalidate other nodes this decision affected. A stale \
-         `--base-version` fails cleanly — re-pull the document, re-edit, and retry.\n\
+         `--base-version` fails cleanly — re-pull the document, re-edit, and retry. \
+         Prototype sessions also ship the artifact here: `--artifact PATH` (the file you \
+         built in this scratch workspace; the CLI base64-uploads it — big files through \
+         paths, not tool-args) with optional `--artifact-mime MIME` (default `text/html`) \
+         and `--artifact-label \"...\"` (its file name works well); it is stored as a \
+         `node_asset` linked from the node and rendered for the humans in a sandboxed \
+         iframe.\n\
          Each verb prints JSON on success and `dearborn: <error>` on failure. When the \
          decision this node poses is settled, resolve it with ONE `node resolve` call \
          carrying everything the decision decided.\n",
@@ -161,6 +167,9 @@ reason about on paper, and that a non-developer could drive.
 react to.
 
 Rules for either branch:
+- Your working directory is a throwaway SCRATCH WORKSPACE — not the project's code, \
+not a checkout. Build the artifact here (a single self-contained HTML app is the \
+default shape); nothing here touches the target repo.
 - Throwaway from day one, and clearly marked as such. Skip the polish: no tests, no \
 error handling beyond what makes it runnable, no abstractions. The point is to learn \
 something fast.
@@ -169,7 +178,9 @@ about a database.
 - Surface the state. After every action or variation switch, render the full relevant \
 state so the human can see what changed.
 - Capture the verdict. When the artifact has answered the question, state the decision \
-it settled in one line.
+it settled in one line — and ship the artifact: resolve the node with \
+`node resolve NODE --artifact <file>` so it is stored under the node for the humans \
+to open.
 
 Stay on THIS node's question. This is planning: produce a decision informed by the \
 artifact, not a production feature.";
@@ -556,15 +567,29 @@ pub fn spawn_node_reply(
             }
         };
 
-        // Read-only grounding: point the run at the project's checkout when it
-        // is on disk. The SAME directory is the run's scratch workspace — the
-        // document round trip (`document pull` / the resolution's folded sync)
-        // works through a scratch file there.
-        let cwd = crate::epics::get_epic_clone_path(conn, &epic_id)
-            .await
-            .ok()
-            .flatten()
-            .map(PathBuf::from);
+        // Grounding + workspace: a GRILLING node's run works in the project's
+        // read-only checkout (its prompt cross-references the code). A
+        // PROTOTYPE node's run instead gets a dedicated throwaway SCRATCH
+        // WORKSPACE (wayfinder epic §10) — deliberately NOT the target-repo
+        // clone — where it builds the artifact its resolution later ships as
+        // a `node_asset`. The same directory doubles as the scratch file for
+        // the document round trip (`document pull` / the resolution's folded
+        // sync).
+        let cwd: Option<PathBuf> = if kind == "prototype" {
+            match ensure_prototype_scratch(&state, &node_id) {
+                Ok(dir) => Some(dir),
+                Err(err) => {
+                    tracing::warn!(node = %node_id, error = %err, "node reply: failed to create the prototype scratch workspace; aborting");
+                    return;
+                }
+            }
+        } else {
+            crate::epics::get_epic_clone_path(conn, &epic_id)
+                .await
+                .ok()
+                .flatten()
+                .map(PathBuf::from)
+        };
 
         // Wire the resolution surface: mint a per-run capability token scoped
         // to this epic with the node's kind as the phase (the HITL marker —
@@ -648,6 +673,26 @@ pub fn spawn_node_reply(
 
 // ---- helpers ----------------------------------------------------------------
 
+/// The scratch workspace a PROTOTYPE node's run works in (wayfinder epic
+/// §10): `<scratch_root>/prototype/<node_id>/`, created on first use and
+/// reused across the node's turns (a session resumes where it left off).
+/// Deliberately **not** a target-repo clone — it lives under
+/// `Config::scratch_root` (`DEARBORN_SCRATCH_ROOT`), a tree separate from the
+/// per-project clones, because prototype work is throwaway planning material
+/// that must never be mistaken for (or leak into) project code.
+fn ensure_prototype_scratch(state: &AppState, node_id: &str) -> AppResult<PathBuf> {
+    let dir = PathBuf::from(&state.config.scratch_root)
+        .join("prototype")
+        .join(node_id);
+    std::fs::create_dir_all(&dir).map_err(|err| {
+        AppError::Internal(format!(
+            "failed to create the prototype scratch workspace {}: {err}",
+            dir.display()
+        ))
+    })?;
+    Ok(dir)
+}
+
 /// Load a node, guard it belongs to `epic_id`, and confirm its kind has an
 /// interactive engine. `404` unknown epic/node; `409` for research/task kinds.
 async fn require_interactive_node(
@@ -673,7 +718,9 @@ async fn require_interactive_node(
 /// A compact context header prepended to a node's first agent turn: the node's
 /// id (what `node resolve` addresses), the epic's destination, and the node's
 /// own question, so the agent orients before the human's opening message
-/// (wayfinder epic §8: it infers "I'm first" from an empty transcript).
+/// (wayfinder epic §8: it infers "I'm first" from an empty transcript). A
+/// prototype node is additionally told its working directory is the
+/// throwaway scratch workspace, not the project checkout.
 async fn first_turn_context(conn: &Connection, epic_id: &str, node_id: &str) -> String {
     let mut lines = Vec::new();
     lines.push(format!(
@@ -684,6 +731,13 @@ async fn first_turn_context(conn: &Connection, epic_id: &str, node_id: &str) -> 
         lines.push(format!("The node: {}.", node.title));
         if let Some(question) = node.question.filter(|q| !q.trim().is_empty()) {
             lines.push(format!("The decision this node resolves: {question}"));
+        }
+        if node.kind == "prototype" {
+            lines.push(
+                "Your working directory is a throwaway scratch workspace — build the \\
+                 artifact there, and ship it with `node resolve <id> --artifact <file>`."
+                    .to_string(),
+            );
         }
     }
     if let Ok(mut rows) = conn
@@ -1142,6 +1196,99 @@ mod tests {
             state.caps.resolve(&cap_token).is_none(),
             "the run's capability token must be revoked when the run ends"
         );
+    }
+
+    // ---- AC: a prototype run works in a scratch workspace, never the clone
+    //         (grilling keeps the project checkout) -----------------------
+
+    #[tokio::test]
+    async fn a_prototype_run_gets_a_scratch_workspace_and_grilling_keeps_the_clone() {
+        let gate = Arc::new(Gate::default());
+        let agent =
+            Arc::new(ScriptedPlanningAgent::new("sess-scratch", &["building"]).with_gate(gate.clone()));
+        let recorded = agent.recorded();
+        let (state, app) = boot(agent).await;
+        // Advertise the base so the turn is CLI-wired, and give the project a
+        // ready clone — which the PROTOTYPE run must NOT work in.
+        *state.advertised_base.lock().unwrap() = Some("http://127.0.0.1:8787".to_string());
+        let user = users::testing::seed_user(&state, "planner", Role::Admin, true).await;
+        let token = crate::sessions::testing::login_as(&state, &user).await;
+        let epic_id = seed_epic(&state).await;
+        state
+            .db
+            .conn()
+            .execute(
+                "UPDATE project SET clone_path = '/tmp/dearborn-clone-x' \
+                 WHERE id = (SELECT project_id FROM epic WHERE id = ?1)",
+                params![epic_id.clone()],
+            )
+            .await
+            .unwrap();
+
+        async fn run_turn(
+            app: &axum::Router,
+            token: &str,
+            epic_id: &str,
+            node_id: &str,
+        ) {
+            let posted = app
+                .clone()
+                .oneshot(post_json_bearer(
+                    &format!("/epics/{epic_id}/map-nodes/{node_id}/messages"),
+                    token,
+                    json!({ "content": "go" }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(body_json(posted).await["reply_started"], true);
+        }
+
+        // The prototype node's turn runs in a scratch workspace under the
+        // configured scratch root — a fresh directory, NOT the clone.
+        let prototype_id = seed_node(&state, &epic_id, "prototype", None).await;
+        run_turn(&app, &token, &epic_id, &prototype_id).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while recorded.lock().unwrap().len() < 1
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        {
+            let runs = recorded.lock().unwrap();
+            let cwd = runs[0].cwd.as_deref().expect("prototype run gets a cwd");
+            let expected = std::path::Path::new(&state.config.scratch_root)
+                .join("prototype")
+                .join(&prototype_id);
+            assert_eq!(cwd, expected.as_path());
+            assert!(cwd.is_dir(), "the scratch workspace is created on first use");
+            assert_ne!(cwd, std::path::Path::new("/tmp/dearborn-clone-x"));
+            // The prototype prompt tells the agent the same thing.
+            assert!(runs[0].system_prompt.starts_with(PROTOTYPE_PROMPT));
+            assert!(runs[0].system_prompt.contains("--artifact PATH"));
+            assert!(runs[0].prompt.contains("throwaway scratch workspace"));
+        }
+        gate.release();
+        wait_until_unlocked(&state, &prototype_id).await;
+
+        // A grilling node's turn on the SAME epic still works in the project's
+        // read-only checkout.
+        let grilling_id = seed_node(&state, &epic_id, "grilling", None).await;
+        run_turn(&app, &token, &epic_id, &grilling_id).await;
+        let deadline = tokio::time::Instant::now() + Duration::from_secs(5);
+        while recorded.lock().unwrap().len() < 2
+            && tokio::time::Instant::now() < deadline
+        {
+            tokio::time::sleep(Duration::from_millis(5)).await;
+        }
+        {
+            let runs = recorded.lock().unwrap();
+            assert_eq!(
+                runs[1].cwd.as_deref(),
+                Some(std::path::Path::new("/tmp/dearborn-clone-x"))
+            );
+        }
+        gate.release();
+        wait_until_unlocked(&state, &grilling_id).await;
     }
 
     // ---- non-interactive kinds have no interactive session ------------------

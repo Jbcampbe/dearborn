@@ -11,6 +11,11 @@
 //!    file tools, and the resolution **folds the sync in** (`document.sync`
 //!    under the per-epic write semaphore, base-version checked — siblings
 //!    never stall behind anything but the bounded critical section, §7).
+//! 2½. **Ship the prototype artifact** (prototype nodes only) — the throwaway
+//!    artifact the session built in its scratch workspace (never a
+//!    target-repo clone) is stored as a `node_asset` **linked from the node**
+//!    ([`crate::node_asset`], §4.7) and rendered client-side in a sandboxed
+//!    iframe.
 //! 3. **Graduate fog into new frontier nodes** — each graduated node is
 //!    created open and **blocked by this node** (the graduation shape); since
 //!    a resolved blocker is settled, the new layer lands directly on the
@@ -65,6 +70,11 @@ pub struct ResolveNodeBody {
     /// read at (exactly what `document sync` carries).
     #[serde(default)]
     document: Option<ResolveDocumentBody>,
+    /// The shipped prototype artifact (`data_base64` + `mime` + optional
+    /// `label`) — stored as a `node_asset` linked from the node. Prototype
+    /// nodes only; a grilling resolution carries no artifact.
+    #[serde(default)]
+    artifact: Option<ResolveArtifactBody>,
     /// New frontier nodes to graduate out of the fog, each blocked by this
     /// node.
     #[serde(default)]
@@ -88,6 +98,19 @@ pub struct ResolveNodeBody {
 pub struct ResolveDocumentBody {
     html: Option<String>,
     base_version: Option<i64>,
+}
+
+/// The shipped prototype artifact (wayfinder epic §4.7): the scratch
+/// workspace file, base64-encoded by the CLI (`--artifact PATH`), with its
+/// `mime` (default `text/html`) and an optional human `label` (the file name
+/// works well). Stored as a `node_asset` **linked from the node** — never
+/// inlined into the map or the transcript.
+#[derive(Debug, Deserialize)]
+pub struct ResolveArtifactBody {
+    data_base64: Option<String>,
+    mime: Option<String>,
+    #[serde(default)]
+    label: Option<String>,
 }
 
 /// One fog graduation: a new node, created open and blocked by the resolving
@@ -166,6 +189,7 @@ pub async fn resolve_node(
     let ResolveNodeBody {
         gist,
         document,
+        artifact,
         graduations,
         trim_fog,
         out_of_scope,
@@ -289,6 +313,41 @@ pub async fn resolve_node(
             },
         ));
     }
+    // The shipped prototype artifact (§4.7): validated like everything else
+    // BEFORE any write, and prototype-only — a grilling resolution carries no
+    // artifact (its deliverable is a decision, not a build).
+    let artifact = match artifact {
+        Some(art) => {
+            if node.kind != "prototype" {
+                return Err(AppError::BadRequest(format!(
+                    "map node {node_id} is a `{}` node: only prototype resolutions ship an \\
+                     artifact (a grilling decision is a decision, not a build)",
+                    node.kind
+                )));
+            }
+            let data_base64 = art
+                .data_base64
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    AppError::BadRequest(
+                        "`artifact.data_base64` is required (the scratch file, base64-encoded)"
+                            .to_string(),
+                    )
+                })?;
+            let bytes = crate::node_asset::decode_artifact_bytes(data_base64)?;
+            let mime = crate::node_asset::validate_mime(art.mime.as_deref())?;
+            let label = art
+                .label
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .map(str::to_string);
+            Some((mime, bytes, label))
+        }
+        None => None,
+    };
 
     // ---- apply: document first (the only semaphore-taking step) ------------
     // A stale base version fails here as a bare 409 with the map untouched —
@@ -327,6 +386,26 @@ pub async fn resolve_node(
     .await?;
     // The node's interactive session (if any) is done: mark it complete.
     node_engine::mark_session_complete(&conn, &node_id).await?;
+
+    // 1½. Ship the prototype artifact: stored as a `node_asset` linked from
+    //     the node (wayfinder epic §4.7), from where the client renders it in
+    //     a sandboxed iframe. (The scratch workspace file itself stays
+    //     throwaway — the store is the durable copy.)
+    let asset_payload = match artifact {
+        Some((mime, bytes, label)) => {
+            let meta = crate::node_asset::insert_asset(
+                &conn,
+                &node_id,
+                &mime,
+                bytes,
+                label.as_deref(),
+                actor.user_id.as_deref(),
+            )
+            .await?;
+            Some(serde_json::to_value(&meta).unwrap_or(Value::Null))
+        }
+        None => None,
+    };
 
     // 2. Graduate fog into the next frontier layer: each new node is open and
     //    blocked by THIS node — a settled blocker, so the layer is on the
@@ -408,6 +487,7 @@ pub async fn resolve_node(
     Ok(Json(json!({
         "node": node,
         "document": document_payload,
+        "asset": asset_payload,
         "created": created,
         "out_of_scope": ruled_out,
         "updated": updated,
@@ -420,6 +500,7 @@ pub async fn resolve_node(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use base64::Engine as _;
     use crate::capability::now_ms;
     use crate::users::{self, Role};
     use crate::{app, AppState, Config, Db};
@@ -944,5 +1025,117 @@ mod tests {
         // The map is untouched.
         let map = get_map(&app, &token, &epic_id).await;
         assert_eq!(node_of(&map, &node_id)["state"], "open");
+    }
+
+    // ---- AC: resolving a prototype node stores its artifact as a
+    //         node_asset linked from the node ----------------------------
+
+    #[tokio::test]
+    async fn resolving_a_prototype_node_stores_a_linked_node_asset() {
+        let (state, app) = boot().await;
+        let user = users::testing::seed_user(&state, "planner", Role::Admin, true).await;
+        let token = crate::sessions::testing::login_as(&state, &user).await;
+        let (_project_id, epic_id) = seed_epic(&state).await;
+        let node_id = seed_node(&state, &epic_id, "prototype", None).await;
+
+        let artifact_html = "<h1>State machine probe</h1><button>next</button>";
+        let encoded = base64::engine::general_purpose::STANDARD.encode(artifact_html);
+        let (status, outcome) = resolve(
+            &app,
+            &token,
+            &epic_id,
+            &node_id,
+            json!({
+                "gist": "The list-based state model feels right",
+                "artifact": { "data_base64": encoded, "label": "index.html" }
+            }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK, "outcome: {outcome}");
+        assert_eq!(outcome["node"]["state"], "resolved");
+
+        // The response names the stored asset; the store lists it under the
+        // node (metadata only — linked, not inlined).
+        assert_eq!(outcome["asset"]["label"], "index.html");
+        assert_eq!(outcome["asset"]["mime"], "text/html");
+        let asset_id = outcome["asset"]["id"].as_str().unwrap().to_string();
+        let listed = app
+            .clone()
+            .oneshot(
+                Request::builder()
+                    .uri(&format!(
+                        "/epics/{epic_id}/map-nodes/{node_id}/assets"
+                    ))
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(listed.status(), StatusCode::OK);
+        let listed = body_json(listed).await;
+        let items = listed["items"].as_array().unwrap();
+        assert_eq!(items.len(), 1);
+        assert_eq!(items[0]["id"], asset_id.as_str());
+        assert_eq!(items[0]["node_id"], node_id.as_str());
+
+        // And the bytes read back raw, with the (default) text/html type —
+        // exactly what the client feeds its sandboxed iframe.
+        let raw = app
+            .oneshot(
+                Request::builder()
+                    .uri(&format!(
+                        "/epics/{epic_id}/map-nodes/{node_id}/assets/{asset_id}"
+                    ))
+                    .header(AUTHORIZATION, format!("Bearer {token}"))
+                    .body(Body::empty())
+                    .unwrap(),
+            )
+            .await
+            .unwrap();
+        assert_eq!(raw.status(), StatusCode::OK);
+        assert_eq!(raw.headers()["content-type"], "text/html");
+        let bytes = axum::body::to_bytes(raw.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        assert_eq!(&bytes[..], artifact_html.as_bytes());
+    }
+
+    #[tokio::test]
+    async fn a_grilling_resolution_cannot_ship_an_artifact() {
+        let (state, app) = boot().await;
+        let user = users::testing::seed_user(&state, "planner", Role::Admin, true).await;
+        let token = crate::sessions::testing::login_as(&state, &user).await;
+        let (_project_id, epic_id) = seed_epic(&state).await;
+        let node_id = seed_node(&state, &epic_id, "grilling", None).await;
+
+        let encoded = base64::engine::general_purpose::STANDARD.encode("<h1>x</h1>");
+        let (status, outcome) = resolve(
+            &app,
+            &token,
+            &epic_id,
+            &node_id,
+            json!({ "gist": "decided", "artifact": { "data_base64": encoded } }),
+        )
+        .await;
+        assert_eq!(status, StatusCode::BAD_REQUEST, "outcome: {outcome}");
+        assert!(outcome["error"]["message"]
+            .as_str()
+            .unwrap()
+            .contains("only prototype resolutions"));
+
+        // Nothing was applied: the node is still open and nothing stored.
+        let node = map::fetch_node(state.db.conn(), &node_id)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(node.state, "open");
+        assert_eq!(
+            crate::node_asset::list_assets(state.db.conn(), &node_id)
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
     }
 }

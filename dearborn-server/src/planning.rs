@@ -231,7 +231,9 @@ pub(crate) mod testing {
     }
 
     /// One interactive turn as the fake saw it — enough for a test to assert the
-    /// per-node engine passed the right prompt, resume handle, and system prompt.
+    /// per-node engine passed the right prompt, resume handle, system prompt,
+    /// and working directory (grilling = the project checkout; prototype = the
+    /// scratch workspace).
     #[derive(Clone, Debug)]
     #[allow(dead_code)]
     pub struct RecordedPlanningRun {
@@ -239,6 +241,7 @@ pub(crate) mod testing {
         pub prompt: String,
         pub resume: Option<String>,
         pub system_prompt: String,
+        pub cwd: Option<std::path::PathBuf>,
     }
 
     /// A scripted [`PlanningAgent`] (mirrors breakdown's `ScriptedBreakdownAgent`):
@@ -281,6 +284,7 @@ pub(crate) mod testing {
                 prompt: req.prompt.clone(),
                 resume: req.resume.clone(),
                 system_prompt: req.system_prompt.clone(),
+                cwd: req.cwd.clone(),
             });
 
             let (tx, rx) = std::sync::mpsc::channel();

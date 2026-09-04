@@ -9,10 +9,13 @@ import { getProject } from "../api/projects";
 import {
   getNodeSession,
   getParticipants,
+  listNodeAssets,
+  getNodeAssetText,
   openNodeSession,
   postNodeMessage,
   resolveNode,
   type GraduateInput,
+  type NodeAsset,
   type NodeMessage,
   type OutOfScopeInput,
   type Participant,
@@ -39,6 +42,8 @@ import { renderMarkdown } from "../lib/markdown";
 // RunEvents relay in `dearborn-server/src/node_engine.rs`). The resolve
 // affordance triggers the grilling resolution flow (`POST …/resolve`): record
 // the decision, graduate the next frontier layer, rule things out of scope.
+// A PROTOTYPE node additionally renders its stored artifact (`node_asset` —
+// linked, not inlined) in a sandboxed iframe below the transcript.
 //
 // Reached from the Map graph (click-to-open) via the `epic-node` route; the
 // map re-fetches on return, so nothing here has to keep the map in sync.
@@ -63,6 +68,15 @@ const replyQueued = ref(false);
 // The breadcrumb's project name (the epic only carries `project_id`); fills in
 // after load and falls back to "…" if the fetch fails.
 const projectName = ref<string | null>(null);
+
+// ---- prototype artifact (plan §4.7: linked, not inlined) ----------------------
+
+// The node's stored prototype artifacts (metadata) and the rendered one's
+// HTML. Non-fatal: a load failure degrades to the panel's own note, never to
+// the view-level error banner.
+const assets = ref<NodeAsset[]>([]);
+const artifactHtml = ref<string | null>(null);
+const artifactFailed = ref(false);
 
 // ---- resolve affordance -----------------------------------------------------
 
@@ -108,6 +122,7 @@ function canReshapeMap(kind: string): boolean {
 }
 
 const isInteractive = computed(() => node.value !== null && isInteractiveKind(node.value.kind));
+const isPrototype = computed(() => node.value !== null && node.value.kind === "prototype");
 const isSettled = computed(
   () =>
     node.value !== null &&
@@ -157,6 +172,51 @@ function formatTime(ts: number): string {
   return new Date(ts).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" });
 }
 
+/** Human byte size for the artifact's label. */
+function formatBytes(size: number): string {
+  if (size < 1024) return `${size} B`;
+  if (size < 1024 * 1024) return `${(size / 1024).toFixed(1)} KB`;
+  return `${(size / (1024 * 1024)).toFixed(1)} MB`;
+}
+
+/** The artifact to render: prefer an HTML one — a standalone app is the shape. */
+const renderedAsset = computed(() => {
+  return (
+    assets.value.find((a) => a.mime.startsWith("text/html")) ?? assets.value[0] ?? null
+  );
+});
+
+/**
+ * Load the prototype node's stored artifacts and fetch the rendered one's
+ * HTML for the sandboxed iframe (`srcdoc`). Re-run on resync (a WS
+ * re-subscribe) so an artifact stored mid-session appears without a reload.
+ */
+async function loadAssets() {
+  const token = auth.accessToken;
+  if (token === null || !isPrototype.value) {
+    return;
+  }
+  artifactFailed.value = false;
+  try {
+    assets.value = await listNodeAssets(token, props.id, props.nodeId);
+    artifactHtml.value = null;
+    const asset = renderedAsset.value;
+    if (asset !== null) {
+      artifactHtml.value = await getNodeAssetText(
+        token,
+        props.id,
+        props.nodeId,
+        asset.id,
+      );
+    }
+  } catch (err) {
+    if (bounceIfAuth(err)) {
+      return;
+    }
+    artifactFailed.value = true;
+  }
+}
+
 /** A run is in flight while the reducer holds a streaming turn. */
 const runInFlight = computed(() => state.streaming !== null);
 
@@ -199,6 +259,9 @@ async function load() {
   error.value = null;
   outcome.value = null;
   replyQueued.value = false;
+  assets.value = [];
+  artifactHtml.value = null;
+  artifactFailed.value = false;
   Object.assign(state, initialNodeState());
   try {
     const [epicObj, nodeObj, participantsList] = await Promise.all([
@@ -232,6 +295,9 @@ async function load() {
     void getProject(token, epicObj.project_id)
       .then((p) => (projectName.value = p.name))
       .catch((err) => bounceIfAuth(err));
+
+    // The prototype artifact panel loads independently of the session.
+    void loadAssets();
   } catch (err) {
     if (bounceIfAuth(err)) {
       return;
@@ -248,7 +314,13 @@ async function load() {
  */
 async function resync() {
   const token = auth.accessToken;
-  if (token === null || !isInteractive.value) {
+  if (token === null) {
+    return;
+  }
+  // The artifact store can gain entries mid-session (the agent's resolution
+  // ships one); re-check it on every WS re-subscribe too.
+  void loadAssets();
+  if (!isInteractive.value) {
     return;
   }
   try {
@@ -368,6 +440,9 @@ async function submitResolve() {
     }
     outcome.value = result;
     resolveOpen.value = false;
+    // The resolution may have shipped an artifact (prototype nodes); the
+    // asset panel should reflect it immediately.
+    void loadAssets();
   } catch (err) {
     if (bounceIfAuth(err)) {
       return;
@@ -478,6 +553,41 @@ onMounted(load);
           </RouterLink>
         </span>
       </div>
+
+      <!--
+        Prototype artifact (wayfinder epic §4.7/§11): the node's stored
+        `node_asset`, fetched separately (linked, not inlined) and rendered in
+        a sandboxed iframe — allow-scripts so the artifact runs as the
+        standalone app it is, but no allow-same-origin, so it gets an opaque
+        origin and cannot touch this app, its storage, or its cookies.
+      -->
+      <section v-if="isPrototype" class="card artifact" aria-label="Prototype artifact">
+        <div class="artifact-head">
+          <h2>Prototype artifact</h2>
+          <span v-if="renderedAsset" class="artifact-meta">
+            {{ renderedAsset.label ?? renderedAsset.id.slice(0, 8) }} ·
+            {{ formatBytes(renderedAsset.byte_size) }}
+          </span>
+        </div>
+        <p v-if="artifactFailed" class="banner banner-error artifact-note" role="alert">
+          The artifact could not be loaded — try reloading the page.
+        </p>
+        <iframe
+          v-else-if="artifactHtml !== null"
+          class="artifact-frame"
+          sandbox="allow-scripts"
+          referrerpolicy="no-referrer"
+          :srcdoc="artifactHtml"
+          title="Prototype artifact"
+        ></iframe>
+        <div v-else class="artifact-empty">
+          <AppIcon name="box" :size="18" />
+          <p>
+            No artifact stored yet — the prototype agent builds one in its
+            throwaway scratch workspace and ships it with the resolution.
+          </p>
+        </div>
+      </section>
 
       <div class="panes">
         <!-- Conversation --------------------------------------------------- -->
@@ -793,6 +903,68 @@ onMounted(load);
   align-items: center;
   gap: var(--spacing-8);
   color: var(--text-muted);
+}
+
+/* --- Prototype artifact (sandboxed iframe render) -------------------------- */
+
+.artifact {
+  display: flex;
+  flex-direction: column;
+  gap: var(--spacing-12);
+  padding: var(--spacing-16) var(--spacing-20);
+  margin-bottom: var(--spacing-16);
+}
+
+.artifact-head {
+  display: flex;
+  align-items: baseline;
+  justify-content: space-between;
+  gap: var(--spacing-12);
+}
+
+.artifact-head h2 {
+  font-size: var(--text-caption);
+  font-weight: var(--weight-medium);
+}
+
+.artifact-meta {
+  font-size: var(--text-micro);
+  color: var(--text-faint);
+  font-family: var(--font-mono);
+}
+
+/* `sandbox` (opaque origin, no same-origin access) does the isolating; the
+   fixed height keeps a large artifact from blowing up the page. */
+.artifact-frame {
+  width: 100%;
+  height: 60vh;
+  min-height: 360px;
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-cards);
+  background: #fff;
+}
+
+.artifact-note {
+  margin: 0;
+}
+
+.artifact-empty {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  gap: var(--spacing-8);
+  padding: var(--spacing-24) var(--spacing-16);
+  border: 1px dashed var(--border-hairline);
+  border-radius: var(--radius-cards);
+  color: var(--text-faint);
+  font-size: var(--text-caption);
+  text-align: center;
+}
+
+.artifact-empty p {
+  margin: 0;
+  max-width: 380px;
+  line-height: 1.5;
 }
 
 .panes {

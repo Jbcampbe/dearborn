@@ -222,6 +222,13 @@ pub fn authorize_cap_request(
         ("PATCH", ["epics", e, "map-nodes", _]) => *e == epic && reshape,
         ("POST", ["epics", e, "map-node-dependencies"]) => *e == epic && reshape,
         ("POST", ["epics", e, "map-nodes", _, "resolve"]) => *e == epic && reshape,
+        // The prototype artifact store (wayfinder epic §4.7 — see
+        // `crate::node_asset`): listing and reading a node's stored prototype
+        // artifacts for the sandboxed-iframe render. Reads, open to every
+        // phase — the only WRITE is the resolution bundle's `artifact` part,
+        // which rides the already-HITL-gated `…/resolve` route above.
+        ("GET", ["epics", e, "map-nodes", _, "assets"]) => *e == epic,
+        ("GET", ["epics", e, "map-nodes", _, "assets", _]) => *e == epic,
         // The living Document round trip (`dearborn document pull|sync` —
         // see `crate::document`). Pulling is a read; syncing is the
         // resolution edit, so it is HITL-only too.

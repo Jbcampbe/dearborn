@@ -20,6 +20,11 @@ pub const DEFAULT_BIND: &str = "127.0.0.1:8787";
 pub const DEFAULT_DB_PATH: &str = "~/.dearborn/dearborn.db";
 /// Default per-project clone root when `DEARBORN_CLONE_ROOT` is unset.
 pub const DEFAULT_CLONE_ROOT: &str = "~/.dearborn/clones";
+/// Default scratch-workspace root when `DEARBORN_SCRATCH_ROOT` is unset.
+/// Prototype nodes build their throwaway artifacts under here — deliberately
+/// a separate tree from [`DEFAULT_CLONE_ROOT`], because a prototype's scratch
+/// workspace is **not** a target-repo clone (wayfinder epic §10).
+pub const DEFAULT_SCRATCH_ROOT: &str = "~/.dearborn/scratch";
 /// Default directory of built SPA assets when `DEARBORN_STATIC_DIR` is unset.
 /// Relative to the process working directory (the workspace root under `cargo
 /// run`). If it does not exist the server serves the API only (see `lib::app`).
@@ -37,6 +42,12 @@ pub struct Config {
     pub db_path: String,
     /// Root directory under which per-project clones live (`DEARBORN_CLONE_ROOT`).
     pub clone_root: String,
+    /// Root directory under which throwaway agent scratch workspaces live
+    /// (`DEARBORN_SCRATCH_ROOT`) — prototype nodes get
+    /// `<scratch_root>/prototype/<node_id>/` as their working directory, kept
+    /// strictly apart from the project clones (wayfinder epic §10: the
+    /// prototype's scratch workspace is never a target-repo clone).
+    pub scratch_root: String,
     /// Directory of built Vite SPA assets served at `/` (`DEARBORN_STATIC_DIR`).
     /// When it is absent the server logs a warning and serves the API only.
     pub static_dir: String,
@@ -202,6 +213,11 @@ impl Config {
                 .filter(|v| !v.is_empty())
                 .unwrap_or_else(|| DEFAULT_CLONE_ROOT.to_string()),
         );
+        let scratch_root = expand_tilde(
+            resolve(&file, "DEARBORN_SCRATCH_ROOT")
+                .filter(|v| !v.is_empty())
+                .unwrap_or_else(|| DEFAULT_SCRATCH_ROOT.to_string()),
+        );
         let static_dir = resolve(&file, "DEARBORN_STATIC_DIR")
             .filter(|v| !v.is_empty())
             .unwrap_or_else(|| DEFAULT_STATIC_DIR.to_string());
@@ -213,6 +229,7 @@ impl Config {
             master_key,
             db_path,
             clone_root,
+            scratch_root,
             static_dir,
             auto_clone: true,
             argon2_fast: false,
@@ -434,6 +451,13 @@ impl Config {
             master_key: "test-master-key".to_string(),
             db_path: ":memory:".to_string(),
             clone_root: DEFAULT_CLONE_ROOT.to_string(),
+            // A throwaway location no real scratch work would ever live in —
+            // per-node scratch directories are ULID-keyed, so concurrent
+            // tests never collide.
+            scratch_root: std::env::temp_dir()
+                .join("dearborn-test-scratch")
+                .to_string_lossy()
+                .to_string(),
             static_dir: DEFAULT_STATIC_DIR.to_string(),
             // Plain CRUD tests must not shell out to git; T-103 tests that
             // exercise cloning flip this on explicitly.
