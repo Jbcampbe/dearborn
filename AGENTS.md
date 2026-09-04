@@ -1,0 +1,2 @@
+- Use ripgrep (`rg`) instead of `grep` for faster searches where possible
+- Use `fd` instead of `find` for faster lookups where possible

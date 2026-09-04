@@ -89,23 +89,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0012_pr_feedback",
         sql: include_str!("../migrations/0012_pr_feedback.sql"),
     },
-    // NOTE: id 13 is owned by `0013_agent_run_thinking` (the `record-thinking`
-    // line of work, merged ahead of this one). These two branches independently
-    // authored an id-13 migration; to avoid the collision that silently skips
-    // one of them, the wayfinder pair sits at 14/15 on the assumption
-    // record-thinking lands first. Never reuse an id across branches.
-    //
-    // The pair is ordered drop-then-create (14 before 15) so a db that already
-    // recorded `drop_linear_planning` at id 14 (agent_run_thinking took 13, so
-    // `planning_map_schema` was skipped) self-heals: the next boot applies id 15
-    // and nothing else. The two are independent — `drop_linear_planning` only
-    // drops `transcript_message`/`planning_session`, and `planning_map_schema`
-    // references only its own new tables — so the order is purely mechanical.
-    //
-    // Clean cutover (wayfinder epic §12): retire the linear product/technical
-    // planning store — `transcript_message` and `planning_session` — now that
-    // the code paths reading and writing them are gone (no feature flag, no
-    // coexistence; per-node `node_session`/`node_message` take over).
+    Migration {
+        id: 13,
+        name: "0013_agent_run_thinking",
+        sql: include_str!("../migrations/0013_agent_run_thinking.sql"),
+    },
     Migration {
         id: 14,
         name: "0014_drop_linear_planning",
@@ -948,13 +936,7 @@ mod tests {
             ),
             (
                 "document",
-                &[
-                    "epic_id",
-                    "html",
-                    "version",
-                    "last_edited_by",
-                    "updated_at",
-                ],
+                &["epic_id", "html", "version", "last_edited_by", "updated_at"],
             ),
             (
                 "document_version",
@@ -1040,12 +1022,7 @@ mod tests {
         while let Some(row) = rows.next().await.unwrap() {
             epic_columns.push(row.get::<String>(1).unwrap());
         }
-        for column in [
-            "destination",
-            "notes",
-            "not_yet_specified",
-            "out_of_scope",
-        ] {
+        for column in ["destination", "notes", "not_yet_specified", "out_of_scope"] {
             assert!(
                 epic_columns.iter().any(|c| c == column),
                 "missing epic.{column}"
@@ -1084,14 +1061,8 @@ mod tests {
                  VALUES ('{id}', '{epic_id}', 'grilling', 'open', 'T', 1, 1)"
             )
         };
-        db.conn()
-            .execute(&node_row("n1", "e"), ())
-            .await
-            .unwrap();
-        db.conn()
-            .execute(&node_row("n2", "e"), ())
-            .await
-            .unwrap();
+        db.conn().execute(&node_row("n1", "e"), ()).await.unwrap();
+        db.conn().execute(&node_row("n2", "e"), ()).await.unwrap();
         db.conn()
             .execute(
                 "INSERT INTO map_node_dependency (blocker_id, blocked_id) VALUES ('n1', 'n2')",
@@ -1106,7 +1077,10 @@ mod tests {
                 (),
             )
             .await;
-        assert!(dup_edge.is_err(), "duplicate dependency edge must be rejected");
+        assert!(
+            dup_edge.is_err(),
+            "duplicate dependency edge must be rejected"
+        );
 
         db.conn()
             .execute(
@@ -1140,7 +1114,10 @@ mod tests {
         // FK enforcement: nodes/edges/messages/assets referencing missing rows
         // are rejected (PRAGMA foreign_keys = ON).
         let orphan_node = db.conn().execute(&node_row("orphan", "ghost"), ()).await;
-        assert!(orphan_node.is_err(), "FK violation on epic_id must be rejected");
+        assert!(
+            orphan_node.is_err(),
+            "FK violation on epic_id must be rejected"
+        );
         let orphan_edge = db
             .conn()
             .execute(
@@ -1148,7 +1125,10 @@ mod tests {
                 (),
             )
             .await;
-        assert!(orphan_edge.is_err(), "FK violation on blocker_id must be rejected");
+        assert!(
+            orphan_edge.is_err(),
+            "FK violation on blocker_id must be rejected"
+        );
         let orphan_message = db
             .conn()
             .execute(
@@ -1157,7 +1137,10 @@ mod tests {
                 (),
             )
             .await;
-        assert!(orphan_message.is_err(), "FK violation on node_id must be rejected");
+        assert!(
+            orphan_message.is_err(),
+            "FK violation on node_id must be rejected"
+        );
         let orphan_asset = db
             .conn()
             .execute(
@@ -1166,7 +1149,10 @@ mod tests {
                 (),
             )
             .await;
-        assert!(orphan_asset.is_err(), "FK violation on node_id must be rejected");
+        assert!(
+            orphan_asset.is_err(),
+            "FK violation on node_id must be rejected"
+        );
 
         // The overhauled comment anchors to a node and defaults its flags.
         db.conn()

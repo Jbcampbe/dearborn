@@ -11,6 +11,7 @@ import {
   hydratePipeline,
   initialPipelineState,
   reconcileLiveLog,
+  reconcileLiveThinking,
   resetLiveTail,
   runStatusLabel,
   runningRun,
@@ -92,6 +93,26 @@ const expandedLog = computed<string | null>(() => {
   return expandedDetail.value?.log ?? null;
 });
 const expandedSegments = computed(() => (expandedLog.value !== null ? splitLog(expandedLog.value) : null));
+/**
+ * The expanded row's reasoning stream, or `null` when it has none. For the
+ * running row this is the live-tailed `state.liveThinking` (seeded once from
+ * the REST snapshot via `reconcileLiveThinking`, then grown by incoming
+ * `thinking` frames); for a completed row it's the persisted `thinking` the
+ * on-demand `getRunLog` fetched into `logCache`. Empty string reads as "none"
+ * so the collapsible never renders an empty shell.
+ */
+const expandedThinking = computed<string | null>(() => {
+  if (expandedId.value === null) {
+    return null;
+  }
+  const thinking =
+    expandedId.value === runningRunId.value
+      ? state.liveThinking
+      : expandedDetail.value?.thinking ?? "";
+  return thinking.length > 0 ? thinking : null;
+});
+/** Whether the currently-expanded row is the live/running one. */
+const expandedIsRunning = computed(() => expandedId.value !== null && expandedId.value === runningRunId.value);
 
 function bounceIfAuth(err: unknown): boolean {
   if (err instanceof ApiError && err.isAuth) {
@@ -137,6 +158,7 @@ async function load() {
       try {
         const detail = await getRunLog(token, running.id);
         reconcileLiveLog(state, detail.log);
+        reconcileLiveThinking(state, detail.thinking);
       } catch (err) {
         // Best-effort: the live tail still renders from the buffered text
         // alone (`state.liveLog`, un-reconciled) -- just not proven gap-free
@@ -308,6 +330,25 @@ onMounted(load);
               <span class="tool-state">{{ call.status }}</span>
             </span>
           </div>
+          <!-- Reasoning: the model's thinking stream, rendered as a collapsible
+               <details>. The running stage streams `thinking` deltas live over
+               the WebSocket (open by default + a pulse, so an active stage's
+               reasoning is visible at a glance — the answer to "is the agent
+               stuck or just thinking?"); a completed stage shows its persisted
+               `thinking` (server's agent_run.thinking column), collapsed by
+               default so the log stays the focus. -->
+          <details
+            v-if="expandedId === run.id && expandedThinking !== null"
+            class="thinking-block"
+            :open="expandedIsRunning"
+          >
+            <summary class="thinking-summary">
+              <AppIcon name="chevron-right" :size="12" class="thinking-caret" />
+              <span v-if="expandedIsRunning" class="thinking-pulse" aria-hidden="true" />
+              <span class="thinking-label">Thinking</span>
+            </summary>
+            <div class="thinking-md md" v-html="renderMarkdown(expandedThinking)" />
+          </details>
           <p v-if="logLoading.has(run.id)" class="log-note">Loading log…</p>
           <p v-else-if="logError.has(run.id)" class="banner banner-error" role="alert">
             {{ logError.get(run.id) }}
@@ -463,6 +504,87 @@ onMounted(load);
   font-size: 12px;
   line-height: 1.55;
   color: var(--text-body);
+}
+
+/* Live reasoning stream — a distinct, quietly-tinted collapsible so it reads
+   as the model's thinking rather than its output log. */
+.thinking-block {
+  margin: var(--spacing-8) 0 0;
+  border: 1px solid var(--border-hairline);
+  border-radius: var(--radius-buttons);
+  background: var(--surface-void);
+  overflow: hidden;
+}
+
+.thinking-summary {
+  display: flex;
+  align-items: center;
+  gap: 6px;
+  padding: 6px var(--spacing-12);
+  cursor: pointer;
+  list-style: none;
+  user-select: none;
+  font-size: var(--text-label);
+  color: var(--color-iris-violet);
+}
+
+/* Hide the UA disclosure triangle (we draw our own caret). */
+.thinking-summary::-webkit-details-marker {
+  display: none;
+}
+
+.thinking-caret {
+  color: var(--text-muted);
+  transition: transform var(--duration-fast) var(--ease-out);
+}
+
+.thinking-block[open] .thinking-caret {
+  transform: rotate(90deg);
+}
+
+.thinking-label {
+  font-weight: var(--weight-medium);
+  letter-spacing: 0.02em;
+}
+
+/* A soft pulse so an actively-reasoning stage reads as alive even when the
+   block is collapsed — the "thinking, not stuck" signal. */
+.thinking-pulse {
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  background: var(--color-iris-violet);
+  animation: thinking-pulse 1.4s ease-in-out infinite;
+}
+
+@keyframes thinking-pulse {
+  0%,
+  100% {
+    opacity: 0.35;
+    transform: scale(0.85);
+  }
+  50% {
+    opacity: 1;
+    transform: scale(1.1);
+  }
+}
+
+@media (prefers-reduced-motion: reduce) {
+  .thinking-pulse {
+    animation: none;
+    opacity: 0.8;
+  }
+}
+
+.thinking-md {
+  margin: 0;
+  padding: var(--spacing-8) var(--spacing-12);
+  border-top: 1px solid var(--border-hairline);
+  max-height: 240px;
+  overflow: auto;
+  font-size: 12px;
+  line-height: 1.55;
+  color: var(--text-muted);
 }
 
 .log-elided {

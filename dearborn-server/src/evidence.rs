@@ -183,17 +183,21 @@ pub async fn open_stage(
     Ok(StageHandle { id, started_at })
 }
 
-/// Overwrite the row's `log` without touching status/timestamps — the D14
-/// ~2s partial flush a streaming agent stage calls while it runs (see
-/// [`crate::task_agent::run_agent_stage`]).
+/// Overwrite the row's `log` and `thinking` without touching
+/// status/timestamps — the D14 ~2s partial flush a streaming agent stage calls
+/// while it runs (see [`crate::task_agent::run_agent_stage`]). Both columns are
+/// capped ([`cap_log`]) so a runaway transcript or reasoning stream can't grow
+/// the row without bound; the shared cap/marker means the client's `splitLog`
+/// renders an elided `thinking` the same way it does an elided `log`.
 pub async fn flush_stage_log(
     conn: &Connection,
     handle: &StageHandle,
     log: &str,
+    thinking: &str,
 ) -> Result<(), libsql::Error> {
     conn.execute(
-        "UPDATE agent_run SET log = ?1 WHERE id = ?2",
-        params![cap_log(log), handle.id.clone()],
+        "UPDATE agent_run SET log = ?1, thinking = ?2 WHERE id = ?3",
+        params![cap_log(log), cap_log(thinking), handle.id.clone()],
     )
     .await?;
     Ok(())
@@ -362,6 +366,27 @@ pub async fn set_actual_model(
     conn.execute(
         "UPDATE agent_run SET actual_model = ?1 WHERE id = ?2",
         params![model, run_id],
+    )
+    .await?;
+    Ok(())
+}
+
+/// Set `agent_run.thinking` on an **already-closed** row — the model's final
+/// reasoning stream ([`crate::task_agent::AgentStageOutcome::thinking`]).
+/// Shares the [`set_actual_model`] shape and rationale: the full value is only
+/// known once the stage's `RunEvent`s are drained, after [`close_stage`] has
+/// run, so it is a plain independent `UPDATE` (capped, like the flush path)
+/// rather than a field threaded through [`CloseStage`] — which keeps every
+/// non-agent close site untouched. Best-effort at the call site: a failure is
+/// logged, never fails the stage, and the last D14 flush's value survives.
+pub async fn set_thinking(
+    conn: &Connection,
+    run_id: &str,
+    thinking: &str,
+) -> Result<(), libsql::Error> {
+    conn.execute(
+        "UPDATE agent_run SET thinking = ?1 WHERE id = ?2",
+        params![cap_log(thinking), run_id],
     )
     .await?;
     Ok(())
@@ -584,6 +609,11 @@ pub struct AgentRunDetail {
     #[serde(flatten)]
     pub summary: AgentRunSummary,
     pub log: String,
+    /// The model's reasoning stream for this run (capped, may be elided the
+    /// same way `log` is). `""` for a run that emitted none or predates the
+    /// column — see the `thinking` migration. Fetched with the detail rather
+    /// than the summary for the same reason `log` is: it can be large.
+    pub thinking: String,
 }
 
 /// Columns [`row_to_summary`] expects, in order. `GET /runs/{id}` appends
@@ -639,7 +669,7 @@ pub async fn list_runs_for_task(
 
 /// One `agent_run` row with its full log, or `None` if `id` is unknown.
 pub async fn fetch_run_detail(conn: &Connection, id: &str) -> AppResult<Option<AgentRunDetail>> {
-    let sql = format!("SELECT {RUN_SUMMARY_COLUMNS}, log FROM agent_run WHERE id = ?1");
+    let sql = format!("SELECT {RUN_SUMMARY_COLUMNS}, log, thinking FROM agent_run WHERE id = ?1");
     let mut rows = conn.query(&sql, params![id]).await?;
     match rows.next().await? {
         Some(row) => {
@@ -647,9 +677,14 @@ pub async fn fetch_run_detail(conn: &Connection, id: &str) -> AppResult<Option<A
             // `RUN_SUMMARY_COLUMNS` (15 cols) precedes `log`, so `log` sits at
             // index 15 — the same relative position `row_to_summary` relied on
             // before `actual_model`, then `input_tokens`/`output_tokens`, were
-            // appended.
+            // appended. `thinking` follows `log` at index 16.
             let log: String = row.get(15)?;
-            Ok(Some(AgentRunDetail { summary, log }))
+            let thinking: String = row.get(16)?;
+            Ok(Some(AgentRunDetail {
+                summary,
+                log,
+                thinking,
+            }))
         }
         None => Ok(None),
     }
@@ -793,7 +828,7 @@ mod tests {
         // The orphan the reconciliation exists for: mid-flight, log already
         // partially flushed.
         let orphan_with_log = open("implement", 1).await;
-        flush_stage_log(conn, &orphan_with_log, "half a transcript")
+        flush_stage_log(conn, &orphan_with_log, "half a transcript", "")
             .await
             .unwrap();
         // Second orphan whose log was never flushed (empty-log branch).
@@ -953,15 +988,16 @@ mod tests {
         .await
         .unwrap();
 
-        // Immediately visible as `running`, empty log.
+        // Immediately visible as `running`, empty log and thinking.
         let row = fetch_run_detail(conn, &handle.id).await.unwrap().unwrap();
         assert_eq!(row.summary.status, "running");
         assert_eq!(row.log, "");
+        assert_eq!(row.thinking, "");
         assert_eq!(row.summary.stage, "implement");
         assert_eq!(row.summary.attempt, 1);
 
-        // A partial flush updates the log but not the status.
-        flush_stage_log(conn, &handle, "partial output so far")
+        // A partial flush updates log and thinking but not the status.
+        flush_stage_log(conn, &handle, "partial output so far", "partial reasoning")
             .await
             .unwrap();
         let row = fetch_run_detail(conn, &handle.id).await.unwrap().unwrap();
@@ -970,8 +1006,10 @@ mod tests {
             "flush must not change status"
         );
         assert_eq!(row.log, "partial output so far");
+        assert_eq!(row.thinking, "partial reasoning");
 
-        // Closing writes the terminal fields.
+        // Closing writes the terminal fields; it does not touch thinking (the
+        // post-close `set_thinking` owns that, mirroring `set_actual_model`).
         close_stage(
             conn,
             &handle,
@@ -987,12 +1025,16 @@ mod tests {
         )
         .await
         .unwrap();
+        set_thinking(conn, &handle.id, "final reasoning")
+            .await
+            .unwrap();
         let row = fetch_run_detail(conn, &handle.id).await.unwrap().unwrap();
         assert_eq!(row.summary.status, "ok");
         assert_eq!(row.summary.session_id.as_deref(), Some("sess-9"));
         assert_eq!(row.summary.verdict.as_deref(), Some("PASS"));
         assert_eq!(row.summary.exit_code, Some(0));
         assert_eq!(row.log, "final output");
+        assert_eq!(row.thinking, "final reasoning");
         assert!(row.summary.ended_at.is_some());
     }
 

@@ -428,7 +428,7 @@ epic-scoped, issued only through this one endpoint.
 
 Every agent stage (`implement`/`fix`/`review`/`verify_complete`/`summarize`)
 carries a wall-clock deadline, `DEARBORN_AGENT_STAGE_TIMEOUT_SECS` (default
-`9000`, 2.5 hours — no separate per-stage override; D18 explicitly rejects
+`18000`, 5 hours — no separate per-stage override; D18 explicitly rejects
 an epic-level budget instead). Exceeding it kills the stage through the
 identical mechanism T-542 built for a human-initiated cancel (D12: one
 `RunControl::cancel()`, looked up in the same `AppState.cancel_registry`) —

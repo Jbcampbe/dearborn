@@ -788,6 +788,15 @@ pub struct ToolEventRecord {
 pub struct AgentStageOutcome {
     /// All `Text` deltas, concatenated — the agent's assembled reply.
     pub text: String,
+    /// All `Thinking` deltas, concatenated — the model's reasoning stream
+    /// (Claude's `thinking_delta`, pi's `thinking_delta`). Kept strictly
+    /// separate from [`Self::text`]: it is not part of the assembled reply and
+    /// never folded into `agent_run.log`; it lands in its own `agent_run.thinking`
+    /// column (via [`crate::evidence::flush_stage_log`] while streaming and a
+    /// post-close [`crate::evidence::set_thinking`]) so the pipeline view can
+    /// render it for completed runs as well as live. Empty when the harness
+    /// emitted no reasoning (e.g. a non-reasoning model).
+    pub thinking: String,
     /// The harness session id, if the CLI reported one.
     pub session_id: Option<String>,
     /// The model the harness **actually** used, as reported by its own session
@@ -869,6 +878,9 @@ impl AgentStageOutcome {
     fn absorb(&mut self, event: &RunEvent) {
         match event {
             RunEvent::Text { delta, .. } => self.text.push_str(delta),
+            // Reasoning deltas accumulate in their own buffer (see `thinking`);
+            // kept out of `text` so the log trail stays the assembled reply.
+            RunEvent::Thinking { delta, .. } => self.thinking.push_str(delta),
             RunEvent::Session {
                 session_id, model, ..
             } => {
@@ -1181,16 +1193,17 @@ pub async fn run_agent_stage(
                                // first *real* flush is ~PARTIAL_FLUSH_INTERVAL in.
         loop {
             interval.tick().await;
-            let snapshot = flush_shared
-                .lock()
-                .expect("shared_outcome mutex poisoned")
-                .text
-                .clone();
+            let (log_snapshot, thinking_snapshot) = {
+                let guard = flush_shared.lock().expect("shared_outcome mutex poisoned");
+                (guard.text.clone(), guard.thinking.clone())
+            };
             let handle = StageHandle {
                 id: flush_row_id.clone(),
                 started_at: stage_row.started_at,
             };
-            let _ = evidence::flush_stage_log(&flush_conn, &handle, &snapshot).await;
+            let _ =
+                evidence::flush_stage_log(&flush_conn, &handle, &log_snapshot, &thinking_snapshot)
+                    .await;
         }
     });
 
@@ -1350,6 +1363,17 @@ pub async fn run_agent_stage(
     // stage; the configured T8 `model` column still records intent.
     if let Some(actual_model) = outcome.model.as_deref() {
         let _ = evidence::set_actual_model(conn, &stage_row.id, actual_model).await;
+    }
+
+    // Persist the final reasoning stream (see `AgentStageOutcome::thinking`).
+    // Like `set_actual_model`, this rides a post-close `UPDATE` rather than a
+    // `CloseStage` field so no non-agent close site has to carry it; the flush
+    // loop above wrote intermediate values while streaming, and this stamps the
+    // complete one. Best-effort — the last flush's value survives a failure,
+    // and thinking is never load-bearing for the stage's own status. Skipped
+    // when empty so a non-reasoning run leaves the column at its `''` default.
+    if !outcome.thinking.is_empty() {
+        let _ = evidence::set_thinking(conn, &stage_row.id, &outcome.thinking).await;
     }
 
     Ok(outcome)
@@ -2064,6 +2088,30 @@ mod tests {
         }]);
         assert_eq!(silent.input_tokens, None);
         assert_eq!(silent.output_tokens, None);
+    }
+
+    #[test]
+    fn thinking_deltas_accumulate_separately_from_text() {
+        // Reasoning deltas must land in `thinking`, interleaved text in `text`,
+        // and the two must never contaminate each other — the pipeline view
+        // renders them as distinct sections, and only `text` is the assembled
+        // reply persisted into `agent_run.log`.
+        let outcome = absorbed(&[
+            RunEvent::Thinking {
+                run_id: "r".to_string(),
+                delta: "let me consider ".to_string(),
+            },
+            RunEvent::Text {
+                run_id: "r".to_string(),
+                delta: "The answer is 42.".to_string(),
+            },
+            RunEvent::Thinking {
+                run_id: "r".to_string(),
+                delta: "the edge cases".to_string(),
+            },
+        ]);
+        assert_eq!(outcome.thinking, "let me consider the edge cases");
+        assert_eq!(outcome.text, "The answer is 42.");
     }
 
     #[test]
