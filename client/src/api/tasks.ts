@@ -217,6 +217,12 @@ export interface AgentRunSummary {
 /** One `agent_run` row **with** its full (capped) log — `GET /runs/{id}`. */
 export interface AgentRunDetail extends AgentRunSummary {
   log: string;
+  /**
+   * The model's reasoning stream for this run (capped, may carry the same
+   * elision marker `log` does). `""` for a run that emitted no reasoning or
+   * predates the server's `thinking` column — see `PipelineState.liveThinking`.
+   */
+  thinking: string;
 }
 
 /**

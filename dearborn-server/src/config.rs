@@ -114,7 +114,7 @@ pub struct ExecutorConfig {
     /// against the database.
     pub heartbeat_secs: u64,
     /// Wall-clock ceiling on a single agent stage — implement, review, or fix
-    /// (`DEARBORN_AGENT_STAGE_TIMEOUT_SECS`). Default `9000` (2.5 hours):
+    /// (`DEARBORN_AGENT_STAGE_TIMEOUT_SECS`). Default `18000` (5 hours):
     /// generous enough for a real Claude Code run on a nontrivial task while
     /// still bounding a stuck or looping agent. **Rejects `0`**: an instant
     /// timeout would fail every stage before it could produce anything —
@@ -282,7 +282,7 @@ fn executor_from(map: &HashMap<String, String>) -> ExecutorConfig {
         agent_stage_timeout_secs: parse_or_warn(
             map,
             "DEARBORN_AGENT_STAGE_TIMEOUT_SECS",
-            9000u64,
+            18000u64,
             true,
         ),
         cmd_timeout_secs: parse_or_warn(map, "DEARBORN_CMD_TIMEOUT_SECS", 900u64, true),
@@ -563,7 +563,7 @@ mod tests {
         assert_eq!(cfg.worker_concurrency, 2);
         assert_eq!(cfg.lease_ttl_secs, 300);
         assert_eq!(cfg.heartbeat_secs, 30);
-        assert_eq!(cfg.agent_stage_timeout_secs, 9000);
+        assert_eq!(cfg.agent_stage_timeout_secs, 18000);
         assert_eq!(cfg.cmd_timeout_secs, 900);
         assert_eq!(cfg.max_test_fix_attempts, 3);
         assert_eq!(cfg.max_fix_rounds, 3);
@@ -627,7 +627,7 @@ mod tests {
         assert_eq!(cfg.worker_concurrency, 2);
         assert_eq!(cfg.lease_ttl_secs, 300);
         assert_eq!(cfg.heartbeat_secs, 30);
-        assert_eq!(cfg.agent_stage_timeout_secs, 9000);
+        assert_eq!(cfg.agent_stage_timeout_secs, 18000);
         assert_eq!(cfg.cmd_timeout_secs, 900);
         assert_eq!(cfg.poll_interval_ms, 1500);
         assert_eq!(cfg.review_poll_interval_secs, 60);

@@ -89,6 +89,11 @@ const MIGRATIONS: &[Migration] = &[
         name: "0012_pr_feedback",
         sql: include_str!("../migrations/0012_pr_feedback.sql"),
     },
+    Migration {
+        id: 13,
+        name: "0013_agent_run_thinking",
+        sql: include_str!("../migrations/0013_agent_run_thinking.sql"),
+    },
 ];
 
 /// Errors surfaced while opening the database or running migrations.
