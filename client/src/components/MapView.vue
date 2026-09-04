@@ -1,6 +1,6 @@
 <script setup lang="ts">
 import { computed, onBeforeUnmount, onMounted, reactive, ref } from "vue";
-import { RouterLink } from "vue-router";
+import { RouterLink, useRouter } from "vue-router";
 
 import { useAuthStore } from "../stores/auth";
 import { ApiError } from "../api/client";
@@ -13,7 +13,6 @@ import {
 import {
   hydrateMap,
   initialMapState,
-  nodeById,
   readinessOf,
   type MapState,
   type Readiness,
@@ -37,11 +36,12 @@ import StatusIcon from "./StatusIcon.vue";
 // plumbing. The graph canvas (`MapGraph.vue`) is deliberately generic so the
 // executor task DAG can adopt it later.
 //
-// Click-to-open shows a node detail panel; the node session view (multi-party
-// chat + resolve) is a later client task and will take over the open affordance.
+// Click-to-open navigates to the node session view (`epic-node` route): the
+// multi-party chat + resolve surface that took over the open affordance.
 const props = defineProps<{ id: string }>();
 
 const auth = useAuthStore();
+const router = useRouter();
 const state = reactive<MapState>(initialMapState());
 const loading = ref(true);
 const error = ref<string | null>(null);
@@ -49,9 +49,6 @@ const streamStatus = ref<StreamStatus>("connecting");
 // The breadcrumb's project name (the epic only carries `project_id`); fills in
 // after load and falls back to "…" if the fetch fails.
 const projectName = ref<string | null>(null);
-
-// The currently-open node (click-to-open); null = panel closed.
-const selectedId = ref<string | null>(null);
 
 let stream: ReturnType<typeof useMapStream> | null = null;
 onBeforeUnmount(() => stream?.close());
@@ -72,10 +69,6 @@ const layout = computed(() => layoutGraph(nodes.value, edges.value));
 /** The canvas wants `{ id, x, y, node }`; the layout returns `{ node, x, y }`. */
 const placedNodes = computed(() =>
   layout.value.placed.map((p) => ({ id: p.node.id, x: p.x, y: p.y, node: p.node })),
-);
-
-const selectedNode = computed(() =>
-  selectedId.value === null ? undefined : nodeById(state, selectedId.value),
 );
 
 const KIND_LABELS: Record<string, string> = {
@@ -109,10 +102,6 @@ function readiness(n: MapNodeView): Readiness {
   return readinessOf(n);
 }
 
-function titleOf(id: string): string {
-  return nodeById(state, id)?.title ?? id.slice(0, 6);
-}
-
 /** Snippet under the title: a resolution gist, the question, or nothing. */
 function nodeSnippet(n: MapNodeView): string {
   return n.gist ?? n.question ?? "";
@@ -126,12 +115,9 @@ function bounceIfAuth(err: unknown): boolean {
   return false;
 }
 
+/** Click-to-open: the node's multi-party session view (chat + resolve). */
 function openNode(id: string): void {
-  selectedId.value = id;
-}
-
-function closeNode(): void {
-  selectedId.value = null;
+  void router.push({ name: "epic-node", params: { id: props.id, nodeId: id } });
 }
 
 async function load() {
@@ -216,7 +202,7 @@ onMounted(load);
         {{ completion.open_nodes }} open node{{ completion.open_nodes === 1 ? "" : "s" }}<template v-if="completion.fog_remaining"> and fog remaining</template>.
       </div>
 
-      <div class="map-columns" :class="{ 'has-panel': selectedNode }">
+      <div class="map-columns">
         <section class="map-area">
           <div v-if="nodes.length === 0" class="empty-state">
             <AppIcon name="map" :size="20" />
@@ -231,7 +217,6 @@ onMounted(load);
             :node-height="NODE_HEIGHT"
             :width="layout.width"
             :height="layout.height"
-            :selected-id="selectedId"
             @node-click="openNode"
           >
             <template #node="{ node }">
@@ -270,60 +255,6 @@ onMounted(load);
             </span>
           </div>
         </section>
-
-        <!-- Click-to-open node details ------------------------------------- -->
-        <aside v-if="selectedNode" class="node-panel">
-          <div class="section-head">
-            <h2>Node</h2>
-            <button class="btn btn-icon" aria-label="Close node details" @click="closeNode">
-              <AppIcon name="x" :size="12" />
-            </button>
-          </div>
-
-          <div class="node-panel-body" :data-kind="selectedNode.kind">
-            <div class="panel-badges">
-              <span class="kind-pill" :data-kind="selectedNode.kind">{{ kindLabel(selectedNode.kind) }}</span>
-              <span class="badge" :data-tone="READINESS_TONES[readiness(selectedNode)]">
-                {{ READINESS_LABELS[readiness(selectedNode)] }}
-              </span>
-              <span v-if="selectedNode.task_mode" class="badge">{{ selectedNode.task_mode }}</span>
-            </div>
-
-            <h3 class="panel-title" :data-out-of-scope="selectedNode.state === 'out_of_scope'">
-              {{ selectedNode.title }}
-            </h3>
-
-            <div v-if="selectedNode.question" class="panel-field">
-              <span class="label">Question</span>
-              <p>{{ selectedNode.question }}</p>
-            </div>
-
-            <div v-if="selectedNode.gist" class="panel-field">
-              <span class="label">Decision</span>
-              <p>{{ selectedNode.gist }}</p>
-            </div>
-
-            <div v-if="selectedNode.out_of_scope_reason" class="panel-field">
-              <span class="label">Why out of scope</span>
-              <p>{{ selectedNode.out_of_scope_reason }}</p>
-            </div>
-
-            <div v-if="selectedNode.blocked_by.length" class="panel-field">
-              <span class="label">Blocked by</span>
-              <div class="chip-row">
-                <button
-                  v-for="b in selectedNode.blocked_by"
-                  :key="b"
-                  class="chip chip-link"
-                  type="button"
-                  @click="openNode(b)"
-                >
-                  {{ titleOf(b) }}
-                </button>
-              </div>
-            </div>
-          </div>
-        </aside>
       </div>
 
       <!-- Fog / out-of-scope prose (never nodes — plan §3). -->
@@ -394,29 +325,6 @@ onMounted(load);
   grid-template-columns: minmax(0, 1fr);
   gap: var(--spacing-24);
   margin-top: var(--spacing-16);
-}
-
-.map-columns.has-panel {
-  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
-}
-
-@media (max-width: 60rem) {
-  .map-columns.has-panel {
-    grid-template-columns: 1fr;
-  }
-}
-
-.section-head {
-  display: flex;
-  align-items: center;
-  justify-content: space-between;
-  gap: var(--spacing-8);
-  margin-bottom: var(--spacing-12);
-}
-
-.section-head h2 {
-  font-size: var(--text-body-sm);
-  font-weight: var(--weight-medium);
 }
 
 /* Node cards (slotted into the generic canvas) --------------------------- */
@@ -588,100 +496,6 @@ onMounted(load);
 .readiness-dot[data-readiness="out_of_scope"] {
   background: var(--color-graphite);
   box-shadow: 0 0 0 1px var(--color-smoke);
-}
-
-/* Node detail panel -------------------------------------------------------- */
-.node-panel {
-  min-width: 0;
-}
-
-.node-panel-body {
-  padding: var(--spacing-16);
-  border: 1px solid var(--border-hairline);
-  border-left-width: 3px;
-  border-left-color: var(--color-ash);
-  border-radius: var(--radius-cards);
-  background: var(--surface-obsidian);
-  display: flex;
-  flex-direction: column;
-  gap: var(--spacing-12);
-}
-
-.node-panel-body[data-kind="grilling"] {
-  border-left-color: var(--color-iris-violet);
-}
-
-.node-panel-body[data-kind="prototype"] {
-  border-left-color: var(--color-lavender);
-}
-
-.node-panel-body[data-kind="research"] {
-  border-left-color: var(--color-signal-teal);
-}
-
-.node-panel-body[data-kind="task"] {
-  border-left-color: var(--color-fog);
-}
-
-.panel-badges {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: var(--spacing-8);
-}
-
-.kind-pill {
-  font-size: var(--text-micro);
-  font-weight: var(--weight-medium);
-  text-transform: uppercase;
-  letter-spacing: 0.06em;
-  color: var(--text-muted);
-  border: 1px solid var(--border-hairline);
-  border-radius: var(--radius-pills);
-  padding: 2px 8px;
-}
-
-.panel-title {
-  margin: 0;
-  font-size: var(--text-body-sm);
-  font-weight: var(--weight-medium);
-  color: var(--text-primary);
-  line-height: 1.3;
-}
-
-.panel-title[data-out-of-scope="true"] {
-  text-decoration: line-through;
-  color: var(--text-faint);
-}
-
-.panel-field {
-  display: flex;
-  flex-direction: column;
-  gap: 4px;
-}
-
-.panel-field p {
-  margin: 0;
-  font-size: var(--text-caption);
-  color: var(--text-body);
-  line-height: 1.5;
-  white-space: pre-wrap;
-}
-
-.chip-row {
-  display: flex;
-  align-items: center;
-  flex-wrap: wrap;
-  gap: 6px;
-}
-
-.chip-link {
-  cursor: pointer;
-}
-
-.chip-link:hover {
-  color: var(--text-primary);
-  border-color: var(--border-strong);
 }
 
 /* Prose cards -------------------------------------------------------------- */

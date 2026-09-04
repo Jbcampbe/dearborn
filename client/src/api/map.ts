@@ -11,8 +11,8 @@
 // Readiness is computed server-side from the dependency graph on every read
 // (never stored): `frontier` = open with every blocker settled, `blocked_by`
 // = the unsettled blocker ids. Node sessions / resolution / message surfaces
-// are separate endpoints (`/map-nodes/:id/...`) consumed by the node session
-// view (a later client task), not by the graph view.
+// are separate endpoints (`/map-nodes/:id/...`) — the node session view's
+// REST client lives in `src/api/nodes.ts`.
 
 import { apiFetch } from "./client";
 
@@ -100,4 +100,19 @@ export interface Map {
 /** `GET /epics/{id}/map` → the epic's computed map. 404 if the epic is gone. */
 export function getMap(token: string, epicId: string): Promise<Map> {
   return apiFetch<Map>(`/epics/${encodeURIComponent(epicId)}/map`, token);
+}
+
+/**
+ * `GET /epics/{id}/map-nodes/{nodeId}` → one node with its computed readiness.
+ * 404 if the epic or node is unknown, or the node belongs to a different epic.
+ */
+export function getMapNode(
+  token: string,
+  epicId: string,
+  nodeId: string,
+): Promise<MapNodeView> {
+  return apiFetch<MapNodeView>(
+    `/epics/${encodeURIComponent(epicId)}/map-nodes/${encodeURIComponent(nodeId)}`,
+    token,
+  );
 }

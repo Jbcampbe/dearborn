@@ -8,8 +8,8 @@ import AppIcon from "./AppIcon.vue";
 // it stays stable (`Projects / <project name>`) across the routes — this tab
 // bar is what identifies which view of the epic you're on. Each view passes its
 // own key as `tab`; navigation is plain route links, so a manual URL edit lands
-// on the right tab too. (The remaining planning-map views — node sessions,
-// Document — join these tabs with their client tasks.)
+// on the right tab too. (A node's session view opens as a drill-down from the
+// Map — `epic-node` — rather than a tab of its own.)
 const props = defineProps<{ id: string; tab: "map" | "details" | "tasks" | "board" }>();
 
 const TABS = [

@@ -4,6 +4,7 @@ import ProjectsView from "../components/ProjectsView.vue";
 import ProjectDetailView from "../components/ProjectDetailView.vue";
 import EpicDetailView from "../components/EpicDetailView.vue";
 import MapView from "../components/MapView.vue";
+import NodeSessionView from "../components/NodeSessionView.vue";
 import DagEditorView from "../components/DagEditorView.vue";
 import EpicKanbanView from "../components/EpicKanbanView.vue";
 import SettingsView from "../components/SettingsView.vue";
@@ -69,6 +70,16 @@ const routes: RouteRecordRaw[] = [
     path: "/epic/:id/map",
     name: "epic-map",
     component: MapView,
+    props: true,
+  },
+  {
+    // A node's multi-party session view (wayfinder epic): the node-scoped
+    // chat + resolve affordance, opened by clicking a node on the map.
+    // Singular `/epic/:id/nodes/:nodeId` keeps it under the epic client
+    // route; the API owns `/epics/:id/map-nodes/:nodeId`.
+    path: "/epic/:id/nodes/:nodeId",
+    name: "epic-node",
+    component: NodeSessionView,
     props: true,
   },
   {
