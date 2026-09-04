@@ -3,6 +3,7 @@ import { createRouter, createWebHistory, type RouteRecordRaw } from "vue-router"
 import ProjectsView from "../components/ProjectsView.vue";
 import ProjectDetailView from "../components/ProjectDetailView.vue";
 import EpicDetailView from "../components/EpicDetailView.vue";
+import MapView from "../components/MapView.vue";
 import DagEditorView from "../components/DagEditorView.vue";
 import EpicKanbanView from "../components/EpicKanbanView.vue";
 import SettingsView from "../components/SettingsView.vue";
@@ -59,6 +60,16 @@ const routes: RouteRecordRaw[] = [
     path: "/epic/:id",
     name: "epic-details-default",
     redirect: (to) => ({ name: "epic-details", params: { id: to.params.id } }),
+  },
+  {
+    // The planning-map graph view (wayfinder epic): the epic's decision nodes
+    // colored by kind + computed readiness, dependency edges, click-to-open,
+    // live via `map_updated` frames on `epic:<id>`. Singular `/epic/:id/map`
+    // keeps it under the epic client route; the API owns `/epics/:id/map`.
+    path: "/epic/:id/map",
+    name: "epic-map",
+    component: MapView,
+    props: true,
   },
   {
     // Manual epic-details editor: view/edit the epic's title and product /

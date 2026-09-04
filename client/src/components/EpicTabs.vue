@@ -4,15 +4,16 @@ import { RouterLink } from "vue-router";
 import AppIcon from "./AppIcon.vue";
 
 // Linear-style view switcher for the epic detail pages (manual details editor,
-// Ready-lane DAG editor, task kanban). The breadcrumb above it stays stable
-// (`Projects / <project name>`) across the routes — this tab bar is what
-// identifies which view of the epic you're on. Each view passes its own key as
-// `tab`; navigation is plain route links, so a manual URL edit lands on the
-// right tab too. (The planning-map views — map graph, node sessions, Document
-// — join these tabs with their client tasks.)
-const props = defineProps<{ id: string; tab: "details" | "tasks" | "board" }>();
+// planning-map graph, Ready-lane DAG editor, task kanban). The breadcrumb above
+// it stays stable (`Projects / <project name>`) across the routes — this tab
+// bar is what identifies which view of the epic you're on. Each view passes its
+// own key as `tab`; navigation is plain route links, so a manual URL edit lands
+// on the right tab too. (The remaining planning-map views — node sessions,
+// Document — join these tabs with their client tasks.)
+const props = defineProps<{ id: string; tab: "map" | "details" | "tasks" | "board" }>();
 
 const TABS = [
+  { key: "map", label: "Map", icon: "map", route: "epic-map" },
   { key: "details", label: "Details", icon: "pencil", route: "epic-details" },
   { key: "tasks", label: "Tasks", icon: "diagram", route: "epic-dag" },
   { key: "board", label: "Board", icon: "board", route: "epic-board" },
