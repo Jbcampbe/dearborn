@@ -494,6 +494,15 @@ pub async fn post_comment(
         body,
     )
     .await?;
+    crate::activity::record(
+        conn,
+        &id,
+        None,
+        actor.user_id.as_deref(),
+        crate::activity::COMMENT_POSTED,
+        Some(&format!("{anchor_kind} {anchor_id}")),
+    )
+    .await?;
 
     publish_comments(&state, &id).await;
     Ok((StatusCode::CREATED, Json(comment)))
@@ -528,12 +537,22 @@ pub async fn list_comments_handler(
 pub async fn resolve_comment(
     State(state): State<AppState>,
     Path((id, comment_id)): Path<(String, String)>,
+    actor: Actor,
 ) -> AppResult<Json<HashMap<&'static str, Vec<Comment>>>> {
     let conn = state.db.conn();
     if !crate::map::epic_exists(conn, &id).await? {
         return Err(AppError::NotFound(format!("epic {id} not found")));
     }
     let thread = set_thread_resolved(conn, &id, &comment_id, true).await?;
+    crate::activity::record(
+        conn,
+        &id,
+        None,
+        actor.user_id.as_deref(),
+        crate::activity::COMMENT_RESOLVED,
+        thread.first().map(|c| c.thread_id.as_str()),
+    )
+    .await?;
     publish_comments(&state, &id).await;
     Ok(Json(HashMap::from([("items", thread)])))
 }
@@ -586,6 +605,19 @@ pub async fn promote_comment(
     .await?;
 
     publish_comments(&state, &id).await;
+    // The feed records the promotion in two rows: the map's `node_created`
+    // (written by `map::create_node` inside `promote_thread`) plus this
+    // thread-level `thread_promoted` row, linking the conversation to the
+    // node it became.
+    crate::activity::record(
+        conn,
+        &id,
+        Some(&node.id),
+        actor.user_id.as_deref(),
+        crate::activity::THREAD_PROMOTED,
+        Some(&node.title),
+    )
+    .await?;
     crate::map::publish_map(&state, &id).await;
     Ok((StatusCode::CREATED, Json(PromoteOutcome { node, thread })))
 }

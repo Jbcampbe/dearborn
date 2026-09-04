@@ -345,7 +345,7 @@ pub async fn resolve_node(
             None,
         )
         .await?;
-        map::link_nodes(&conn, &node_id, &new_node.id).await?;
+        map::link_nodes(&conn, &node_id, &new_node.id, actor.user_id.as_deref()).await?;
         created.push(new_node);
     }
 
@@ -376,7 +376,7 @@ pub async fn resolve_node(
             actor.user_id.as_deref(),
         )
         .await?;
-        map::append_out_of_scope_prose(&conn, &id, &reason).await?;
+        map::append_out_of_scope_prose(&conn, &id, &reason, actor.user_id.as_deref()).await?;
         ruled_out.push(oos_node);
     }
 
@@ -395,6 +395,7 @@ pub async fn resolve_node(
                 not_yet_specified: Some(fog),
                 ..Default::default()
             },
+            actor.user_id.as_deref(),
         )
         .await?;
     }

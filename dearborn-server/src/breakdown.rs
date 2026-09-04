@@ -314,6 +314,18 @@ pub async fn trigger_breakdown(
         )));
     };
 
+    // The attribution feed row: a human pulled the trigger (wayfinder epic
+    // §4.9 — see [`crate::activity`]).
+    crate::activity::record(
+        &conn,
+        &id,
+        None,
+        Some(_human.0.sub.as_str()),
+        crate::activity::BREAKDOWN_STARTED,
+        None,
+    )
+    .await?;
+
     spawn_breakdown(state.clone(), id, guard);
 
     Ok((

@@ -522,7 +522,28 @@ pub fn spawn_afk_run(
                 )
                 .await;
             match settled {
-                Ok(_) => crate::map::publish_map(&state, &epic_id).await,
+                Ok(affected) => {
+                    // The attribution feed row for the run's only map write
+                    // (wayfinder epic §4.9 — see [`crate::activity`]): an
+                    // unattended agent run, so no human actor. Recorded only
+                    // when the fenced update actually settled the node (the
+                    // same guard the report itself rode on).
+                    if affected > 0 {
+                        if let Err(err) = crate::activity::record(
+                            &conn,
+                            &epic_id,
+                            Some(&node_id),
+                            None,
+                            crate::activity::NODE_RESOLVED,
+                            Some(report),
+                        )
+                        .await
+                        {
+                            tracing::warn!(node = %node_id, error = %err, "afk run: failed to append the activity row")
+                        }
+                    }
+                    crate::map::publish_map(&state, &epic_id).await
+                }
                 Err(err) => {
                     tracing::warn!(node = %node_id, error = %err, "afk run: failed to record the report as gist")
                 }

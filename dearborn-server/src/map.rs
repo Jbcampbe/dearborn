@@ -328,7 +328,11 @@ impl axum::extract::FromRequestParts<AppState> for Actor {
 
 /// Insert a map node, landing it in `state='open'`. Validation of `kind` /
 /// `task_mode` / `title` is the caller's job (the handlers do it with
-/// route-specific error messages); this is the pure write.
+/// route-specific error messages); this is the pure write. Appends the
+/// `node_created` activity row (the attribution feed — see [`crate::activity`])
+/// so every creation surface (REST, the grilling resolution's graduations,
+/// out-of-scope rulings, promotion, the epic seed) lands its feed row in one
+/// place.
 pub async fn create_node(
     conn: &Connection,
     epic_id: &str,
@@ -360,6 +364,16 @@ pub async fn create_node(
             position_y,
             now
         ],
+    )
+    .await?;
+
+    crate::activity::record(
+        conn,
+        epic_id,
+        Some(&id),
+        created_by,
+        crate::activity::NODE_CREATED,
+        Some(title),
     )
     .await?;
 
@@ -415,7 +429,11 @@ pub async fn node_belongs_to_epic(
 ///
 /// This is the minimal state-transition surface the frontier computation
 /// needs; the rich grilling resolution bundle (document edits, fog
-/// graduation, map reshaping) in [`crate::resolve`] builds on it.
+/// graduation, map reshaping) in [`crate::resolve`] builds on it. Every
+/// successful update appends its activity row ([`crate::activity`]): a
+/// settle (`state = "resolved"`) records `node_resolved` with the decision's
+/// gist, an out-of-scope closure records `node_out_of_scope` with its
+/// reason, and any other change records `node_updated`.
 pub async fn update_node(
     conn: &Connection,
     node_id: &str,
@@ -424,6 +442,10 @@ pub async fn update_node(
 ) -> AppResult<MapNode> {
     let mut assignments: Vec<&str> = Vec::new();
     let mut values: Vec<Value> = Vec::new();
+
+    // Kept for the activity feed's action choice below (the move below
+    // consumes `patch.state`).
+    let new_state = patch.state.clone();
 
     if let Some(state) = patch.state {
         if !VALID_STATES.contains(&state.as_str()) {
@@ -493,9 +515,28 @@ pub async fn update_node(
         return Err(AppError::NotFound(format!("map node {node_id} not found")));
     }
 
-    fetch_node(conn, node_id)
+    let node = fetch_node(conn, node_id)
         .await?
-        .ok_or_else(|| AppError::Internal(format!("map node {node_id} vanished after update")))
+        .ok_or_else(|| AppError::Internal(format!("map node {node_id} vanished after update")))?;
+
+    // The attribution feed row for this mutation (the action names the shape
+    // of the change; the detail carries the human-readable payload).
+    let (action, detail): (&str, Option<String>) = match new_state.as_deref() {
+        Some("resolved") => (crate::activity::NODE_RESOLVED, node.gist.clone()),
+        Some("out_of_scope") => (
+            crate::activity::NODE_OUT_OF_SCOPE,
+            node.out_of_scope_reason.clone(),
+        ),
+        Some(state) => (
+            crate::activity::NODE_UPDATED,
+            Some(format!("state \u{2192} {state}")),
+        ),
+        None => (crate::activity::NODE_UPDATED, None),
+    };
+    crate::activity::record(conn, &node.epic_id, Some(node_id), actor_user_id, action, detail.as_deref())
+        .await?;
+
+    Ok(node)
 }
 
 // ---- store: dependency edges ----------------------------------------------
@@ -505,11 +546,14 @@ pub async fn update_node(
 /// same epic; a cycle is rejected with `409` — the check mirrors the task
 /// DAG's ([`crate::tasks::would_create_cycle`]): a cycle appears iff
 /// `blocked_id` can already reach `blocker_id` by following existing edges
-/// forward, so the new edge would close the loop.
+/// forward, so the new edge would close the loop. On success appends the
+/// `dependency_linked` activity row attributed to `actor_user_id` (the
+/// attribution feed — see [`crate::activity`]).
 pub async fn link_nodes(
     conn: &Connection,
     blocker_id: &str,
     blocked_id: &str,
+    actor_user_id: Option<&str>,
 ) -> AppResult<()> {
     if blocker_id == blocked_id {
         return Err(AppError::BadRequest(
@@ -539,6 +583,15 @@ pub async fn link_nodes(
     conn.execute(
         "INSERT OR IGNORE INTO map_node_dependency (blocker_id, blocked_id) VALUES (?1, ?2)",
         params![blocker_id, blocked_id],
+    )
+    .await?;
+    crate::activity::record(
+        conn,
+        &blocker.epic_id,
+        Some(blocked_id),
+        actor_user_id,
+        crate::activity::DEPENDENCY_LINKED,
+        Some(&format!("{blocker_id} → {blocked_id}")),
     )
     .await?;
     Ok(())
@@ -735,20 +788,24 @@ pub(crate) fn compute_completion(
 /// Apply the four wayfinder prose fields to the epic (the `map set-*` CLI
 /// verbs' write path). `destination` must be non-empty when present; the other
 /// three trim, storing an empty string as `NULL`. `updated_at` always bumps.
-/// `404` if the epic does not exist.
+/// On success appends one `map_prose_updated` activity row naming the fields
+/// touched, attributed to `actor_user_id`. `404` if the epic does not exist.
 pub async fn update_prose(
     conn: &Connection,
     epic_id: &str,
     patch: UpdateMapProseBody,
+    actor_user_id: Option<&str>,
 ) -> AppResult<()> {
     let mut assignments: Vec<&str> = Vec::new();
     let mut values: Vec<Value> = Vec::new();
+    let mut touched: Vec<&str> = Vec::new();
 
     if let Some(destination) = patch.destination {
         assignments.push("destination = ?");
         values.push(Value::Text(
             require_non_empty(&destination, "destination")?.to_string(),
         ));
+        touched.push("destination");
     }
 
     let UpdateMapProseBody {
@@ -757,14 +814,15 @@ pub async fn update_prose(
         not_yet_specified,
         out_of_scope,
     } = patch;
-    for (column, field) in [
-        ("notes = ?", notes),
-        ("not_yet_specified = ?", not_yet_specified),
-        ("out_of_scope = ?", out_of_scope),
+    for (column, field, name) in [
+        ("notes = ?", notes, "notes"),
+        ("not_yet_specified = ?", not_yet_specified, "not_yet_specified"),
+        ("out_of_scope = ?", out_of_scope, "out_of_scope"),
     ] {
         if let Some(value) = field {
             assignments.push(column);
             values.push(trimmed_or_null(&value));
+            touched.push(name);
         }
     }
 
@@ -777,17 +835,29 @@ pub async fn update_prose(
     if affected == 0 {
         return Err(AppError::NotFound(format!("epic {epic_id} not found")));
     }
+    crate::activity::record(
+        conn,
+        epic_id,
+        None,
+        actor_user_id,
+        crate::activity::MAP_PROSE_UPDATED,
+        Some(&touched.join(", ")),
+    )
+    .await?;
     Ok(())
 }
 
 /// Append one line to the epic's out-of-scope prose (the wayfinder §6 "rule
 /// things out of scope: create+close an out_of_scope node + prose line"
 /// write path). The line is appended on its own line after any existing prose
-/// (or becomes the first line); blank input is rejected. `404` unknown epic.
+/// (or becomes the first line); blank input is rejected. Attributed to
+/// `actor_user_id` (the `map_prose_updated` activity row names the
+/// `out_of_scope` field). `404` unknown epic.
 pub async fn append_out_of_scope_prose(
     conn: &Connection,
     epic_id: &str,
     line: &str,
+    actor_user_id: Option<&str>,
 ) -> AppResult<()> {
     let line = line.trim();
     if line.is_empty() {
@@ -813,6 +883,7 @@ pub async fn append_out_of_scope_prose(
             out_of_scope: Some(combined),
             ..Default::default()
         },
+        actor_user_id,
     )
     .await
 }
@@ -880,11 +951,11 @@ pub async fn create_map_node(
     // node blocks each listed id.
     for blocker_id in &req.blocked_by {
         link_epic_guard(conn, &id, blocker_id).await?;
-        link_nodes(conn, blocker_id, &node.id).await?;
+        link_nodes(conn, blocker_id, &node.id, actor.user_id.as_deref()).await?;
     }
     for blocked_id in &req.blocks {
         link_epic_guard(conn, &id, blocked_id).await?;
-        link_nodes(conn, &node.id, blocked_id).await?;
+        link_nodes(conn, &node.id, blocked_id, actor.user_id.as_deref()).await?;
     }
 
     publish_map(&state, &id).await;
@@ -951,6 +1022,7 @@ pub async fn patch_map_node(
 pub async fn link_map_nodes(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    actor: Actor,
     Json(req): Json<LinkMapNodesBody>,
 ) -> AppResult<(StatusCode, Json<MapEdge>)> {
     let conn = state.db.conn();
@@ -975,7 +1047,7 @@ pub async fn link_map_nodes(
         link_epic_guard(conn, &id, nid).await?;
     }
 
-    link_nodes(conn, blocker_id, blocked_id).await?; // 400 self/cross, 409 cycle
+    link_nodes(conn, blocker_id, blocked_id, actor.user_id.as_deref()).await?; // 400 self/cross, 409 cycle
     publish_map(&state, &id).await;
     Ok((
         StatusCode::CREATED,
@@ -994,10 +1066,11 @@ pub async fn link_map_nodes(
 pub async fn patch_map_prose(
     State(state): State<AppState>,
     Path(id): Path<String>,
+    actor: Actor,
     Json(req): Json<UpdateMapProseBody>,
 ) -> AppResult<Json<Map>> {
     let conn = state.db.conn();
-    update_prose(conn, &id, req).await?;
+    update_prose(conn, &id, req, actor.user_id.as_deref()).await?;
     let map = compute_map(conn, &id).await?;
     publish_map(&state, &id).await;
     Ok(Json(map))

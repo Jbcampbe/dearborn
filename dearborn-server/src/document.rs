@@ -572,6 +572,18 @@ pub async fn sync_under_semaphore(
         node_id,
     )
     .await?;
+    // The attribution feed row (the `document_synced` history entry this
+    // version lands — see [`crate::activity`]); node provenance covers the
+    // agent-written edits (the row's `node_id`), humans their user id.
+    crate::activity::record(
+        &conn,
+        epic_id,
+        node_id,
+        editor_user_id,
+        crate::activity::DOCUMENT_SYNCED,
+        Some(&format!("version {new_version}")),
+    )
+    .await?;
     drop(_guard);
 
     let view = DocumentView {

@@ -7,6 +7,7 @@
 pub mod afk_engine;
 pub mod agent_settings;
 pub mod agent_slot;
+pub mod activity;
 pub mod auth;
 pub mod board;
 pub mod breakdown;
@@ -695,6 +696,13 @@ pub fn app(state: AppState) -> Router {
             "/epics/:id/comments/:commentId/promote",
             axum::routing::post(comments::promote_comment),
         )
+        // Attribution & activity feed (wayfinder epic §4.9/§9): the
+        // append-only history of key mutations (every mutation surface
+        // records into it) and the participants derived as distinct actors
+        // across all attribution surfaces. Reads, so they are on the
+        // capability-token allow-list for every phase.
+        .route("/epics/:id/activity", get(activity::get_activity))
+        .route("/epics/:id/participants", get(activity::get_participants))
         .route(
             "/epics/:id/map-node-dependencies",
             axum::routing::post(map::link_map_nodes),

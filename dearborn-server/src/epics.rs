@@ -202,13 +202,25 @@ pub async fn create_epic(
         params![
             id.clone(),
             project_id,
-            title,
+            title.clone(),
             description,
             destination,
             notes,
             base_branch,
             now
         ],
+    )
+    .await?;
+
+    // The attribution feed's first row (see [`crate::activity`]); the seed's
+    // `node_created` row follows it below.
+    crate::activity::record(
+        conn,
+        &id,
+        None,
+        actor.user_id.as_deref(),
+        crate::activity::EPIC_CREATED,
+        Some(&title),
     )
     .await?;
 

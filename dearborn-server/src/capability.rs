@@ -236,6 +236,11 @@ pub fn authorize_cap_request(
         ("POST", ["epics", e, "comments"]) => *e == epic,
         ("POST", ["epics", e, "comments", _, "resolve"]) => *e == epic,
         ("POST", ["epics", e, "comments", _, "promote"]) => *e == epic && reshape,
+        // The attribution feed (wayfinder epic §4.9 — see `crate::activity`):
+        // the append-only mutation history and the participants derived as
+        // distinct actors. Reads, open to every phase.
+        ("GET", ["epics", e, "activity"]) => *e == epic,
+        ("GET", ["epics", e, "participants"]) => *e == epic,
         _ => false,
     }
 }
