@@ -679,8 +679,10 @@ pub fn app(state: AppState) -> Router {
         // Comments (wayfinder epic §4.8/§9): threaded, anchored to a map node
         // or a Document section, user-attributed with agent replies (an agent
         // run posts through its capability token, `is_agent = 1`), thread-
-        // level resolve. The `dearborn` CLI's `comment post|list|resolve`
-        // verbs call exactly these (capability-token scoped).
+        // level resolve, and thread promotion into a new open frontier node
+        // (stamping `promoted_node_id` on the source thread). The `dearborn`
+        // CLI's `comment post|list|resolve|promote` verbs call exactly these
+        // (capability-token scoped).
         .route(
             "/epics/:id/comments",
             get(comments::list_comments_handler).post(comments::post_comment),
@@ -688,6 +690,10 @@ pub fn app(state: AppState) -> Router {
         .route(
             "/epics/:id/comments/:commentId/resolve",
             axum::routing::post(comments::resolve_comment),
+        )
+        .route(
+            "/epics/:id/comments/:commentId/promote",
+            axum::routing::post(comments::promote_comment),
         )
         .route(
             "/epics/:id/map-node-dependencies",

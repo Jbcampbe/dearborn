@@ -53,6 +53,12 @@
 //! - `comment list [--anchor-kind node|section --anchor-id ANCHOR_ID]` — the
 //!   epic's comments (optionally narrowed to one anchor)
 //! - `comment resolve COMMENT` — resolve a comment's whole thread
+//! - `comment promote COMMENT --kind grilling|research|prototype
+//!   [--title "..."] [--question "..."]` — promote the comment's whole
+//!   thread into a new open frontier node of the chosen kind (wayfinder epic
+//!   §9 promote-to-node), stamping `promoted_node_id` on the source thread;
+//!   an absent `--title` is derived from the thread's head comment. HITL
+//!   phases only (it creates a map node)
 //! - `scope` — print the token's own capability scope (`GET /auth/capability`)
 //!
 //! Output contract (assumed by the prompt text and the breakdown
@@ -518,6 +524,34 @@ impl CliClient {
         )
         .await
     }
+
+    /// `comment promote COMMENT --kind KIND [--title "..."] [--question
+    /// "..."]` — `POST /epics/{scoped epic}/comments/{comment}/promote`,
+    /// promoting the comment's whole thread into a new open frontier node of
+    /// `kind` (grilling|research|prototype) carrying the optional extra
+    /// context, stamping `promoted_node_id` on the thread. Returns
+    /// `{ node, thread }` — the node is on the map's frontier; the thread's
+    /// comments now name it. A HITL-phase token only (it reshapes the map).
+    pub async fn comment_promote(
+        &self,
+        comment_id: &str,
+        kind: &str,
+        title: Option<&str>,
+        question: Option<&str>,
+    ) -> Result<Value, CliError> {
+        let epic_id = self.epic_id().await?;
+        let body = json!({
+            "kind": kind,
+            "title": title,
+            "question": question,
+        });
+        self.request(
+            reqwest::Method::POST,
+            &format!("/epics/{epic_id}/comments/{comment_id}/promote"),
+            Some(body),
+        )
+        .await
+    }
 }
 
 // ---- tests ----------------------------------------------------------------
@@ -760,6 +794,107 @@ mod tests {
         assert_eq!(err.status, Some(400));
         assert!(err.message.contains("not part of epic"));
         assert!(rendered(&err).starts_with(ERROR_PREFIX));
+    }
+
+    /// `comment promote` round trips: the thread becomes a fresh open
+    /// frontier node of the chosen kind (with the carried context), the
+    /// thread is stamped with `promoted_node_id`, and the node shows on the
+    /// map. A HITL (grilling/prototype) phase token may promote — it reshapes
+    /// the map — while an AFK (research) phase token is 403'd before any
+    /// handler runs.
+    #[tokio::test]
+    async fn comment_promote_creates_a_frontier_node_and_is_hitl_only() {
+        let (state, client) = boot().await;
+        let (project_id, epic_id) = seed_epic(&state).await;
+        let node = crate::map::create_node(
+            state.db.conn(),
+            &epic_id,
+            "grilling",
+            None,
+            "Which store?",
+            Some("Pick the blob store"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap();
+        let (cli, _guard) = scoped(&state, &client, &project_id, &epic_id, "grilling");
+
+        // The thread to promote: one head comment from the agent's session.
+        let head = cli
+            .comment_post(Some("node"), Some(&node.id), "Which store are we picking?", None)
+            .await
+            .unwrap();
+        let head_id = head["id"].as_str().unwrap().to_string();
+
+        // Promote with explicit title + question.
+        let outcome = cli
+            .comment_promote(&head_id, "research", Some("Survey blob stores"), Some("Which fits evidence?"))
+            .await
+            .unwrap();
+        let promoted = outcome["node"].clone();
+        assert_eq!(promoted["kind"], "research");
+        assert_eq!(promoted["state"], "open");
+        assert_eq!(promoted["title"], "Survey blob stores");
+        assert_eq!(promoted["question"], "Which fits evidence?");
+        assert_eq!(promoted["created_by"], Value::Null);
+        let promoted_id = promoted["id"].as_str().unwrap().to_string();
+
+        // The thread is stamped.
+        let thread = outcome["thread"].as_array().unwrap();
+        assert_eq!(thread.len(), 1);
+        assert_eq!(thread[0]["promoted_node_id"], promoted_id.as_str());
+
+        // The node is on the map's frontier.
+        let map = cli.map().await.unwrap();
+        let view = map["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["id"] == promoted_id.as_str())
+            .unwrap();
+        assert_eq!(view["frontier"], json!(true));
+
+        // Promoting again is a 409; task kind is a 400 (the handler checks
+        // the kind vocabulary before the thread's promotion state).
+        let err = cli
+            .comment_promote(&head_id, "grilling", None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, Some(409));
+        assert!(err.message.contains("already been promoted"));
+        let err = cli
+            .comment_promote(&head_id, "task", None, None)
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, Some(400));
+
+        // An AFK phase token (a leaked research run) cannot promote: it
+        // creates a node, a map reshaping act (§6).
+        let other_head = cli
+            .comment_post(Some("node"), Some(&node.id), "Another thread?", None)
+            .await
+            .unwrap();
+        let (afk, _afk_guard) = scoped(&state, &client, &project_id, &epic_id, "research");
+        let err = afk
+            .comment_promote(
+                other_head["id"].as_str().unwrap(),
+                "research",
+                None,
+                None,
+            )
+            .await
+            .unwrap_err();
+        assert_eq!(err.status, Some(403));
+
+        // Nothing was promoted by the AFK attempt.
+        let comments = cli.comment_list(None, None).await.unwrap();
+        for item in comments["items"].as_array().unwrap() {
+            if item["thread_id"] == other_head["thread_id"] {
+                assert_eq!(item["promoted_node_id"], Value::Null);
+            }
+        }
     }
 
     #[tokio::test]

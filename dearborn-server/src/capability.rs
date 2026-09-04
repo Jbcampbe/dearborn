@@ -227,13 +227,15 @@ pub fn authorize_cap_request(
         // resolution edit, so it is HITL-only too.
         ("GET", ["epics", e, "document"]) => *e == epic,
         ("POST", ["epics", e, "document", "sync"]) => *e == epic && reshape,
-        // Comments (`dearborn comment post|list|resolve` — see
+        // Comments (`dearborn comment post|list|resolve|promote` — see
         // `crate::comments`): threaded, node/section-anchored conversation.
         // Posting (the agent's replies included), reading, and resolving are
-        // open to every phase — comments never reshape the map.
+        // open to every phase. PROMOTING a thread creates a map node — a map
+        // reshaping act — so it is HITL-only like every other map mutation.
         ("GET", ["epics", e, "comments"]) => *e == epic,
         ("POST", ["epics", e, "comments"]) => *e == epic,
         ("POST", ["epics", e, "comments", _, "resolve"]) => *e == epic,
+        ("POST", ["epics", e, "comments", _, "promote"]) => *e == epic && reshape,
         _ => false,
     }
 }

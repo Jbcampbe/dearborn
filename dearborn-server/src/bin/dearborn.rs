@@ -42,6 +42,11 @@
 //!   inherited; attribution comes from the token)
 //! - `comment list [--anchor-kind node|section --anchor-id ANCHOR_ID]`
 //! - `comment resolve COMMENT` — resolve a comment's whole thread
+//! - `comment promote COMMENT --kind grilling|research|prototype
+//!   [--title "..."] [--question "..."]` — promote the comment's whole
+//!   thread into a new open frontier node of the chosen kind (wayfinder epic
+//!   §9), stamping `promoted_node_id` on the source thread; an absent
+//!   `--title` is derived from the thread's head comment. HITL phases only.
 //! - `scope`
 //!
 //! Every verb prints the API's JSON to stdout on success (exit 0). Any failure
@@ -94,7 +99,7 @@ fn run(args: Vec<String>) -> Result<(), i32> {
 
     let verb = match args.first() {
         Some(verb) => verb.as_str(),
-        None => return usage("expected a verb: task create | task link | dag | node create | node link | node resolve | map | map set-* | document pull | document sync | comment post | comment list | comment resolve | scope"),
+        None => return usage("expected a verb: task create | task link | dag | node create | node link | node resolve | map | map set-* | document pull | document sync | comment post | comment list | comment resolve | comment promote | scope"),
     };
     args = &args[1..];
 
@@ -253,7 +258,7 @@ fn run(args: Vec<String>) -> Result<(), i32> {
         "comment" => {
             let sub = match args.first() {
                 Some(sub) => sub.as_str(),
-                None => return usage("expected a `comment` sub-verb (post | list | resolve)"),
+                None => return usage("expected a `comment` sub-verb (post | list | resolve | promote)"),
             };
             args = &args[1..];
             match sub {
@@ -296,13 +301,24 @@ fn run(args: Vec<String>) -> Result<(), i32> {
                         Ok(())
                     })
                 }
+                "promote" => {
+                    let (comment_id, kind, title, question) = comment_promote_flags(args)?;
+                    let client = client(&base_url, &token)?;
+                    block_on(async move {
+                        let outcome = client
+                            .comment_promote(&comment_id, &kind, title.as_deref(), question.as_deref())
+                            .await?;
+                        println!("{}", serde_json::to_string(&outcome).expect("promote result is JSON"));
+                        Ok(())
+                    })
+                }
                 other => usage(&format!(
-                    "unknown comment verb `{other}` (expected: post | list | resolve)"
+                    "unknown comment verb `{other}` (expected: post | list | resolve | promote)"
                 )),
             }
         }
         other => usage(&format!(
-            "unknown verb `{other}` (expected: task create | task link | dag | node create | node link | node resolve | map | map set-* | document pull | document sync | comment post | comment list | comment resolve | scope)"
+            "unknown verb `{other}` (expected: task create | task link | dag | node create | node link | node resolve | map | map set-* | document pull | document sync | comment post | comment list | comment resolve | comment promote | scope)"
         )),
     }
 }
@@ -451,6 +467,70 @@ fn comment_post_flags(args: &[String]) -> Result<CommentPostFlags, i32> {
             "expected `comment post --anchor node|section --id ANCHOR_ID --body \"TEXT\"` or `comment post --thread THREAD_ID --body \"TEXT\"`",
         ),
     }
+}
+
+/// The parsed `comment promote` flag set:
+/// `(comment_id, kind, title, question)`.
+type CommentPromoteFlags = (String, String, Option<String>, Option<String>);
+
+/// `comment promote` flags: the positional COMMENT id, the required `--kind`
+/// (grilling|research|prototype — never task), and the optional extra context
+/// the new node carries: `--title` (derived from the thread's head comment
+/// when absent) and `--question`.
+fn comment_promote_flags(args: &[String]) -> Result<CommentPromoteFlags, i32> {
+    let mut positional: Option<String> = None;
+    let mut kind: Option<String> = None;
+    let mut title: Option<String> = None;
+    let mut question: Option<String> = None;
+
+    let mut i = 0;
+    while i < args.len() {
+        let (name, inline) = match args[i].split_once('=') {
+            Some((name, value)) => (name, Some(value.to_string())),
+            None => (args[i].as_str(), None),
+        };
+        let take = || -> Result<String, i32> {
+            if let Some(value) = inline.clone() {
+                return Ok(value);
+            }
+            if i + 1 >= args.len() {
+                return usage(&format!("{name} requires a value"));
+            }
+            Ok(args[i + 1].clone())
+        };
+        match name {
+            "--kind" => kind = Some(take()?),
+            "--title" => title = Some(take()?),
+            "--question" => question = Some(take()?),
+            other if other.starts_with("--") => {
+                return usage(&format!(
+                    "unknown comment promote flag `{other}` (expected: --kind, --title, --question)"
+                ))
+            }
+            _ => {
+                if positional.is_some() {
+                    return usage(
+                        "expected `comment promote COMMENT [flags]` (one positional comment id)",
+                    );
+                }
+                positional = Some(args[i].clone());
+            }
+        }
+        // Advance: an inline `--flag=value` or a positional consumes only
+        // itself; a separate-value flag consumed the NEXT token too. (A
+        // positional must not skip the following flag.)
+        i += if inline.is_some() || !name.starts_with("--") { 1 } else { 2 };
+    }
+
+    let comment_id = match positional {
+        Some(comment_id) if !comment_id.trim().is_empty() => comment_id,
+        _ => return usage("expected `comment promote COMMENT --kind KIND [--title \"...\"] [--question \"...\"]`"),
+    };
+    let kind = match kind {
+        Some(kind) if !kind.trim().is_empty() => kind,
+        _ => return usage("--kind is required (grilling | research | prototype)"),
+    };
+    Ok((comment_id, kind, title, question))
 }
 
 /// The parsed `comment list` flag set: `(anchor_kind, anchor_id)` — both or
@@ -887,6 +967,7 @@ usage: dearborn --url <base> --token <cap> <verb>
   comment post --thread THREAD_ID --body \"TEXT\"
   comment list [--anchor-kind node|section --anchor-id ANCHOR_ID]
   comment resolve COMMENT
+  comment promote COMMENT --kind grilling|research|prototype [--title \"...\"] [--question \"...\"]
   scope"
     );
     Err(2)
@@ -1084,6 +1165,50 @@ mod tests {
             .map(|s| s.to_string())
             .collect();
         assert_eq!(comment_list_flags(&args).unwrap_err(), 2);
+    }
+
+    #[test]
+    fn comment_promote_flags_take_a_positional_id_and_the_required_kind() {
+        // The full shape: positional COMMENT id + --kind + optional context.
+        let (comment_id, kind, title, question) = comment_promote_flags(
+            &[
+                "01COMMENT", "--kind", "research", "--title", "Survey stores",
+                "--question", "Which fits evidence?",
+            ]
+            .iter()
+            .map(|s| s.to_string())
+            .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(comment_id, "01COMMENT");
+        assert_eq!(kind, "research");
+        assert_eq!(title.as_deref(), Some("Survey stores"));
+        assert_eq!(question.as_deref(), Some("Which fits evidence?"));
+
+        // `--flag=value` inline form and flags before the positional.
+        let (comment_id, kind, title, question) = comment_promote_flags(
+            &["--kind=grilling", "01C"]
+                .iter()
+                .map(|s| s.to_string())
+                .collect::<Vec<_>>(),
+        )
+        .unwrap();
+        assert_eq!(comment_id, "01C");
+        assert_eq!(kind, "grilling");
+        assert_eq!(title, None);
+        assert_eq!(question, None);
+
+        // Usage errors: no positional id, a missing --kind, an unknown flag,
+        // two positionals.
+        for args in [
+            vec!["--kind", "grilling"],
+            vec!["01C"],
+            vec!["01C", "--kind", "task", "--wat"],
+            vec!["01C", "01D", "--kind", "grilling"],
+        ] {
+            let args: Vec<String> = args.into_iter().map(String::from).collect();
+            assert_eq!(comment_promote_flags(&args).unwrap_err(), 2);
+        }
     }
 
     #[test]
