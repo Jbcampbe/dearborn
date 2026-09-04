@@ -284,11 +284,33 @@ export interface PipelineState {
    * running stage ends so one stage's tools never bleed into the next.
    */
   liveTools: ToolCall[];
+  /**
+   * Accumulated `thinking` deltas for the currently-running stage — the
+   * model's reasoning stream (Claude's `thinking_delta`, pi's `thinking_delta`;
+   * see `harness_pi.rs`). Kept OUT of `liveLog`: thinking is not part of the
+   * assembled reply and lives in its own `agent_run.thinking` column
+   * server-side, not `agent_run.log`. It IS persisted, though (the server's
+   * D14 flush writes it while streaming and a post-close write finalizes it),
+   * so — exactly like `liveLog` — it reconciles against a REST snapshot at the
+   * hydration boundary (`reconcileLiveThinking`) to recover reasoning that
+   * streamed before this client subscribed. A completed stage's thinking is
+   * fetched with its `GET /runs/{id}` detail instead, not held here. Reset to
+   * `""` when the running row goes terminal (see `applyStageChanged`), same as
+   * `liveLog`.
+   */
+  liveThinking: string;
 }
 
 /** A fresh, empty view model. */
 export function initialPipelineState(): PipelineState {
-  return { taskId: null, runs: [], liveLog: "", liveLogReconciled: false, liveTools: [] };
+  return {
+    taskId: null,
+    runs: [],
+    liveLog: "",
+    liveLogReconciled: false,
+    liveTools: [],
+    liveThinking: "",
+  };
 }
 
 /**
@@ -331,6 +353,7 @@ export function resetLiveTail(state: PipelineState): PipelineState {
   state.liveLog = "";
   state.liveLogReconciled = false;
   state.liveTools = [];
+  state.liveThinking = "";
   return state;
 }
 
@@ -382,6 +405,20 @@ export function reconcileLiveLog(state: PipelineState, restLog: string): Pipelin
   return state;
 }
 
+/**
+ * The `liveThinking` counterpart of `reconcileLiveLog`: merge the running
+ * row's REST-fetched `thinking` snapshot (a prefix of its true reasoning as of
+ * the last D14 flush) with whatever thinking the client already buffered live,
+ * using the same overlap rule (`mergeHydratedLog`). Called once, alongside
+ * `reconcileLiveLog`, when the running row's `GET /runs/{id}` resolves — the
+ * two streams flush together server-side and share the subscribe-before-hydrate
+ * ordering, so the same "no gap or duplication" argument applies verbatim.
+ */
+export function reconcileLiveThinking(state: PipelineState, restThinking: string): PipelineState {
+  state.liveThinking = mergeHydratedLog(restThinking, state.liveThinking);
+  return state;
+}
+
 // ---- WS reducer (T-563) -----------------------------------------------------
 
 /** A WS frame as delivered on `task:<id>` (same envelope as every other stream). */
@@ -416,21 +453,29 @@ interface StageChangedPayload {
  * - `error`: append `\n[error] {message}\n`, matching
  *   `AgentStageOutcome::absorb` exactly so `mergeHydratedLog` can find a true
  *   overlap against the eventual REST log.
+ * - `thinking`: append the delta to `liveThinking` — the running stage's live
+ *   reasoning stream, kept separate from `liveLog` (it is not part of
+ *   `agent_run.log`; see `PipelineState.liveThinking`).
  * - `stage_changed`: advance the timeline (see `applyStageChanged`).
  * - `tool_start`/`tool_end`: open/close a pill in `liveTools` for the
  *   currently-running stage (see `ToolCall`).
- * - everything else (`thinking`, `started`,
+ * - everything else (`started`,
  *   `session`, `exited`, `usage`, `activity`, `suggested_edits`,
  *   `ask_question`, acks, future kinds): ignored. None of these are part of
  *   `agent_run.log` server-side (only `Text`/`Error` are folded into it — see
  *   `absorb`) or carry enough to update the timeline, matching
- *   `planning/stream.ts`'s/`dag/stream.ts`'s own `default` branches.
+ *   `dag/stream.ts`'s own `default` branches.
  */
 export function applyPipelineFrame(state: PipelineState, frame: PipelineFrame): PipelineState {
   switch (frame.type) {
     case "text": {
       const p = frame.payload as DeltaPayload;
       state.liveLog += p?.delta ?? "";
+      break;
+    }
+    case "thinking": {
+      const p = frame.payload as DeltaPayload;
+      state.liveThinking += p?.delta ?? "";
       break;
     }
     case "error": {
@@ -515,8 +560,9 @@ function applyStageChanged(state: PipelineState, p: StageChangedPayload): void {
   if (wasRunning) {
     state.liveLog = "";
     state.liveLogReconciled = false;
-    // Tools belong to the stage that just ended; don't let them persist into
-    // whatever runs next.
+    // Tools and reasoning belong to the stage that just ended; don't let them
+    // persist into whatever runs next.
     state.liveTools = [];
+    state.liveThinking = "";
   }
 }

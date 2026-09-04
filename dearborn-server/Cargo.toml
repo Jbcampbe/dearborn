@@ -8,6 +8,14 @@ license.workspace = true
 name = "dearborn-server"
 path = "src/main.rs"
 
+# The agent-facing CLI (T-301): a thin authenticated REST client the breakdown
+# agent shells out to. A separate binary so `cargo build` can put it on PATH
+# beside `dearborn-server` (e.g. symlinked into the agent's PATH). See
+# `src/cli.rs` for the client and `src/bin/dearborn.rs` for argv wiring.
+[[bin]]
+name = "dearborn"
+path = "src/bin/dearborn.rs"
+
 [lib]
 name = "dearborn_server"
 path = "src/lib.rs"

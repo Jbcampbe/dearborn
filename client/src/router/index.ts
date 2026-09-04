@@ -2,8 +2,10 @@ import { createRouter, createWebHistory, type RouteRecordRaw } from "vue-router"
 
 import ProjectsView from "../components/ProjectsView.vue";
 import ProjectDetailView from "../components/ProjectDetailView.vue";
-import PlanningView from "../components/PlanningView.vue";
 import EpicDetailView from "../components/EpicDetailView.vue";
+import MapView from "../components/MapView.vue";
+import DocumentView from "../components/DocumentView.vue";
+import NodeSessionView from "../components/NodeSessionView.vue";
 import DagEditorView from "../components/DagEditorView.vue";
 import EpicKanbanView from "../components/EpicKanbanView.vue";
 import SettingsView from "../components/SettingsView.vue";
@@ -52,12 +54,45 @@ const routes: RouteRecordRaw[] = [
     props: true,
   },
   {
-    // Singular `/epic/:id` for the same reason as `/project/:id`: the API owns
-    // `/epics` (and the Vite dev proxy forwards it), so the singular path avoids
-    // shadowing the REST namespace on a hard reload / deep link.
+    // `/epic/:id` is the epic's landing spot — the living-Document view — and
+    // merely redirects to the same-named route below. The API owns
+    // `/epics/:id` (GET/PATCH), so the singular path avoids shadowing the
+    // REST namespace on a hard reload / deep link (same pattern as
+    // `/project/:id`).
     path: "/epic/:id",
-    name: "epic-planning",
-    component: PlanningView,
+    name: "epic-details-default",
+    redirect: (to) => ({ name: "epic-document", params: { id: to.params.id } }),
+  },
+  {
+    // The living-Document view (wayfinder epic §4.5/§10): the epic's
+    // settled-decisions HTML rendered inline, with a TOC + per-section
+    // provenance chips built from the server's section index, section-anchored
+    // comments, and live updates via `document_updated` frames on `epic:<id>`.
+    // Singular `/epic/:id/document` keeps it under the epic client route; the
+    // API owns `/epics/:id/document`.
+    path: "/epic/:id/document",
+    name: "epic-document",
+    component: DocumentView,
+    props: true,
+  },
+  {
+    // The planning-map graph view (wayfinder epic): the epic's decision nodes
+    // colored by kind + computed readiness, dependency edges, click-to-open,
+    // live via `map_updated` frames on `epic:<id>`. Singular `/epic/:id/map`
+    // keeps it under the epic client route; the API owns `/epics/:id/map`.
+    path: "/epic/:id/map",
+    name: "epic-map",
+    component: MapView,
+    props: true,
+  },
+  {
+    // A node's multi-party session view (wayfinder epic): the node-scoped
+    // chat + resolve affordance, opened by clicking a node on the map.
+    // Singular `/epic/:id/nodes/:nodeId` keeps it under the epic client
+    // route; the API owns `/epics/:id/map-nodes/:nodeId`.
+    path: "/epic/:id/nodes/:nodeId",
+    name: "epic-node",
+    component: NodeSessionView,
     props: true,
   },
   {

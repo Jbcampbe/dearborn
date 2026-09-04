@@ -1488,12 +1488,12 @@ use libsql::{params, Connection};
 use tokio::task::JoinHandle;
 
 use crate::board;
+use crate::capability;
 use crate::cmd::{self, StageCommand, StageOutcome};
 use crate::epics::{fetch_epic, get_epic_project_id};
 use crate::evidence::{self, CloseStage, OpenStage, StageHandle};
 use crate::git;
 use crate::git_host::{OpenPrRequest, PushRequest};
-use crate::mcp;
 use crate::pr;
 use crate::spec::{self, EpicContext, SiblingTask, SpecFields, TaskContext};
 use crate::task_agent::{self, AgentStageParams, Stage, TaskRunRequest};
@@ -2508,7 +2508,7 @@ async fn run_epic_pipeline_inner(state: AppState, epic_id: String, lease: LeaseH
                 // "Completed only after a real PR opens" section. A lost
                 // lease between the DAG check above and here must still be
                 // re-checked — finalize does its own writes.
-                mcp::publish_dag(&state, &epic_id).await;
+                capability::publish_dag(&state, &epic_id).await;
                 if !lease.is_lost() {
                     finalize_epic(&state, &epic_id, &epic, &dag, &workspace, &lease).await;
                 }
@@ -2554,8 +2554,6 @@ async fn run_epic_pipeline_inner(state: AppState, epic_id: String, lease: LeaseH
         let epic_ctx = EpicContext {
             title: &epic.title,
             description: epic.description.as_deref(),
-            product_context: epic.product_context.as_deref(),
-            technical_context: epic.technical_context.as_deref(),
         };
 
         match process_one_task(
@@ -2782,7 +2780,7 @@ async fn process_one_task(
         )
         .await;
     if let Some(epic_id) = epic_id {
-        mcp::publish_dag(state, epic_id).await;
+        capability::publish_dag(state, epic_id).await;
     }
     // A standalone task's own status is what the project board shows
     // directly (there is no epic lane it moves instead) — this
@@ -3211,7 +3209,7 @@ async fn process_one_task(
         )
         .await;
     match epic_id {
-        Some(epic_id) => mcp::publish_dag(state, epic_id).await,
+        Some(epic_id) => capability::publish_dag(state, epic_id).await,
         // T-551: a standalone task reaching `Done` *is* the board-visible
         // change (there is no epic lane it moves separately) — publish
         // `board_updated` directly rather than relying on
@@ -4789,7 +4787,7 @@ async fn fail_item(state: &AppState, ctx: FailureContext<'_>) {
         return;
     };
 
-    mcp::publish_dag(state, epic_id).await;
+    capability::publish_dag(state, epic_id).await;
 
     let took_epic = conn
         .execute(
@@ -5208,7 +5206,7 @@ async fn handle_cancelled_task(state: &AppState, epic_id: Option<&str>, task_id:
         )
         .await;
     match epic_id {
-        Some(epic_id) => mcp::publish_dag(state, epic_id).await,
+        Some(epic_id) => capability::publish_dag(state, epic_id).await,
         None => {
             if let Ok(Some(task)) = crate::tasks::fetch_task(conn, task_id).await {
                 board::publish_board(state, &task.project_id).await;
@@ -8825,8 +8823,8 @@ mod tests {
 
     /// The D8 prompt actually carries the epic's background and the sibling
     /// manifest, not a bare spec: A's prompt lists B under "Owned by later
-    /// tasks" (with the epic's description/product/technical context all
-    /// present); once A is Done, B's prompt lists A under "Already built".
+    /// tasks" (with the epic's description present); once A is Done, B's
+    /// prompt lists A under "Already built".
     #[tokio::test]
     async fn implement_prompt_includes_epic_context_and_sibling_manifest() {
         let agent = Arc::new(ScriptedTaskAgent::new());
@@ -8840,14 +8838,8 @@ mod tests {
             .db
             .conn()
             .execute(
-                "UPDATE epic SET description = ?1, product_context = ?2, technical_context = ?3 \
-                 WHERE id = ?4",
-                params![
-                    "Let users manage their profile.",
-                    "Users abandon onboarding at the profile step.",
-                    "REST endpoints backed by the existing user table.",
-                    epic_id.clone(),
-                ],
+                "UPDATE epic SET description = ?1 WHERE id = ?2",
+                params!["Let users manage their profile.", epic_id.clone()],
             )
             .await
             .unwrap();
@@ -8873,12 +8865,6 @@ mod tests {
         // A's prompt: epic context present; B listed as owned by a later task.
         assert!(runs[0].prompt.contains("Epic Context"));
         assert!(runs[0].prompt.contains("Let users manage their profile."));
-        assert!(runs[0]
-            .prompt
-            .contains("Users abandon onboarding at the profile step."));
-        assert!(runs[0]
-            .prompt
-            .contains("REST endpoints backed by the existing user table."));
         assert!(runs[0].prompt.contains("Owned by later tasks"));
         assert!(runs[0].prompt.contains("Wire the profile API"));
 

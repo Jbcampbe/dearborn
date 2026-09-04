@@ -24,14 +24,18 @@
 //! {"type":"message_end","message":{…,"usage":{…},"stopReason":"stop"}}
 //! ```
 //!
-//! ## What pi cannot do
+//! ## What pi cannot do (historical note)
 //!
 //! pi has **no MCP client** (checked against the installed 0.84.2 bundle: no
-//! `--mcp-config`, nothing MCP-shaped in `dist/`). Dearborn's planning and
-//! breakdown slots call *back* into the server over MCP ([`crate::mcp`]), so
-//! those three slots are Claude-only — enforced by
-//! [`crate::agent_settings::harness_supports_slot`], not by this module. The
-//! five task-stage slots use no MCP and run on pi unchanged.
+//! `--mcp-config`, nothing MCP-shaped in `dist/`). That is why Dearborn's
+//! planning and breakdown slots — which used to call back into the server
+//! over a now-retired in-process MCP server — were Claude-only for a while.
+//!
+//! Agents now reach Dearborn through the `dearborn` CLI ([`crate::cli`]) —
+//! any harness able to run a shell command can call it — but the *slot*
+//! restriction stands: breakdown runs are still driven by the Claude Code
+//! adapter, and [`crate::agent_settings::harness_supports_slot`] (not this
+//! module) is what refuses a non-Claude harness for a Claude-only slot.
 //!
 //! ## Auth
 //!

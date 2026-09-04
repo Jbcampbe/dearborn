@@ -1,7 +1,7 @@
 // Pure WS-event → view-state reducer for the Ready-lane DAG editor (T-303).
 //
 // Framework-free and dependency-free (no Vue, no fetch) so it can be unit-tested
-// without a browser — mirrors `planning/stream.ts`. It folds the ordered stream
+// without a browser. It folds the ordered stream
 // of WebSocket frames published on `epic:<id>` into the editor's view model:
 // the task nodes (with readiness), the dependency edges, and the live Epic
 // record. The server publishes a `dag_updated` frame (payload = the full

@@ -1,0 +1,1358 @@
+//! Threaded, anchored comments (wayfinder epic §4.8/§9, Phase 5).
+//!
+//! A **comment** hangs off an **anchor** — a map node or a living-Document
+//! section — and lives in a **thread** (`thread_id`): the first post of a
+//! thread chooses the anchor, every reply (human *or* agent) joins by
+//! `thread_id` and inherits it. Attribution follows the flat-permission
+//! model: a signed-in human's comment carries `author_user_id`; an agent
+//! run posting through its capability token carries `author_user_id = NULL`
+//! and `is_agent = 1`. The `resolved` flag is **thread-wide**: resolving any
+//! comment in a thread resolves the conversation (the per-row column keeps
+//! the store dumb; the handler applies the flag to the whole thread).
+//!
+//! **Promote-to-node** (§9) turns a thread into a new open frontier node of
+//! a chosen kind (grilling/research/prototype — never task, whose `task_mode`
+//! is fixed at creation), carrying optional extra context (`title` — derived
+//! from the thread's head comment when absent — and `question`), and stamps
+//! `promoted_node_id` across the source thread so the conversation keeps its
+//! link to the node it became. Promoting MUTATES the map, so a capability
+//! token may call it only from a HITL map-reshaping phase (the same
+//! grilling/prototype bar as every other map mutation); re-promoting an
+//! already-promoted thread is a `409`.
+//!
+//! The REST surface is exactly what the `dearborn` CLI's `comment
+//! post|list|resolve|promote` verbs call, so it is on the capability-token
+//! allow-list (`crate::capability::authorize_cap_request`) and accepts either
+//! a browser session token or a per-run capability token. Every mutation
+//! publishes a `comments_updated` frame on `epic:<id>` carrying the epic's
+//! full comment list, so a subscribed client re-renders — the same
+//! best-effort pattern as `map_updated` / `document_updated`. Promotion
+//! additionally publishes `map_updated` (the new node must appear on the
+//! map).
+
+use std::collections::HashMap;
+
+use axum::{
+    extract::{Path, Query, State},
+    http::StatusCode,
+    Json,
+};
+use libsql::{params, Value};
+use serde::{Deserialize, Serialize};
+
+use crate::{map::Actor, AppError, AppResult, AppState};
+
+/// The anchor vocabulary: a comment hangs off a map node or a Document
+/// section (`document_section.section_id`).
+pub(crate) const VALID_ANCHOR_KINDS: &[&str] = &["node", "section"];
+
+/// The kinds a thread may be promoted into (wayfinder §9's chosen kind):
+/// grilling, research, and prototype. `task` is deliberately absent — its
+/// `task_mode` is fixed at creation and promotion is about growing the
+/// decision frontier, not scheduling manual work.
+pub(crate) const PROMOTABLE_KINDS: &[&str] = &["grilling", "research", "prototype"];
+
+/// Cap on a promoted node's DERIVED title (the head comment's first line) so
+/// a long discussion opening stays a one-line node title.
+const DERIVED_TITLE_MAX_CHARS: usize = 80;
+
+const COMMENT_COLUMNS: &str = "id, epic_id, thread_id, anchor_kind, anchor_id, \
+     author_user_id, is_agent, body, resolved, promoted_node_id, created_at";
+
+// ---- DTOs ------------------------------------------------------------------
+
+/// A comment as stored. `author_user_id` is `NULL` and `is_agent` is `true`
+/// when the author was an agent run (a capability token).
+#[derive(Debug, Clone, Serialize)]
+pub struct Comment {
+    pub id: String,
+    pub epic_id: String,
+    pub thread_id: String,
+    pub anchor_kind: String,
+    pub anchor_id: String,
+    pub author_user_id: Option<String>,
+    pub is_agent: bool,
+    pub body: String,
+    pub resolved: bool,
+    pub promoted_node_id: Option<String>,
+    pub created_at: i64,
+}
+
+/// `POST /epics/{id}/comments` body: `{ anchor_kind, anchor_id, body,
+/// thread_id? }`. When `thread_id` is present the comment JOINS that thread
+/// (an agent reply's shape) and the anchor fields are optional — absent, they
+/// are inherited from the thread; present, they must match the thread's
+/// anchor. Without `thread_id` the comment starts a new thread under the
+/// required anchor.
+#[derive(Debug, Deserialize)]
+pub struct PostCommentBody {
+    anchor_kind: Option<String>,
+    anchor_id: Option<String>,
+    body: Option<String>,
+    thread_id: Option<String>,
+}
+
+/// `GET /epics/{id}/comments` query filters. All optional; every filter
+/// supplied must match.
+#[derive(Debug, Default, Deserialize)]
+pub struct ListCommentsQuery {
+    anchor_kind: Option<String>,
+    anchor_id: Option<String>,
+    thread_id: Option<String>,
+}
+
+/// `POST /epics/{id}/comments/:commentId/promote` body. `kind` is required
+/// (grilling|research|prototype). `title` and `question` are the optional
+/// extra context the new node carries: an absent/blank `title` is derived
+/// from the thread's head comment; an absent/blank `question` stores `NULL`.
+#[derive(Debug, Deserialize)]
+pub struct PromoteThreadBody {
+    kind: Option<String>,
+    title: Option<String>,
+    question: Option<String>,
+}
+
+/// The promote outcome: the fresh frontier node plus the stamped thread (its
+/// comments now all carry `promoted_node_id`).
+#[derive(Debug, Serialize)]
+pub struct PromoteOutcome {
+    pub node: crate::map::MapNode,
+    pub thread: Vec<Comment>,
+}
+
+fn row_to_comment(row: &libsql::Row) -> AppResult<Comment> {
+    Ok(Comment {
+        id: row.get(0)?,
+        epic_id: row.get(1)?,
+        thread_id: row.get(2)?,
+        anchor_kind: row.get(3)?,
+        anchor_id: row.get(4)?,
+        author_user_id: row.get(5)?,
+        is_agent: row.get::<i64>(6)? != 0,
+        body: row.get(7)?,
+        resolved: row.get::<i64>(8)? != 0,
+        promoted_node_id: row.get(9)?,
+        created_at: row.get(10)?,
+    })
+}
+
+// ---- store -----------------------------------------------------------------
+
+/// Insert one comment with a pre-resolved thread id; the pure write. All
+/// validation (anchor existence, thread membership, non-empty body) is the
+/// caller's job.
+pub async fn insert_comment(
+    conn: &libsql::Connection,
+    epic_id: &str,
+    thread_id: &str,
+    anchor_kind: &str,
+    anchor_id: &str,
+    author_user_id: Option<&str>,
+    is_agent: bool,
+    body: &str,
+) -> AppResult<Comment> {
+    let id = ulid::Ulid::new().to_string();
+    let now = crate::capability::now_ms();
+
+    conn.execute(
+        "INSERT INTO comment \
+             (id, epic_id, thread_id, anchor_kind, anchor_id, author_user_id, \
+              is_agent, body, resolved, promoted_node_id, created_at) \
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, 0, NULL, ?9)",
+        params![
+            id.clone(),
+            epic_id,
+            thread_id,
+            anchor_kind,
+            anchor_id,
+            author_user_id,
+            is_agent as i64,
+            body,
+            now
+        ],
+    )
+    .await?;
+
+    fetch_comment(conn, &id)
+        .await?
+        .ok_or_else(|| AppError::Internal(format!("comment {id} vanished after insert")))
+}
+
+/// Fetch one comment by id, or `None`.
+pub async fn fetch_comment(conn: &libsql::Connection, id: &str) -> AppResult<Option<Comment>> {
+    let sql = format!("SELECT {COMMENT_COLUMNS} FROM comment WHERE id = ?1");
+    let mut rows = conn.query(&sql, params![id]).await?;
+    match rows.next().await? {
+        Some(row) => Ok(Some(row_to_comment(&row)?)),
+        None => Ok(None),
+    }
+}
+
+/// A comment's thread members, oldest first (then insertion order for
+/// stability).
+pub async fn list_thread(
+    conn: &libsql::Connection,
+    epic_id: &str,
+    thread_id: &str,
+) -> AppResult<Vec<Comment>> {
+    let sql = format!(
+        "SELECT {COMMENT_COLUMNS} FROM comment \
+         WHERE epic_id = ?1 AND thread_id = ?2 ORDER BY created_at ASC, rowid ASC"
+    );
+    let mut rows = conn.query(&sql, params![epic_id, thread_id]).await?;
+    let mut items = Vec::new();
+    while let Some(row) = rows.next().await? {
+        items.push(row_to_comment(&row)?);
+    }
+    Ok(items)
+}
+
+/// The epic's comments, oldest first (then insertion order for stability),
+/// optionally narrowed by anchor or thread. Every filter must match.
+///
+/// The tie-break is `rowid` — insertion order — not `id`: comments written in
+/// the same millisecond share `created_at`, and ULIDs are not monotonic
+/// across rows, so an `id` tie-break would shuffle same-ms comments (the
+/// thread's head could sort behind its replies).
+pub async fn list_comments(
+    conn: &libsql::Connection,
+    epic_id: &str,
+    filter: &ListCommentsQuery,
+) -> AppResult<Vec<Comment>> {
+    let mut sql = format!(
+        "SELECT {COMMENT_COLUMNS} FROM comment WHERE epic_id = ?1"
+    );
+    let mut values: Vec<Value> = vec![Value::Text(epic_id.to_string())];
+    for (column, field) in [
+        ("anchor_kind", &filter.anchor_kind),
+        ("anchor_id", &filter.anchor_id),
+        ("thread_id", &filter.thread_id),
+    ] {
+        if let Some(value) = field {
+            sql.push_str(&format!(" AND {column} = ?"));
+            values.push(Value::Text(value.clone()));
+        }
+    }
+    sql.push_str(" ORDER BY created_at ASC, rowid ASC");
+
+    let mut rows = conn.query(&sql, values).await?;
+    let mut items = Vec::new();
+    while let Some(row) = rows.next().await? {
+        items.push(row_to_comment(&row)?);
+    }
+    Ok(items)
+}
+
+/// Set `resolved` on every comment of `comment`'s thread (thread-level
+/// resolution, §9). Returns the thread as it now stands. `404` if the
+/// comment does not exist or belongs to another epic.
+pub async fn set_thread_resolved(
+    conn: &libsql::Connection,
+    epic_id: &str,
+    comment_id: &str,
+    resolved: bool,
+) -> AppResult<Vec<Comment>> {
+    let comment = fetch_comment(conn, comment_id)
+        .await?
+        .filter(|c| c.epic_id == epic_id)
+        .ok_or_else(|| AppError::NotFound(format!("comment {comment_id} not found")))?;
+    let thread_id = comment.thread_id.clone();
+    conn.execute(
+        "UPDATE comment SET resolved = ?1 WHERE epic_id = ?2 AND thread_id = ?3",
+        params![resolved as i64, epic_id, thread_id.clone()],
+    )
+    .await?;
+    list_thread(conn, epic_id, &thread_id).await
+}
+
+// ---- promotion (wayfinder epic §9) -----------------------------------------
+
+/// Derive a promoted node's title from a thread's head comment: the body's
+/// first line, trimmed, truncated to [`DERIVED_TITLE_MAX_CHARS`] characters
+/// with an ellipsis when it does not fit. Posts reject blank bodies, so this
+/// always yields a non-empty title; the fallback keeps that guarantee total
+/// even for a hand-seeded row.
+fn derived_title(body: &str) -> String {
+    let first_line = body.lines().next().unwrap_or("").trim();
+    let mut title: String = first_line.chars().take(DERIVED_TITLE_MAX_CHARS).collect();
+    if first_line.chars().count() > DERIVED_TITLE_MAX_CHARS {
+        title.push('…');
+    }
+    if title.is_empty() {
+        title = "Promoted comment thread".to_string();
+    }
+    title
+}
+
+/// Promote a thread into a new open frontier node (wayfinder epic §9):
+/// create the node of `kind` carrying the extra context, then stamp
+/// `promoted_node_id` across the whole thread — the thread-level mirror of
+/// [`set_thread_resolved`]'s thread-wide write. Returns the node and the
+/// thread as it now stands.
+///
+/// Validation of `kind` is the caller's job (the handler does it with the
+/// promote-specific vocabulary message). `404` if the comment does not exist
+/// or belongs to another epic; `409` if the thread has already been
+/// promoted (a thread becomes one node, once).
+pub async fn promote_thread(
+    conn: &libsql::Connection,
+    epic_id: &str,
+    comment_id: &str,
+    kind: &str,
+    title: Option<&str>,
+    question: Option<&str>,
+    actor_user_id: Option<&str>,
+) -> AppResult<(crate::map::MapNode, Vec<Comment>)> {
+    let head = fetch_comment(conn, comment_id)
+        .await?
+        .filter(|c| c.epic_id == epic_id)
+        .ok_or_else(|| AppError::NotFound(format!("comment {comment_id} not found")))?;
+    let thread_id = head.thread_id.clone();
+    let thread = list_thread(conn, epic_id, &thread_id).await?;
+
+    if thread.iter().any(|c| c.promoted_node_id.is_some()) {
+        return Err(AppError::Conflict(format!(
+            "thread {thread_id} has already been promoted"
+        )));
+    }
+
+    // The extra context the node carries: an explicit title wins; otherwise
+    // the thread speaks for itself via the head comment's first line. A
+    // blank `question` stores `NULL` (matching the map's prose trimming).
+    let title = match title.map(str::trim).filter(|s| !s.is_empty()) {
+        Some(title) => title.to_string(),
+        None => derived_title(&head.body),
+    };
+    let question = question.map(str::trim).filter(|s| !s.is_empty());
+
+    // No dependency edges: a fresh node is open with every (zero) blocker
+    // settled, so it lands on the frontier by computation alone.
+    let node = crate::map::create_node(
+        conn,
+        epic_id,
+        kind,
+        None,
+        &title,
+        question,
+        actor_user_id,
+        None,
+        None,
+    )
+    .await?;
+
+    conn.execute(
+        "UPDATE comment SET promoted_node_id = ?1 WHERE epic_id = ?2 AND thread_id = ?3",
+        params![node.id.clone(), epic_id, thread_id.clone()],
+    )
+    .await?;
+    let thread = list_thread(conn, epic_id, &thread_id).await?;
+    Ok((node, thread))
+}
+
+// ---- anchor validation -----------------------------------------------------
+
+/// Validate the anchor of a NEW thread: `anchor_kind` must be in the
+/// vocabulary and the anchor must exist under this epic (a map node for
+/// `node`, a `document_section` row for `section`). Unknown or cross-epic
+/// anchors are a `400`, matching the map's edge-linking guard style.
+pub(crate) async fn validate_anchor(
+    conn: &libsql::Connection,
+    epic_id: &str,
+    anchor_kind: &str,
+    anchor_id: &str,
+) -> AppResult<()> {
+    if !VALID_ANCHOR_KINDS.contains(&anchor_kind) {
+        return Err(AppError::BadRequest(format!(
+            "`anchor_kind` must be one of node|section, got `{anchor_kind}`"
+        )));
+    }
+    match anchor_kind {
+        "node" => {
+            if !crate::map::node_belongs_to_epic(conn, anchor_id, epic_id).await? {
+                return Err(AppError::BadRequest(format!(
+                    "map node {anchor_id} is not part of epic {epic_id}"
+                )));
+            }
+        }
+        "section" => {
+            let mut rows = conn
+                .query(
+                    "SELECT 1 FROM document_section WHERE epic_id = ?1 AND section_id = ?2",
+                    params![epic_id, anchor_id],
+                )
+                .await?;
+            if rows.next().await?.is_none() {
+                return Err(AppError::BadRequest(format!(
+                    "document section {anchor_id} is not part of epic {epic_id} \
+                     (sections appear as a document is synced)"
+                )));
+            }
+        }
+        _ => unreachable!("VALID_ANCHOR_KINDS covers every arm"),
+    }
+    Ok(())
+}
+
+// ---- REST handlers ---------------------------------------------------------
+
+/// `POST /epics/{id}/comments` — post a comment: either start a new thread
+/// under an anchor (`anchor_kind` + `anchor_id` + `body`) or reply into an
+/// existing thread (`thread_id` [+ matching anchor fields]). Any
+/// authenticated user may post; a capability-token (agent) post is
+/// attributed `is_agent = 1` with `author_user_id = NULL`. `201` with the
+/// comment; `400` blank body, unknown anchor vocabulary, anchor/thread
+/// mismatch; `404` unknown epic. Publishes `comments_updated` on `epic:<id>`.
+pub async fn post_comment(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    actor: Actor,
+    Json(req): Json<PostCommentBody>,
+) -> AppResult<(StatusCode, Json<Comment>)> {
+    let conn = state.db.conn();
+    if !crate::map::epic_exists(conn, &id).await? {
+        return Err(AppError::NotFound(format!("epic {id} not found")));
+    }
+    let body = req
+        .body
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| AppError::BadRequest("`body` is required and must not be empty".to_string()))?;
+
+    // Resolve the thread + anchor: join an existing thread (inheriting or
+    // re-confirming its anchor) or start a new one under a required anchor.
+    let (thread_id, anchor_kind, anchor_id) = match req.thread_id.as_deref().map(str::trim) {
+        Some(thread_id) if !thread_id.is_empty() => {
+            // The thread must exist under THIS epic; its head comment fixes
+            // the anchor every member shares.
+            let head = list_thread(conn, &id, thread_id)
+                .await?
+                .into_iter()
+                .next()
+                .ok_or_else(|| {
+                    AppError::BadRequest(format!(
+                        "thread {thread_id} does not exist in epic {id}"
+                    ))
+                })?;
+            if let Some(anchor_kind) = req.anchor_kind.as_deref().map(str::trim) {
+                if anchor_kind != head.anchor_kind {
+                    return Err(AppError::BadRequest(format!(
+                        "thread {thread_id} is anchored to `{}`; a reply may not re-anchor it to `{anchor_kind}`",
+                        head.anchor_kind
+                    )));
+                }
+            }
+            if let Some(anchor_id) = req.anchor_id.as_deref().map(str::trim) {
+                if anchor_id != head.anchor_id {
+                    return Err(AppError::BadRequest(format!(
+                        "thread {thread_id} is anchored to {}; a reply may not re-anchor it",
+                        head.anchor_id
+                    )));
+                }
+            }
+            (
+                thread_id.to_string(),
+                head.anchor_kind,
+                head.anchor_id,
+            )
+        }
+        _ => {
+            let anchor_kind = req
+                .anchor_kind
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    AppError::BadRequest(
+                        "`anchor_kind` is required to start a thread (node|section)".to_string(),
+                    )
+                })?;
+            let anchor_id = req
+                .anchor_id
+                .as_deref()
+                .map(str::trim)
+                .filter(|s| !s.is_empty())
+                .ok_or_else(|| {
+                    AppError::BadRequest("`anchor_id` is required to start a thread".to_string())
+                })?;
+            validate_anchor(conn, &id, anchor_kind, anchor_id).await?;
+            (ulid::Ulid::new().to_string(), anchor_kind.to_string(), anchor_id.to_string())
+        }
+    };
+
+    // Attribution: a signed-in human carries its user id; an agent run (a
+    // capability token — no user behind `Actor`) is `is_agent = 1`.
+    let is_agent = actor.user_id.is_none();
+    let comment = insert_comment(
+        conn,
+        &id,
+        &thread_id,
+        &anchor_kind,
+        &anchor_id,
+        actor.user_id.as_deref(),
+        is_agent,
+        body,
+    )
+    .await?;
+    crate::activity::record(
+        conn,
+        &id,
+        None,
+        actor.user_id.as_deref(),
+        crate::activity::COMMENT_POSTED,
+        Some(&format!("{anchor_kind} {anchor_id}")),
+    )
+    .await?;
+
+    publish_comments(&state, &id).await;
+    Ok((StatusCode::CREATED, Json(comment)))
+}
+
+/// `GET /epics/{id}/comments` — the epic's comments, optionally narrowed by
+/// `?anchor_kind=&anchor_id=` or `?thread_id=`. `404` unknown epic.
+pub async fn list_comments_handler(
+    State(state): State<AppState>,
+    Path(id): Path<String>,
+    Query(filter): Query<ListCommentsQuery>,
+) -> AppResult<Json<HashMap<&'static str, Vec<Comment>>>> {
+    let conn = state.db.conn();
+    if !crate::map::epic_exists(conn, &id).await? {
+        return Err(AppError::NotFound(format!("epic {id} not found")));
+    }
+    if let Some(anchor_kind) = filter.anchor_kind.as_deref() {
+        if !VALID_ANCHOR_KINDS.contains(&anchor_kind) {
+            return Err(AppError::BadRequest(format!(
+                "`anchor_kind` must be one of node|section, got `{anchor_kind}`"
+            )));
+        }
+    }
+    let items = list_comments(conn, &id, &filter).await?;
+    Ok(Json(HashMap::from([("items", items)])))
+}
+
+/// `POST /epics/{id}/comments/:commentId/resolve` — resolve the comment's
+/// whole thread (§9's resolved flag is a conversation-level state). `200`
+/// with the thread as it now stands; `404` unknown epic/comment. Publishes
+/// `comments_updated` on `epic:<id>`.
+pub async fn resolve_comment(
+    State(state): State<AppState>,
+    Path((id, comment_id)): Path<(String, String)>,
+    actor: Actor,
+) -> AppResult<Json<HashMap<&'static str, Vec<Comment>>>> {
+    let conn = state.db.conn();
+    if !crate::map::epic_exists(conn, &id).await? {
+        return Err(AppError::NotFound(format!("epic {id} not found")));
+    }
+    let thread = set_thread_resolved(conn, &id, &comment_id, true).await?;
+    crate::activity::record(
+        conn,
+        &id,
+        None,
+        actor.user_id.as_deref(),
+        crate::activity::COMMENT_RESOLVED,
+        thread.first().map(|c| c.thread_id.as_str()),
+    )
+    .await?;
+    publish_comments(&state, &id).await;
+    Ok(Json(HashMap::from([("items", thread)])))
+}
+
+/// `POST /epics/{id}/comments/:commentId/promote` — promote the comment's
+/// whole thread into a NEW open frontier node of the chosen kind (§9's
+/// promote-to-node; grilling|research|prototype — never `task`). The node
+/// carries the optional extra context (`title` — derived from the thread's
+/// head comment when absent — and `question`) and the thread is stamped with
+/// `promoted_node_id`; a fresh node has no blockers, so it is on the frontier
+/// by computation. `201` with `{ node, thread }`; `400` on an unknown or
+/// missing `kind`; `404` unknown epic/comment; `409` if the thread was
+/// already promoted. Publishes `comments_updated` (the thread's stamp) AND
+/// `map_updated` (the new node) on `epic:<id>`.
+pub async fn promote_comment(
+    State(state): State<AppState>,
+    Path((id, comment_id)): Path<(String, String)>,
+    actor: Actor,
+    Json(req): Json<PromoteThreadBody>,
+) -> AppResult<(StatusCode, Json<PromoteOutcome>)> {
+    let conn = state.db.conn();
+    if !crate::map::epic_exists(conn, &id).await? {
+        return Err(AppError::NotFound(format!("epic {id} not found")));
+    }
+    let kind = req
+        .kind
+        .as_deref()
+        .map(str::trim)
+        .filter(|s| !s.is_empty())
+        .ok_or_else(|| {
+            AppError::BadRequest("`kind` is required (grilling|research|prototype)".to_string())
+        })?;
+    if !PROMOTABLE_KINDS.contains(&kind) {
+        return Err(AppError::BadRequest(format!(
+            "`kind` must be one of grilling|research|prototype, got `{kind}`"
+        )));
+    }
+
+    // Attribution follows the flat-permission model: a signed-in human's
+    // promotion stamps the node's `created_by`; an agent run's is NULL.
+    let (node, thread) = promote_thread(
+        conn,
+        &id,
+        &comment_id,
+        kind,
+        req.title.as_deref(),
+        req.question.as_deref(),
+        actor.user_id.as_deref(),
+    )
+    .await?;
+
+    publish_comments(&state, &id).await;
+    // The feed records the promotion in two rows: the map's `node_created`
+    // (written by `map::create_node` inside `promote_thread`) plus this
+    // thread-level `thread_promoted` row, linking the conversation to the
+    // node it became.
+    crate::activity::record(
+        conn,
+        &id,
+        Some(&node.id),
+        actor.user_id.as_deref(),
+        crate::activity::THREAD_PROMOTED,
+        Some(&node.title),
+    )
+    .await?;
+    crate::map::publish_map(&state, &id).await;
+    Ok((StatusCode::CREATED, Json(PromoteOutcome { node, thread })))
+}
+
+// ---- live updates ----------------------------------------------------------
+
+/// Publish a `comments_updated` frame on `epic:<id>` carrying the epic's
+/// full comment list, so a subscribed client re-renders. Best-effort: a read
+/// error is logged and the publish is skipped (the DB write already
+/// committed).
+async fn publish_comments(state: &AppState, epic_id: &str) {
+    match list_comments(state.db.conn(), epic_id, &ListCommentsQuery::default()).await {
+        Ok(items) => {
+            let payload =
+                serde_json::to_value(&items).unwrap_or(serde_json::Value::Null);
+            state
+                .hub
+                .publish(&format!("epic:{epic_id}"), "comments_updated", payload);
+        }
+        Err(err) => {
+            tracing::warn!(epic = %epic_id, error = %err, "comment publish: failed to load comments");
+        }
+    }
+}
+
+// ---- tests ------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::users::{self, Role};
+    use crate::{app, Config, Db};
+    use axum::body::Body;
+    use axum::http::{header::AUTHORIZATION, Request, StatusCode};
+    use serde_json::{json, Value};
+    use std::path::PathBuf;
+    use tower::ServiceExt;
+
+    async fn boot() -> (AppState, axum::Router) {
+        let db = Db::connect(":memory:").await.unwrap();
+        db.run_migrations().await.unwrap();
+        let state = AppState::new(Config::for_test(), db);
+        let router = app(state.clone());
+        (state, router)
+    }
+
+    /// Insert a project + epic; return ids.
+    async fn seed_epic(state: &AppState) -> (String, String) {
+        let conn = state.db.conn();
+        let now = crate::capability::now_ms();
+        let project_id = ulid::Ulid::new().to_string();
+        conn.execute(
+            "INSERT INTO project (id, name, repo_url, clone_path, clone_status, created_at, updated_at) \
+             VALUES (?1, 'P', 'https://example.com/p.git', NULL, 'ready', ?2, ?2)",
+            libsql::params![project_id.clone(), now],
+        )
+        .await
+        .unwrap();
+        let epic_id = ulid::Ulid::new().to_string();
+        conn.execute(
+            "INSERT INTO epic (id, project_id, title, status, destination, created_at, updated_at) \
+             VALUES (?1, ?2, 'E', 'Planning', 'It works end to end', ?3, ?3)",
+            libsql::params![epic_id.clone(), project_id.clone(), now],
+        )
+        .await
+        .unwrap();
+        (project_id, epic_id)
+    }
+
+    /// Seed one map node to anchor comments to.
+    async fn seed_node(state: &AppState, epic_id: &str, kind: &str) -> String {
+        crate::map::create_node(
+            state.db.conn(),
+            epic_id,
+            kind,
+            None,
+            "Which store?",
+            Some("Pick the blob store"),
+            None,
+            None,
+            None,
+        )
+        .await
+        .unwrap()
+        .id
+    }
+
+    /// Seed one document-section anchor row directly (sections are indexed
+    /// from a synced document; the anchor validation only reads the index).
+    async fn seed_section(state: &AppState, epic_id: &str, section_id: &str) {
+        state
+            .db
+            .conn()
+            .execute(
+                "INSERT INTO document_section (epic_id, section_id, title, provenance, last_edited_by, version) \
+                 VALUES (?1, ?2, 'Decisions', NULL, NULL, 1)",
+                libsql::params![epic_id, section_id],
+            )
+            .await
+            .unwrap();
+    }
+
+    fn get_bearer(uri: &str, token: &str) -> Request<Body> {
+        Request::builder()
+            .uri(uri)
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .body(Body::empty())
+            .unwrap()
+    }
+
+    fn json_bearer(method: &str, uri: &str, token: &str, body: Value) -> Request<Body> {
+        Request::builder()
+            .method(method)
+            .uri(uri)
+            .header(AUTHORIZATION, format!("Bearer {token}"))
+            .header("content-type", "application/json")
+            .body(Body::from(body.to_string()))
+            .unwrap()
+    }
+
+    async fn body_json(response: axum::response::Response) -> Value {
+        let bytes = axum::body::to_bytes(response.into_body(), usize::MAX)
+            .await
+            .unwrap();
+        serde_json::from_slice(&bytes).unwrap()
+    }
+
+    async fn post_comment(app: &axum::Router, token: &str, epic_id: &str, body: Value) -> axum::response::Response {
+        app.clone()
+            .oneshot(json_bearer(
+                "POST",
+                &format!("/epics/{epic_id}/comments"),
+                token,
+                body,
+            ))
+            .await
+            .unwrap()
+    }
+
+    async fn get_comments(app: &axum::Router, token: &str, epic_id: &str, query: &str) -> (StatusCode, Value) {
+        let response = app
+            .clone()
+            .oneshot(get_bearer(
+                &format!("/epics/{epic_id}/comments{query}"),
+                token,
+            ))
+            .await
+            .unwrap();
+        let status = response.status();
+        (status, body_json(response).await)
+    }
+
+    /// AC: two distinct users post into the same node's comment thread and
+    /// both appear with correct attribution — and the agent (a capability
+    /// token) can reply into the same thread, attributed `is_agent = 1`.
+    #[tokio::test]
+    async fn two_users_and_the_agent_share_one_node_thread_with_correct_attribution() {
+        let (state, app) = boot().await;
+        let (project_id, epic_id) = seed_epic(&state).await;
+        let node_id = seed_node(&state, &epic_id, "grilling").await;
+        let alice = users::testing::seed_user(&state, "alice", Role::Admin, true).await;
+        let bob = users::testing::seed_user(&state, "bob", Role::User, true).await;
+        let alice_token = crate::sessions::testing::login_as(&state, &alice).await;
+        let bob_token = crate::sessions::testing::login_as(&state, &bob).await;
+        let agent_guard = state.caps.mint(
+            epic_id.clone(),
+            project_id.clone(),
+            "grilling".into(),
+            PathBuf::from("/tmp"),
+        );
+        let agent_token = agent_guard.token().to_string();
+
+        // Alice opens the thread on the node.
+        let response = post_comment(
+            &app,
+            &alice_token,
+            &epic_id,
+            json!({
+                "anchor_kind": "node",
+                "anchor_id": node_id,
+                "body": "Which store are we picking?",
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let head = body_json(response).await;
+        assert_eq!(head["anchor_kind"], "node");
+        assert_eq!(head["anchor_id"], node_id.as_str());
+        assert_eq!(head["author_user_id"], alice.id.as_str());
+        assert_eq!(head["is_agent"], false);
+        assert_eq!(head["resolved"], false);
+        let thread_id = head["thread_id"].as_str().unwrap().to_string();
+
+        // Bob replies into the SAME thread — anchor inherited.
+        let response = post_comment(
+            &app,
+            &bob_token,
+            &epic_id,
+            json!({ "thread_id": thread_id, "body": "The evidence store fits." }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let reply = body_json(response).await;
+        assert_eq!(reply["thread_id"], thread_id.as_str());
+        assert_eq!(reply["anchor_id"], node_id.as_str());
+        assert_eq!(reply["author_user_id"], bob.id.as_str());
+        assert_eq!(reply["is_agent"], false);
+
+        // The agent replies in turn, through its capability token: still the
+        // same thread, but attributed to the agent (no human author).
+        let response = post_comment(
+            &app,
+            &agent_token,
+            &epic_id,
+            json!({ "thread_id": thread_id, "body": "Leaning evidence store too." }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let agent_reply = body_json(response).await;
+        assert_eq!(agent_reply["thread_id"], thread_id.as_str());
+        assert_eq!(agent_reply["author_user_id"], Value::Null);
+        assert_eq!(agent_reply["is_agent"], true);
+
+        // All three appear in the epic's list, oldest first, correctly
+        // attributed.
+        let (status, list) = get_comments(&app, &alice_token, &epic_id, "").await;
+        assert_eq!(status, StatusCode::OK);
+        let items = list["items"].as_array().unwrap();
+        assert_eq!(items.len(), 3);
+        assert_eq!(items[0]["author_user_id"], alice.id.as_str());
+        assert_eq!(items[1]["author_user_id"], bob.id.as_str());
+        assert_eq!(items[2]["author_user_id"], Value::Null);
+        assert_eq!(items[2]["is_agent"], true);
+        for item in items {
+            assert_eq!(item["thread_id"], thread_id.as_str());
+        }
+
+        // Narrowing to the node's anchor returns exactly this thread.
+        let (status, list) = get_comments(
+            &app,
+            &bob_token,
+            &epic_id,
+            &format!("?anchor_kind=node&anchor_id={node_id}"),
+        )
+        .await;
+        assert_eq!(status, StatusCode::OK);
+        assert_eq!(list["items"].as_array().unwrap().len(), 3);
+
+        // Resolving any member resolves the WHOLE thread.
+        let reply_id = reply["id"].as_str().unwrap().to_string();
+        let response = app
+            .clone()
+            .oneshot(json_bearer(
+                "POST",
+                &format!("/epics/{epic_id}/comments/{reply_id}/resolve"),
+                &alice_token,
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::OK);
+        let thread = body_json(response).await;
+        let items = thread["items"].as_array().unwrap();
+        assert_eq!(items.len(), 3);
+        for item in items {
+            assert_eq!(item["resolved"], true);
+        }
+
+        // And the list reflects it.
+        let (_, list) = get_comments(&app, &alice_token, &epic_id, "").await;
+        for item in list["items"].as_array().unwrap() {
+            assert_eq!(item["resolved"], true);
+        }
+    }
+
+    /// A section-anchored comment requires an existing section anchor row.
+    #[tokio::test]
+    async fn section_anchors_validate_against_the_document_section_index() {
+        let (state, app) = boot().await;
+        let (_project_id, epic_id) = seed_epic(&state).await;
+        let user = users::testing::seed_user(&state, "planner", Role::Admin, true).await;
+        let token = crate::sessions::testing::login_as(&state, &user).await;
+
+        // Unknown anchor id → 400, naming the epic (matches the map's
+        // edge-link guard style).
+        let response = post_comment(
+            &app,
+            &token,
+            &epic_id,
+            json!({
+                "anchor_kind": "section",
+                "anchor_id": "no-such-section",
+                "body": "Hello?",
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Once the section exists (a synced document indexed it), the same
+        // comment posts fine.
+        seed_section(&state, &epic_id, "decisions").await;
+        let response = post_comment(
+            &app,
+            &token,
+            &epic_id,
+            json!({
+                "anchor_kind": "section",
+                "anchor_id": "decisions",
+                "body": "This section reads well.",
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let comment = body_json(response).await;
+        assert_eq!(comment["anchor_kind"], "section");
+        assert_eq!(comment["anchor_id"], "decisions");
+
+        // The two anchor vocabularies stay distinct: node anchors validate
+        // against the map, section anchors against the document.
+        let response = post_comment(
+            &app,
+            &token,
+            &epic_id,
+            json!({
+                "anchor_kind": "node",
+                "anchor_id": "decisions",
+                "body": "wrong vocabulary",
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn malformed_comment_posts_are_rejected() {
+        let (state, app) = boot().await;
+        let (_project_id, epic_id) = seed_epic(&state).await;
+        let node_id = seed_node(&state, &epic_id, "grilling").await;
+        let user = users::testing::seed_user(&state, "planner", Role::Admin, true).await;
+        let token = crate::sessions::testing::login_as(&state, &user).await;
+
+        // Unknown epic → 404.
+        let response = post_comment(
+            &app,
+            &token,
+            "not-an-epic",
+            json!({ "anchor_kind": "node", "anchor_id": node_id, "body": "hi" }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // Unknown anchor vocabulary.
+        let response = post_comment(
+            &app,
+            &token,
+            &epic_id,
+            json!({ "anchor_kind": "task", "anchor_id": node_id, "body": "hi" }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Blank body.
+        let response = post_comment(
+            &app,
+            &token,
+            &epic_id,
+            json!({ "anchor_kind": "node", "anchor_id": node_id, "body": "   " }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // A new thread without an anchor.
+        let response = post_comment(&app, &token, &epic_id, json!({ "body": "hi" })).await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // An unknown thread id.
+        let response = post_comment(
+            &app,
+            &token,
+            &epic_id,
+            json!({ "thread_id": "01NOPE", "body": "hi" }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // A reply may not re-anchor its thread.
+        let response = post_comment(
+            &app,
+            &token,
+            &epic_id,
+            json!({
+                "anchor_kind": "node",
+                "anchor_id": node_id,
+                "body": "head",
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let thread_id = body_json(response).await["thread_id"]
+            .as_str()
+            .unwrap()
+            .to_string();
+        let response = post_comment(
+            &app,
+            &token,
+            &epic_id,
+            json!({
+                "thread_id": thread_id,
+                "anchor_id": "not-the-anchor",
+                "body": "reply",
+            }),
+        )
+        .await;
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+    }
+
+    #[tokio::test]
+    async fn resolving_an_unknown_comment_is_a_404() {
+        let (state, app) = boot().await;
+        let (_project_id, epic_id) = seed_epic(&state).await;
+        let user = users::testing::seed_user(&state, "planner", Role::Admin, true).await;
+        let token = crate::sessions::testing::login_as(&state, &user).await;
+
+        let response = app
+            .clone()
+            .oneshot(json_bearer(
+                "POST",
+                &format!("/epics/{epic_id}/comments/01NOPE/resolve"),
+                &token,
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // Cross-epic lookups stay scoped: a comment from another epic is
+        // equally invisible here.
+        let (_other_project, other_epic) = seed_epic(&state).await;
+        let node_id = seed_node(&state, &other_epic, "grilling").await;
+        let response = post_comment(
+            &app,
+            &token,
+            &other_epic,
+            json!({ "anchor_kind": "node", "anchor_id": node_id, "body": "elsewhere" }),
+        )
+        .await;
+        let comment = body_json(response).await;
+        let response = app
+            .oneshot(json_bearer(
+                "POST",
+                &format!("/epics/{epic_id}/comments/{}/resolve", comment["id"].as_str().unwrap()),
+                &token,
+                serde_json::json!({}),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+    }
+
+    /// AC (promote-to-node): promoting a thread creates a new open frontier
+    /// node of the chosen kind with the carried context, stamps
+    /// `promoted_node_id` on the source thread, and the node appears on the
+    /// map.
+    #[tokio::test]
+    async fn promoting_a_thread_creates_a_frontier_node_and_stamps_the_thread() {
+        let (state, app) = boot().await;
+        let (_project_id, epic_id) = seed_epic(&state).await;
+        let node_id = seed_node(&state, &epic_id, "grilling").await;
+        let user = users::testing::seed_user(&state, "planner", Role::Admin, true).await;
+        let token = crate::sessions::testing::login_as(&state, &user).await;
+
+        // A two-comment thread (its head starts with a long first line so the
+        // derived-title path is exercised too).
+        let response = post_comment(
+            &app,
+            &token,
+            &epic_id,
+            json!({
+                "anchor_kind": "node",
+                "anchor_id": node_id,
+                "body": "Should we really hand-roll the blob store here? This thread keeps coming back to it.",
+            }),
+        )
+        .await;
+        let head = body_json(response).await;
+        let thread_id = head["thread_id"].as_str().unwrap().to_string();
+        let head_id = head["id"].as_str().unwrap().to_string();
+        post_comment(
+            &app,
+            &token,
+            &epic_id,
+            json!({ "thread_id": thread_id, "body": "Agreed, promote it to a decision." }),
+        )
+        .await;
+
+        // Promote via ANY member of the thread (here the reply): explicit
+        // title + question are the carried context; kind = research is
+        // promotable too.
+        let response = app
+            .clone()
+            .oneshot(json_bearer(
+                "POST",
+                &format!("/epics/{epic_id}/comments/{head_id}/promote"),
+                &token,
+                json!({
+                    "kind": "research",
+                    "title": "Survey blob stores",
+                    "question": "Which store fits evidence blobs?",
+                }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let outcome = body_json(response).await;
+
+        // The new node: open, of the chosen kind, carrying the context.
+        let promoted = outcome["node"].clone();
+        assert_eq!(promoted["kind"], "research");
+        assert_eq!(promoted["state"], "open");
+        assert_eq!(promoted["title"], "Survey blob stores");
+        assert_eq!(promoted["question"], "Which store fits evidence blobs?");
+        assert_eq!(promoted["epic_id"], epic_id.as_str());
+        assert_eq!(promoted["created_by"], user.id.as_str());
+        let promoted_id = promoted["id"].as_str().unwrap().to_string();
+        assert_ne!(promoted_id, node_id, "a fresh node, not the anchor");
+
+        // The whole source thread is stamped with the promoted node id.
+        let thread = outcome["thread"].as_array().unwrap();
+        assert_eq!(thread.len(), 2);
+        for comment in thread {
+            assert_eq!(comment["promoted_node_id"], promoted_id.as_str());
+            assert_eq!(comment["thread_id"], thread_id.as_str());
+        }
+        // And the epic-wide list reflects the stamp.
+        let (_, list) = get_comments(&app, &token, &epic_id, "").await;
+        for comment in list["items"].as_array().unwrap() {
+            assert_eq!(comment["promoted_node_id"], promoted_id.as_str());
+        }
+
+        // The node appears on the map, on the frontier (no blockers).
+        let map = body_json(
+            app.clone()
+                .oneshot(get_bearer(&format!("/epics/{epic_id}/map"), &token))
+                .await
+                .unwrap(),
+        )
+        .await;
+        let view = map["nodes"]
+            .as_array()
+            .unwrap()
+            .iter()
+            .find(|n| n["id"] == promoted_id.as_str())
+            .unwrap();
+        assert_eq!(view["kind"], "research");
+        assert_eq!(view["state"], "open");
+        assert_eq!(view["frontier"], true);
+        assert_eq!(view["blocked_by"].as_array().unwrap().len(), 0);
+    }
+
+    /// Promoting without an explicit title derives it from the thread's head
+    /// comment (first line, truncated); without a question the node stores
+    /// NULL. The promoted node's created_by is NULL for an agent token.
+    #[tokio::test]
+    async fn promotion_derives_the_title_from_the_thread_and_accepts_the_agent() {
+        let (state, app) = boot().await;
+        let (project_id, epic_id) = seed_epic(&state).await;
+        let node_id = seed_node(&state, &epic_id, "grilling").await;
+        let agent_guard = state.caps.mint(
+            epic_id.clone(),
+            project_id.clone(),
+            "grilling".into(),
+            PathBuf::from("/tmp"),
+        );
+        let agent_token = agent_guard.token().to_string();
+
+        let long_body = "Grilling the retention question in depth; and then some padding to push past the eighty character derived-title boundary";
+        let response = post_comment(
+            &app,
+            &agent_token,
+            &epic_id,
+            json!({ "anchor_kind": "node", "anchor_id": node_id, "body": long_body }),
+        )
+        .await;
+        let head = body_json(response).await;
+        let head_id = head["id"].as_str().unwrap().to_string();
+
+        let response = app
+            .clone()
+            .oneshot(json_bearer(
+                "POST",
+                &format!("/epics/{epic_id}/comments/{head_id}/promote"),
+                &agent_token,
+                json!({ "kind": "grilling" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let outcome = body_json(response).await;
+        let promoted = outcome["node"].clone();
+
+        // Title = the head comment's first line, truncated to 80 chars + an
+        // ellipsis; question stays NULL; agent attribution (no human author).
+        let title = promoted["title"].as_str().unwrap();
+        let expected: String = long_body.chars().take(80).collect();
+        assert_eq!(title, format!("{expected}\u{2026}"));
+        assert_eq!(promoted["question"], Value::Null);
+        assert_eq!(promoted["created_by"], Value::Null);
+        assert_eq!(promoted["kind"], "grilling");
+        assert_eq!(promoted["state"], "open");
+    }
+
+    /// Promotion validates the kind vocabulary (task is not promotable), the
+    /// comment/epic scope, and refuses a second promotion of the thread.
+    #[tokio::test]
+    async fn promotion_validates_kind_scope_and_double_promotion() {
+        let (state, app) = boot().await;
+        let (_project_id, epic_id) = seed_epic(&state).await;
+        let node_id = seed_node(&state, &epic_id, "grilling").await;
+        let user = users::testing::seed_user(&state, "planner", Role::Admin, true).await;
+        let token = crate::sessions::testing::login_as(&state, &user).await;
+
+        let response = post_comment(
+            &app,
+            &token,
+            &epic_id,
+            json!({ "anchor_kind": "node", "anchor_id": node_id, "body": "Promote me" }),
+        )
+        .await;
+        let head = body_json(response).await;
+        let head_id = head["id"].as_str().unwrap().to_string();
+        let promote_uri = |comment_id: &str| format!("/epics/{epic_id}/comments/{comment_id}/promote");
+
+        // kind is required and limited to grilling|research|prototype: task
+        // (whose task_mode is fixed at creation) and unknown vocab are 400s.
+        for kind in ["task", "charting"] {
+            let response = app
+                .clone()
+                .oneshot(json_bearer(
+                    "POST",
+                    &promote_uri(&head_id),
+                    &token,
+                    json!({ "kind": kind }),
+                ))
+                .await
+                .unwrap();
+            assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+        }
+        let response = app
+            .clone()
+            .oneshot(json_bearer("POST", &promote_uri(&head_id), &token, json!({})))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::BAD_REQUEST);
+
+        // Unknown comment / unknown epic → 404.
+        let response = app
+            .clone()
+            .oneshot(json_bearer(
+                "POST",
+                &promote_uri("01NOPE"),
+                &token,
+                json!({ "kind": "grilling" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+        let response = app
+            .clone()
+            .oneshot(json_bearer(
+                "POST",
+                &format!("/epics/01NOPE/comments/{head_id}/promote"),
+                &token,
+                json!({ "kind": "grilling" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // Cross-epic comment stays invisible.
+        let (_other_project, other_epic) = seed_epic(&state).await;
+        let other_node = seed_node(&state, &other_epic, "grilling").await;
+        let response = post_comment(
+            &app,
+            &token,
+            &other_epic,
+            json!({ "anchor_kind": "node", "anchor_id": other_node, "body": "elsewhere" }),
+        )
+        .await;
+        let other_comment = body_json(response).await;
+        let response = app
+            .clone()
+            .oneshot(json_bearer(
+                "POST",
+                &format!("/epics/{epic_id}/comments/{}/promote", other_comment["id"].as_str().unwrap()),
+                &token,
+                json!({ "kind": "grilling" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::NOT_FOUND);
+
+        // One real promotion succeeds…
+        let response = app
+            .clone()
+            .oneshot(json_bearer(
+                "POST",
+                &promote_uri(&head_id),
+                &token,
+                json!({ "kind": "prototype", "title": "Spike it" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CREATED);
+        let outcome = body_json(response).await;
+        assert_eq!(outcome["node"]["kind"], "prototype");
+
+        // …and a second promotion of the same thread is a 409: a thread
+        // becomes one node, once.
+        let response = app
+            .clone()
+            .oneshot(json_bearer(
+                "POST",
+                &promote_uri(&head_id),
+                &token,
+                json!({ "kind": "grilling" }),
+            ))
+            .await
+            .unwrap();
+        assert_eq!(response.status(), StatusCode::CONFLICT);
+
+        // The failed attempts created nothing: only the seed node plus the
+        // one promoted node exist.
+        let nodes = crate::map::list_nodes_for_epic(state.db.conn(), &epic_id)
+            .await
+            .unwrap();
+        assert_eq!(nodes.len(), 2);
+    }
+}

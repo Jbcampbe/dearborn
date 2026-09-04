@@ -235,8 +235,9 @@ onMounted(load);
         <h2 class="section-title">Default harness</h2>
         <p class="hint">
           Used by every agent slot without its own override — so it must be able to run
-          <em>every</em> slot. A harness that can't (pi has no MCP client, which planning and
-          breakdown need) is picked per slot instead, on a project's settings.
+          <em>every</em> slot. A harness that can't (the breakdown engine runs on the
+          Claude Code adapter until the per-node planning engines land) is picked per slot
+          instead, on a project's settings.
         </p>
         <div class="radio-list">
           <label

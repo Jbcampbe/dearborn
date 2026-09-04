@@ -325,30 +325,39 @@ pub async fn harness_references(
 /// storable), the spawn path does not.
 pub const SUPPORTED_HARNESSES: &[&str] = &["claude", crate::harness_pi::PI_HARNESS_ID];
 
-/// The harnesses that can reach Dearborn's local MCP server ([`crate::mcp`]).
+/// The harness keys whose CLI currently drives the planning/breakdown engines.
 ///
-/// Only Claude Code speaks MCP among the CLIs Dearborn drives: pi has no MCP
-/// client at all (verified against the shipped CLI — no `--mcp-config`, no MCP
-/// transport). This is a **capability**, not a preference, which is why it is
-/// a list rather than a special case at each spawn site.
-pub const MCP_CAPABLE_HARNESSES: &[&str] = &["claude"];
+/// Those engines are implemented on the Claude Code adapter today, so only
+/// `claude` may run them — this is an **engine** capability, not a transport
+/// one: the `dearborn` CLI the slots call back through is harness-agnostic
+/// (any harness that can run a shell command can invoke it), and pi gains the
+/// planning/breakdown engines when they land. This is a capability list rather
+/// than a special case at each spawn site for the same reason as before.
+pub const PLANNING_CAPABLE_HARNESSES: &[&str] = &["claude"];
 
 /// Whether `harness` is one Dearborn can spawn at all.
 pub fn is_supported_harness(harness: &str) -> bool {
     SUPPORTED_HARNESSES.contains(&harness)
 }
 
-/// Whether a slot's run needs the agent to call *back* into Dearborn over MCP.
-///
-/// True for exactly the three planning-side slots: `planning_product` and
-/// `planning_technical` maintain the epic record through `update_epic` and
-/// read the canonical clone through `read_codebase_context`; `breakdown`
-/// builds the task DAG through `create_task`/`link_dependency`. The five
-/// task-stage slots act on a checked-out workspace with the CLI's own file
-/// tools and never call home, so they impose no such requirement.
-pub fn slot_requires_mcp(slot: AgentSlot) -> bool {
+/// Whether a slot's run is implemented on the Claude Code adapter only
+/// (`breakdown` — until the per-node planning engines land). These slots call
+/// back into Dearborn through the harness-
+/// agnostic `dearborn` CLI — but their run engines themselves are Claude-
+/// Code-bound until the per-node engines land. The task-stage slots act on a
+/// checked-out workspace with the CLI's own file tools and run on every
+/// supported harness.
+pub fn slot_is_claude_only(slot: AgentSlot) -> bool {
     match slot {
-        AgentSlot::PlanningProduct | AgentSlot::PlanningTechnical | AgentSlot::Breakdown => true,
+        // The one-shot breakdown engine and the interactive per-node
+        // grilling/prototype engines are all implemented on the Claude Code
+        // adapter today (wayfinder epic §5's determinism seam runs through the
+        // Claude-bound `PlanningAgent`).
+        AgentSlot::Breakdown | AgentSlot::Grilling | AgentSlot::Prototype => true,
+        // The one-shot AFK node engine (research / afk_task) is likewise
+        // implemented on the Claude Code adapter only (wayfinder epic §5's
+        // determinism seam runs through the Claude-bound agent).
+        AgentSlot::Research | AgentSlot::AfkTask => true,
         AgentSlot::Implement
         | AgentSlot::Fix
         | AgentSlot::Review
@@ -358,18 +367,19 @@ pub fn slot_requires_mcp(slot: AgentSlot) -> bool {
     }
 }
 
-/// Whether `harness` can run `slot` — supported at all, and MCP-capable when
-/// the slot needs MCP. The single predicate every spawn site and the settings
-/// API validate against, so "which harness may run where" is stated once.
+/// Whether `harness` can run `slot` — supported at all, and Claude-bound-when-
+/// the-slot-is-Claude-bound. The single predicate every spawn site and the
+/// settings API validate against, so "which harness may run where" is stated
+/// once.
 pub fn harness_supports_slot(harness: &str, slot: AgentSlot) -> bool {
     is_supported_harness(harness)
-        && (!slot_requires_mcp(slot) || MCP_CAPABLE_HARNESSES.contains(&harness))
+        && (!slot_is_claude_only(slot) || PLANNING_CAPABLE_HARNESSES.contains(&harness))
 }
 
 /// The error message a spawn site (or the settings API) reports when
 /// [`harness_supports_slot`] says no. Written once so the planning, breakdown,
 /// and task-stage paths phrase the same refusal identically, and so the reason
-/// — unsupported vs. MCP-incapable — is never lost.
+/// — unsupported vs. Claude-Code-bound-slot — is never lost.
 pub fn unsupported_harness_message(harness: &str, slot: AgentSlot) -> String {
     if !is_supported_harness(harness) {
         format!(
@@ -378,9 +388,10 @@ pub fn unsupported_harness_message(harness: &str, slot: AgentSlot) -> String {
         )
     } else {
         format!(
-            "harness `{harness}` cannot run the `{slot}` slot: that slot calls back into \
-             Dearborn over MCP, and only {} can do that",
-            MCP_CAPABLE_HARNESSES.join(", ")
+            "harness `{harness}` cannot run the `{slot}` slot: that slot's run engine is \
+             currently wired to Claude Code only",
+            harness = harness,
+            slot = slot
         )
     }
 }
@@ -675,12 +686,9 @@ fn slot_view(
 /// planning/breakdown from their own modules' single constants).
 pub fn default_prompt(slot: AgentSlot) -> &'static str {
     use crate::breakdown::BREAKDOWN_PROMPT;
-    use crate::planning::{PRODUCT_PLANNING_PROMPT, TECHNICAL_PLANNING_PROMPT};
     use crate::spec::prompt_for;
     use crate::task_agent::Stage;
     match slot {
-        AgentSlot::PlanningProduct => PRODUCT_PLANNING_PROMPT,
-        AgentSlot::PlanningTechnical => TECHNICAL_PLANNING_PROMPT,
         AgentSlot::Breakdown => BREAKDOWN_PROMPT,
         // Every agent stage has a compiled prompt (`spec.rs`'s own test
         // asserts non-empty for each); `expect` mirrors the spawn sites.
@@ -696,6 +704,15 @@ pub fn default_prompt(slot: AgentSlot) -> &'static str {
             prompt_for(Stage::Summarize).expect("Stage::Summarize always has a prompt")
         }
         AgentSlot::Triage => prompt_for(Stage::Triage).expect("Stage::Triage always has a prompt"),
+        // The interactive per-node engines carry their methodology as a system
+        // prompt (wayfinder epic §5: "methodologies are prompts, not Skill-tool
+        // calls"), adapted from `matt-pocock-skills` and owned by `node_engine`.
+        AgentSlot::Grilling => crate::node_engine::GRILLING_PROMPT,
+        AgentSlot::Prototype => crate::node_engine::PROTOTYPE_PROMPT,
+        // The one-shot AFK node engine likewise carries its per-kind method
+        // as a system prompt (wayfinder epic §5), owned by `afk_engine`.
+        AgentSlot::Research => crate::afk_engine::RESEARCH_PROMPT,
+        AgentSlot::AfkTask => crate::afk_engine::AFK_TASK_PROMPT,
     }
 }
 
@@ -714,7 +731,7 @@ async fn ensure_project(db: &Db, project_id: &str) -> AppResult<()> {
     Ok(())
 }
 
-/// `GET /projects/{id}/agent-settings` — all nine slots in canonical order,
+/// `GET /projects/{id}/agent-settings` — all slots in canonical order,
 /// each with its raw overrides and resolved effective config.
 pub async fn get_project_agent_settings(
     State(state): State<AppState>,
@@ -1104,7 +1121,7 @@ mod tests {
             &db,
             &project,
             &AgentSetting {
-                slot: AgentSlot::PlanningProduct,
+                slot: AgentSlot::Breakdown,
                 harness: Some("claude".to_string()),
                 model: None,
                 system_prompt: Some("plan well".to_string()),
@@ -1114,7 +1131,7 @@ mod tests {
         .unwrap();
         let listed = list_agent_settings(&db, &project).await.unwrap();
         let slots: Vec<AgentSlot> = listed.iter().map(|s| s.slot).collect();
-        assert_eq!(slots, vec![AgentSlot::PlanningProduct, AgentSlot::Review]);
+        assert_eq!(slots, vec![AgentSlot::Breakdown, AgentSlot::Review]);
 
         // Delete removes exactly the targeted slot.
         assert!(delete_agent_setting(&db, &project, AgentSlot::Review)
@@ -1477,16 +1494,19 @@ mod tests {
     // ---- harness/slot capability (pi) --------------------------------------
 
     #[test]
-    fn slot_capability_splits_the_mcp_bound_slots_from_the_task_stages() {
+    fn slot_capability_splits_the_claude_bound_slots_from_the_task_stages() {
         use crate::harness_pi::PI_HARNESS_ID;
 
-        // The three planning-side slots call back into Dearborn over MCP.
+        // Breakdown, the interactive per-node engines, and the one-shot AFK
+        // node engine run on the Claude Code adapter only.
         for slot in [
-            AgentSlot::PlanningProduct,
-            AgentSlot::PlanningTechnical,
             AgentSlot::Breakdown,
+            AgentSlot::Grilling,
+            AgentSlot::Prototype,
+            AgentSlot::Research,
+            AgentSlot::AfkTask,
         ] {
-            assert!(slot_requires_mcp(slot), "{slot}");
+            assert!(slot_is_claude_only(slot), "{slot}");
             assert!(harness_supports_slot("claude", slot), "{slot}");
             assert!(!harness_supports_slot(PI_HARNESS_ID, slot), "{slot}");
         }
@@ -1500,7 +1520,7 @@ mod tests {
             AgentSlot::Summarize,
             AgentSlot::Triage,
         ] {
-            assert!(!slot_requires_mcp(slot), "{slot}");
+            assert!(!slot_is_claude_only(slot), "{slot}");
             assert!(harness_supports_slot("claude", slot), "{slot}");
             assert!(harness_supports_slot(PI_HARNESS_ID, slot), "{slot}");
         }
@@ -1510,7 +1530,7 @@ mod tests {
     }
 
     #[test]
-    fn the_refusal_message_distinguishes_unsupported_from_mcp_incapable() {
+    fn the_refusal_message_distinguishes_unsupported_from_claude_bound() {
         use crate::harness_pi::PI_HARNESS_ID;
 
         let unknown = unsupported_harness_message("codex", AgentSlot::Implement);
@@ -1519,7 +1539,7 @@ mod tests {
 
         let incapable = unsupported_harness_message(PI_HARNESS_ID, AgentSlot::Breakdown);
         assert!(!incapable.contains("unsupported"), "{incapable}");
-        assert!(incapable.contains("MCP"), "{incapable}");
+        assert!(incapable.contains("Claude Code"), "{incapable}");
         assert!(incapable.contains("breakdown"), "{incapable}");
     }
 
@@ -1540,7 +1560,7 @@ mod tests {
             .unwrap();
         assert_eq!(enable.status(), StatusCode::OK);
 
-        // pi on an MCP-bound slot: refused at configuration time.
+        // pi on a Claude-bound slot: refused at configuration time.
         let refused = app
             .clone()
             .oneshot(req(
@@ -1555,7 +1575,7 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .to_string();
-        assert!(message.contains("MCP"), "{message}");
+        assert!(message.contains("Claude Code"), "{message}");
 
         // The same harness on a task-stage slot is accepted.
         let ok = app
@@ -1596,7 +1616,7 @@ mod tests {
             .as_str()
             .unwrap_or_default()
             .to_string();
-        assert!(message.contains("MCP"), "{message}");
+        assert!(message.contains("Claude Code"), "{message}");
         assert!(message.contains("per slot"), "{message}");
     }
 
@@ -1699,18 +1719,15 @@ mod tests {
     }
 
     /// The editor-prefill contract: `default_prompt` is non-empty for all
-    /// nine slots and byte-identical to the constant each spawn site uses
+    /// slots and byte-identical to the constant each spawn site uses
     /// (no duplication, no drift between API and spawn path).
     #[tokio::test]
     async fn every_slot_serves_its_compiled_default_prompt() {
         use crate::breakdown::BREAKDOWN_PROMPT;
-        use crate::planning::{PRODUCT_PLANNING_PROMPT, TECHNICAL_PLANNING_PROMPT};
         use crate::spec::prompt_for;
         use crate::task_agent::Stage;
 
         let expected = [
-            (AgentSlot::PlanningProduct, PRODUCT_PLANNING_PROMPT),
-            (AgentSlot::PlanningTechnical, TECHNICAL_PLANNING_PROMPT),
             (AgentSlot::Breakdown, BREAKDOWN_PROMPT),
             (AgentSlot::Implement, prompt_for(Stage::Implement).unwrap()),
             (AgentSlot::Fix, prompt_for(Stage::Fix).unwrap()),
@@ -1749,7 +1766,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn get_agent_settings_lists_all_nine_slots_with_effective_values() {
+    async fn get_agent_settings_lists_all_slots_with_effective_values() {
         let (app, _state) = test_app().await;
         let project = create_project(&app).await;
 
@@ -1765,20 +1782,22 @@ mod tests {
         assert_eq!(got.status(), StatusCode::OK);
         let body = body_json(got).await;
         let items = body["items"].as_array().unwrap();
-        assert_eq!(items.len(), 9, "the closed slot vocabulary, all present");
+        assert_eq!(items.len(), 11, "the closed slot vocabulary, all present");
         let slot_keys: Vec<&str> = items.iter().map(|i| i["slot"].as_str().unwrap()).collect();
         assert_eq!(
             slot_keys,
             vec![
-                "planning_product",
-                "planning_technical",
                 "breakdown",
                 "implement",
                 "fix",
                 "review",
                 "verify_complete",
                 "summarize",
-                "triage"
+                "triage",
+                "grilling",
+                "prototype",
+                "research",
+                "afk_task"
             ]
         );
         // No overrides yet: raw facets null, effective resolves to the seed.

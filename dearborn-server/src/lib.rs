@@ -4,16 +4,22 @@
 //! binary entrypoint so later tasks can add modules and integration tests
 //! cleanly.
 
+pub mod afk_engine;
 pub mod agent_settings;
 pub mod agent_slot;
+pub mod activity;
 pub mod auth;
 pub mod board;
 pub mod breakdown;
+pub mod capability;
+pub mod cli;
 pub mod cmd;
+pub mod comments;
 pub mod config;
 pub mod cost;
 pub mod crypto;
 pub mod db;
+pub mod document;
 pub mod epics;
 pub mod error;
 pub mod evidence;
@@ -22,11 +28,14 @@ pub mod git_host;
 pub mod harness_pi;
 pub mod hub;
 pub mod lanes;
-pub mod mcp;
+pub mod map;
+pub mod node_asset;
+pub mod node_engine;
 pub mod planning;
 pub mod pr;
 pub mod projects;
 pub(crate) mod retry;
+pub mod resolve;
 pub mod review_poll;
 pub mod sessions;
 pub mod spec;
@@ -51,13 +60,14 @@ use tower_http::{
 };
 
 pub use breakdown::BreakdownAgent;
+pub use afk_engine::AfkAgent;
 pub use config::{AuthConfig, Config, ConfigError, ExecutorConfig};
 pub use crypto::{CryptoError, MasterKey};
 pub use db::{Db, DbError};
 pub use error::{AppError, AppResult};
 pub use git_host::GitHost;
 pub use hub::Hub;
-pub use mcp::CapabilityStore;
+pub use capability::CapabilityStore;
 pub use planning::PlanningAgent;
 pub use task_agent::TaskAgent;
 
@@ -98,8 +108,9 @@ pub struct AppState {
     /// `user` rows are never deleted, and the lockout guards make "zero active
     /// admins" unreachable through the API. See [`AppState::instance_claimed`].
     pub claimed: Arc<AtomicBool>,
-    /// The planning agent that drives interactive epic-planning runs (T-202).
-    /// Production is [`planning::ClaudePlanningAgent`]; tests inject a fake.
+    /// The interactive agent-run seam (see [`planning`]). The per-node
+    /// planning engines (grilling/prototype — wayfinder epic, later tasks)
+    /// build on this seam; tests inject a scripted fake.
     pub planner: Arc<dyn PlanningAgent>,
     /// The one-shot breakdown agent that turns an approved epic into a task DAG
     /// (T-301). Production is [`breakdown::ClaudeBreakdownAgent`]; tests inject
@@ -115,6 +126,16 @@ pub struct AppState {
     /// claimed task at a time, by construction of the DAG walk), not a
     /// per-epic guard like planning's.
     pub task_agent: Arc<dyn TaskAgent>,
+    /// The one-shot AFK node engine that runs research and AFK-task map nodes
+    /// unattended (wayfinder epic §5). Production is
+    /// [`afk_engine::ClaudeAfkAgent`]; tests inject a scripted fake. Like
+    /// breakdown it is one-shot (no resume), but it is wired to no `dearborn`
+    /// CLI at all — an unattended run gets no write surface, so the map it is
+    /// forbidden from reshaping is structurally out of reach; Dearborn itself
+    /// records the report into the node's `gist`. Concurrency is the
+    /// per-node run-lock ([`AppState::node_inflight`]), so the frontier's AFK
+    /// nodes fire in parallel.
+    pub afk: Arc<dyn AfkAgent>,
     /// The git-hosting seam (T-514): push the epic branch and open its PR.
     /// Production is [`git_host::GithubHost`]; tests inject
     /// [`git_host::testing::FakeHost`] so `just test` never talks to a real
@@ -126,15 +147,29 @@ pub struct AppState {
     /// Epics with a planning run currently in flight. A second trigger for an
     /// epic already in this set is ignored (its user message is still stored),
     /// so runs never interleave on `seq`/resume. See [`AppState::try_acquire_run`].
+    ///
+    /// Breakdown (the one-shot epic → task DAG run) is the only remaining
+    /// per-epic-locked engine. The interactive per-node engines
+    /// (grilling/prototype) moved their one-run-in-flight lock down to
+    /// [`AppState::node_inflight`] so unblocked frontier nodes run concurrently
+    /// (wayfinder epic §7).
     pub inflight: Arc<Mutex<HashSet<String>>>,
-    /// Per-run MCP capability tokens (T-203). A planning run mints a token scoped
-    /// to one `(epic, phase, clone_path)`; the shelled-out agent authenticates its
-    /// `POST /mcp/:cap` calls with it. See [`crate::mcp`].
+    /// Map nodes with an interactive agent reply currently in flight, keyed by
+    /// `map_node.id` — the per-node run-lock (wayfinder epic §7). A message
+    /// posted into a node whose id is already here is still stored, but does not
+    /// start a second agent turn: the lock serializes the agent's replies within
+    /// a node while leaving *different* nodes free to run in parallel. See
+    /// [`AppState::try_acquire_node_run`].
+    pub node_inflight: Arc<Mutex<HashSet<String>>>,
+    /// Per-run capability tokens. An agent run mints a token scoped to one
+    /// `(epic, project, phase, clone)`; the agent authenticates its `dearborn`
+    /// CLI calls with it as a bearer, and the token can act only on that epic
+    /// through the CLI's REST surface. See [`crate::capability`].
     pub caps: Arc<CapabilityStore>,
     /// Dearborn's own loopback origin (e.g. `http://127.0.0.1:8787`), used to
-    /// build the MCP config URL handed to the agent. Set once after the listener
-    /// binds (`main`, or the live test); `None` in unit tests that never spawn a
-    /// real agent, which disables MCP wiring for the run.
+    /// build the `--url` handed to the agent's `dearborn` CLI. Set once after
+    /// the listener binds (`main`, or the live test); `None` in unit tests that
+    /// never spawn a real agent, which disables CLI wiring for the run.
     pub advertised_base: Arc<Mutex<Option<String>>>,
     /// The worker pool's wake signal (D2, T-510). Anything that enqueues work —
     /// today, the `Ready → InProgress` lane transition — calls
@@ -156,6 +191,17 @@ pub struct AppState {
     /// `.await`); the per-project `tokio::sync::Mutex` it hands out is the
     /// actual (long-held, across-await) exclusion.
     pub refresh_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
+    /// Per-epic document write semaphores (wayfinder epic §7): a
+    /// `tokio::sync::Mutex` keyed by `epic_id`, handed out by
+    /// [`AppState::document_write_lock`]. The living Document's sync
+    /// ([`crate::document::sync_document`]) takes this for its bounded
+    /// read→check→commit — base-version check, version + section-index
+    /// persistence — so two sibling node sessions' resolution edits can never
+    /// interleave. An in-process lock suffices: Dearborn is a single server
+    /// process (no horizontal scaling) and SQLite already serializes writers.
+    /// Keyed by epic id, so epics never block each other. Same pattern as
+    /// [`AppState::refresh_locks`] and the in-flight sets above.
+    pub document_locks: Arc<Mutex<HashMap<String, Arc<tokio::sync::Mutex<()>>>>>,
     /// Live `RunHandle`s for whatever agent stage is currently running,
     /// keyed by the claimed item's id (T-542, MILESTONE_2 D12/§7). Populated
     /// by [`task_agent::run_agent_stage`] for the duration of exactly one
@@ -224,8 +270,23 @@ pub struct AppState {
 }
 
 impl AppState {
+    /// Hand out `epic_id`'s document write semaphore (wayfinder epic §7),
+    /// creating it on first use. The same epic id always yields the same
+    /// underlying `tokio::sync::Mutex` (checked via `Arc::ptr_eq` in tests),
+    /// so every document sync on that epic excludes every other, while
+    /// different epics never contend. See [`AppState::document_locks`].
+    pub fn document_write_lock(&self, epic_id: &str) -> Arc<tokio::sync::Mutex<()>> {
+        let mut map = self
+            .document_locks
+            .lock()
+            .expect("document_locks mutex poisoned");
+        map.entry(epic_id.to_string())
+            .or_insert_with(|| Arc::new(tokio::sync::Mutex::new(())))
+            .clone()
+    }
+
     /// Construct shared state from a resolved [`Config`] and open [`Db`], using
-    /// the production planning agent ([`planning::ClaudePlanningAgent`]).
+    /// the production interactive agent ([`planning::ClaudePlanningAgent`]).
     ///
     /// The master key is derived here; `config.master_key` is guaranteed
     /// non-empty by config loading, so derivation cannot fail. Boot code should
@@ -240,9 +301,7 @@ impl AppState {
     }
 
     /// Like [`AppState::new`] but with an injected [`PlanningAgent`] — the seam
-    /// that lets tests drive planning runs hermetically with a scripted fake.
-    /// The breakdown agent defaults to the production
-    /// [`breakdown::ClaudeBreakdownAgent`] (override it via [`with_agents`]).
+    /// that lets tests drive interactive runs hermetically with a scripted fake.
     pub fn with_planner(config: Config, db: Db, planner: Arc<dyn PlanningAgent>) -> AppState {
         AppState::with_agents(
             config,
@@ -272,6 +331,16 @@ impl AppState {
             breakdown,
             Arc::new(task_agent::CliTaskAgent::new()),
         )
+    }
+
+    /// Swap in an injected [`AfkAgent`] — the seam tests use to drive the
+    /// one-shot AFK node engine (research / AFK-task nodes) hermetically.
+    /// Consumes and returns `self` so it chains after any constructor;
+    /// production wiring defaults the agent to
+    /// [`afk_engine::ClaudeAfkAgent`].
+    pub fn with_afk(mut self, afk: Arc<dyn AfkAgent>) -> AppState {
+        self.afk = afk;
+        self
     }
 
     /// Like [`with_agents`](Self::with_agents) but also injecting the
@@ -323,12 +392,15 @@ impl AppState {
             planner,
             breakdown,
             task_agent,
+            afk: Arc::new(afk_engine::ClaudeAfkAgent::new()),
             git_host,
             inflight: Arc::new(Mutex::new(HashSet::new())),
+            node_inflight: Arc::new(Mutex::new(HashSet::new())),
             caps: Arc::new(CapabilityStore::new()),
             advertised_base: Arc::new(Mutex::new(None)),
             notify: Arc::new(tokio::sync::Notify::new()),
             refresh_locks: Arc::new(Mutex::new(HashMap::new())),
+            document_locks: Arc::new(Mutex::new(HashMap::new())),
             cancel_registry: Arc::new(std::sync::Mutex::new(HashMap::new())),
             #[cfg(test)]
             test_pipeline_hook: None,
@@ -336,7 +408,7 @@ impl AppState {
     }
 
     /// Record Dearborn's loopback origin (`http://host:port`) once the listener
-    /// is bound, so planning runs can build the agent's MCP config URL. Idempotent
+    /// is bound, so agent runs can build the `dearborn` CLI's `--url`. Idempotent
     /// last-write-wins.
     pub fn set_advertised_base(&self, base: impl Into<String>) {
         *self.advertised_base.lock().expect("base mutex poisoned") = Some(base.into());
@@ -415,6 +487,31 @@ impl AppState {
             epic_id: epic_id.to_string(),
         })
     }
+
+    /// Claim the per-node run-lock for `node_id` for an interactive agent reply
+    /// (wayfinder epic §7).
+    ///
+    /// Returns `Some(guard)` if no reply was already in flight for the node —
+    /// the caller spawns the reply and holds the guard for its lifetime;
+    /// dropping it frees the lock. Returns `None` if a reply is already running
+    /// (the caller then leaves the just-stored user message for the in-flight
+    /// turn's successor, exactly like [`try_acquire_run`](Self::try_acquire_run)
+    /// does per epic). The lock is keyed by node, so a reply in one node never
+    /// blocks a reply in another.
+    pub fn try_acquire_node_run(&self, node_id: &str) -> Option<NodeRunGuard> {
+        let mut set = self
+            .node_inflight
+            .lock()
+            .expect("node_inflight mutex poisoned");
+        if set.contains(node_id) {
+            return None;
+        }
+        set.insert(node_id.to_string());
+        Some(NodeRunGuard {
+            set: self.node_inflight.clone(),
+            node_id: node_id.to_string(),
+        })
+    }
 }
 
 #[cfg(test)]
@@ -443,6 +540,22 @@ impl Drop for InflightGuard {
     }
 }
 
+/// RAII claim on a map node's interactive run-lock. Frees the lock on drop, so
+/// the node is workable again however the reply ends (completion, error, or
+/// panic). The per-node analogue of [`InflightGuard`] (wayfinder epic §7).
+pub struct NodeRunGuard {
+    set: Arc<Mutex<HashSet<String>>>,
+    node_id: String,
+}
+
+impl Drop for NodeRunGuard {
+    fn drop(&mut self) {
+        if let Ok(mut set) = self.set.lock() {
+            set.remove(&self.node_id);
+        }
+    }
+}
+
 /// Build the application router.
 ///
 /// `/health` is public; every other API route sits behind the bearer-token
@@ -457,10 +570,6 @@ pub fn app(state: AppState) -> Router {
     let public = Router::new()
         .route("/health", get(health))
         .route("/ws", get(ws::ws_handler))
-        // Dearborn's local MCP server for planning runs (T-203). Authed by the
-        // per-run capability token in the `:cap` path segment, NOT the browser
-        // bearer token — so it lives outside the bearer layer, like `/ws`.
-        .route("/mcp/:cap", axum::routing::post(mcp::mcp_endpoint))
         // First-launch claim, login, and session refresh. Unauthenticated by
         // necessity: these are how a caller *gets* a credential, so they
         // cannot sit behind one.
@@ -471,6 +580,10 @@ pub fn app(state: AppState) -> Router {
 
     let protected = Router::new()
         .route("/auth/me", get(sessions::me))
+        // The `dearborn` CLI's `scope` verb: names the bearer capability
+        // token's own epic/project/phase (a session token gets 403 here —
+        // see `capability::CapabilityActor`).
+        .route("/auth/capability", get(capability::whoami))
         .route("/auth/logout", axum::routing::post(sessions::logout))
         .route(
             "/auth/password",
@@ -513,15 +626,99 @@ pub fn app(state: AppState) -> Router {
             axum::routing::put(agent_settings::put_agent_setting),
         )
         .route("/epics/:id", get(epics::get_epic).patch(epics::update_epic))
+        // The planning map (wayfinder epic): node CRUD + dependency edges +
+        // the four prose fields, plus the computed-map query. The `dearborn`
+        // CLI's `node`/`map` verbs call exactly these (capability-token scoped).
         .route(
-            "/epics/:id/messages",
-            axum::routing::post(epics::post_message),
+            "/epics/:id/map",
+            get(map::get_map).patch(map::patch_map_prose),
         )
-        .route("/epics/:id/transcript", get(epics::get_transcript))
-        .route("/epics/:id/sessions", get(epics::list_sessions))
+        .route("/epics/:id/map-nodes", axum::routing::post(map::create_map_node))
         .route(
-            "/epics/:id/advance-phase",
-            axum::routing::post(epics::advance_phase),
+            "/epics/:id/map-nodes/:nodeId",
+            get(map::get_map_node).patch(map::patch_map_node),
+        )
+        // The interactive per-node engine (wayfinder epic §5/§7): opening a
+        // grilling/prototype node starts/resumes its node-scoped session, and
+        // any user may post a message whose reply the per-node run-lock
+        // serializes. Live `RunEvent`s stream on `node:<id>`.
+        .route(
+            "/epics/:id/map-nodes/:nodeId/session",
+            get(node_engine::get_node_session).post(node_engine::open_node_session),
+        )
+        .route(
+            "/epics/:id/map-nodes/:nodeId/messages",
+            get(node_engine::list_node_messages).post(node_engine::post_node_message),
+        )
+        // The prototype artifact store (wayfinder epic §4.7/§11): a node's
+        // stored prototype artifacts, listed (metadata — linked, not inlined)
+        // and read back raw so the client can render them in a sandboxed
+        // iframe. Writes ride the resolution bundle (HITL-gated above).
+        .route(
+            "/epics/:id/map-nodes/:nodeId/assets",
+            get(node_asset::list_node_assets),
+        )
+        .route(
+            "/epics/:id/map-nodes/:nodeId/assets/:assetId",
+            get(node_asset::get_node_asset),
+        )
+        // The grilling resolution bundle (wayfinder epic §6/§10): one call that
+        // records the decision, folds in the Document edit under the per-epic
+        // write semaphore, graduates fog into new frontier nodes, rules things
+        // out of scope, and updates affected nodes. HITL kinds only — the
+        // `dearborn` CLI's (upgraded) `node resolve` verb calls exactly this.
+        .route(
+            "/epics/:id/map-nodes/:nodeId/resolve",
+            axum::routing::post(resolve::resolve_node),
+        )
+        // The one-shot AFK node engine (wayfinder epic §5): firing a research
+        // or AFK-task node runs one unattended agent turn whose report lands
+        // in the node's `gist`; per-node runs never reshape the map and fire
+        // in parallel under the per-node run-lock. Live `RunEvent`s stream on
+        // `node:<id>`.
+        .route(
+            "/epics/:id/map-nodes/:nodeId/run",
+            axum::routing::post(afk_engine::fire_node),
+        )
+        // The living Document (wayfinder epic §4.5/§10, Phase 3): read the
+        // epic's HTML document for the scratch-file round trip, and sync an
+        // edited file back as a new version under the per-epic write
+        // semaphore. The `dearborn` CLI's `document pull|sync` verbs call
+        // exactly these (capability-token scoped).
+        .route("/epics/:id/document", get(document::get_document))
+        .route(
+            "/epics/:id/document/sync",
+            axum::routing::post(document::sync_document),
+        )
+        // Comments (wayfinder epic §4.8/§9): threaded, anchored to a map node
+        // or a Document section, user-attributed with agent replies (an agent
+        // run posts through its capability token, `is_agent = 1`), thread-
+        // level resolve, and thread promotion into a new open frontier node
+        // (stamping `promoted_node_id` on the source thread). The `dearborn`
+        // CLI's `comment post|list|resolve|promote` verbs call exactly these
+        // (capability-token scoped).
+        .route(
+            "/epics/:id/comments",
+            get(comments::list_comments_handler).post(comments::post_comment),
+        )
+        .route(
+            "/epics/:id/comments/:commentId/resolve",
+            axum::routing::post(comments::resolve_comment),
+        )
+        .route(
+            "/epics/:id/comments/:commentId/promote",
+            axum::routing::post(comments::promote_comment),
+        )
+        // Attribution & activity feed (wayfinder epic §4.9/§9): the
+        // append-only history of key mutations (every mutation surface
+        // records into it) and the participants derived as distinct actors
+        // across all attribution surfaces. Reads, so they are on the
+        // capability-token allow-list for every phase.
+        .route("/epics/:id/activity", get(activity::get_activity))
+        .route("/epics/:id/participants", get(activity::get_participants))
+        .route(
+            "/epics/:id/map-node-dependencies",
+            axum::routing::post(map::link_map_nodes),
         )
         .route(
             "/epics/:id/breakdown",

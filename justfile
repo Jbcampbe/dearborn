@@ -22,7 +22,7 @@ backend:
     : "${DEARBORN_MASTER_KEY:=dev-master-key}"
     : "${DEARBORN_BIND:=127.0.0.1:8787}"
     export DEARBORN_MASTER_KEY DEARBORN_BIND
-    cargo run -p dearborn-server
+    cargo run -p dearborn-server --bin dearborn-server
     # cargo watch -x run
 
 # Run the Vite frontend dev server alone.

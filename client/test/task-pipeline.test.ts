@@ -15,6 +15,7 @@ import {
   initialPipelineState,
   mergeHydratedLog,
   reconcileLiveLog,
+  reconcileLiveThinking,
   resetLiveTail,
   runStatusLabel,
   runningRun,
@@ -182,6 +183,7 @@ describe("initialPipelineState / hydratePipeline", () => {
     const state = initialPipelineState();
     expect(state.liveLog).toBe("");
     expect(state.liveLogReconciled).toBe(false);
+    expect(state.liveThinking).toBe("");
   });
 
   it("does NOT reset liveLog -- resetLiveTail owns that (see its own doc)", () => {
@@ -239,13 +241,15 @@ describe("mergeHydratedLog", () => {
 });
 
 describe("resetLiveTail / reconcileLiveLog", () => {
-  it("resetLiveTail clears both fields", () => {
+  it("resetLiveTail clears the live-tail fields", () => {
     const state = initialPipelineState();
     state.liveLog = "stale from a previous task";
     state.liveLogReconciled = true;
+    state.liveThinking = "stale reasoning";
     resetLiveTail(state);
     expect(state.liveLog).toBe("");
     expect(state.liveLogReconciled).toBe(false);
+    expect(state.liveThinking).toBe("");
   });
 
   it("reconcileLiveLog merges and marks reconciled", () => {
@@ -254,6 +258,21 @@ describe("resetLiveTail / reconcileLiveLog", () => {
     reconcileLiveLog(state, "tail one\ntail two\n");
     expect(state.liveLog).toBe("tail one\ntail two\n");
     expect(state.liveLogReconciled).toBe(true);
+  });
+
+  it("reconcileLiveThinking merges the buffered reasoning against the REST snapshot, no duplication", () => {
+    const state = initialPipelineState();
+    // Buffered live thinking that the flushed snapshot already caught up past.
+    state.liveThinking = "considering the diff";
+    reconcileLiveThinking(state, "earlier reasoning\nconsidering the diff");
+    expect(state.liveThinking).toBe("earlier reasoning\nconsidering the diff");
+  });
+
+  it("reconcileLiveThinking appends buffered reasoning the snapshot predates, no gap", () => {
+    const state = initialPipelineState();
+    state.liveThinking = "newest reasoning";
+    reconcileLiveThinking(state, "flushed reasoning so far\n");
+    expect(state.liveThinking).toBe("flushed reasoning so far\nnewest reasoning");
   });
 });
 
@@ -277,13 +296,26 @@ describe("applyPipelineFrame -- the hydration boundary (T-563's hard part)", () 
     expect(state.liveLog).toBe("partial output\n[error] boom\n");
   });
 
-  it("ignores thinking/tool/session/etc -- only Text/Error are part of agent_run.log", () => {
+  it("keeps thinking out of liveLog (not part of agent_run.log) but folds it into liveThinking", () => {
     const state = initialPipelineState();
-    applyPipelineFrame(state, frame("thinking", { runId: "r1", delta: "pondering" }));
+    applyPipelineFrame(state, frame("thinking", { runId: "r1", delta: "pondering " }));
+    applyPipelineFrame(state, frame("thinking", { runId: "r1", delta: "the plan" }));
     applyPipelineFrame(state, frame("tool_start", { runId: "r1", toolCallId: "c1", name: "bash" }));
     applyPipelineFrame(state, frame("started", { runId: "r1" }));
     applyPipelineFrame(state, frame("subscribed", {}));
+    // Thinking accumulates on its own field...
+    expect(state.liveThinking).toBe("pondering the plan");
+    // ...and never leaks into the persisted-log tail.
     expect(state.liveLog).toBe("");
+  });
+
+  it("interleaved thinking and text deltas land in their own buffers, never mixed", () => {
+    const state = initialPipelineState();
+    applyPipelineFrame(state, frame("thinking", { runId: "r1", delta: "let me check X" }));
+    applyPipelineFrame(state, frame("text", { runId: "r1", delta: "Here is the answer." }));
+    applyPipelineFrame(state, frame("thinking", { runId: "r1", delta: " and now Y" }));
+    expect(state.liveThinking).toBe("let me check X and now Y");
+    expect(state.liveLog).toBe("Here is the answer.");
   });
 
   it("a joiner whose hydrate lands before some buffered live events sees all of it, no gap", () => {
@@ -357,7 +389,9 @@ describe("applyPipelineFrame -- stage_changed advances the timeline", () => {
     const state = initialPipelineState();
     hydratePipeline(state, "T1", [run({ id: "R1", stage: "review", attempt: 0, status: "running" })]);
     applyPipelineFrame(state, frame("text", { runId: "r1", delta: "reviewing..." }));
+    applyPipelineFrame(state, frame("thinking", { runId: "r1", delta: "considering the diff" }));
     expect(state.liveLog).toBe("reviewing...");
+    expect(state.liveThinking).toBe("considering the diff");
 
     applyPipelineFrame(
       state,
@@ -366,6 +400,8 @@ describe("applyPipelineFrame -- stage_changed advances the timeline", () => {
 
     expect(state.liveLog).toBe("");
     expect(state.liveLogReconciled).toBe(false);
+    // Reasoning belongs to the stage that just ended — it must not bleed forward.
+    expect(state.liveThinking).toBe("");
   });
 
   it("inserts a synthesized row for a stage this client's hydrate never saw, rather than dropping it", () => {

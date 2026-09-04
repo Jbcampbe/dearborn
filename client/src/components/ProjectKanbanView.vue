@@ -410,7 +410,7 @@ onMounted(load);
           >
             <RouterLink
               class="card-title"
-              :to="{ name: 'epic-planning', params: { id: epic.id } }"
+              :to="{ name: 'epic-details', params: { id: epic.id } }"
             >
               {{ epic.title }}
             </RouterLink>

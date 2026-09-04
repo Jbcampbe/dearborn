@@ -84,7 +84,7 @@ pub(crate) async fn load_board(conn: &Connection, project_id: &str) -> AppResult
 
 /// Best-effort publish of the board on `project:<id>` as a `board_updated`
 /// frame (payload `{ epics, tasks, epic_progress }`). A read error is logged and the publish
-/// is skipped — mirrors `mcp::publish_dag`.
+/// is skipped — mirrors `capability::publish_dag`.
 pub async fn publish_board(state: &AppState, project_id: &str) {
     let board = match load_board(state.db.conn(), project_id).await {
         Ok(board) => board,

@@ -1077,8 +1077,6 @@ async fn run_triage(
         title,
         description,
         acceptance,
-        product_ctx,
-        technical_ctx,
         epic_id,
         task_id,
         workspace_path,
@@ -1095,8 +1093,6 @@ async fn run_triage(
                 epic.title.clone(),
                 epic.description.clone(),
                 None,
-                epic.product_context.clone(),
-                epic.technical_context.clone(),
                 Some(candidate.id.clone()),
                 None,
                 epic_workspace_path(&state.config.clone_root, &candidate.id),
@@ -1114,8 +1110,6 @@ async fn run_triage(
                 task.title.clone(),
                 task.description.clone(),
                 task.acceptance.clone(),
-                None,
-                None,
                 None,
                 Some(candidate.id.clone()),
                 task_workspace_path(&state.config.clone_root, &candidate.id),
@@ -1135,8 +1129,6 @@ async fn run_triage(
             WorkKind::Epic => Some(crate::spec::EpicContext {
                 title: &title,
                 description: description.as_deref(),
-                product_context: product_ctx.as_deref(),
-                technical_context: technical_ctx.as_deref(),
             }),
             WorkKind::Task => None,
         },
@@ -1617,7 +1609,7 @@ async fn spawn_epic_change_tasks(
                 spawned = %spawned.len(),
                 "review poll: epic moved to InProgress for change work"
             );
-            crate::mcp::publish_dag(state, &candidate.id).await;
+            crate::capability::publish_dag(state, &candidate.id).await;
             crate::board::publish_board(state, &candidate.project_id).await;
             state.notify.notify_waiters();
         }

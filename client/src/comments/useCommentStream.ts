@@ -1,23 +1,26 @@
-// WebSocket client composable for the planning stream (T-204).
+// WebSocket client composable for the shared comment panel's live updates.
 //
-// Opens `GET /ws?token=<token>` (browsers pass the token in the query string —
-// see CONVENTIONS.md §Handshake auth), subscribes to `epic:<id>`, waits for the
-// `subscribed` ack, then feeds every subsequent frame through the pure reducer
-// (`stream.ts`) into a caller-provided reactive `PlanningState`. It owns the
-// socket lifecycle: unsubscribe + close on unmount, and a bounded reconnect with
-// backoff on an unexpected drop.
+// Mirrors `map/useMapStream.ts` (same transport pattern, shared `epic:<id>`
+// topic): opens `GET /ws?token=<token>`, subscribes to `epic:<id>`, waits for
+// the `subscribed` ack, then feeds every subsequent frame through the pure
+// reducer (`comments/stream.ts`) into a caller-provided reactive
+// `CommentState`. Owns the socket lifecycle (unsubscribe + close on unmount,
+// bounded reconnect with backoff). `comments_updated` is the only frame the
+// reducer folds — the panel ignores the rest of the topic's traffic.
 //
-// The reducer holds all the state logic; this file is just transport + wiring,
-// so it stays small and the risk-bearing folding is unit-tested in isolation.
+// A view that already holds an `epic:<id>` subscription (Map, Document) opens
+// this alongside its own — one socket per surface, matching the per-view
+// transport convention.
 
 import { getCurrentScope, onScopeDispose, ref, type Ref } from "vue";
 
-import { applyFrame, type EpicFrame, type PlanningState } from "./stream";
+import { applyCommentFrame, type CommentFrame, type CommentState } from "./stream";
+import type { Comment } from "../api/comments";
 
 /** Connection lifecycle, surfaced to the view for a small status line. */
 export type StreamStatus = "connecting" | "open" | "closed";
 
-export interface EpicStream {
+export interface CommentStream {
   /** Live connection status. */
   status: Ref<StreamStatus>;
   /** Manually tear down. Also runs automatically if an effect scope is active. */
@@ -33,46 +36,48 @@ const BACKOFF_BASE_MS = 500;
  * attempt (including reconnects), so a socket reconnecting after a long idle
  * presents a live token instead of an expired one. Resolving `null` means the
  * caller is not authenticated; connecting then stops rather than retrying.
- *
- * The provider should be cheap when the stored token is still valid —
- * `auth.ensureFresh()` only refreshes near expiry.
  */
 export type TokenProvider = () => Promise<string | null>;
 
-/**
- * Build the `ws(s)://…/ws?token=…` URL from the current origin so it works both
- * behind the Vite dev proxy (which forwards `/ws` with `ws:true`) and in
- * production (the Rust binary upgrades `/ws` itself).
- */
+/** Build the `ws(s)://…/ws?token=…` URL from the current origin. */
 function wsUrl(token: string): string {
   const proto = window.location.protocol === "https:" ? "wss:" : "ws:";
   return `${proto}//${window.location.host}/ws?token=${encodeURIComponent(token)}`;
 }
 
+/** A frame filter: only comments anchored to this node/section are folded. */
+export interface CommentScope {
+  anchorKind: string;
+  anchorId: string;
+}
+
 /**
- * Subscribe a reactive `PlanningState` to an epic's live planning stream.
+ * Subscribe a reactive `CommentState` to an epic's live comment stream.
  *
  * @param epicId    the epic to subscribe to (`epic:<id>`).
  * @param getToken  awaited on every connect attempt (including reconnects) to
  *                  obtain the access token for the WS query string.
  * @param state     the reactive view model the reducer folds frames into.
- * @param status  an optional external status ref to drive (e.g. a component's);
- *                one is created if omitted. Passing the component's own ref
- *                avoids a `watch` when this is called outside the setup scope
- *                (e.g. after `await` in an `onMounted` handler).
+ * @param status  an optional external status ref to drive; one is created if
+ *                omitted. Passing the component's own ref avoids a `watch` when
+ *                this is called outside the setup scope (e.g. after `await`).
+ * @param scope   an optional anchor filter — the `comments_updated` frame
+ *                carries the epic's FULL list, so a panel scoped to one anchor
+ *                (its REST hydrate was filtered) must narrow frames the same
+ *                way or a live frame would widen it back to the whole epic.
  */
-export function useEpicStream(
+export function useCommentStream(
   epicId: string,
   getToken: TokenProvider,
-  state: PlanningState,
+  state: CommentState,
   status: Ref<StreamStatus> = ref<StreamStatus>("connecting"),
-): EpicStream {
+  scope?: CommentScope,
+): CommentStream {
   const topic = `epic:${epicId}`;
 
   let socket: WebSocket | null = null;
   let attempts = 0;
   let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
-  // Set once the caller (or scope teardown) asks us to stop — suppresses reconnect.
   let disposed = false;
 
   async function connect(): Promise<void> {
@@ -106,33 +111,39 @@ export function useEpicStream(
     socket = ws;
 
     ws.onopen = () => {
-      // Ask for the epic topic; frames start flowing after the `subscribed` ack.
       ws.send(JSON.stringify({ type: "subscribe", topic }));
     };
 
     ws.onmessage = (event: MessageEvent<string>) => {
-      let frame: EpicFrame;
+      let frame: CommentFrame;
       try {
-        frame = JSON.parse(event.data) as EpicFrame;
+        frame = JSON.parse(event.data) as CommentFrame;
       } catch {
-        return; // ignore anything that isn't a JSON frame
+        return;
       }
       if (frame.type === "subscribed") {
-        attempts = 0; // a clean subscribe resets the backoff budget
+        attempts = 0;
         status.value = "open";
         return;
       }
       if (frame.type === "unsubscribed") {
         return;
       }
-      // Only fold frames for our topic (the socket is single-topic, but be safe).
       if (frame.topic === topic) {
-        applyFrame(state, frame);
+        if (scope !== undefined && frame.type === "comments_updated" && Array.isArray(frame.payload)) {
+          frame = {
+            ...frame,
+            payload: (frame.payload as Comment[]).filter(
+              (c) => c.anchor_kind === scope.anchorKind && c.anchor_id === scope.anchorId,
+            ),
+          };
+        }
+        applyCommentFrame(state, frame);
       }
     };
 
     ws.onerror = () => {
-      // `onclose` always follows; let it drive reconnect so we don't double-fire.
+      // `onclose` always follows; let it drive reconnect.
     };
 
     ws.onclose = () => {
@@ -171,25 +182,20 @@ export function useEpicStream(
     const ws = socket;
     socket = null;
     if (ws !== null) {
-      // Best-effort clean unsubscribe before closing (server also tears down on
-      // socket close, so this is belt-and-suspenders).
       if (ws.readyState === WebSocket.OPEN) {
         try {
           ws.send(JSON.stringify({ type: "unsubscribe", topic }));
         } catch {
-          // ignore — we're closing anyway
+          // ignore — closing anyway
         }
       }
-      ws.onclose = null; // don't let the manual close trigger a reconnect
+      ws.onclose = null;
       ws.close();
     }
     status.value = "closed";
   }
 
   connect();
-  // Automatic cleanup when the owning effect scope unmounts — only if one is
-  // active (this may be called after `await`, where no scope is current; the
-  // caller then owns teardown via the returned `close`).
   if (getCurrentScope()) {
     onScopeDispose(close);
   }

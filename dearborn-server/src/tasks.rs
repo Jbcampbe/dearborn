@@ -4,8 +4,8 @@
 //! §2.2). Breakdown (T-301) creates a graph of them under an epic, wired by
 //! `task_dependency` edges (`blocker` blocks `blocked`, matching to-tasks'
 //! `blocks:`). This module is the shared, framework-free store layer both the
-//! breakdown MCP tools (`create_task` / `link_dependency`, see [`crate::mcp`])
-//! and later the REST DAG API (T-302) build on. It follows the `epics.rs` store
+//! breakdown agent's `dearborn task create` / `task link` CLI verbs and the
+//! REST DAG API (T-302) build on. It follows the `epics.rs` store
 //! style: crate-visible helpers, ULID ids, unix-ms timestamps, and atomic
 //! `MAX(..)+1` ordinals assigned inside the single `INSERT`.
 //!
@@ -585,7 +585,7 @@ pub async fn create_epic_task(
         link_dependency(conn, &task.id, blocked_id).await?; // 404/400/409 propagate
     }
 
-    crate::mcp::publish_dag(&state, &id).await;
+    crate::capability::publish_dag(&state, &id).await;
     // A new task changes the epic's total on the project board's progress badge.
     crate::board::publish_board(&state, &epic.project_id).await;
     Ok((StatusCode::CREATED, Json(task)))
@@ -670,7 +670,7 @@ pub async fn patch_task(
     )
     .await?;
     if let Some(epic_id) = task.epic_id.as_ref() {
-        crate::mcp::publish_dag(&state, epic_id).await;
+        crate::capability::publish_dag(&state, epic_id).await;
     }
     // Always refresh the project board: standalone tasks live on it directly,
     // and an epic-scoped status change moves the epic's progress badge.
@@ -818,7 +818,7 @@ pub async fn retry_task(
         )
         .await?;
 
-        crate::mcp::publish_dag(&state, epic_id).await;
+        crate::capability::publish_dag(&state, epic_id).await;
         if let Some(updated_epic) = fetch_epic(conn, epic_id).await? {
             let payload = serde_json::to_value(&updated_epic).unwrap_or(serde_json::Value::Null);
             state
@@ -916,7 +916,7 @@ pub async fn remove_task(
         .ok_or_else(|| AppError::NotFound(format!("task {id} not found")))?;
     delete_task(conn, &id).await?;
     if let Some(epic_id) = task.epic_id.as_ref() {
-        crate::mcp::publish_dag(&state, epic_id).await;
+        crate::capability::publish_dag(&state, epic_id).await;
     }
     crate::board::publish_board(&state, &task.project_id).await;
     Ok(StatusCode::NO_CONTENT)
@@ -964,7 +964,7 @@ pub async fn post_dependency(
     }
 
     link_dependency(conn, blocker_id, blocked_id).await?; // 400 self/cross, 409 cycle
-    crate::mcp::publish_dag(&state, &id).await;
+    crate::capability::publish_dag(&state, &id).await;
     Ok((
         StatusCode::CREATED,
         Json(Dependency {
@@ -993,7 +993,7 @@ pub async fn remove_dependency(
         return Err(AppError::NotFound(format!("epic {id} not found")));
     }
     unlink_dependency(conn, &q.blocker_id, &q.blocked_id).await?;
-    crate::mcp::publish_dag(&state, &id).await;
+    crate::capability::publish_dag(&state, &id).await;
     Ok(StatusCode::NO_CONTENT)
 }
 

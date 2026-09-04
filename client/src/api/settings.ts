@@ -14,10 +14,8 @@
 
 import { apiFetch, type Collection } from "./client";
 
-/** The nine agent slots, canonical order (server `AgentSlot::ALL`). */
+/** The agent slots, canonical order (server `AgentSlot::ALL`). */
 export const AGENT_SLOTS = [
-  "planning_product",
-  "planning_technical",
   "breakdown",
   "implement",
   "fix",
@@ -39,23 +37,22 @@ export type AgentSlot = (typeof AGENT_SLOTS)[number];
 export const SUPPORTED_HARNESSES = ["claude", "pi"] as const;
 
 /**
- * Harnesses that can reach Dearborn's local MCP server. Mirrors the server's
- * `agent_settings::MCP_CAPABLE_HARNESSES`: only Claude Code speaks MCP among
- * the CLIs Dearborn drives — pi has no MCP client at all.
+ * Harnesses whose engine is currently wired to the Claude Code adapter.
+ * Mirrors the server's `agent_settings::PLANNING_CAPABLE_HARNESSES`: the
+ * breakdown run engine is Claude-Code-bound today — the `dearborn` CLI it
+ * calls back through is itself harness-agnostic, and pi gains the engine when
+ * the per-node planning engines land.
  */
-export const MCP_CAPABLE_HARNESSES = ["claude"] as const;
+export const PLANNING_CAPABLE_HARNESSES = ["claude"] as const;
 
 /**
- * The three slots whose agent calls *back* into Dearborn over MCP (planning
- * maintains the epic record and reads the clone; breakdown writes the task
- * DAG). Mirrors the server's `agent_settings::slot_requires_mcp` — the six
- * task-stage slots act only on their workspace and need nothing from us.
+ * The slots that are Claude-Code-bound: breakdown calls back into the server
+ * through the harness-agnostic `dearborn` CLI, but its engine itself runs on
+ * the Claude Code adapter. The task-stage slots act only on their workspace
+ * and run on every supported harness. (The per-node planning engines pick up
+ * their own slots when they land.)
  */
-export const MCP_BOUND_SLOTS: readonly AgentSlot[] = [
-  "planning_product",
-  "planning_technical",
-  "breakdown",
-];
+export const MCP_BOUND_SLOTS: readonly AgentSlot[] = ["breakdown"];
 
 /**
  * Whether `harness` can run `slot`. The client-side mirror of the server's
@@ -70,7 +67,7 @@ export function harnessSupportsSlot(harness: string, slot: AgentSlot): boolean {
   }
   return (
     !MCP_BOUND_SLOTS.includes(slot) ||
-    (MCP_CAPABLE_HARNESSES as readonly string[]).includes(harness)
+    (PLANNING_CAPABLE_HARNESSES as readonly string[]).includes(harness)
   );
 }
 
@@ -160,7 +157,7 @@ export function updateGlobalSettings(
   });
 }
 
-/** `GET /projects/{id}/agent-settings` → all eight slots in canonical order. */
+/** `GET /projects/{id}/agent-settings` → all slots in canonical order. */
 export async function listProjectAgentSettings(
   token: string,
   projectId: string,
@@ -231,8 +228,6 @@ export function promptSaveValue(draft: string, slot: SlotSetting): string | null
  * server slot without a label still renders (with its raw key) via fallback.
  */
 export const SLOT_LABELS: Record<AgentSlot, string> = {
-  planning_product: "Planning — product",
-  planning_technical: "Planning — technical",
   breakdown: "Breakdown",
   implement: "Implement",
   fix: "Fix loop",

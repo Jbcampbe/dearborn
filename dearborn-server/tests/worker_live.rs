@@ -40,7 +40,7 @@
 //! yes, to Anthropic's API only; `claude`: yes; GitHub: no, `FakeHost` stands
 //! in). `#[ignore]` is what keeps it out of the default `cargo test`/`just
 //! test` run — see the bottom of this file for the "excluded from the gate"
-//! proof, and `tests/mcp_live.rs` (T-203) for the identical convention this
+//! proof, and `tests/harness_pi_live.rs` for the identical convention this
 //! follows.
 //!
 //! ## The fixture: hermetic except for the one `claude` API call

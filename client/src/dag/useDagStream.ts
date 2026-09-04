@@ -1,6 +1,6 @@
 // WebSocket client composable for the DAG editor's live updates (T-303).
 //
-// Mirrors `planning/useEpicStream.ts`: opens `GET /ws?token=<token>`, subscribes
+// Opens `GET /ws?token=<token>`, subscribes
 // to `epic:<id>`, waits for the `subscribed` ack, then feeds every subsequent
 // frame through the pure reducer (`dag/stream.ts`) into a caller-provided
 // reactive `DagState`. Owns the socket lifecycle (unsubscribe + close on unmount,

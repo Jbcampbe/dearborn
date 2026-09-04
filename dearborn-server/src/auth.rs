@@ -3,10 +3,20 @@
 //!
 //! [`require_auth`] replaces the old shared-static-token bearer layer as
 //! the `route_layer` over the protected router: it reads the `Authorization:
-//! Bearer` header, verifies the presented token with the instance's [`AuthKey`]
-//! (stateless — one HMAC, zero database reads), inserts the resulting [`Claims`]
-//! into the request extensions, and lets the request through. Public routes
-//! (notably `GET /health`) bypass it entirely.
+//! Bearer` header and resolves it as one of two credential kinds:
+//!
+//! 1. **Session token** — verified with the instance's [`AuthKey`] (stateless —
+//!    one HMAC, zero database reads); the resulting [`Claims`] are inserted
+//!    into the request extensions and the request proceeds with full access.
+//! 2. **Capability token** (agent runs) — resolved against the instance's
+//!    [`CapabilityStore`](crate::capability::CapabilityStore). On a hit the
+//!    request must also pass [`capability::authorize_cap_request`], the fixed
+//!    method+path allow-list a scoped token may act on; the scope is inserted
+//!    into the extensions (read back by `GET /auth/capability` via
+//!    [`crate::capability::CapabilityActor`]). This is the `dearborn` CLI's
+//!    bearer: a token minted for one epic can act only on that epic.
+//!
+//! Public routes (notably `GET /health`) bypass it entirely.
 //!
 //! On failure the layer returns `401`. When the token is absent or invalid
 //! **and** the instance has no users yet (unclaimed), it returns
@@ -53,6 +63,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use subtle::ConstantTimeEq;
 
+use crate::capability;
 use crate::{users::Role, AppError, AppState};
 
 /// Version tag embedded in every token and covered by the MAC. Bump on any
@@ -210,14 +221,9 @@ fn now_ms() -> i64 {
         .unwrap_or_default()
 }
 
-/// Authenticate a request by verifying its `Authorization: Bearer <token>`
-/// against the instance's signing key, then inserting the verified [`Claims`]
-/// into the request extensions for handlers to read via [`CurrentUser`].
-///
-/// Verification is stateless: one HMAC check and an `exp` comparison, no
-/// database query — that is what keeps the hot path cheap. Revocation of a live
-/// token therefore does not happen mid-flight; it lands at the next refresh
-/// (`POST /auth/refresh` re-reads the user row).
+/// Authenticate a request by resolving its `Authorization: Bearer <token>` as
+/// a session token or a capability token (see the module doc for the two
+/// credential kinds and their privileges).
 ///
 /// On any failure returns `401` ([`AppError::Unauthorized`]), **except** when
 /// the instance is unclaimed — no `user` row exists yet — in which case it
@@ -235,16 +241,32 @@ pub async fn require_auth(
         .and_then(|value| value.to_str().ok())
         .and_then(bearer_token);
 
-    let claims = match presented {
-        Some(token) => state.auth_key.verify(token).ok(),
-        None => None,
-    };
-    let Some(claims) = claims else {
-        return Err(unauthorized_or_setup(&state).await);
-    };
+    if let Some(token) = presented {
+        // Kind 1: a browser session token. Stateless verify; full access.
+        if let Ok(claims) = state.auth_key.verify(token) {
+            request.extensions_mut().insert(claims);
+            return Ok(next.run(request).await);
+        }
 
-    request.extensions_mut().insert(claims);
-    Ok(next.run(request).await)
+        // Kind 2: a per-run capability token (the agent-facing `dearborn`
+        // CLI's bearer). Tokens are opaque ULIDs, so a token that failed the
+        // session check above may still be live here. On a hit, the request
+        // must be inside the token's scope AND on the capability allow-list —
+        // a scoped token can only act on its epic, only through the CLI's
+        // verbs. Anything else is a 403, before any handler runs.
+        if let Some(scope) = state.caps.resolve(token) {
+            if !capability::authorize_cap_request(&scope, request.method(), request.uri().path()) {
+                return Err(AppError::Forbidden(
+                    "capability token is scoped to a single epic; this request is outside its scope"
+                        .to_string(),
+                ));
+            }
+            request.extensions_mut().insert(scope);
+            return Ok(next.run(request).await);
+        }
+    }
+
+    Err(unauthorized_or_setup(&state).await)
 }
 
 /// The 401 an unauthenticated caller gets: `setup_required` while the instance
