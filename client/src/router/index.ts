@@ -4,6 +4,7 @@ import ProjectsView from "../components/ProjectsView.vue";
 import ProjectDetailView from "../components/ProjectDetailView.vue";
 import EpicDetailView from "../components/EpicDetailView.vue";
 import MapView from "../components/MapView.vue";
+import DocumentView from "../components/DocumentView.vue";
 import NodeSessionView from "../components/NodeSessionView.vue";
 import DagEditorView from "../components/DagEditorView.vue";
 import EpicKanbanView from "../components/EpicKanbanView.vue";
@@ -53,14 +54,26 @@ const routes: RouteRecordRaw[] = [
     props: true,
   },
   {
-    // The planning-map workflow's own views (map graph, node sessions,
-    // Document) land with their client tasks; for now `/epic/:id` redirects to
-    // the epic's Details page. The API owns `/epics/:id` (GET/PATCH), so the
-    // singular path avoids shadowing the REST namespace on a hard reload /
-    // deep link (same pattern as `/project/:id`).
+    // `/epic/:id` is the epic's landing spot — the living-Document view — and
+    // merely redirects to the same-named route below. The API owns
+    // `/epics/:id` (GET/PATCH), so the singular path avoids shadowing the
+    // REST namespace on a hard reload / deep link (same pattern as
+    // `/project/:id`).
     path: "/epic/:id",
     name: "epic-details-default",
-    redirect: (to) => ({ name: "epic-details", params: { id: to.params.id } }),
+    redirect: (to) => ({ name: "epic-document", params: { id: to.params.id } }),
+  },
+  {
+    // The living-Document view (wayfinder epic §4.5/§10): the epic's
+    // settled-decisions HTML rendered inline, with a TOC + per-section
+    // provenance chips built from the server's section index, section-anchored
+    // comments, and live updates via `document_updated` frames on `epic:<id>`.
+    // Singular `/epic/:id/document` keeps it under the epic client route; the
+    // API owns `/epics/:id/document`.
+    path: "/epic/:id/document",
+    name: "epic-document",
+    component: DocumentView,
+    props: true,
   },
   {
     // The planning-map graph view (wayfinder epic): the epic's decision nodes
