@@ -44,7 +44,7 @@
 //!    failed run the node stays `in_progress` (re-firable) and the evidence
 //!    row closes as `error`.
 //!
-//! AFK nodes never create a `node_session` row (migration 0013: "AFK/no-engine
+//! AFK nodes never create a `node_session` row (migration 0015: "AFK/no-engine
 //! nodes may never create a row") — there is nothing to resume.
 
 use std::path::PathBuf;
@@ -954,7 +954,7 @@ mod tests {
         assert_eq!(map.nodes.len(), 1);
         assert!(map.edges.is_empty());
 
-        // AFK nodes never create a node_session row (migration 0013) — there
+        // AFK nodes never create a node_session row (migration 0015) — there
         // is nothing to resume.
         assert!(crate::node_engine::fetch_session(state.db.conn(), &node_id)
             .await

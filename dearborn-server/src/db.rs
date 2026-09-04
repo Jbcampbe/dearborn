@@ -89,16 +89,19 @@ const MIGRATIONS: &[Migration] = &[
         name: "0012_pr_feedback",
         sql: include_str!("../migrations/0012_pr_feedback.sql"),
     },
-    // Planning-map & living-document data model (epic "Wayfinder-Inspired
-    // Planning" §4): map_node, map_node_dependency, node_session, node_message,
-    // document, document_version, document_section, node_asset, the overhauled
-    // comment, and activity; the epic prose cutover adds destination/notes/
-    // not_yet_specified/out_of_scope and drops product_context/technical_context.
-    Migration {
-        id: 13,
-        name: "0013_planning_map_schema",
-        sql: include_str!("../migrations/0013_planning_map_schema.sql"),
-    },
+    // NOTE: id 13 is owned by `0013_agent_run_thinking` (the `record-thinking`
+    // line of work, merged ahead of this one). These two branches independently
+    // authored an id-13 migration; to avoid the collision that silently skips
+    // one of them, the wayfinder pair sits at 14/15 on the assumption
+    // record-thinking lands first. Never reuse an id across branches.
+    //
+    // The pair is ordered drop-then-create (14 before 15) so a db that already
+    // recorded `drop_linear_planning` at id 14 (agent_run_thinking took 13, so
+    // `planning_map_schema` was skipped) self-heals: the next boot applies id 15
+    // and nothing else. The two are independent — `drop_linear_planning` only
+    // drops `transcript_message`/`planning_session`, and `planning_map_schema`
+    // references only its own new tables — so the order is purely mechanical.
+    //
     // Clean cutover (wayfinder epic §12): retire the linear product/technical
     // planning store — `transcript_message` and `planning_session` — now that
     // the code paths reading and writing them are gone (no feature flag, no
@@ -107,6 +110,16 @@ const MIGRATIONS: &[Migration] = &[
         id: 14,
         name: "0014_drop_linear_planning",
         sql: include_str!("../migrations/0014_drop_linear_planning.sql"),
+    },
+    // Planning-map & living-document data model (epic "Wayfinder-Inspired
+    // Planning" §4): map_node, map_node_dependency, node_session, node_message,
+    // document, document_version, document_section, node_asset, the overhauled
+    // comment, and activity; the epic prose cutover adds destination/notes/
+    // not_yet_specified/out_of_scope and drops product_context/technical_context.
+    Migration {
+        id: 15,
+        name: "0015_planning_map_schema",
+        sql: include_str!("../migrations/0015_planning_map_schema.sql"),
     },
 ];
 
@@ -850,13 +863,13 @@ mod tests {
         );
     }
 
-    /// Migration `0013_planning_map_schema` lands every planning-map table with
+    /// Migration `0015_planning_map_schema` lands every planning-map table with
     /// the exact schema the wayfinder epic plan §4 spells out: documented
     /// columns, PKs, and FKs (FK enforcement via `PRAGMA foreign_keys = ON`
     /// rejects orphan rows), plus the epic prose cutover — the four wayfinder
     /// columns present, product_context/technical_context gone.
     #[tokio::test]
-    async fn migration_0013_creates_planning_map_tables_and_epic_prose_cutover() {
+    async fn migration_0015_creates_planning_map_tables_and_epic_prose_cutover() {
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
 
@@ -1199,11 +1212,11 @@ mod tests {
     }
 
     /// The planning-map cutover leaves Ready/InProgress epics intact: on a DB
-    /// migrated through 0013, a pre-existing epic row with executor columns
+    /// migrated through 0015, a pre-existing epic row with executor columns
     /// populated still round-trips, and the executor task tables/claim indexes
     /// are untouched (planning nodes are a separate namespace).
     #[tokio::test]
-    async fn migration_0013_keeps_existing_ready_and_in_progress_epics_intact() {
+    async fn migration_0015_keeps_existing_ready_and_in_progress_epics_intact() {
         let db = Db::connect(":memory:").await.unwrap();
         db.run_migrations().await.unwrap();
 
