@@ -6,7 +6,7 @@
 
 **Plan with your team. Ship with agents.**
 
-A self-hosted Rust server that turns a foggy idea into a reviewed pull request.
+A self-hosted Rust server that turns an idea into a reviewed pull request.
 Chart the decisions with your team, then let coding agents build it.
 
 ![Rust](https://img.shields.io/badge/Rust-axum%20%2B%20tokio-orange?logo=rust)
